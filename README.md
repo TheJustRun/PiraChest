@@ -60,8 +60,10 @@
 - Download manager is still quirky with a lot of files, currently it is recommended to download about 3 files at once. Needs more testing
 - The accent color option is a placeholder
 - Persistent settings don't work xd
-- And more idk? I need more testing, that's why I'm releasing it in alpha, so I get more feedback on the thing rather than just blindly making it.
 - Light mode sucks
+- main.py doesn't work for testing for some reason, you have to build the app to do so. It will be fixed soon
+- And more idk? I need more testing, that's why I'm releasing it in alpha, so I get more feedback on the thing rather than just blindly making it.
+
 
 ## Requirements
 - **Python 3.10+**
