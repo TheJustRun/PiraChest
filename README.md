@@ -32,6 +32,7 @@
 - [ ] Localization
 - [ ] Linux *(never™)*
 - more ig
+
 ## Photos
 
 <table>
@@ -59,6 +60,7 @@
 - The accent color option is a placeholder
 - Persistent settings don't work xd
 - And more idk? I need more testing, that's why I'm releasing it in alpha, so I get more feedback on the thing rather than just blindly making it.
+- Light mode sucks
 
 ## Requirements
 - **Python 3.10+**
@@ -151,6 +153,7 @@ Settings are stored in `.config/pirachest_settings.json` relative to the project
 ├── requirements.txt
 └── README.md
 ```
+Also, special thanks to [spicysaltysparty](https://www.reddit.com/user/spicysaltysparty/) for creating the logo
 
 ## Disclaimer
 
@@ -164,3 +167,4 @@ Settings are stored in `.config/pirachest_settings.json` relative to the project
 > The Minerva Archive and its contributors do not endorse or encourage
 > copyright infringement. Please only download ROMs for software you own a
 > legal copy of, or for software that is in the public domain.
+
