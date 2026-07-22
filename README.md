@@ -145,14 +145,9 @@ Settings are stored in `.config/pirachest_settings.json` relative to the project
 │       ├── splash.py            # Splash screen icon lookup
 │       ├── download_manager_panel.py  # Download queue page with live stats
 │       ├── rom_details_panel.py     # Right-side ROM metadata card (local DB only)
-│       ├── rom_table_model.py       # Paginated QAbstractTableModel for ROM table
-│       └── components/
-│           ├── rom_details.py       # Rich ROM info card (cover art, metadata)
-│           ├── rom_table.py         # Results table with title cleaning & region extraction
-│           └── search_bar.py        # Debounced search input
-├── build.bat                  # PyInstaller build script (Windows)
-├── MinervaROMDownloader.spec  # PyInstaller spec file
-├── pyproject.toml
+│       └── rom_table_model.py       # Paginated QAbstractTableModel for ROM table      
+├── build.bat  
+├── PiraChest.spec  # PyInstaller spec file
 ├── requirements.txt
 └── README.md
 ```
