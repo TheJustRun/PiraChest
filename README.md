@@ -1,6 +1,6 @@
 # PiraChest: An all-in-one desktop free media downloader (WIP)
 <img width="2484" height="1200" alt="banner" src="https://github.com/user-attachments/assets/20c0fe91-385c-410a-94e0-7bf191610cab" />
- A Work in Progress desktop GUI application to download specific ROMs from the [Minerva Archive](https://minerva-archive.org ) using BitTorrent (With more sources and features coming!), with the hope of being a complete app for sailing the seven seas, downloading music, books, courses, and many more.
+ A Work in Progress desktop GUI application to download specific ROMs from the Minerva Archive : https://minerva-archive.org ,using BitTorrent (With more sources and features coming!), with the hope of being a complete app for sailing the seven seas, downloading music, books, courses, and many more.
 
 ## Features
 
