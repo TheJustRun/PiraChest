@@ -1,0 +1,6 @@
+PyQt6>=6.5.0
+PyQt6-Fluent-Widgets>=1.7.0
+libtorrent==2.0.13
+requests>=2.31.0
+orjson>=3.9.0
+darketect
