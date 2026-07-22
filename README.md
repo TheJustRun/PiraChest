@@ -5,7 +5,8 @@
 ## Features
 
 **DISCLAIMER**: This app is in **ALPHA**. I'm just releasing it as is right now to get feedback and contributions to help polish and improve the app over time, even the current features that are added may have bugs, issues, freezes, or just incomplete and not finished
-**another DISCLAIMER**: this app has been AI-assisted using a local LLM ( Qwen 3.6 35B ) to *help* with the backend, if without it, I wouldn't have gotten the torrent per-file downloading system working, and I would have shot myself dead
+
+**DISCLAIMER²**: this app has been AI-assisted using a local LLM ( Qwen 3.6 35B ) to *help* with the backend, if without it, I wouldn't have gotten the torrent per-file downloading system working, and I would have shot myself dead
 - **ROM Browsing** : Browse a local SQLite-indexed ROM catalog covering 70+ console platforms. Filter by console, source (No-Intro, Redump, TOSEC, etc.), and per-console variants.
 - **Smart Torrent Engine**: Uses `libtorrent 2.0.13` to download only the requested ROM file from multi-gigabyte torrent dumps, via a persistent queue with pause/resume/retry/cancel controls.
 - **Download Manager**: Real-time download queue with drag-and-drop reordering, live speed/progress/seed stats, per-torrent settings (speed limits, peer caps, ratio/time limits, force recheck).
