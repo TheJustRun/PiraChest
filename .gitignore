@@ -4,3 +4,6 @@ __pycache__/
 *.pyo
 *.log
 .env
+dist/
+build/
+src/data
