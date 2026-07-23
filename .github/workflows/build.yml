@@ -3,6 +3,7 @@ name: Build PiraChest (Windows x64)
 on:
   push:
     branches: [ main ]
+
 permissions:
   contents: write
 
@@ -52,7 +53,6 @@ jobs:
 
           Write-Output "Created artifact: $zipName"
           
-          # Set an environment variable so the next step knows the exact filename
           echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
           echo "ZIP_PATH=$zipPath" >> $env:GITHUB_ENV
 
@@ -64,4 +64,4 @@ jobs:
           body: "Automated alpha build from commit ${{ github.sha }}."
           draft: false
           prerelease: true
-          files: ${{ env:ZIP_PATH }}
+          files: ${{ env.ZIP_PATH }}
