@@ -1,0 +1,13 @@
+{
+  "download_dir": "C:\\Users\\Mahdi\\Desktop\\Projects\\github\\PiraChest\\downloads",
+  "speed_limit": 0,
+  "upload_speed_limit": 500,
+  "seed_time": 0,
+  "auto_download": false,
+  "delete_torrent_after": true,
+  "theme_mode": "Dark",
+  "hide_alpha_disclaimer": false,
+  "pc_games_enabled": false,
+  "local_dat_enabled": false,
+  "_console_structure": true
+}

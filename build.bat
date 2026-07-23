@@ -23,6 +23,7 @@ echo.
 
 python -m PyInstaller ^
     --name=PiraChest ^
+    --icon=".\src\gui\icon.ico" ^
     --onedir ^
     --windowed ^
     --noconfirm ^

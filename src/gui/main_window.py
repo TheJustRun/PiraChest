@@ -7,7 +7,7 @@ from typing import Optional
 
 from PyQt6.QtCore import QMimeData, QObject, QThread, QUrl, Qt, QEvent, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel as QtQLabel
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtGui import QFont, QColor, QGuiApplication
 from PyQt6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -217,6 +217,148 @@ class DetailsPanel(QWidget):
         except Exception:
             logger.exception("Download click handler error")
 
+class GameListScrollArea:
+    @staticmethod
+    def configure(scroll) -> None:
+        try:
+            from PyQt6.QtWidgets import QAbstractScrollArea
+            scroll.setViewportUpdateMode(QAbstractScrollArea.ViewportUpdateMode.FullViewportUpdate)
+        except Exception:
+            pass
+        try:
+            scroll.viewport().setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+            scroll.viewport().setAutoFillBackground(False)
+        except Exception:
+            pass
+        try:
+            scroll.viewport().setUpdatesEnabled(True)
+        except Exception:
+            pass
+
+        try:
+            scroll.setSingleStep(60)
+        except Exception:
+            pass
+
+        repaint_timer = QTimer(scroll)
+        repaint_timer.setInterval(8)
+        repaint_timer.setTimerType(Qt.TimerType.PreciseTimer)
+
+        def _tick(_scroll=scroll):
+            viewport = _scroll.viewport()
+            if viewport is not None:
+                viewport.repaint()
+
+        repaint_timer.timeout.connect(_tick)
+        scroll._tearing_fix_timer = repaint_timer
+
+        def _start_repaint_guard():
+            if not repaint_timer.isActive():
+                repaint_timer.start()
+
+        def _stop_repaint_guard():
+            repaint_timer.stop()
+
+        v_bar = scroll.verticalScrollBar()
+        if v_bar is not None:
+            v_bar.valueChanged.connect(lambda _v: _start_repaint_guard())
+
+        animation = getattr(scroll, "scrollAnimation", None)
+        if animation is not None:
+            try:
+                animation.finished.connect(_stop_repaint_guard)
+            except Exception:
+                pass
+
+        idle_stop_timer = QTimer(scroll)
+        idle_stop_timer.setSingleShot(True)
+        idle_stop_timer.setInterval(150)
+        idle_stop_timer.timeout.connect(_stop_repaint_guard)
+        scroll._tearing_fix_idle_timer = idle_stop_timer
+
+        def _restart_idle_stop(_v=None):
+            idle_stop_timer.start()
+
+        if v_bar is not None:
+            v_bar.valueChanged.connect(_restart_idle_stop)
+
+        original_wheel_event = scroll.wheelEvent
+
+        def _guarded_wheel_event(event, _scroll=scroll, _orig=original_wheel_event):
+            anim = getattr(_scroll, "scrollAnimation", None)
+            if anim is not None:
+                try:
+                    if anim.state() == anim.State.Running:
+                        anim.stop()
+                except Exception:
+                    pass
+            _start_repaint_guard()
+            idle_stop_timer.start()
+            return _orig(event)
+
+        scroll.wheelEvent = _guarded_wheel_event
+
+
+def _make_smooth_scroll_area(parent=None):
+    from qfluentwidgets import SmoothScrollArea
+
+    scroll = SmoothScrollArea(parent) if parent is not None else SmoothScrollArea()
+    GameListScrollArea.configure(scroll)
+    return scroll
+
+
+from qfluentwidgets.components.widgets.combo_box import ComboBoxMenu
+
+
+class _BoundedComboBoxMenu(ComboBoxMenu):
+    MAX_POPUP_WIDTH = 320
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.view.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.view.setWordWrap(False)
+        self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def _capped_width(self):
+        owner = self.parent()
+        window = owner.window() if owner is not None else None
+        screen = owner.screen() if owner is not None and hasattr(owner, "screen") else None
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+
+        limit = self.MAX_POPUP_WIDTH
+        if screen is not None:
+            limit = min(limit, screen.availableGeometry().width() - 24)
+        if window is not None:
+            limit = min(limit, window.width() - 24)
+        if owner is not None:
+            limit = max(limit, owner.width())
+        return max(limit, 160)
+
+    def adjustSize(self):
+        super().adjustSize()
+        capped_width = self._capped_width()
+        if self.view.width() > capped_width:
+            size = self.view.size()
+            size.setWidth(capped_width)
+            self.view.setFixedSize(size)
+        if self.width() > capped_width:
+            size = self.size()
+            size.setWidth(capped_width)
+            self.setFixedSize(size)
+
+
+class ConsoleComboBox(ComboBox):
+    MAX_VISIBLE_ROWS = 10
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMaxVisibleItems(self.MAX_VISIBLE_ROWS)
+
+    def _createComboMenu(self):
+        return _BoundedComboBoxMenu(self)
+
+
 class HomePage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -271,7 +413,7 @@ class HomePage(QWidget):
         cv_layout = QHBoxLayout(cv_group)
         cv_layout.setContentsMargins(0, 0, 0, 0)
         cv_layout.setSpacing(6)
-        self._console_filter = ComboBox()
+        self._console_filter = ConsoleComboBox()
         self._console_filter.setPlaceholderText("Console")
         self._console_filter.setFixedHeight(30)
         self._console_filter.setMinimumWidth(90)
@@ -372,9 +514,7 @@ class HomePage(QWidget):
         pag_row.addStretch()
         left_layout.addLayout(pag_row)
 
-        from qfluentwidgets import SmoothScrollArea
-
-        scroll = SmoothScrollArea()
+        scroll = _make_smooth_scroll_area()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
@@ -874,9 +1014,7 @@ class SettingsPage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        from qfluentwidgets import SmoothScrollArea
-
-        scroll = SmoothScrollArea(self)
+        scroll = _make_smooth_scroll_area(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
@@ -1183,9 +1321,7 @@ class AboutPage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        from qfluentwidgets import SmoothScrollArea
-
-        scroll = SmoothScrollArea(self)
+        scroll = _make_smooth_scroll_area(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
