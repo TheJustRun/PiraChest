@@ -1,0 +1,67 @@
+name: Build PiraChest (Windows x64)
+
+on:
+  push:
+    branches: [ main ]
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: PyInstaller → Permanent Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install project dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --clean PiraChest.spec
+
+      - name: Zip application contents
+        shell: pwsh
+        run: |
+          $distDir = "dist/PiraChest"
+
+          if (-not (Test-Path $distDir)) {
+            Write-Error "Expected build output at $distDir but it does not exist."
+            Write-Error "Contents of dist/:"
+            Get-ChildItem -Path dist | Select-Object -ExpandProperty Name
+            exit 1
+          }
+
+          $runNumber   = "${{ github.run_number }}"
+          $zipName     = "PiraChest-v0.1.${runNumber}-alpha-Windows-x64.zip"
+          $zipPath     = "${{ github.workspace }}\$zipName"
+
+          Compress-Archive -Path "${distDir}\*" -DestinationPath $zipPath -Force
+
+          Write-Output "Created artifact: $zipName"
+          
+          # Set an environment variable so the next step knows the exact filename
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+          echo "ZIP_PATH=$zipPath" >> $env:GITHUB_ENV
+
+      - name: Create Permanent GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v0.1.${{ github.run_number }}-alpha"
+          name: "PiraChest v0.1.${{ github.run_number }} Alpha"
+          body: "Automated alpha build from commit ${{ github.sha }}."
+          draft: false
+          prerelease: true
+          files: ${{ env:ZIP_PATH }}
