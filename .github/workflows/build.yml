@@ -65,4 +65,4 @@ jobs:
           body: "Automated alpha build from commit ${{ github.sha }}."
           draft: false
           prerelease: true
-          files: ${{ env:EXE_PATH }}
+          files: ${{ env.EXE_PATH }}
