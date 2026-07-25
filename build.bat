@@ -29,6 +29,7 @@ python -m PyInstaller ^
     --noconfirm ^
     --noupx ^
     --clean ^
+    --onefile ^
     --exclude-module=PyQt5 ^
     --exclude-module=PySide2 ^
     --exclude-module=PySide6 ^
@@ -95,7 +96,8 @@ python -m PyInstaller ^
     --collect-submodules=PyQt6.QtXml ^
     --collect-submodules=qfluentwidgets ^
     --collect-data=qfluentwidgets ^
-    --add-data "src;src" ^
+    --add-data "src\gui;src\gui" ^
+    --add-data "src\core;src\core" ^
     --hidden-import=PyQt6.QtCore ^
     --hidden-import=PyQt6.QtGui ^
     --hidden-import=PyQt6.QtWidgets ^

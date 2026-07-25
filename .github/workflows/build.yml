@@ -28,33 +28,34 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Write version file
+        shell: pwsh
+        run: |
+          $runNumber = "${{ github.run_number }}"
+          $version = "0.1.$runNumber"
+          Set-Content -Path "VERSION" -Value $version -NoNewline
+
       - name: Build with PyInstaller
         run: |
           pyinstaller --clean PiraChest.spec
 
-      - name: Zip application contents
+      - name: Rename executable
         shell: pwsh
         run: |
-          $distDir = "dist/PiraChest"
+          $exePath = "dist/PiraChest.exe"
 
-          if (-not (Test-Path $distDir)) {
-            Write-Error "Expected build output at $distDir but it does not exist."
-            Write-Error "Contents of dist/:"
-            Get-ChildItem -Path dist | Select-Object -ExpandProperty Name
+          if (-not (Test-Path $exePath)) {
+            Write-Error "Expected build output at $exePath but it does not exist."
             exit 1
           }
 
-          $runNumber   = "${{ github.run_number }}"
-          $zipName     = "PiraChest-v0.1.${runNumber}-alpha-Windows-x64.zip"
-          $zipPath     = "${{ github.workspace }}\$zipName"
+          $runNumber = "${{ github.run_number }}"
+          $exeName   = "PiraChest-v0.1.${runNumber}-alpha-Windows-x64.exe"
+          $exePathOut = "${{ github.workspace }}\$exeName"
 
-          Compress-Archive -Path "${distDir}\*" -DestinationPath $zipPath -Force
+          Copy-Item -Path $exePath -Destination $exePathOut -Force
 
-          Write-Output "Created artifact: $zipName"
-          
-          # Set an environment variable so the next step knows the exact filename
-          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
-          echo "ZIP_PATH=$zipPath" >> $env:GITHUB_ENV
+          echo "EXE_PATH=$exePathOut" >> $env:GITHUB_ENV
 
       - name: Create Permanent GitHub Release
         uses: softprops/action-gh-release@v2
@@ -64,4 +65,4 @@ jobs:
           body: "Automated alpha build from commit ${{ github.sha }}."
           draft: false
           prerelease: true
-          files: ${{ env:ZIP_PATH }}
+          files: ${{ env:EXE_PATH }}

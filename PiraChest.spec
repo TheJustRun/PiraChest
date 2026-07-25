@@ -2,7 +2,7 @@
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_submodules
 
-datas = [('src', 'src')]
+datas = [('src\\gui', 'src\\gui'), ('src\\core', 'src\\core')]
 hiddenimports = ['PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets', 'PyQt6.QtSvg', 'PyQt6.QtXml', 'requests', 'orjson', 'qfluentwidgets']
 datas += collect_data_files('qfluentwidgets')
 hiddenimports += collect_submodules('PyQt6.QtCore')
@@ -31,13 +31,16 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name='PiraChest',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
+    upx_exclude=[],
+    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -45,13 +48,4 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['src\\gui\\icon.ico'],
-)
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name='PiraChest',
 )

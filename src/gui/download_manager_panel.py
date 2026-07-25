@@ -452,33 +452,31 @@ class DownloadManagerPage(QWidget):
             handle_hover = "rgba(0, 0, 0, 72)"
         self._list.setStyleSheet(
             f"""
-            QListWidget
+            QListWidget {{
                 background-color: {tint};
                 border: none;
                 outline: none;
             }}
-            QListWidget
+            QListWidget::item {{
                 background: transparent;
             }}
-            QListWidget
+            QScrollBar:vertical {{
                 background: transparent;
                 width: 10px;
                 margin: 2px;
             }}
-            QListWidget
+            QScrollBar::handle:vertical {{
                 background: {handle};
                 border-radius: 5px;
                 min-height: 24px;
             }}
-            QListWidget
+            QScrollBar::handle:vertical:hover {{
                 background: {handle_hover};
             }}
-            QListWidget
-            QListWidget
+            QScrollBar:horizontal {{
                 height: 0px;
             }}
-            QListWidget
-            QListWidget
+            QScrollBar::add-line, QScrollBar::sub-line {{
                 background: transparent;
             }}
             """

@@ -17,9 +17,8 @@ logger = logging.getLogger(__name__)
 
 INDEX_RAW_ZIP_URL = "https://github.com/Caprico1/Minerva-archive-ids/archive/refs/heads/main.zip"
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_CLONE_DIR = os.path.join(_PROJECT_ROOT, "tmp", "minerva-index-clone")
-_DATA_DIR = os.path.join(_PROJECT_ROOT, "src", "data")
+from .config import paths as _paths
+_CLONE_DIR = os.path.join(_paths.app_data_dir, "tmp", "minerva-index-clone")
 
 _RE_TABLE_HEADER = re.compile(r"^\|\s*ID\s*")
 

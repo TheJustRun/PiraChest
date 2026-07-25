@@ -4,3 +4,4 @@ libtorrent==2.0.13
 requests>=2.31.0
 orjson>=3.9.0
 darkdetect>=0.8.0
+beautifulsoup4

@@ -7,9 +7,10 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_DATA_DIR = os.path.join(_PROJECT_ROOT, "src", "data")
-_DB_PATH = os.path.join(_DATA_DIR, "minerva_index.db")
+from .config import paths as _paths
+
+_DATA_DIR = _paths.data_dir
+_DB_PATH = _paths.db_path
 
 def _migrate_name_to_title(conn: sqlite3.Connection) -> None:
     existing = {

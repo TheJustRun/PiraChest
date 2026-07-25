@@ -60,11 +60,38 @@ from ..core import database as db, sync as sync_module
 from ..core import console_variants
 from ..core.config import settings as _global_settings, resolve_theme, ThemeMode
 from ..core.theme import palette, settings_qss
-from .settings_dialog import save_settings
+from ..core.config import save_settings
+from .repacks_page import RepacksPage
+
+
+class _LazyRepacksPage(QWidget):
+    def __init__(self, download_manager, parent=None):
+        super().__init__(parent)
+        self._download_manager = download_manager
+        self._real_page: Optional[QWidget] = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._layout = layout
+
+    def showEvent(self, event):
+        if self._real_page is None:
+            self._real_page = RepacksPage(self._download_manager)
+            self._layout.addWidget(self._real_page)
+        super().showEvent(event)
 
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 30
+
+_GUI_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOGO_CANDIDATES = ("logo.ico", "logo.png", "logo.svg", "logo.jpg", "logo.jpeg")
+
+def find_logo_path() -> Optional[str]:
+    for name in _LOGO_CANDIDATES:
+        candidate = os.path.join(_GUI_DIR, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 def _get_all_consoles() -> list[str]:
     try:
@@ -94,7 +121,7 @@ class RomCardWidget(CardWidget):
         from qfluentwidgets import CheckBox as _CheckBox
         self._select_chk = _CheckBox()
         self._select_chk.setFixedWidth(20)
-        self._select_chk.toggled.connect(lambda checked, r=rom: self.selection_toggled.emit(r, checked))
+        self._select_chk.toggled.connect(lambda checked: self.selection_toggled.emit(self._rom, checked))
         layout.addWidget(self._select_chk)
         title_val = str(rom.get("title", "—") or "—")
         self._title_lbl = StrongBodyLabel(title_val)
@@ -111,7 +138,7 @@ class RomCardWidget(CardWidget):
         self._dl_btn = PrimaryToolButton(FluentIcon.DOWNLOAD, self)
         self._dl_btn.setFixedSize(36, 36)
         self._dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._dl_btn.clicked.connect(lambda _=False, r=rom: self.download_clicked.emit(r))
+        self._dl_btn.clicked.connect(lambda _=False: self.download_clicked.emit(self._rom))
         layout.addWidget(self._dl_btn)
 
     def set_rom(self, rom: dict):
@@ -222,16 +249,12 @@ class GameListScrollArea:
     def configure(scroll) -> None:
         try:
             from PyQt6.QtWidgets import QAbstractScrollArea
-            scroll.setViewportUpdateMode(QAbstractScrollArea.ViewportUpdateMode.FullViewportUpdate)
+            scroll.setViewportUpdateMode(QAbstractScrollArea.ViewportUpdateMode.MinimalViewportUpdate)
         except Exception:
             pass
         try:
-            scroll.viewport().setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+            scroll.viewport().setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
             scroll.viewport().setAutoFillBackground(False)
-        except Exception:
-            pass
-        try:
-            scroll.viewport().setUpdatesEnabled(True)
         except Exception:
             pass
 
@@ -240,63 +263,15 @@ class GameListScrollArea:
         except Exception:
             pass
 
-        repaint_timer = QTimer(scroll)
-        repaint_timer.setInterval(8)
-        repaint_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        v_bar = scroll.verticalScrollBar()
 
-        def _tick(_scroll=scroll):
+        def _on_scroll(_v=None, _scroll=scroll):
             viewport = _scroll.viewport()
             if viewport is not None:
-                viewport.repaint()
-
-        repaint_timer.timeout.connect(_tick)
-        scroll._tearing_fix_timer = repaint_timer
-
-        def _start_repaint_guard():
-            if not repaint_timer.isActive():
-                repaint_timer.start()
-
-        def _stop_repaint_guard():
-            repaint_timer.stop()
-
-        v_bar = scroll.verticalScrollBar()
-        if v_bar is not None:
-            v_bar.valueChanged.connect(lambda _v: _start_repaint_guard())
-
-        animation = getattr(scroll, "scrollAnimation", None)
-        if animation is not None:
-            try:
-                animation.finished.connect(_stop_repaint_guard)
-            except Exception:
-                pass
-
-        idle_stop_timer = QTimer(scroll)
-        idle_stop_timer.setSingleShot(True)
-        idle_stop_timer.setInterval(150)
-        idle_stop_timer.timeout.connect(_stop_repaint_guard)
-        scroll._tearing_fix_idle_timer = idle_stop_timer
-
-        def _restart_idle_stop(_v=None):
-            idle_stop_timer.start()
+                viewport.update()
 
         if v_bar is not None:
-            v_bar.valueChanged.connect(_restart_idle_stop)
-
-        original_wheel_event = scroll.wheelEvent
-
-        def _guarded_wheel_event(event, _scroll=scroll, _orig=original_wheel_event):
-            anim = getattr(_scroll, "scrollAnimation", None)
-            if anim is not None:
-                try:
-                    if anim.state() == anim.State.Running:
-                        anim.stop()
-                except Exception:
-                    pass
-            _start_repaint_guard()
-            idle_stop_timer.start()
-            return _orig(event)
-
-        scroll.wheelEvent = _guarded_wheel_event
+            v_bar.valueChanged.connect(_on_scroll)
 
 
 def _make_smooth_scroll_area(parent=None):
@@ -1039,7 +1014,7 @@ class SettingsPage(QWidget):
         app_group = SettingCardGroup("Appearance", self)
 
         self._theme_combo = ComboBox()
-        self._theme_combo.addItems(["Dark", "Light", "Auto (Follow System)"])
+        self._theme_combo.addItems(["Dark", "Light (Kinda suck)", "Auto (Follow System)"])
         self._theme_combo.setMinimumWidth(160)
         theme_card = SettingCard(
             FluentIcon.BRUSH,
@@ -1154,15 +1129,30 @@ class SettingsPage(QWidget):
         )
         perf_group.addSettingCard(self._chk_delete_torrent)
 
+        self._chk_close_to_tray = SwitchSettingCard(
+            icon=FluentIcon.MINIMIZE,
+            title="Minimize to system tray on close",
+            content="Keep PiraChest running in the system tray instead of exiting when you close the window",
+        )
+        perf_group.addSettingCard(self._chk_close_to_tray)
+
         layout.addWidget(perf_group)
         layout.addSpacing(20)
 
-        feature_group = SettingCardGroup("Experimental Features (Currently placeholders)", self)
+        feature_group = SettingCardGroup("Features", self)
+
+        self._chk_minerva = SwitchSettingCard(
+            icon=FluentIcon.LIBRARY,
+            title="Minerva ROM Index",
+            content="Show the Home section with ROM browsing and sync",
+        )
+        self._connect_switch(self._chk_minerva, self._on_minerva_toggled)
+        feature_group.addSettingCard(self._chk_minerva)
 
         self._chk_pc_games = SwitchSettingCard(
             icon=FluentIcon.GAME,
-            title="PC Games (Repacks)",
-            content="Show a PC Games section in the sidebar (placeholder, repack management coming later)",
+            title="Repacks (PC Games)",
+            content="Show a PC Games section in the sidebar",
         )
         self._connect_switch(self._chk_pc_games, self._on_pc_games_toggled)
         feature_group.addSettingCard(self._chk_pc_games)
@@ -1176,6 +1166,39 @@ class SettingsPage(QWidget):
         feature_group.addSettingCard(self._chk_local_dat)
 
         layout.addWidget(feature_group)
+        layout.addSpacing(20)
+
+        adv_group = SettingCardGroup("Advanced / Power Options", self)
+
+        self._chk_admin_mode = SwitchSettingCard(
+            icon=FluentIcon.DEVELOPER_TOOLS,
+            title="Run with administrator privileges",
+            content="Relaunches PiraChest as admin so all app data can always be "
+                    "written next to the executable, even in protected folders. "
+                    "Requires app restart.",
+        )
+        self._connect_switch(self._chk_admin_mode, self._on_admin_mode_toggled)
+        adv_group.addSettingCard(self._chk_admin_mode)
+
+        from ..core.updater import __version__ as _app_version
+
+        self._update_status_lbl = CaptionLabel("")
+        self._btn_check_update = PushButton("Check for Updates")
+        self._btn_check_update.clicked.connect(self._on_check_update)
+
+        update_card = SettingCard(
+            FluentIcon.SYNC,
+            "Software Updates",
+            f"Current version: v{_app_version}",
+            self,
+        )
+        update_card.hBoxLayout.addWidget(self._update_status_lbl, 0, Qt.AlignmentFlag.AlignRight)
+        update_card.hBoxLayout.addSpacing(8)
+        update_card.hBoxLayout.addWidget(self._btn_check_update, 0, Qt.AlignmentFlag.AlignRight)
+        update_card.hBoxLayout.addSpacing(4)
+        adv_group.addSettingCard(update_card)
+
+        layout.addWidget(adv_group)
         layout.addSpacing(20)
 
         self._save_btn = PrimaryPushButton(FluentIcon.SAVE, "Save Settings")
@@ -1195,6 +1218,14 @@ class SettingsPage(QWidget):
             sig = card.switchButton.checkedChanged
         sig.connect(slot)
 
+    def _on_minerva_toggled(self, checked: bool):
+        from ..core.config import settings as _s, apply_settings
+
+        _s.minerva_enabled = checked
+        apply_settings(minerva_enabled=checked)
+        save_settings(_s)
+        self.settings_changed.emit()
+
     def _on_pc_games_toggled(self, checked: bool):
         from ..core.config import settings as _s, apply_settings
 
@@ -1209,6 +1240,170 @@ class SettingsPage(QWidget):
         _s.local_dat_enabled = checked
         apply_settings(local_dat_enabled=checked)
         save_settings(_s)
+        self.settings_changed.emit()
+
+    def _on_check_update(self):
+        self._btn_check_update.setEnabled(False)
+        self._update_status_lbl.setText("Checking…")
+
+        from ..core import updater as _updater
+
+        class _CheckWorker(QObject):
+            done = pyqtSignal(object)
+
+            def run(self):
+                try:
+                    result = _updater.check_for_update()
+                except Exception:
+                    logger.exception("Update check failed")
+                    result = None
+                self.done.emit(result)
+
+        thread = QThread(self)
+        worker = _CheckWorker()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(self._on_update_check_done)
+        worker.done.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._update_thread = thread
+        self._update_worker = worker
+        thread.start()
+
+    def _on_update_check_done(self, result):
+        self._btn_check_update.setEnabled(True)
+
+        if result is None:
+            self._update_status_lbl.setText("Up to date")
+            return
+
+        self._update_status_lbl.setText(f"Update available: {result['tag']}")
+
+        box = MessageBoxBase(self.window())
+        box_layout = QVBoxLayout()
+        box_layout.addWidget(StrongBodyLabel(f"PiraChest {result['tag']} is available"))
+        notes = result.get("notes") or "No release notes provided."
+        notes_lbl = BodyLabel(notes[:500])
+        notes_lbl.setWordWrap(True)
+        box_layout.addWidget(notes_lbl)
+        box.viewLayout.addLayout(box_layout)
+        box.yesButton.setText("Update Now")
+        box.cancelButton.setText("Later")
+
+        if box.exec():
+            self._start_update_download(result)
+
+    def _start_update_download(self, result):
+        from ..core import updater as _updater
+
+        self._update_status_lbl.setText("Downloading…")
+        self._btn_check_update.setEnabled(False)
+
+        class _DownloadWorker(QObject):
+            progress = pyqtSignal(int, int)
+            finished = pyqtSignal(str)
+            error = pyqtSignal(str)
+
+            def run(self):
+                try:
+                    path = _updater.download_update(
+                        result["download_url"],
+                        on_progress=lambda d, t: self.progress.emit(d, t),
+                    )
+                    self.finished.emit(path)
+                except Exception as exc:
+                    self.error.emit(str(exc))
+
+        thread = QThread(self)
+        worker = _DownloadWorker()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_update_download_progress)
+        worker.finished.connect(self._on_update_download_finished)
+        worker.error.connect(self._on_update_download_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._download_thread = thread
+        self._download_worker = worker
+        thread.start()
+
+    def _on_update_download_progress(self, downloaded: int, total: int):
+        if total > 0:
+            pct = int(downloaded / total * 100)
+            self._update_status_lbl.setText(f"Downloading… {pct}%")
+
+    def _on_update_download_finished(self, path: str):
+        self._update_status_lbl.setText("Restarting to apply update…")
+
+        from ..core import updater as _updater
+
+        try:
+            win = self.window()
+            if hasattr(win, "_force_quit"):
+                win._force_quit = True
+            _updater.apply_update_and_restart(path)
+        except Exception as exc:
+            logger.exception("Failed to apply update")
+            self._update_status_lbl.setText("Update failed")
+            self._btn_check_update.setEnabled(True)
+            InfoBar.error(
+                title="Update Failed",
+                content=str(exc),
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=4000,
+                parent=self.window(),
+            )
+
+    def _on_update_download_error(self, msg: str):
+        self._update_status_lbl.setText("Download failed")
+        self._btn_check_update.setEnabled(True)
+        InfoBar.error(
+            title="Update Download Failed",
+            content=msg,
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=4000,
+            parent=self.window(),
+        )
+
+
+        from ..core.config import settings as _s, apply_settings
+
+        _s.local_dat_enabled = checked
+        apply_settings(local_dat_enabled=checked)
+        save_settings(_s)
+        self.settings_changed.emit()
+
+    def _on_admin_mode_toggled(self, checked: bool):
+        from ..core.config import settings as _s, apply_settings, save_settings, relaunch_as_admin, is_admin
+
+        _s.admin_mode = checked
+        apply_settings(admin_mode=checked)
+        save_settings(_s)
+
+        if checked and not is_admin():
+            box = MessageBoxBase(self.window())
+            box_layout = QVBoxLayout()
+            box_layout.addWidget(BodyLabel(
+                "PiraChest needs to restart with administrator privileges "
+                "for this to take effect. Restart now?"
+            ))
+            box.viewLayout.addLayout(box_layout)
+            box.yesButton.setText("Restart Now")
+            box.cancelButton.setText("Later")
+            if box.exec():
+                if relaunch_as_admin():
+                    win = self.window()
+                    if hasattr(win, "_force_quit"):
+                        win._force_quit = True
+                    win.close()
+
         self.settings_changed.emit()
 
     def _on_save(self):
@@ -1266,8 +1461,11 @@ class SettingsPage(QWidget):
         self._spin_upload_speed.setValue(getattr(_s, "upload_speed_limit", 500))
         self._chk_auto.setChecked(getattr(_s, "auto_download", False))
         self._chk_delete_torrent.setChecked(getattr(_s, "delete_torrent_after", True))
+        self._chk_minerva.setChecked(getattr(_s, "minerva_enabled", True))
         self._chk_pc_games.setChecked(getattr(_s, "pc_games_enabled", False))
         self._chk_local_dat.setChecked(getattr(_s, "local_dat_enabled", False))
+        self._chk_close_to_tray.setChecked(getattr(_s, "close_to_tray", False))
+        self._chk_admin_mode.setChecked(getattr(_s, "admin_mode", False))
 
         mode_map = {"Dark": 0, "Light": 1, "Auto": 2}
         idx = mode_map.get(_s.theme_mode, 0)
@@ -1284,8 +1482,11 @@ class SettingsPage(QWidget):
         _s.delete_torrent_after = self._chk_delete_torrent.isChecked()
         _s._console_structure = self._chk_console_structure.isChecked()
         _s.auto_download = self._chk_auto.isChecked()
+        _s.minerva_enabled = self._chk_minerva.isChecked()
         _s.pc_games_enabled = self._chk_pc_games.isChecked()
         _s.local_dat_enabled = self._chk_local_dat.isChecked()
+        _s.close_to_tray = self._chk_close_to_tray.isChecked()
+        _s.admin_mode = self._chk_admin_mode.isChecked()
 
         theme_idx = self._theme_combo.currentIndex()
         theme_modes = [ThemeMode.DARK, ThemeMode.LIGHT, ThemeMode.AUTO]
@@ -1470,7 +1671,6 @@ class AboutPage(QWidget):
 
             logo_path = None
             try:
-                from .splash import find_logo_path
                 logo_path = find_logo_path()
             except Exception:
                 pass
@@ -1517,7 +1717,6 @@ class AboutPage(QWidget):
 
         pixmap_path = None
         try:
-            from .splash import find_logo_path
             import os as _os
 
             gui_dir = _os.path.dirname(_os.path.abspath(__file__))
@@ -1665,6 +1864,32 @@ def _maybe_show_alpha_disclaimer(parent: "MainWindow") -> None:
         except Exception:
             logger.exception("Fail")
 
+class _IconSplashScreen(QWidget):
+    def __init__(self, icon, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        from qfluentwidgets import Theme as _FWTheme
+        bg_color = "#1c1c1c" if qconfig.theme == _FWTheme.DARK else "#f3f3f3"
+        self.setStyleSheet(f"background-color: {bg_color};")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        icon_label = QLabel(self)
+        icon_label.setPixmap(icon.pixmap(160, 160))
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(icon_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        parent.installEventFilter(self)
+        self.raise_()
+        self.show()
+
+    def eventFilter(self, obj, event):
+        if obj is self.parent() and event.type() == QEvent.Type.Resize:
+            self.resize(self.parent().size())
+        return super().eventFilter(obj, event)
+
+    def finish(self):
+        self.parent().removeEventFilter(self)
+        self.deleteLater()
+
 class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
@@ -1674,11 +1899,9 @@ class MainWindow(FluentWindow):
 
         resolve_theme(setTheme)
 
-        from .splash import find_logo_path
-        from PyQt6.QtGui import QIcon
+        from PyQt6.QtGui import QIcon, QPixmap
         from PyQt6.QtCore import QSize
         from PyQt6.QtWidgets import QApplication
-        from qfluentwidgets import SplashScreen
 
         logo_path = find_logo_path()
         if logo_path:
@@ -1688,33 +1911,32 @@ class MainWindow(FluentWindow):
                 "No logo"
             )
 
-        self.splashScreen = SplashScreen(self.windowIcon(), self)
-        self.splashScreen.setIconSize(QSize(160, 160))
-        self.show()
+        self.splashScreen = _IconSplashScreen(self.windowIcon(), self)
+        self.showMaximized()
         QApplication.processEvents()
 
-        self.setMicaEffectEnabled(True)
+        self.setMicaEffectEnabled(False)
 
         self.navigationInterface.setExpandWidth(180)
         self.navigationInterface.setCollapsible(False)
 
+        self._force_quit = False
+        self._tray_icon = None
+        self._init_tray_icon()
+
         qconfig.themeChanged.connect(lambda *_: self._apply_content_surface_tint())
 
-        self.home_page = HomePage(self)
-        self.home_page.setObjectName("minervaPage")
-        self.addSubInterface(
-            self.home_page, FluentIcon.LIBRARY, "Minerva"
-        )
-
+        self.home_page: Optional[HomePage] = None
         self.pc_games_page: Optional[QWidget] = None
         self.local_dat_page: Optional[QWidget] = None
-
-        self._sync_optional_pages()
 
         from ..core.download_manager import DownloadManager
         from .download_manager_panel import DownloadManagerPage
 
         self.download_manager = DownloadManager(self)
+
+        self._sync_optional_pages()
+
         self.download_page = DownloadManagerPage(self.download_manager, self)
         self.download_page.setObjectName("downloadPage")
         self.addSubInterface(
@@ -1736,7 +1958,8 @@ class MainWindow(FluentWindow):
 
         self._apply_content_surface_tint()
 
-        self.switchTo(self.home_page)
+        if self.home_page is not None:
+            self.switchTo(self.home_page)
 
         self.settings_page.settings_changed.connect(self._on_settings_changed)
 
@@ -1753,12 +1976,77 @@ class MainWindow(FluentWindow):
         self.settings_page.setStyleSheet(style)
         self.about_page.setStyleSheet(style)
 
+    def _init_tray_icon(self):
+        from PyQt6.QtWidgets import QSystemTrayIcon, QMenu
+        from PyQt6.QtGui import QAction
+
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logger.warning("System tray is not available on this platform")
+            return
+
+        self._tray_icon = QSystemTrayIcon(self.windowIcon(), self)
+        self._tray_icon.setToolTip("PiraChest")
+
+        menu = QMenu()
+        show_action = QAction("Show PiraChest", self)
+        show_action.triggered.connect(self._restore_from_tray)
+        menu.addAction(show_action)
+
+        menu.addSeparator()
+
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self._quit_from_tray)
+        menu.addAction(exit_action)
+
+        self._tray_icon.setContextMenu(menu)
+        self._tray_icon.activated.connect(self._on_tray_activated)
+        self._tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        from PyQt6.QtWidgets import QSystemTrayIcon
+
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._restore_from_tray()
+
+    def _restore_from_tray(self):
+        self.showNormal() if not self.isMaximized() else self.showMaximized()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self):
+        self._force_quit = True
+        self.close()
+
     def closeEvent(self, event):
+        from ..core.config import settings as _s
+
+        close_to_tray = getattr(_s, "close_to_tray", False)
+
+        if close_to_tray and not self._force_quit and self._tray_icon is not None:
+            event.ignore()
+            self.hide()
+            self._tray_icon.showMessage(
+                "PiraChest",
+                "PiraChest is still running in the background.",
+            )
+            return
+
         try:
             self.download_manager.shutdown()
         except Exception:
             logger.exception("Error stopping download manager")
+        try:
+            from ..core.repacks import cache as repack_cache
+
+            repack_cache.clear_all_cache()
+        except Exception:
+            logger.exception("Error clearing repacks cache")
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
         super().closeEvent(event)
+        from PyQt6.QtWidgets import QApplication
+
+        QApplication.quit()
 
     def _on_settings_changed(self):
         try:
@@ -1795,18 +2083,26 @@ class MainWindow(FluentWindow):
     def _sync_optional_pages(self) -> None:
         from ..core.config import settings as _s
 
+        minerva_enabled = getattr(_s, "minerva_enabled", True)
         pc_enabled = getattr(_s, "pc_games_enabled", False)
         dat_enabled = getattr(_s, "local_dat_enabled", False)
 
         added_new_page = False
 
-        if pc_enabled and self.pc_games_page is None:
-            self.pc_games_page = PlaceholderPage(
-                FluentIcon.GAME,
-                "PC Games (Repacks)",
-                "Browse, manage, and download PC game repacks from here once this "
-                "feature is implemented.",
+        if minerva_enabled and self.home_page is None:
+            self.home_page = HomePage(self)
+            self.home_page.setObjectName("minervaPage")
+            self.addSubInterface(
+                self.home_page, FluentIcon.LIBRARY, "Minerva",
+                position=NavigationItemPosition.TOP,
             )
+            added_new_page = True
+        elif not minerva_enabled and self.home_page is not None:
+            self._remove_subinterface(self.home_page)
+            self.home_page = None
+
+        if pc_enabled and self.pc_games_page is None:
+            self.pc_games_page = _LazyRepacksPage(self.download_manager)
             self.pc_games_page.setObjectName("pcGamesPage")
             self.addSubInterface(
                 self.pc_games_page, FluentIcon.GAME, "PC Games",
@@ -1851,6 +2147,8 @@ class MainWindow(FluentWindow):
             self.addSubInterface(page, icon, text)
 
     def _load_filters(self):
+        if self.home_page is None:
+            return
         consoles = _get_all_consoles()
         if consoles:
             self.home_page._console_filter.clear()
@@ -1870,6 +2168,8 @@ class MainWindow(FluentWindow):
             logger.warning("Failed to load initial ROM data: %s", exc)
 
     def _auto_sync(self):
+        if self.home_page is None:
+            return
         try:
             count = db.count_roms()
         except Exception:
@@ -1880,10 +2180,23 @@ class MainWindow(FluentWindow):
             self.home_page._on_sync()
 
 def _build_app_font() -> "QFont":
-    candidates = ["Segoe UI Variable", "Segoe UI", "Inter", "Noto Sans", "Arial"]
+    candidates = [
+        "Segoe UI Variable",
+        "Segoe UI",
+        "Inter",
+        "Noto Sans",
+        "Arial",
+    ]
+    seen = set()
+    ordered_candidates = []
+    for name in candidates:
+        if name not in seen:
+            seen.add(name)
+            ordered_candidates.append(name)
+
     font = QFont()
-    font.setFamilies(candidates)
-    font.setPointSize(10)
+    font.setFamilies(ordered_candidates)
+    font.setPointSize(11)
     font.setStyleStrategy(
         QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality
     )
@@ -1904,6 +2217,7 @@ def create_application(argv: Optional[list] = None):
     app.setApplicationName("PiraChest")
     app.setApplicationDisplayName("PiraChest")
     app.setOrganizationName("PiraChest")
+    app.setQuitOnLastWindowClosed(False)
 
     base_font = _build_app_font()
     app.setFont(base_font)
