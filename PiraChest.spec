@@ -2,7 +2,7 @@
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_submodules
 
-datas = [('src\\gui', 'src\\gui'), ('src\\core', 'src\\core')]
+datas = [('src\\gui', 'src\\gui'), ('src\\core', 'src\\core'), ('VERSION', '.')]
 hiddenimports = ['PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets', 'PyQt6.QtSvg', 'PyQt6.QtXml', 'requests', 'orjson', 'qfluentwidgets']
 datas += collect_data_files('qfluentwidgets')
 hiddenimports += collect_submodules('PyQt6.QtCore')
