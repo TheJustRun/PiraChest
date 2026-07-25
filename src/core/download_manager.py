@@ -688,14 +688,14 @@ class DownloadManager(QObject):
         _add(torrent_file.replace('_', ' '))
         from urllib.parse import quote
         for name in candidates:
-            url = f'{network.cdn_base}/{quote(name, safe='')}'
+            url = f"{network.cdn_base}/{quote(name, safe='')}"
             try:
                 return self._fetch_torrent(url, cached)
             except FileNotFoundError:
                 continue
         matched = self._find_on_cdn_listing(torrent_file)
         if matched:
-            url = f'{network.cdn_base}/{quote(matched, safe='')}'
+            url = f"{network.cdn_base}/{quote(matched, safe='')}"
             return self._fetch_torrent(url, cached)
         raise RuntimeError(f"Could not locate '{torrent_file}' on the Minerva CDN.")
 
