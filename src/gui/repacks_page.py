@@ -1309,6 +1309,13 @@ class UpcomingRepacksDialog(MessageBoxBase):
         self._card = UpcomingRepacksCard(self)
         self.viewLayout.addWidget(self._card)
         self.widget.setFixedWidth(self._card.CARD_WIDTH + 48)
+        self.finished.connect(self._force_repaint)
+
+    def _force_repaint(self, *_):
+        from PyQt6.QtWidgets import QApplication
+        for w in QApplication.topLevelWidgets():
+            w.update()
+            w.repaint()
 
     def show_loading(self) -> None:
         self._card.set_titles('Upcoming Repacks', '', [])
@@ -1388,6 +1395,13 @@ class RepacksPage(QWidget):
             app.aboutToQuit.connect(self._on_app_about_to_quit)
 
     def _on_app_about_to_quit(self) -> None:
+        thread = getattr(self, '_upcoming_thread', None)
+        try:
+            if thread is not None and thread.isRunning():
+                thread.quit()
+                thread.wait(2000)
+        except RuntimeError:
+            pass
         for tab in self._tabs.values():
             try:
                 tab.shutdown()
@@ -1432,17 +1446,49 @@ class RepacksPage(QWidget):
         if current_key not in _SOURCE_UPCOMING_SUPPORTED:
             return
         existing_thread = getattr(self, '_upcoming_thread', None)
-        if existing_thread is not None and existing_thread.isRunning():
-            return
+        if existing_thread is not None:
+            try:
+                if existing_thread.isRunning():
+                    return
+            except RuntimeError:
+                self._upcoming_thread = None
         dialog = UpcomingRepacksDialog(self)
         dialog.show_loading()
-        dialog.show()
-        self._upcoming_thread, self._upcoming_worker = fetch_upcoming_repacks_async(
+
+        def _safe_done(details):
+            if dialog.isVisible():
+                dialog.show_details(details)
+
+        def _safe_error(message):
+            if dialog.isVisible():
+                dialog.show_error(message)
+
+        thread, worker = fetch_upcoming_repacks_async(
             current_key,
-            on_done=dialog.show_details,
-            on_error=dialog.show_error,
+            on_done=_safe_done,
+            on_error=_safe_error,
             use_cache=True,
         )
+        self._upcoming_thread, self._upcoming_worker = thread, worker
+
+        def _clear_thread_ref():
+            if getattr(self, '_upcoming_thread', None) is thread:
+                self._upcoming_thread = None
+                self._upcoming_worker = None
+
+        thread.finished.connect(_clear_thread_ref)
+
+        def _cleanup_thread():
+            t = getattr(self, '_upcoming_thread', None)
+            try:
+                if t is not None and t.isRunning():
+                    t.quit()
+                    t.wait(3000)
+            except RuntimeError:
+                pass
+
+        dialog.finished.connect(_cleanup_thread)
+        dialog.show()
 
     def _on_refresh_clicked(self) -> None:
         current_key = self._pivot.currentRouteKey()
