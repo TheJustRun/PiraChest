@@ -1,6 +1,6 @@
 # PiraChest: An all-in-one desktop free media downloader (WIP)
 <img width="2484" height="1200" alt="banner" src="https://github.com/user-attachments/assets/20c0fe91-385c-410a-94e0-7bf191610cab" />
- A Work in Progress desktop GUI application to download specific ROMs from the Minerva Archive : https://minerva-archive.org ,using BitTorrent (With more sources and features coming!), with the hope of being a complete app for sailing the seven seas, downloading music, books, courses, and many more.
+ A Work in Progress desktop GUI application to download specific ROMs from the Minerva Archive : https://minerva-archive.org , and PC Game Repacks using libTorrent (With more sources and features coming!), with the hope of being a complete app for sailing the seven seas, downloading music, books, courses, and many more.
 
 ## Features
 
@@ -9,6 +9,7 @@
 **DISCLAIMER²**: this app has been AI-assisted using a local LLM ( Qwen 3.6 35B ) to *help* with the backend, if without it, I wouldn't have gotten the torrent per-file downloading system working, and I would have shot myself dead
 - **ROM Browsing** : Browse a local SQLite-indexed ROM catalog covering 70+ console platforms. Filter by console, source (No-Intro, Redump, TOSEC, etc.), and per-console variants.
 - **Smart Torrent Engine**: Uses `libtorrent 2.0.13` to download only the requested ROM file from multi-gigabyte torrent dumps, via a persistent queue with pause/resume/retry/cancel controls.
+- **PC Repacks** : Browse and download PC Game Repacks ( Currently FitGirl for now )
 - **Download Manager**: Real-time download queue with drag-and-drop reordering, live speed/progress/seed stats, per-torrent settings (speed limits, peer caps, ratio/time limits, force recheck).
 - **Console-First Classification**: Automatic console detection from the Minerva archive naming scheme with per-console variant support (Retail, Encrypted/Decrypted, BIOS, Demo, Prototype, Homebrew, etc.).
 - **Dark & Light Theme**: Full Light/Dark/Auto theming via QFluentWidgets, with a shared palette so every widget stays in sync.
@@ -26,8 +27,8 @@
 - [x] Torrent support
 - [x] Multi-console support
 - [x] Download manager
+- [x] PC Games (Repacks..)
 - [ ] DAT Support
-- [ ] PC Games (Repacks..)
 - [ ] Updates & DLC (You can find some, but it isn't very reliable)
 - [ ] Media downloads (Music, Books, Courses..)
 - [ ] Localization
@@ -53,13 +54,13 @@
 
 ## Supported Sources
 - [x] Minerva Archive
+- [x] FitGirl Repacks
 - [ ] More... like nopaystation.. etc
 
 ## **Current** Issues and Quirks
 - Not all Consoles have their variant system working yet
-- Download manager is still quirky with a lot of files, currently it is recommended to download about 3 files at once. Needs more testing
+- Download manager is still quirky with a lot of files, currently it is recommended to download about 3 files at once. Needs more testing ( it's improving )
 - The accent color option is a placeholder
-- Persistent settings don't work xd
 - Light mode sucks
 - And more idk? I need more testing, that's why I'm releasing it in alpha, so I get more feedback on the thing rather than just blindly making it.
 
