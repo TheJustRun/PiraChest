@@ -50,6 +50,22 @@
     <td><img width="1552" height="900" alt="Settings" src="https://github.com/user-attachments/assets/6f80bc53-44d4-4d79-b125-bd4d35763e3f" />
 </td>
   </tr>
+  <tr>
+    <td><img width="1552" height="900" alt="Repacks grid view" src="https://github.com/user-attachments/assets/c99da4c4-ef43-4195-b03b-66159e3e47ce" />
+</td>
+    <td><img width="1552" height="900" alt="Upcoming Games" src="https://github.com/user-attachments/assets/455d4dd5-169d-47b3-8d8e-d520118a6b97" />
+
+</td>
+ </tr>
+  <tr>
+    <td><img width="1552" height="900" alt="Game Details" src="https://github.com/user-attachments/assets/b9b0cd0e-be0a-4b98-b549-1e6c610748c9" />
+
+</td>
+    <td><img width="1552" height="900" alt="Selective Downloading" src="https://github.com/user-attachments/assets/35bd253a-8942-4199-adf2-404494c668c7" />
+
+</td>
+ </tr>
+ 
 </table>
 
 ## Supported Sources
