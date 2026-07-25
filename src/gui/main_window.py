@@ -1546,7 +1546,8 @@ class AboutPage(QWidget):
         header_left.setSpacing(6)
         header_left.addWidget(title)
 
-        ver = BodyLabel("Version 0.1.0 (Alpha)")
+        from ..core.updater import __version__ as _about_version
+        ver = BodyLabel(f"Version {_about_version} (Alpha)")
         header_left.addWidget(ver)
 
         desc = BodyLabel(
