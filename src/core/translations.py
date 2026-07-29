@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from typing import Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -11,7 +12,20 @@ from .config import settings, apply_settings, save_settings, _PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
-_LANG_DIR = os.path.join(_PROJECT_ROOT, "src", "core", "lang")
+
+def _resolve_lang_dir() -> str:
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        candidate = os.path.join(base, "src", "core", "lang")
+        if os.path.isdir(candidate):
+            return candidate
+        candidate = os.path.join(base, "core", "lang")
+        if os.path.isdir(candidate):
+            return candidate
+    return os.path.join(_PROJECT_ROOT, "src", "core", "lang")
+
+
+_LANG_DIR = _resolve_lang_dir()
 _FALLBACK_LANG = "en"
 _RTL_LANGS = {"ar", "he", "fa", "ur"}
 
