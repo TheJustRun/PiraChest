@@ -8,3 +8,5 @@ dist/
 build/
 src/data
 LICENSE
+LICENSE
+src/__init__.py
