@@ -45,32 +45,9 @@ jobs:
           Set-Content -Path "VERSION" -Value "${{ needs.version.outputs.version }}" -NoNewline
 
       - name: Build with PyInstaller (UPX disabled)
+        shell: cmd
         run: |
-          pyinstaller \
-            --name=PiraChest \
-            --onefile \
-            --noconfirm \
-            --clean \
-            --noupx \
-            --exclude-module=PyQt5 \
-            --exclude-module=PySide2 \
-            --exclude-module=PySide6 \
-            --exclude-module=tkinter \
-            --exclude-module=matplotlib \
-            --exclude-module=numpy \
-            --exclude-module=scipy \
-            --exclude-module=setuptools \
-            --exclude-module=distutils \
-            --exclude-module=pkg_resources \
-            --hidden-import=PyQt6.QtCore \
-            --hidden-import=PyQt6.QtGui \
-            --hidden-import=PyQt6.QtWidgets \
-            --hidden-import=PyQt6.QtSvg \
-            --hidden-import=requests \
-            --hidden-import=qfluentwidgets \
-            --add-data "src/gui:src/gui" \
-            --add-data "src/core:src/core" \
-            src/main.py
+          pyinstaller --name=PiraChest --onefile --noconfirm --clean --noupx --exclude-module=PyQt5 --exclude-module=PySide2 --exclude-module=PySide6 --exclude-module=tkinter --exclude-module=matplotlib --exclude-module=numpy --exclude-module=scipy --exclude-module=setuptools --exclude-module=distutils --exclude-module=pkg_resources --hidden-import=PyQt6.QtCore --hidden-import=PyQt6.QtGui --hidden-import=PyQt6.QtWidgets --hidden-import=PyQt6.QtSvg --hidden-import=requests --hidden-import=qfluentwidgets --add-data "src/gui;src/gui" --add-data "src/core;src/core" src/main.py
 
       - name: Rename executable
         shell: pwsh
