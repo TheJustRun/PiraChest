@@ -1,5 +1,6 @@
 from __future__ import annotations
 import copy
+import gc
 import json
 import logging
 import os
@@ -13,7 +14,9 @@ from enum import Enum
 from typing import Any, Optional
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from .config import Paths, libtorrent_defaults, network, paths, settings
+
 logger = logging.getLogger(__name__)
+
 try:
     import libtorrent as lt
 except ImportError as _exc:
@@ -22,11 +25,20 @@ except ImportError as _exc:
 else:
     _LT_IMPORT_ERROR = None
 
+
 def _require_libtorrent() -> None:
     if lt is None:
         raise RuntimeError("python-libtorrent is not installed. Install it with 'pip install libtorrent==2.0.13' (or your OS package, e.g. 'apt install python3-libtorrent').") from _LT_IMPORT_ERROR
+
+
 _CONFIG_DIR = os.path.join(Paths().project_root, '.config')
 _QUEUE_FILE = os.path.join(_CONFIG_DIR, 'pirachest_downloads.json')
+_METADATA_TIMEOUT_SECS = 120
+_MAX_ACTIVE_TORRENTS = 3
+_DEFAULT_MAX_PEERS = 400
+_DEFAULT_CONNECTIONS_LIMIT = 200
+_DEFAULT_CONNECTION_SPEED = 25
+
 
 class DLState(str, Enum):
     queued = 'Queued'
@@ -38,12 +50,14 @@ class DLState(str, Enum):
     error = 'Error'
     cancelled = 'Cancelled'
 
+
 def _human_bytes(n: float) -> str:
     for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
         if abs(n) < 1024.0:
             return f'{n:3.2f} {unit}'
         n /= 1024.0
     return f'{n:.2f} PiB'
+
 
 def _human_eta(seconds: float) -> str:
     if seconds is None or seconds < 0 or seconds > 10 ** 8:
@@ -56,6 +70,7 @@ def _human_eta(seconds: float) -> str:
         return f'{m}m {s:02d}s'
     return f'{s}s'
 
+
 def _human_duration(seconds: float) -> str:
     if not seconds or seconds < 0:
         return '-'
@@ -64,6 +79,7 @@ def _human_duration(seconds: float) -> str:
     if h:
         return f'{h}h {m:02d}m'
     return f'{m}m {s:02d}s'
+
 
 @dataclass
 class DownloadItem:
@@ -77,7 +93,7 @@ class DownloadItem:
     seed_after: bool = True
     max_down_kbps: int = 0
     max_up_kbps: int = 0
-    max_peers: int = 500
+    max_peers: int = _DEFAULT_MAX_PEERS
     ratio_limit: float = 0.0
     seed_time_limit_min: int = 0
     state: DLState = DLState.queued
@@ -121,6 +137,7 @@ class DownloadItem:
             return f'{_human_bytes(self.downloaded_bytes)} / ?'
         return f'{_human_bytes(self.downloaded_bytes)} / {_human_bytes(self.total_bytes)}'
 
+
 class DownloadManager(QObject):
 
     @staticmethod
@@ -129,7 +146,16 @@ class DownloadManager(QObject):
             return lt.session(settings_pack)
         except Exception as exc:
             logger.warning('lt.session() rejected the full settings pack (%s); retrying with a minimal safe pack', exc)
-        safe_pack = {'user_agent': settings_pack.get('user_agent', 'PiraChest/2.0'), 'listen_interfaces': settings_pack.get('listen_interfaces', '0.0.0.0:6881,[::]:6881'), 'enable_dht': settings_pack.get('enable_dht', True), 'enable_lsd': settings_pack.get('enable_lsd', True), 'enable_upnp': settings_pack.get('enable_upnp', True), 'enable_natpmp': settings_pack.get('enable_natpmp', True), 'download_rate_limit': settings_pack.get('download_rate_limit', 0), 'upload_rate_limit': settings_pack.get('upload_rate_limit', 0)}
+        safe_pack = {
+            'user_agent': settings_pack.get('user_agent', 'PiraChest/2.0'),
+            'listen_interfaces': settings_pack.get('listen_interfaces', '0.0.0.0:6881,[::]:6881'),
+            'enable_dht': settings_pack.get('enable_dht', True),
+            'enable_lsd': settings_pack.get('enable_lsd', True),
+            'enable_upnp': settings_pack.get('enable_upnp', True),
+            'enable_natpmp': settings_pack.get('enable_natpmp', True),
+            'download_rate_limit': settings_pack.get('download_rate_limit', 0),
+            'upload_rate_limit': settings_pack.get('upload_rate_limit', 0),
+        }
         try:
             return lt.session(safe_pack)
         except Exception:
@@ -142,12 +168,57 @@ class DownloadManager(QObject):
     stats_changed = pyqtSignal()
     order_changed = pyqtSignal()
 
-    def __init__(self, parent: Optional[QObject]=None) -> None:
+    def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         _require_libtorrent()
         self.global_down_kbps = int(getattr(settings, 'speed_limit', 0))
         self.global_up_kbps = int(getattr(settings, 'upload_speed_limit', 500))
-        settings_pack = {'user_agent': 'PiraChest/2.0', 'listen_interfaces': '0.0.0.0:6881,[::]:6881', 'enable_dht': libtorrent_defaults.enable_dht, 'enable_lsd': True, 'enable_upnp': True, 'enable_natpmp': True, 'download_rate_limit': self.global_down_kbps * 1024 if self.global_down_kbps else 0, 'upload_rate_limit': self.global_up_kbps * 1024, 'active_downloads': -1, 'active_seeds': -1, 'active_limit': -1, 'active_dht_limit': -1, 'active_tracker_limit': -1, 'active_lsd_limit': -1, 'connections_limit': 800, 'unchoke_slots_limit': -1, 'connection_speed': 200, 'rate_limit_utp': True, 'mixed_mode_algorithm': 0, 'aio_threads': 8, 'send_buffer_watermark': 3 * 1024 * 1024, 'send_buffer_low_watermark': 512 * 1024, 'send_buffer_watermark_factor': 150, 'max_out_request_queue': 1500, 'max_allowed_in_request_queue': 2000, 'request_queue_time': 3, 'checking_mem_usage': 2048, 'use_parole_mode': True, 'smooth_connects': True}
+        settings_pack = {
+            'user_agent': 'PiraChest/2.0',
+            'listen_interfaces': '0.0.0.0:6881,[::]:6881',
+            'enable_dht': libtorrent_defaults.enable_dht,
+            'enable_lsd': True,
+            'enable_upnp': True,
+            'enable_natpmp': True,
+            'download_rate_limit': self.global_down_kbps * 1024 if self.global_down_kbps else 0,
+            'upload_rate_limit': self.global_up_kbps * 1024,
+            'active_downloads': _MAX_ACTIVE_TORRENTS,
+            'active_seeds': _MAX_ACTIVE_TORRENTS,
+            'active_limit': _MAX_ACTIVE_TORRENTS * 2,
+            'active_dht_limit': 88,
+            'active_tracker_limit': 1600,
+            'active_lsd_limit': 60,
+            'connections_limit': max(_DEFAULT_CONNECTIONS_LIMIT, libtorrent_defaults.max_connections_per_torrent * _MAX_ACTIVE_TORRENTS),
+            'unchoke_slots_limit': 0,
+            'connection_speed': 200,
+            'rate_limit_utp': True,
+            'mixed_mode_algorithm': int(lt.bandwidth_mixed_algo_t.prefer_tcp),
+            'aio_threads': 4,
+            'send_buffer_watermark': 1 * 1024 * 1024,
+            'send_buffer_low_watermark': 256 * 1024,
+            'send_buffer_watermark_factor': 100,
+            'max_out_request_queue': 500,
+            'max_allowed_in_request_queue': 500,
+            'request_queue_time': 2,
+            'checking_mem_usage': 1024,
+            'use_parole_mode': True,
+            'smooth_connects': True,
+            'whole_pieces_threshold': 20,
+            'request_timeout': 20,
+            'peer_connect_timeout': 8,
+            'auto_manage_interval': 30,
+            'seed_time_limit': 0,
+            'inactivity_timeout': 300,
+            'stop_tracker_timeout': 5,
+            'tracker_completion_timeout': 20,
+            'tracker_receive_timeout': 10,
+            'peer_timeout': 60,
+            'urlseed_timeout': 15,
+            'piece_timeout': 10,
+            'suggest_mode': int(lt.suggest_mode_t.suggest_read_cache),
+            'disk_io_write_mode': int(lt.io_buffer_mode_t.enable_os_cache),
+            'disk_io_read_mode': int(lt.io_buffer_mode_t.enable_os_cache),
+        }
         self._session = self._create_session(settings_pack)
         if libtorrent_defaults.enable_dht:
             for host, port in (('router.bittorrent.com', 6881), ('dht.transmissionbt.com', 6881), ('router.utorrent.com', 6881)):
@@ -169,16 +240,26 @@ class DownloadManager(QObject):
         os.makedirs(_CONFIG_DIR, exist_ok=True)
         self._lock = threading.RLock()
         self._timer = QTimer(self)
-        self._timer.setInterval(1000)
+        self._timer.setInterval(1500)
         self._timer.timeout.connect(self._poll)
         self._save_counter = 0
+        self._dirty = False
         self._load_state()
         self._timer.start()
         self._try_start_next()
 
-    def add(self, torrent_file: str, file_id: int, game_name: str, console: str, source: str='Minerva', file_ids: Optional[list[int]]=None) -> str:
+    def add(self, torrent_file: str, file_id: int, game_name: str, console: str, source: str = 'Minerva', file_ids: Optional[list[int]] = None) -> str:
         item_id = uuid.uuid4().hex
-        item = DownloadItem(id=item_id, torrent_file=torrent_file, file_id=int(file_id or 1), file_ids=sorted({int(f) for f in file_ids}) if file_ids else [], game_name=game_name or 'Unknown', console=console or '', source=source or 'Minerva', state=DLState.queued)
+        item = DownloadItem(
+            id=item_id,
+            torrent_file=torrent_file,
+            file_id=int(file_id or 1),
+            file_ids=sorted({int(f) for f in file_ids}) if file_ids else [],
+            game_name=game_name or 'Unknown',
+            console=console or '',
+            source=source or 'Minerva',
+            state=DLState.queued,
+        )
         with self._lock:
             self._items[item_id] = item
             self._order.append(item_id)
@@ -188,10 +269,7 @@ class DownloadManager(QObject):
         return item_id
 
     def add_many(self, roms_and_meta: list[dict[str, Any]]) -> list[str]:
-        ids = []
-        for m in roms_and_meta:
-            ids.append(self.add(torrent_file=m.get('torrent_file', ''), file_id=m.get('file_id', 1), game_name=m.get('game_name', ''), console=m.get('console', ''), source=m.get('source', 'Minerva')))
-        return ids
+        return [self.add(torrent_file=m.get('torrent_file', ''), file_id=m.get('file_id', 1), game_name=m.get('game_name', ''), console=m.get('console', ''), source=m.get('source', 'Minerva')) for m in roms_and_meta]
 
     def items_in_order(self) -> list[DownloadItem]:
         with self._lock:
@@ -241,8 +319,8 @@ class DownloadManager(QObject):
         self._save_state()
         self._try_start_next()
 
-    def cancel(self, item_id: str) -> None:
-        self._teardown_handle(item_id, remove_files=False)
+    def cancel(self, item_id: str, delete_files: bool = False) -> None:
+        self._teardown_handle(item_id, remove_files=delete_files)
         with self._lock:
             item = self._items.get(item_id)
             if item:
@@ -256,7 +334,7 @@ class DownloadManager(QObject):
         self._save_state()
         self._try_start_next()
 
-    def remove(self, item_id: str, delete_files: bool=False) -> None:
+    def remove(self, item_id: str, delete_files: bool = False) -> None:
         self._teardown_handle(item_id, remove_files=delete_files)
         with self._lock:
             self._items.pop(item_id, None)
@@ -305,7 +383,7 @@ class DownloadManager(QObject):
         target = item.download_path or os.path.join(settings.download_dir, item.console or '', item.game_name or '')
         return target if os.path.exists(target) else None
 
-    def set_torrent_settings(self, item_id: str, *, seed_after: Optional[bool]=None, max_down_kbps: Optional[int]=None, max_up_kbps: Optional[int]=None, max_peers: Optional[int]=None, ratio_limit: Optional[float]=None, seed_time_limit_min: Optional[int]=None) -> None:
+    def set_torrent_settings(self, item_id: str, *, seed_after: Optional[bool] = None, max_down_kbps: Optional[int] = None, max_up_kbps: Optional[int] = None, max_peers: Optional[int] = None, ratio_limit: Optional[float] = None, seed_time_limit_min: Optional[int] = None) -> None:
         with self._lock:
             item = self._items.get(item_id)
             if not item:
@@ -331,7 +409,10 @@ class DownloadManager(QObject):
     def set_global_limits(self, down_kbps: int, up_kbps: int) -> None:
         self.global_down_kbps = int(down_kbps)
         self.global_up_kbps = int(up_kbps)
-        self._session.apply_settings({'download_rate_limit': self.global_down_kbps * 1024 if self.global_down_kbps else 0, 'upload_rate_limit': self.global_up_kbps * 1024})
+        self._session.apply_settings({
+            'download_rate_limit': self.global_down_kbps * 1024 if self.global_down_kbps else 0,
+            'upload_rate_limit': self.global_up_kbps * 1024,
+        })
         self._try_start_next()
 
     def summary(self) -> dict[str, Any]:
@@ -340,8 +421,8 @@ class DownloadManager(QObject):
         active = [i for i in items if i.state in (DLState.downloading, DLState.verifying)]
         queued = [i for i in items if i.state == DLState.queued]
         completed = [i for i in items if i.state == DLState.completed]
-        total_down = sum((i.speed_down_kbps for i in items if i.state in (DLState.downloading, DLState.verifying)))
-        total_up = sum((i.speed_up_kbps for i in items if i.state in (DLState.downloading, DLState.seeding, DLState.verifying)))
+        total_down = sum(i.speed_down_kbps for i in items if i.state in (DLState.downloading, DLState.verifying))
+        total_up = sum(i.speed_up_kbps for i in items if i.state in (DLState.downloading, DLState.seeding, DLState.verifying))
         return {'active': len(active), 'queued': len(queued), 'completed': len(completed), 'total_down': _human_bytes(total_down * 1024) + '/s', 'total_up': _human_bytes(total_up * 1024) + '/s'}
 
     def shutdown(self) -> None:
@@ -358,26 +439,43 @@ class DownloadManager(QObject):
             except Exception:
                 pass
         self._handles.clear()
-    _MAX_ACTIVE_TORRENTS = 5
 
     def _active_torrent_count(self) -> int:
-        return sum((1 for i in self._handles if self._items.get(i) is not None and self._items[i].state in (DLState.downloading, DLState.verifying)))
+        return sum(1 for i in self._handles if self._items.get(i) is not None and self._items[i].state in (DLState.downloading, DLState.verifying))
+
+    def _has_pending_work(self) -> bool:
+        if self._handles or self._resolving:
+            return True
+        for item_id in self._order:
+            item = self._items.get(item_id)
+            if item is not None and item.state in (DLState.queued, DLState.downloading, DLState.verifying, DLState.seeding):
+                return True
+        return False
+
+    def _sync_timer_state(self) -> None:
+        if self._has_pending_work():
+            if not self._timer.isActive():
+                self._timer.start()
+        else:
+            if self._timer.isActive():
+                self._timer.stop()
+            gc.collect()
 
     def _try_start_next(self) -> None:
         with self._lock:
             order = list(self._order)
-        free_slots = self._MAX_ACTIVE_TORRENTS - self._active_torrent_count()
-        if free_slots <= 0:
-            return
-        for item_id in order:
-            if free_slots <= 0:
-                break
-            item = self._items.get(item_id)
-            if item is None or item.state != DLState.queued or item_id in self._resolving:
-                continue
-            self._resolving.add(item_id)
-            threading.Thread(target=self._start_item, args=(item_id,), daemon=True).start()
-            free_slots -= 1
+        free_slots = _MAX_ACTIVE_TORRENTS - self._active_torrent_count()
+        if free_slots > 0:
+            for item_id in order:
+                if free_slots <= 0:
+                    break
+                item = self._items.get(item_id)
+                if item is None or item.state != DLState.queued or item_id in self._resolving:
+                    continue
+                self._resolving.add(item_id)
+                threading.Thread(target=self._start_item, args=(item_id,), daemon=True).start()
+                free_slots -= 1
+        self._sync_timer_state()
 
     def _start_item(self, item_id: str) -> None:
         item = self._items.get(item_id)
@@ -389,7 +487,6 @@ class DownloadManager(QObject):
             handle = self._add_torrent(source, settings.download_dir)
             self._handles[item_id] = handle
             self._start_time[item_id] = time.time()
-            _METADATA_TIMEOUT_SECS = 120
             metadata_wait_start = time.time()
             while not handle.status().has_metadata:
                 if self._items.get(item_id) is None or self._items[item_id].state == DLState.cancelled:
@@ -414,24 +511,18 @@ class DownloadManager(QObject):
             priorities = [0] * num_files
             for zb in zero_based_list:
                 priorities[zb] = 7
-            handle.set_sequential_download(False)
-            for attempt in range(5):
-                handle.prioritize_files(priorities)
-                time.sleep(0.3)
-                actual = handle.file_priorities()
-                if all((zb < len(actual) and actual[zb] > 0 for zb in zero_based_list)):
-                    break
-                logger.warning('prioritize_files() did not take (attempt %d/5) for item=%s; retrying', attempt + 1, item_id)
-            else:
-                logger.error('File priority never took after 5 attempts — download will likely stall at 0 B/s. item=%s', item_id)
+            handle.set_sequential_download(True)
+            handle.prioritize_files(priorities)
+            actual = handle.file_priorities()
+            if not all(zb < len(actual) and actual[zb] > 0 for zb in zero_based_list):
+                logger.warning('prioritize_files() did not take immediately for item=%s; will re-check on next poll', item_id)
             try:
-                handle.force_recheck()
                 handle.resume()
             except Exception:
-                logger.exception('force_recheck/resume failed for %s', item_id)
+                logger.exception('resume() failed for %s', item_id)
             self._file_index[item_id] = zero_based_list
             files_obj = torrent_info.files()
-            self._selected_size[item_id] = sum((files_obj.file_size(zb) for zb in zero_based_list))
+            self._selected_size[item_id] = sum(files_obj.file_size(zb) for zb in zero_based_list)
             item.total_bytes = self._selected_size[item_id]
             item.state = DLState.downloading
             self._apply_handle_limits(handle, item)
@@ -450,7 +541,8 @@ class DownloadManager(QObject):
         try:
             handle.set_download_limit(item.max_down_kbps * 1024 if item.max_down_kbps else 0)
             handle.set_upload_limit(item.max_up_kbps * 1024 if item.max_up_kbps else 0)
-            handle.set_max_connections(item.max_peers or -1)
+            handle.set_max_connections(item.max_peers or libtorrent_defaults.max_connections_per_torrent or _DEFAULT_MAX_PEERS)
+            handle.set_max_uploads(libtorrent_defaults.max_uploads_per_torrent)
         except Exception:
             pass
 
@@ -469,6 +561,27 @@ class DownloadManager(QObject):
                     self._session.remove_torrent(handle)
             except Exception:
                 pass
+        if remove_files:
+            self._delete_item_files(item_id)
+
+    def _delete_item_files(self, item_id: str) -> None:
+        item = self._items.get(item_id)
+        if item is None:
+            return
+        candidates = []
+        if item.download_path:
+            candidates.append(item.download_path)
+        candidates.append(os.path.join(settings.download_dir, item.console or '', item.game_name or ''))
+        for path in candidates:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+            except Exception:
+                logger.exception('Failed to delete files for %s at %s', item_id, path)
 
     def _poll(self) -> None:
         for item_id in list(self._handles.keys()):
@@ -484,10 +597,13 @@ class DownloadManager(QObject):
                 logger.exception('Poll error for %s', item_id)
         self._try_start_next()
         self.stats_changed.emit()
-        self._save_counter += 1
-        if self._save_counter >= 5:
-            self._save_counter = 0
-            self._save_state()
+        if self._dirty:
+            self._save_counter += 1
+            if self._save_counter >= 5:
+                self._save_counter = 0
+                self._dirty = False
+                self._save_state()
+        self._sync_timer_state()
 
     def _poll_one(self, item_id: str, item: DownloadItem, handle) -> None:
         s = handle.status()
@@ -504,7 +620,7 @@ class DownloadManager(QObject):
             zb_list = self._file_index.get(item_id)
             if zb_list:
                 cur_pri = handle.file_priorities()
-                if any((zb < len(cur_pri) and cur_pri[zb] == 0 for zb in zb_list)):
+                if any(zb < len(cur_pri) and cur_pri[zb] == 0 for zb in zb_list):
                     logger.warning('File priority reset detected mid-download; re-applying. item=%s', item_id)
                     pri = [0] * len(cur_pri)
                     for zb in zb_list:
@@ -515,7 +631,7 @@ class DownloadManager(QObject):
         selected_size = self._selected_size.get(item_id, 0)
         if zb_list and selected_size:
             file_progress = handle.file_progress()
-            done_bytes = sum((file_progress[zb] for zb in zb_list if zb < len(file_progress)))
+            done_bytes = sum(file_progress[zb] for zb in zb_list if zb < len(file_progress))
         else:
             done_bytes = s.total_done
         now = time.time()
@@ -544,6 +660,7 @@ class DownloadManager(QObject):
                 item.state = DLState.verifying
             elif item.state == DLState.verifying:
                 item.state = DLState.downloading
+        self._dirty = True
         finished = selected_size > 0 and done_bytes >= selected_size
         if finished and item.state not in (DLState.completed, DLState.seeding):
             if item_id not in self._finalizing:
@@ -573,16 +690,21 @@ class DownloadManager(QObject):
         final_path = None
         zero_based_list = self._file_index.get(item_id) or []
         try:
+            dest_dir = os.path.join(settings.download_dir, item.console or '', item.game_name or '')
+            os.makedirs(dest_dir, exist_ok=True)
+            current_save_path = handle.status().save_path
+            if os.path.abspath(current_save_path) != os.path.abspath(dest_dir):
+                handle.move_storage(dest_dir)
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    if os.path.abspath(handle.status().save_path) == os.path.abspath(dest_dir):
+                        break
+                    time.sleep(0.2)
+                else:
+                    logger.warning('move_storage did not confirm completion within timeout for %s', item_id)
             torrent_info = handle.torrent_file()
             files_obj = torrent_info.files()
-            dest_dir = os.path.join(settings.download_dir, item.console or '', item.game_name or '')
-            moved_paths: list[str] = []
-            for zb in zero_based_list:
-                selected_path = files_obj.file_path(zb)
-                downloaded_path = os.path.join(settings.download_dir, selected_path)
-                rel_dir = os.path.dirname(selected_path)
-                file_dest_dir = os.path.join(dest_dir, rel_dir) if rel_dir else dest_dir
-                moved_paths.append(self._finalize_file(downloaded_path, file_dest_dir))
+            moved_paths = [os.path.join(dest_dir, files_obj.file_path(zb)) for zb in zero_based_list]
             if len(moved_paths) == 1:
                 final_path = moved_paths[0]
             elif moved_paths:
@@ -612,17 +734,7 @@ class DownloadManager(QObject):
         self.item_updated.emit(item_id)
         self._save_state()
 
-    @staticmethod
-    def _finalize_file(downloaded_path: str, dest_dir: str) -> str:
-        if not os.path.isfile(downloaded_path):
-            return downloaded_path
-        os.makedirs(dest_dir, exist_ok=True)
-        target = os.path.join(dest_dir, os.path.basename(downloaded_path))
-        if os.path.abspath(downloaded_path) != os.path.abspath(target):
-            shutil.move(downloaded_path, target)
-        return target
-
-    def fetch_file_list(self, torrent_file: str, timeout_secs: float=30.0) -> list[tuple[str, int]]:
+    def fetch_file_list(self, torrent_file: str, timeout_secs: float = 30.0) -> list[tuple[str, int]]:
         source = self._resolve_torrent(torrent_file)
         handle = self._add_torrent(source, settings.download_dir)
         try:
@@ -681,6 +793,7 @@ class DownloadManager(QObject):
             if name and name not in seen:
                 seen.add(name)
                 candidates.append(name)
+
         _add(torrent_file)
         _add(torrent_file.replace(' ', '_'))
         if torrent_file.startswith('Minerva_Myrient '):

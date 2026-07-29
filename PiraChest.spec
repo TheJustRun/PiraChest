@@ -1,16 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
-from PyInstaller.utils.hooks import collect_submodules
 
-datas = [('src\\gui', 'src\\gui'), ('src\\core', 'src\\core'), ('VERSION', '.')]
-hiddenimports = ['PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets', 'PyQt6.QtSvg', 'PyQt6.QtXml', 'requests', 'orjson', 'qfluentwidgets']
+datas = [('src\\gui', 'src\\gui'), ('src\\core', 'src\\core')]
 datas += collect_data_files('qfluentwidgets')
-hiddenimports += collect_submodules('PyQt6.QtCore')
-hiddenimports += collect_submodules('PyQt6.QtGui')
-hiddenimports += collect_submodules('PyQt6.QtWidgets')
-hiddenimports += collect_submodules('PyQt6.QtSvg')
-hiddenimports += collect_submodules('PyQt6.QtXml')
-hiddenimports += collect_submodules('qfluentwidgets')
 
 
 a = Analysis(
@@ -18,29 +10,26 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=hiddenimports,
+    hiddenimports=['PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets', 'PyQt6.QtSvg', 'PyQt6.QtMultimedia', 'PyQt6.QtMultimediaWidgets', 'requests', 'qfluentwidgets'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['PyQt5', 'PySide2', 'PySide6', 'shiboken2', 'shiboken6', 'tkinter', 'matplotlib', 'numpy', 'numpy.core', 'numpy.lib', 'numpy.random', 'numpy.fft', 'numpy.linalg', 'numpy.polynomial', 'scipy', 'scipy.special', 'scipy.spatial', 'scipy.stats', 'scipy.sparse', 'scipy.linalg', 'scipy.optimize', 'scipy.signal', 'scipy.fft', 'scipy.integrate', 'scipy.interpolate', 'scipy.io', 'scipy.ndimage', 'scipy.odr', 'scipy.fftpack', 'scipy.misc', 'scipy.cluster', 'scipy.constants', 'scipy.version', 'setuptools', 'distutils', 'pkg_resources', 'PyQt6.QtQml', 'PyQt6.QtQuick', 'PyQt6.QtMultimedia', 'PyQt6.QtMultimediaWidgets', 'PyQt6.QtWebEngineWidgets', 'PyQt6.QtWebEngineCore', 'PyQt6.QtDesigner', 'PyQt6.QtBluetooth', 'PyQt6.QtNetwork', 'PyQt6.QtPositioning', 'PyQt6.QtSensors', 'PyQt6.QtSerialPort', 'PyQt6.QtTest', 'PyQt6.QtOpenGL', 'PyQt6.QtPrintSupport', 'PyQt6.QtSql', 'PyQt6.QtHelp', 'PyQt6.QtUiTools', 'PyQt6.QtConcurrent', 'PyQt6.QtDBus', 'PyQt6.QtX11Extras', 'PyQt6.QtWinExtras', 'PyQt6.QtMacExtras'],
+    excludes=['PyQt5', 'PySide2', 'PySide6', 'shiboken2', 'shiboken6', 'tkinter', 'matplotlib', 'numpy', 'scipy', 'setuptools', 'distutils', 'pkg_resources', 'test', 'unittest', 'pydoc', 'doctest', 'PyQt6.QtQml', 'PyQt6.QtQuick', 'PyQt6.QtQuickWidgets', 'PyQt6.QtWebEngineWidgets', 'PyQt6.QtWebEngineCore', 'PyQt6.QtWebEngineQuick', 'PyQt6.QtDesigner', 'PyQt6.QtBluetooth', 'PyQt6.QtNetwork', 'PyQt6.QtNetworkAuth', 'PyQt6.QtNfc', 'PyQt6.QtPositioning', 'PyQt6.QtLocation', 'PyQt6.QtSensors', 'PyQt6.QtSerialPort', 'PyQt6.QtSerialBus', 'PyQt6.QtTest', 'PyQt6.QtOpenGL', 'PyQt6.QtOpenGLWidgets', 'PyQt6.QtPrintSupport', 'PyQt6.QtSql', 'PyQt6.QtHelp', 'PyQt6.QtUiTools', 'PyQt6.QtConcurrent', 'PyQt6.QtDBus', 'PyQt6.QtX11Extras', 'PyQt6.QtWinExtras', 'PyQt6.QtMacExtras', 'PyQt6.QtPdf', 'PyQt6.QtPdfWidgets', 'PyQt6.QtCharts', 'PyQt6.QtDataVisualization', 'PyQt6.QtRemoteObjects', 'PyQt6.QtSpatialAudio', 'PyQt6.QtStateMachine', 'PyQt6.QtTextToSpeech', 'PyQt6.QtWebChannel', 'PyQt6.QtWebSockets', 'PyQt6.Qt3DCore', 'PyQt6.Qt3DRender', 'PyQt6.Qt3DInput', 'PyQt6.Qt3DLogic', 'PyQt6.Qt3DAnimation', 'PyQt6.Qt3DExtras'],
     noarchive=False,
-    optimize=0,
+    optimize=2,
 )
 pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
-    [],
+    [('O', None, 'OPTION'), ('O', None, 'OPTION')],
+    exclude_binaries=True,
     name='PiraChest',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    strip=True,
+    upx=True,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -48,4 +37,13 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['src\\gui\\icon.ico'],
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=True,
+    upx=True,
+    upx_exclude=[],
+    name='PiraChest',
 )

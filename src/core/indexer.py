@@ -1,4 +1,5 @@
 import argparse
+import gc
 import glob
 import logging
 import os
@@ -308,6 +309,7 @@ def sync_index(
         return total
     finally:
         shutil.rmtree(_CLONE_DIR, ignore_errors=True)
+        gc.collect()
 
 def main() -> None:
     parser = argparse.ArgumentParser(

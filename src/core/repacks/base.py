@@ -2,6 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import urlparse, parse_qs, unquote_plus
+
+
+def magnet_display_name(magnet_url: Optional[str]) -> str:
+    if not magnet_url:
+        return ""
+    try:
+        query = urlparse(magnet_url).query
+        dn = parse_qs(query).get("dn", [""])[0]
+        return unquote_plus(dn)
+    except Exception:
+        return ""
 
 
 @dataclass
@@ -81,6 +93,17 @@ class RepackDetails:
             extra=data.get("extra") or {},
         )
 
+    @property
+    def screenshot_urls(self) -> list[str]:
+        return self.extra.get("screenshot_urls") or []
+
+    @screenshot_urls.setter
+    def screenshot_urls(self, value: list[str]) -> None:
+        if value:
+            self.extra["screenshot_urls"] = value
+        else:
+            self.extra.pop("screenshot_urls", None)
+
 
 class RepackSource:
     key: str = ""
@@ -93,8 +116,13 @@ class RepackSource:
         raise NotImplementedError
 
     def search(self, query: str, page: int = 1, use_cache: bool = True) -> RepackPage:
-        pass
         raise NotImplementedError
 
     def fetch_upcoming_repacks(self, use_cache: bool = True) -> Optional["RepackDetails"]:
         return None
+
+    def fetch_popular_repacks(self, use_cache: bool = True) -> list["RepackEntry"]:
+        return []
+
+    def fetch_latest_repacks(self, use_cache: bool = True) -> list["RepackEntry"]:
+        return []

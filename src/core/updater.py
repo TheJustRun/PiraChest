@@ -75,20 +75,31 @@ def check_for_update() -> dict | None:
         logger.warning("No matching exe asset found in latest release")
         return None
 
+    checksum_url = None
+    checksum_names = (asset["name"] + ".sha256", "SHA256SUMS", "checksums.txt", "SHA256SUMS.txt")
+    for a in data.get("assets", []):
+        if a.get("name", "") in checksum_names:
+            checksum_url = a["browser_download_url"]
+            break
+
     return {
         "tag": tag,
         "version": latest,
         "download_url": asset["browser_download_url"],
         "asset_name": asset["name"],
+        "checksum_url": checksum_url,
         "notes": data.get("body", ""),
     }
 
 
-def download_update(download_url: str, on_progress=None) -> str:
+def download_update(download_url: str, on_progress=None) -> tuple[str, str]:
+    import hashlib
+
     tmp_dir = tempfile.gettempdir()
     tmp_path = os.path.join(tmp_dir, "PiraChest-update.exe")
 
     req = urllib.request.Request(download_url, headers={"User-Agent": "PiraChest-Updater"})
+    hasher = hashlib.sha256()
     with urllib.request.urlopen(req, timeout=60) as resp:
         total = int(resp.headers.get("Content-Length", 0))
         downloaded = 0
@@ -99,6 +110,7 @@ def download_update(download_url: str, on_progress=None) -> str:
                 if not chunk:
                     break
                 fh.write(chunk)
+                hasher.update(chunk)
                 downloaded += len(chunk)
                 if on_progress is not None and total > 0:
                     try:
@@ -106,7 +118,49 @@ def download_update(download_url: str, on_progress=None) -> str:
                     except Exception:
                         logger.exception("Update progress callback raised")
 
-    return tmp_path
+    if total > 0 and downloaded != total:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"Download incomplete: got {downloaded} bytes, expected {total}")
+
+    return tmp_path, hasher.hexdigest()
+
+
+def fetch_expected_checksum(checksum_url: str, asset_name: str) -> str | None:
+    req = urllib.request.Request(checksum_url, headers={"User-Agent": "PiraChest-Updater"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError) as exc:
+        logger.warning("Failed to fetch checksum file: %s", exc)
+        return None
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) == 1:
+            return parts[0].lower()
+        if len(parts) >= 2:
+            digest, name = parts[0].lower(), parts[-1].lstrip("*")
+            if name == asset_name or asset_name in name:
+                return digest
+    return None
+
+
+def verify_checksum(file_path: str, expected_sha256: str) -> bool:
+    import hashlib
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 256)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest().lower() == expected_sha256.lower()
 
 
 def apply_update_and_restart(new_exe_path: str) -> None:
@@ -121,11 +175,13 @@ def apply_update_and_restart(new_exe_path: str) -> None:
     exe_name = os.path.basename(current_exe)
 
     script_path = os.path.join(tempfile.gettempdir(), "pirachest_update.bat")
+    log_path = os.path.join(tempfile.gettempdir(), "pirachest_update_error.log")
 
     script = f"""@echo off
 setlocal
 set TARGET="{current_exe}"
 set NEWEXE="{new_exe_path}"
+set LOG="{log_path}"
 
 :waitloop
 tasklist /FI "IMAGENAME eq {exe_name}" 2>NUL | find /I "{exe_name}" >NUL
@@ -134,8 +190,21 @@ if "%ERRORLEVEL%"=="0" (
     goto waitloop
 )
 
-move /Y %NEWEXE% %TARGET% >NUL
+set RETRIES=0
+:moveloop
+move /Y %NEWEXE% %TARGET% >NUL 2>NUL
+if exist %NEWEXE% (
+    set /a RETRIES+=1
+    if %RETRIES% GEQ 10 (
+        echo Failed to move update after 10 attempts: %NEWEXE% -^> %TARGET% > %LOG%
+        goto end
+    )
+    timeout /t 1 /nobreak >NUL
+    goto moveloop
+)
+
 start "" %TARGET%
+:end
 del "%~f0"
 """
 

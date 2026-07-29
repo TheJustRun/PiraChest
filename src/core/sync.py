@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -32,6 +33,9 @@ class SyncWorker(QObject):
             logger.error("Sync failed: %s", exc, exc_info=True)
             self.error.emit(str(exc))
             return 0
+        finally:
+            db.close_connection()
+            gc.collect()
 
     def _on_sync_progress(self, processed: int) -> None:
         self.progress.emit(processed, 0, f"Indexing… {processed:,} ROMs so far")

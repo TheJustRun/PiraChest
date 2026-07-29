@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import sqlite3
@@ -73,15 +74,37 @@ def _dedup_existing_rows(conn: sqlite3.Connection) -> None:
 def get_db_path() -> str:
     return _DB_PATH
 
+_conn_cache: dict[str, sqlite3.Connection] = {}
+
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     if db_path is None:
         db_path = _DB_PATH
+    cached = _conn_cache.get(db_path)
+    if cached is not None:
+        try:
+            cached.execute("SELECT 1")
+            return cached
+        except sqlite3.Error:
+            _conn_cache.pop(db_path, None)
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-2000")
+    _conn_cache[db_path] = conn
     return conn
+
+def close_connection(db_path: Optional[str] = None) -> None:
+    key = db_path or _DB_PATH
+    conn = _conn_cache.pop(key, None)
+    if conn is not None:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
 
 def _add_column_if_missing(
     conn: sqlite3.Connection,
@@ -175,7 +198,6 @@ def init_db(db_path: Optional[str] = None) -> None:
     )
 
     conn.commit()
-    conn.close()
     logger.info("Database initialised at %s", db_path)
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -188,12 +210,10 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 def clear_roms(db_path: Optional[str] = None) -> int:
     conn = get_connection(db_path)
     if not _table_exists(conn, "roms"):
-        conn.close()
         return 0
     total = conn.execute("SELECT COUNT(*) FROM roms").fetchone()[0]
     conn.execute("DELETE FROM roms")
     conn.commit()
-    conn.close()
     logger.info("Cleared roms table (%d rows removed)", total)
     return total
 
@@ -219,7 +239,6 @@ def upsert_roms(roms: list[dict], db_path: Optional[str] = None) -> int:
     )
     total = conn.execute("SELECT COUNT(*) FROM roms").fetchone()[0]
     conn.commit()
-    conn.close()
     logger.info("Inserted ROM records — total rows in DB: %d", total)
     return total
 
@@ -266,8 +285,9 @@ def upsert_roms_streaming(
     _flush()
 
     total = conn.execute("SELECT COUNT(*) FROM roms").fetchone()[0]
-    conn.close()
+    conn.execute("PRAGMA optimize")
     logger.info("Processed %d ROM records (streaming) — total rows in DB: %d", processed, total)
+    gc.collect()
     return total
 
 def parse_file_size(size_str: str | None) -> tuple[str, int]:
@@ -305,7 +325,6 @@ def count_roms(
 ) -> int:
     conn = get_connection(db_path)
     if not _table_exists(conn, "roms"):
-        conn.close()
         return 0
 
     clauses: list[str] = []
@@ -329,7 +348,6 @@ def count_roms(
 
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
     total = conn.execute(f"SELECT COUNT(*) FROM roms {where}", params).fetchone()[0]
-    conn.close()
     return total
 
 def search_roms(
@@ -345,7 +363,6 @@ def search_roms(
 ) -> list[dict]:
     conn = get_connection(db_path)
     if not _table_exists(conn, "roms"):
-        conn.close()
         return []
 
     clauses: list[str] = []
@@ -388,7 +405,6 @@ def search_roms(
         params + [limit, offset],
     ).fetchall()
 
-    conn.close()
     return [dict(r) for r in rows]
 
 def get_all_consoles(
@@ -400,7 +416,6 @@ def get_all_consoles(
 
     conn = get_connection(db_path)
     if not _table_exists(conn, "roms"):
-        conn.close()
         return []
 
     if sources:
@@ -414,7 +429,6 @@ def get_all_consoles(
         rows = conn.execute(
             "SELECT console, COUNT(*) as cnt FROM roms WHERE console != '' GROUP BY console"
         ).fetchall()
-    conn.close()
 
     canonical_counts: dict[str, int] = {}
     for r in rows:
@@ -438,7 +452,6 @@ def get_all_variants(
         return []
     conn = get_connection(db_path)
     if not _table_exists(conn, "roms"):
-        conn.close()
         return []
 
     if sources:
@@ -454,27 +467,22 @@ def get_all_variants(
             "SELECT DISTINCT variant FROM roms WHERE console = ? AND variant != '' ORDER BY variant",
             (console,),
         ).fetchall()
-    conn.close()
     return [r["variant"] for r in rows]
 
 def get_all_sources(db_path: Optional[str] = None) -> list[str]:
     conn = get_connection(db_path)
     if not _table_exists(conn, "roms"):
-        conn.close()
         return []
     rows = conn.execute(
         "SELECT DISTINCT source FROM roms WHERE source != '' ORDER BY source"
     ).fetchall()
-    conn.close()
     return [r["source"] for r in rows]
 
 def get_stats(db_path: Optional[str] = None) -> dict:
     conn = get_connection(db_path)
     if not _table_exists(conn, "roms"):
-        conn.close()
         return {"total_roms": 0, "consoles": 0, "sources": 0}
     total = conn.execute("SELECT COUNT(*) FROM roms").fetchone()[0]
     consoles = conn.execute("SELECT COUNT(DISTINCT console) FROM roms WHERE console != ''").fetchone()[0]
     sources = conn.execute("SELECT COUNT(DISTINCT source) FROM roms WHERE source != ''").fetchone()[0]
-    conn.close()
     return {"total_roms": total, "consoles": consoles, "sources": sources}

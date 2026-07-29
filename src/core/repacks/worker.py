@@ -9,6 +9,40 @@ from .sources import get_source
 
 logger = logging.getLogger(__name__)
 
+_IN_FLIGHT: set[tuple[QThread, QObject]] = set()
+
+
+def _run_async(worker: QObject, on_done, on_error=None):
+    thread = QThread()
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)
+
+    entry = (thread, worker)
+    _IN_FLIGHT.add(entry)
+
+    def _safe_call(callback, *args):
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except RuntimeError:
+            logger.debug("Callback target was already deleted; skipping.")
+
+    def _cleanup(*_args):
+        thread.quit()
+        thread.wait()
+        _IN_FLIGHT.discard(entry)
+        thread.deleteLater()
+        worker.deleteLater()
+
+    worker.finished.connect(lambda result: _safe_call(on_done, result))
+    worker.finished.connect(_cleanup)
+    worker.failed.connect(lambda err: _safe_call(on_error, err))
+    worker.failed.connect(_cleanup)
+
+    thread.start()
+    return thread, worker
+
 
 class RepackPageWorker(QObject):
     finished = pyqtSignal(object)
@@ -31,26 +65,8 @@ class RepackPageWorker(QObject):
 
 
 def fetch_page_async(source_key: str, page: int, on_done, on_error=None, use_cache: bool = True):
-    thread = QThread()
     worker = RepackPageWorker(source_key, page, use_cache=use_cache)
-    worker.moveToThread(thread)
-
-    thread.started.connect(worker.run)
-
-    def _cleanup(*_args):
-        thread.quit()
-        thread.wait()
-        thread.deleteLater()
-        worker.deleteLater()
-
-    worker.finished.connect(on_done)
-    worker.finished.connect(_cleanup)
-    if on_error is not None:
-        worker.failed.connect(on_error)
-    worker.failed.connect(_cleanup)
-
-    thread.start()
-    return thread, worker
+    return _run_async(worker, on_done, on_error)
 
 
 class RepackSearchWorker(QObject):
@@ -79,26 +95,8 @@ class RepackSearchWorker(QObject):
 
 
 def fetch_search_async(source_key: str, query: str, page: int, on_done, on_error=None, use_cache: bool = True):
-    thread = QThread()
     worker = RepackSearchWorker(source_key, query, page, use_cache=use_cache)
-    worker.moveToThread(thread)
-
-    thread.started.connect(worker.run)
-
-    def _cleanup(*_args):
-        thread.quit()
-        thread.wait()
-        thread.deleteLater()
-        worker.deleteLater()
-
-    worker.finished.connect(on_done)
-    worker.finished.connect(_cleanup)
-    if on_error is not None:
-        worker.failed.connect(on_error)
-    worker.failed.connect(_cleanup)
-
-    thread.start()
-    return thread, worker
+    return _run_async(worker, on_done, on_error)
 
 
 class RepackDetailsWorker(QObject):
@@ -124,26 +122,8 @@ class RepackDetailsWorker(QObject):
 
 
 def fetch_details_async(source_key: str, entry: RepackEntry, on_done, on_error=None, use_cache: bool = True):
-    thread = QThread()
     worker = RepackDetailsWorker(source_key, entry, use_cache=use_cache)
-    worker.moveToThread(thread)
-
-    thread.started.connect(worker.run)
-
-    def _cleanup(*_args):
-        thread.quit()
-        thread.wait()
-        thread.deleteLater()
-        worker.deleteLater()
-
-    worker.finished.connect(on_done)
-    worker.finished.connect(_cleanup)
-    if on_error is not None:
-        worker.failed.connect(on_error)
-    worker.failed.connect(_cleanup)
-
-    thread.start()
-    return thread, worker
+    return _run_async(worker, on_done, on_error)
 
 
 class RepackUpcomingWorker(QObject):
@@ -173,23 +153,5 @@ class RepackUpcomingWorker(QObject):
 
 
 def fetch_upcoming_repacks_async(source_key: str, on_done, on_error=None, use_cache: bool = True):
-    thread = QThread()
     worker = RepackUpcomingWorker(source_key, use_cache=use_cache)
-    worker.moveToThread(thread)
-
-    thread.started.connect(worker.run)
-
-    def _cleanup(*_args):
-        thread.quit()
-        thread.wait()
-        thread.deleteLater()
-        worker.deleteLater()
-
-    worker.finished.connect(on_done)
-    worker.finished.connect(_cleanup)
-    if on_error is not None:
-        worker.failed.connect(on_error)
-    worker.failed.connect(_cleanup)
-
-    thread.start()
-    return thread, worker
+    return _run_async(worker, on_done, on_error)

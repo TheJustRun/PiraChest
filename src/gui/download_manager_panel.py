@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import subprocess
@@ -29,36 +30,51 @@ from qfluentwidgets import (
     FluentIcon,
     InfoBar,
     InfoBarPosition,
+    MessageBox,
     PrimaryPushButton,
     ProgressBar,
     PushButton,
     StrongBodyLabel,
     SubtitleLabel,
     ToolButton,
-    isDarkTheme,
     qconfig,
 )
 
 from ..core.download_manager import DLState, DownloadItem, DownloadManager
-from ..core.theme import palette
+from ..core.theme import palette, scroll_area_qss
+from ..core.translations import tr, register_locale_refresh
 
 logger = logging.getLogger(__name__)
 
-def _state_color(state) -> str:
-    c = palette()
-    key = {
-        DLState.queued: "state_queued",
-        DLState.downloading: "state_downloading",
-        DLState.verifying: "state_verifying",
-        DLState.paused: "state_paused",
-        DLState.seeding: "state_seeding",
-        DLState.completed: "state_completed",
-        DLState.error: "state_error",
-        DLState.cancelled: "state_cancelled",
-    }.get(state, "state_queued")
-    return c[key]
+_STATE_COLOR_KEYS = {
+    DLState.queued: "state_queued",
+    DLState.downloading: "state_downloading",
+    DLState.verifying: "state_verifying",
+    DLState.paused: "state_paused",
+    DLState.seeding: "state_seeding",
+    DLState.completed: "state_completed",
+    DLState.error: "state_error",
+    DLState.cancelled: "state_cancelled",
+}
 
-_STATE_COLOR = {state: _state_color(state) for state in DLState}
+_STATE_LABEL_KEYS = {
+    DLState.queued: "download.state_queued",
+    DLState.downloading: "download.state_downloading",
+    DLState.verifying: "download.state_verifying",
+    DLState.paused: "download.state_paused",
+    DLState.seeding: "download.state_seeding",
+    DLState.completed: "download.state_completed",
+    DLState.error: "download.state_error",
+    DLState.cancelled: "download.state_cancelled",
+}
+
+def _state_label(state) -> str:
+    key = _STATE_LABEL_KEYS.get(state)
+    return tr(key) if key else state.value
+
+
+def _state_color(state) -> str:
+    return palette()[_STATE_COLOR_KEYS.get(state, "state_queued")]
 
 _CARD_RADIUS = 8
 
@@ -68,7 +84,7 @@ def _muted_color() -> str:
 class TorrentSettingsDialog(QDialog):
     def __init__(self, item: DownloadItem, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Torrent Settings — {item.game_name}")
+        self.setWindowTitle(tr('download.torrent_settings_for', name=item.game_name))
         self.setFixedWidth(380)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 16)
@@ -78,48 +94,48 @@ class TorrentSettingsDialog(QDialog):
         form.setSpacing(12)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
 
-        self.chk_seed = CheckBox("Seed after completion")
+        self.chk_seed = CheckBox(tr('download.seed_after_completion'))
         self.chk_seed.setChecked(item.seed_after)
         form.addRow(self.chk_seed)
 
         self.spin_down = CompactSpinBox()
         self.spin_down.setRange(0, 1_000_000)
-        self.spin_down.setSuffix(" KB/s (0 = unlimited)")
+        self.spin_down.setSuffix(tr('download.suffix_kbps_unlimited'))
         self.spin_down.setValue(item.max_down_kbps)
-        form.addRow("Max download speed", self.spin_down)
+        form.addRow(tr('download.max_download_speed'), self.spin_down)
 
         self.spin_up = CompactSpinBox()
         self.spin_up.setRange(0, 1_000_000)
-        self.spin_up.setSuffix(" KB/s (0 = unlimited)")
+        self.spin_up.setSuffix(tr('download.suffix_kbps_unlimited'))
         self.spin_up.setValue(item.max_up_kbps)
-        form.addRow("Max upload speed", self.spin_up)
+        form.addRow(tr('download.max_upload_speed'), self.spin_up)
 
         self.spin_peers = CompactSpinBox()
         self.spin_peers.setRange(1, 1000)
         self.spin_peers.setValue(item.max_peers)
-        form.addRow("Max connections", self.spin_peers)
+        form.addRow(tr('download.max_connections'), self.spin_peers)
 
         self.spin_ratio = DoubleSpinBox()
         self.spin_ratio.setRange(0, 100)
         self.spin_ratio.setSingleStep(0.1)
-        self.spin_ratio.setSuffix(" (0 = unlimited)")
+        self.spin_ratio.setSuffix(tr('download.suffix_unlimited'))
         self.spin_ratio.setValue(item.ratio_limit)
-        form.addRow("Seed ratio limit", self.spin_ratio)
+        form.addRow(tr('download.seed_ratio_limit'), self.spin_ratio)
 
         self.spin_seed_time = CompactSpinBox()
         self.spin_seed_time.setRange(0, 100000)
-        self.spin_seed_time.setSuffix(" min (0 = unlimited)")
+        self.spin_seed_time.setSuffix(tr('download.suffix_min_unlimited'))
         self.spin_seed_time.setValue(item.seed_time_limit_min)
-        form.addRow("Seed time limit", self.spin_seed_time)
+        form.addRow(tr('download.seed_time_limit'), self.spin_seed_time)
 
         layout.addLayout(form)
 
         btn_row = QHBoxLayout()
-        self.btn_recheck = PushButton("Force Recheck")
+        self.btn_recheck = PushButton(tr('download.force_recheck'))
         btn_row.addWidget(self.btn_recheck)
         btn_row.addStretch()
-        self.btn_cancel = PushButton("Cancel")
-        self.btn_save = PrimaryPushButton("Save")
+        self.btn_cancel = PushButton(tr('download.cancel'))
+        self.btn_save = PrimaryPushButton(tr('download.save'))
         btn_row.addWidget(self.btn_cancel)
         btn_row.addWidget(self.btn_save)
         layout.addLayout(btn_row)
@@ -148,7 +164,7 @@ class _StatusDot(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedSize(8, 8)
-        self._color = QColor(_STATE_COLOR[DLState.queued])
+        self._color = QColor(_state_color(DLState.queued))
 
     def set_color(self, hex_color: str) -> None:
         self._color = QColor(hex_color)
@@ -189,7 +205,8 @@ class DownloadItemWidget(CardWidget):
         top_row.addWidget(self._dot, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._title = StrongBodyLabel(item.game_name)
-        self._title.setStyleSheet("font-size: 13px;")
+        self._title.setObjectName("downloadTitleLabel")
+        self._title.setStyleSheet("QLabel#downloadTitleLabel { font-size: 13px; }")
         self._title.setWordWrap(False)
         top_row.addWidget(self._title, 1)
 
@@ -226,19 +243,19 @@ class DownloadItemWidget(CardWidget):
         info_row.addStretch(1)
 
         self._btn_pause = ToolButton(FluentIcon.PAUSE)
-        self._btn_pause.setToolTip("Pause")
+        self._btn_pause.setToolTip(tr('download.pause'))
         self._btn_resume = ToolButton(FluentIcon.PLAY)
-        self._btn_resume.setToolTip("Resume")
+        self._btn_resume.setToolTip(tr('download.resume'))
         self._btn_retry = ToolButton(FluentIcon.SYNC)
-        self._btn_retry.setToolTip("Retry")
+        self._btn_retry.setToolTip(tr('download.retry'))
         self._btn_folder = ToolButton(FluentIcon.FOLDER)
-        self._btn_folder.setToolTip("Open Folder")
+        self._btn_folder.setToolTip(tr('download.open_folder'))
         self._btn_settings = ToolButton(FluentIcon.SETTING)
-        self._btn_settings.setToolTip("Torrent Settings")
+        self._btn_settings.setToolTip(tr('download.torrent_settings'))
         self._btn_cancel = ToolButton(FluentIcon.CLOSE)
-        self._btn_cancel.setToolTip("Cancel")
+        self._btn_cancel.setToolTip(tr('download.cancel'))
         self._btn_remove = ToolButton(FluentIcon.DELETE)
-        self._btn_remove.setToolTip("Remove")
+        self._btn_remove.setToolTip(tr('download.remove'))
 
         for b in (
             self._btn_pause,
@@ -263,16 +280,27 @@ class DownloadItemWidget(CardWidget):
         self._btn_folder.clicked.connect(lambda: self.request_open_folder.emit(self.item_id))
         self._btn_settings.clicked.connect(lambda: self.request_settings.emit(self.item_id))
 
+        self._item = item
         self.update_from_item(item)
+        qconfig.themeChanged.connect(self._on_theme_changed)
+
+    def _on_theme_changed(self, *_):
+        try:
+            self.update_from_item(self._item)
+        except RuntimeError:
+            pass
 
     def update_from_item(self, item: DownloadItem) -> None:
+        self._item = item
+        self._meta.setStyleSheet(f"color: {_muted_color()};")
         self._title.setText(item.game_name)
         self._title.setToolTip(item.game_name)
+        self._title.setStyleSheet("QLabel#downloadTitleLabel { font-size: 13px; }")
         self._meta.setText(f"{item.console}   ·   {item.source}")
 
-        color = _STATE_COLOR.get(item.state, "#8a8a8a")
+        color = _state_color(item.state)
         self._dot.set_color(color)
-        self._state_label.setText(item.state.value)
+        self._state_label.setText(_state_label(item.state))
         self._state_label.setStyleSheet(f"font-weight: 600; color: {color};")
 
         pct = int(item.progress)
@@ -280,27 +308,29 @@ class DownloadItemWidget(CardWidget):
         self._progress.setVisible(item.state != DLState.error)
         self._pct_label.setText(f"{pct}%" if item.state != DLState.error else "—")
 
+        self._size_label.setStyleSheet(f"color: {_muted_color()};")
+        self._speed_label.setStyleSheet(f"color: {_muted_color()};")
         self._size_label.setText(item.display_size())
 
         if item.state == DLState.seeding:
             self._speed_label.setText(f"↓ {item.speed_down}   ↑ {item.speed_up}")
             self._extra_label.setText(
-                f"Seeding {item.seed_time}  ·  Ratio {item.ratio:.2f}  ·  {item.peers} peers"
+                tr('download.seeding_stats', time=item.seed_time, ratio=f"{item.ratio:.2f}", peers=item.peers)
             )
         elif item.state == DLState.error:
             self._speed_label.setText("")
-            self._extra_label.setText((item.error or "Unknown error")[:70])
-            self._extra_label.setStyleSheet(f"color: {_STATE_COLOR[DLState.error]};")
+            self._extra_label.setText((item.error or tr('download.unknown_error'))[:70])
+            self._extra_label.setStyleSheet(f"color: {_state_color(DLState.error)};")
         elif item.state == DLState.completed:
             self._speed_label.setText("")
-            self._extra_label.setText("Done")
+            self._extra_label.setText(tr('download.done'))
         elif item.state == DLState.queued:
             self._speed_label.setText("")
-            self._extra_label.setText("Waiting for a free download slot")
+            self._extra_label.setText(tr('download.waiting_for_slot'))
         else:
             self._speed_label.setText(f"↓ {item.speed_down}   ↑ {item.speed_up}")
             self._extra_label.setStyleSheet(f"color: {_muted_color()};")
-            self._extra_label.setText(f"ETA {item.eta}  ·  {item.peers} peers")
+            self._extra_label.setText(tr('download.eta_peers', eta=item.eta, peers=item.peers))
 
         can_pause = item.state in (DLState.downloading, DLState.verifying)
         can_resume = item.state == DLState.paused
@@ -328,34 +358,37 @@ class StatsBar(CardWidget):
         self.setBorderRadius(_CARD_RADIUS)
         self.setFixedHeight(76)
         self._update_card_surface()
+        qconfig.themeChanged.connect(lambda *_: self._update_card_surface())
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(24, 12, 24, 12)
         layout.setSpacing(0)
 
         self._labels: dict[str, tuple[CaptionLabel, StrongBodyLabel]] = {}
+        self._separators: list[QFrame] = []
         fields = (
-            ("active", "Active"),
-            ("down", "Download Speed"),
-            ("up", "Upload Speed"),
-            ("queued", "Queued"),
-            ("completed", "Completed"),
+            ("active", "download.stats_active"),
+            ("down", "download.stats_download_speed"),
+            ("up", "download.stats_upload_speed"),
+            ("queued", "download.stats_queued"),
+            ("completed", "download.stats_completed"),
         )
-        for idx, (key, title) in enumerate(fields):
+        self._field_keys = dict(fields)
+        for idx, (key, title_key) in enumerate(fields):
             if idx > 0:
                 sep = QFrame()
                 sep.setFrameShape(QFrame.Shape.VLine)
                 sep.setFixedHeight(32)
-                sep.setStyleSheet(f"color: {_muted_color()}; background: transparent;")
                 layout.addWidget(sep)
                 layout.addSpacing(24)
+                self._separators.append(sep)
 
             col = QVBoxLayout()
             col.setSpacing(2)
             val = StrongBodyLabel("0")
-            val.setStyleSheet("font-size: 18px;")
-            cap = CaptionLabel(title)
-            cap.setStyleSheet(f"color: {_muted_color()};")
+            val.setObjectName("statValueLabel")
+            val.setStyleSheet("QLabel#statValueLabel { font-size: 18px; }")
+            cap = CaptionLabel(tr(title_key))
             col.addWidget(val)
             col.addWidget(cap)
             layout.addLayout(col)
@@ -364,6 +397,23 @@ class StatsBar(CardWidget):
                 layout.addSpacing(24)
 
         layout.addStretch(1)
+        self._refresh_muted_colors()
+        qconfig.themeChanged.connect(lambda *_: self._refresh_muted_colors())
+        qconfig.themeChanged.connect(lambda *_: self._refresh_value_sizes())
+
+    def retranslate(self) -> None:
+        for key, (cap, _val) in self._labels.items():
+            cap.setText(tr(self._field_keys[key]))
+
+    def _refresh_value_sizes(self) -> None:
+        for _cap, val in self._labels.values():
+            val.setStyleSheet("QLabel#statValueLabel { font-size: 18px; }")
+
+    def _refresh_muted_colors(self) -> None:
+        for sep in self._separators:
+            sep.setStyleSheet(f"color: {_muted_color()}; background: transparent;")
+        for cap, _val in self._labels.values():
+            cap.setStyleSheet(f"color: {_muted_color()};")
 
     def update_stats(self, summary: dict) -> None:
         self._labels["active"][1].setText(str(summary["active"]))
@@ -373,14 +423,11 @@ class StatsBar(CardWidget):
         self._labels["completed"][1].setText(str(summary["completed"]))
 
     def _update_card_surface(self):
-        if isDarkTheme():
-            bg = "rgba(255, 255, 255, 0.05)"
-        else:
-            bg = "rgba(255, 255, 255, 1)"
+        c = palette()
         self.setStyleSheet(
             f"StatsBar {{ "
-            f"background-color: {bg}; "
-            f"border: none; "
+            f"background-color: {c['card_bg']}; "
+            f"border: 1px solid {c['card_border']}; "
             f"border-radius: {_CARD_RADIUS}px; "
             f"padding: 0px; "
             f"}}"
@@ -397,8 +444,8 @@ class DownloadManagerPage(QWidget):
         root.setSpacing(16)
 
         header_row = QHBoxLayout()
-        header = SubtitleLabel("Download Manager")
-        header_row.addWidget(header)
+        self._header_lbl = SubtitleLabel(tr('download.manager_title'))
+        header_row.addWidget(self._header_lbl)
         header_row.addStretch()
         root.addLayout(header_row)
 
@@ -440,72 +487,50 @@ class DownloadManagerPage(QWidget):
 
         self._rebuild_all()
         self._refresh_stats()
+        register_locale_refresh(self, self._on_locale_changed)
+
+    def _on_locale_changed(self) -> None:
+        self._header_lbl.setText(tr('download.manager_title'))
+        self._empty_title_lbl.setText(tr('download.no_downloads_yet'))
+        self._empty_sub_lbl.setText(tr('download.empty_hint'))
+        self._stats.retranslate()
+        for item_id, widget in list(self._row_widgets.items()):
+            item = self._manager.get(item_id)
+            if item is not None:
+                try:
+                    widget.update_from_item(item)
+                except RuntimeError:
+                    pass
 
     def _apply_list_tint(self):
-        if isDarkTheme():
-            tint = "rgba(0, 0, 0, 32)"
-            handle = "rgba(255, 255, 255, 48)"
-            handle_hover = "rgba(255, 255, 255, 72)"
-        else:
-            tint = "rgba(240, 240, 245, 1)"
-            handle = "rgba(0, 0, 0, 48)"
-            handle_hover = "rgba(0, 0, 0, 72)"
+        c = palette()
         self._list.setStyleSheet(
             f"""
             QListWidget {{
-                background-color: {tint};
+                background-color: {c['list_bg']};
                 border: none;
                 outline: none;
             }}
             QListWidget::item {{
                 background: transparent;
             }}
-            QScrollBar:vertical {{
-                background: transparent;
-                width: 10px;
-                margin: 2px;
-            }}
-            QScrollBar::handle:vertical {{
-                background: {handle};
-                border-radius: 5px;
-                min-height: 24px;
-            }}
-            QScrollBar::handle:vertical:hover {{
-                background: {handle_hover};
-            }}
-            QScrollBar:horizontal {{
-                height: 0px;
-            }}
-            QScrollBar::add-line, QScrollBar::sub-line {{
-                background: transparent;
-            }}
+            {scroll_area_qss()}
             """
         )
 
     def _apply_card_style(self):
-        """Unified DownloadItemWidget appearance across themes.
-
-        qfluentwidgets' CardWidget paints a more opaque surface in Dark Mode
-        which feels visually compressed compared to Light Mode.  Force the
-        same card surface in both themes.
-        """
-        if isDarkTheme():
-            card_tint = "rgba(255, 255, 255, 0.05)"
-            card_hover = "rgba(255, 255, 255, 0.09)"
-        else:
-            card_tint = "rgba(255, 255, 255, 1)"
-            card_hover = "rgba(248, 248, 250, 1)"
+        c = palette()
         self._list.setStyleSheet(
             self._list.styleSheet() + (
                 f"DownloadItemWidget {{ "
-                f"background-color: {card_tint}; "
-                f"border: none; "
+                f"background-color: {c['card_bg']}; "
+                f"border: 1px solid {c['card_border']}; "
                 f"border-radius: 8px; "
                 f"padding: 0px; "
                 f"}} "
                 f"DownloadItemWidget:hover {{ "
-                f"background-color: {card_hover}; "
-                f"border: none; "
+                f"background-color: {c['card_hover']}; "
+                f"border: 1px solid {c['card_border']}; "
                 f"border-radius: 8px; "
                 f"}} "
             )
@@ -521,27 +546,30 @@ class DownloadManagerPage(QWidget):
         icon.setEnabled(False)
         icon.setFixedSize(48, 48)
         icon.setIconSize(QSize(22, 22))
-        if isDarkTheme():
+
+        def _refresh_icon_bg():
             icon.setStyleSheet(
-                "ToolButton { border-radius: 24px; background-color: rgba(255,255,255,0.06); }"
+                f"ToolButton {{ border-radius: 24px; background-color: {palette()['surface_tint_strong']}; }}"
             )
-        else:
-            icon.setStyleSheet(
-                "ToolButton { border-radius: 24px; background-color: rgba(0,0,0,0.06); }"
-            )
+
+        _refresh_icon_bg()
+        qconfig.themeChanged.connect(lambda *_: _refresh_icon_bg())
         icon_row = QHBoxLayout()
         icon_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_row.addWidget(icon)
         layout.addLayout(icon_row)
 
-        title = StrongBodyLabel("No downloads yet")
+        title = StrongBodyLabel(tr('download.no_downloads_yet'))
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
+        self._empty_title_lbl = title
 
-        sub = CaptionLabel("Pick a ROM from Home and hit Download to see it here.")
+        sub = CaptionLabel(tr('download.empty_hint'))
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet(f"color: {_muted_color()};")
+        qconfig.themeChanged.connect(lambda *_: sub.setStyleSheet(f"color: {_muted_color()};"))
         layout.addWidget(sub)
+        self._empty_sub_lbl = sub
 
         return w
 
@@ -555,12 +583,13 @@ class DownloadManagerPage(QWidget):
         finally:
             self._mutating_list = False
         self._update_empty_state()
+        gc.collect()
 
     def _insert_row(self, item: DownloadItem) -> None:
         widget = DownloadItemWidget(item)
         widget.request_pause.connect(self._manager.pause)
         widget.request_resume.connect(self._manager.resume)
-        widget.request_cancel.connect(self._manager.cancel)
+        widget.request_cancel.connect(self._on_cancel_clicked)
         widget.request_retry.connect(self._manager.retry)
         widget.request_remove.connect(self._on_remove_clicked)
         widget.request_open_folder.connect(self._on_open_folder)
@@ -613,15 +642,35 @@ class DownloadManagerPage(QWidget):
             ids.append(li.data(Qt.ItemDataRole.UserRole))
         self._manager.reorder(ids)
 
+    def _on_cancel_clicked(self, item_id: str) -> None:
+        box = MessageBox(
+            tr('download.cancel_download_title'),
+            tr('download.cancel_download_content'),
+            self.window(),
+        )
+        box.yesButton.setText(tr('download.yes'))
+        box.cancelButton.setText(tr('download.no'))
+        if not box.exec():
+            return
+        self._manager.cancel(item_id, delete_files=False)
+
     def _on_remove_clicked(self, item_id: str) -> None:
-        self._manager.remove(item_id, delete_files=False)
+        box = MessageBox(
+            tr('download.remove_download_title'),
+            tr('download.remove_download_content'),
+            self.window(),
+        )
+        box.yesButton.setText(tr('download.delete_file'))
+        box.cancelButton.setText(tr('download.keep_file'))
+        delete_files = box.exec()
+        self._manager.remove(item_id, delete_files=delete_files)
 
     def _on_open_folder(self, item_id: str) -> None:
         path = self._manager.open_folder(item_id)
         if not path:
             InfoBar.warning(
-                title="Folder Not Found",
-                content="This download's folder doesn't exist yet.",
+                title=tr('download.folder_not_found_title'),
+                content=tr('download.folder_not_found_content'),
                 orient=Qt.Orientation.Horizontal,
                 isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT,
@@ -650,12 +699,11 @@ class DownloadManagerPage(QWidget):
                 self._manager.force_recheck(item_id)
 
     def add_from_rom(self, rom: dict) -> None:
-        """Enqueue a single ROM dict (as stored in the local index)."""
         torrent = rom.get("torrent_file", "")
         if not torrent:
             InfoBar.warning(
-                title="No Torrent",
-                content="This ROM doesn't have a torrent file available.",
+                title=tr('download.no_torrent_title'),
+                content=tr('download.no_torrent_content'),
                 orient=Qt.Orientation.Horizontal,
                 isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT,
@@ -671,12 +719,12 @@ class DownloadManagerPage(QWidget):
             torrent_file=torrent,
             file_id=file_id,
             game_name=rom.get("title", "rom"),
-            console=rom.get("console", "Unknown"),
+            console=rom.get("console") or tr('download.unknown'),
             source=rom.get("source", "Minerva"),
         )
         InfoBar.success(
-            title="Added to Queue",
-            content=f"{rom.get('title', 'ROM')} was added to the download queue.",
+            title=tr('download.added_to_queue_title'),
+            content=tr('download.added_to_queue_single', title=rom.get('title') or tr('download.rom_fallback')),
             orient=Qt.Orientation.Horizontal,
             isClosable=True,
             position=InfoBarPosition.TOP_RIGHT,
@@ -698,14 +746,14 @@ class DownloadManagerPage(QWidget):
                 torrent_file=torrent,
                 file_id=file_id,
                 game_name=rom.get("title", "rom"),
-                console=rom.get("console", "Unknown"),
+                console=rom.get("console") or tr('download.unknown'),
                 source=rom.get("source", "Minerva"),
             )
             added += 1
         if added:
             InfoBar.success(
-                title="Added to Queue",
-                content=f"{added} ROM(s) added to the download queue.",
+                title=tr('download.added_to_queue_title'),
+                content=tr('download.added_to_queue_many', count=added),
                 orient=Qt.Orientation.Horizontal,
                 isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT,

@@ -42,6 +42,24 @@ def relaunch_as_admin() -> bool:
         return False
 
 
+def detect_windows_accent_color() -> str:
+    fallback = "#00b7c3"
+    if sys.platform != "win32":
+        return fallback
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\DWM") as key:
+            value, _ = winreg.QueryValueEx(key, "ColorizationColor")
+        argb = int(value) & 0xFFFFFFFF
+        r = (argb >> 16) & 0xFF
+        g = (argb >> 8) & 0xFF
+        b = argb & 0xFF
+        return f"#{r:02x}{g:02x}{b:02x}"
+    except Exception:
+        logger.warning("Could not read Windows accent color; using fallback")
+        return fallback
+
+
 _PROJECT_ROOT = _detect_app_root()
 _APP_DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
 
@@ -104,11 +122,17 @@ class Settings:
     delete_torrent_after: bool = True
     theme_mode: str = ThemeMode.DARK
     hide_alpha_disclaimer: bool = False
+    onboarding_completed: bool = False
+    sync_prompt_shown: bool = False
     pc_games_enabled: bool = False
-    minerva_enabled: bool = True
+    minerva_enabled: bool = False
     local_dat_enabled: bool = False
+    music_enabled: bool = False
+    books_enabled: bool = False
+    accent_color: str = field(default_factory=detect_windows_accent_color)
     close_to_tray: bool = False
     admin_mode: bool = False
+    language: str = "en"
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
@@ -138,7 +162,10 @@ def load_settings() -> Settings:
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            return Settings.from_dict(data)
+            loaded = Settings.from_dict(data)
+            if "onboarding_completed" not in data:
+                loaded.onboarding_completed = True
+            return loaded
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to load settings: %s — using defaults", exc)
     return Settings()

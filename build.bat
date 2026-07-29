@@ -15,7 +15,7 @@ if errorlevel 1 (
 echo [build] Cleaning up pycache, build, and old outputs...
 for /d /r . %%d in (__pycache__) do @if exist "%%d" rd /s /q "%%d"
 if exist build rmdir /s /q build
-if exist dist\PiraChest rmdir /s /q dist\PiraChest
+if exist dist\PiraChest.exe del /q dist\PiraChest.exe
 echo.
 
 echo [build] Running PyInstaller...
@@ -27,9 +27,9 @@ python -m PyInstaller ^
     --onedir ^
     --windowed ^
     --noconfirm ^
-    --noupx ^
     --clean ^
-    --onefile ^
+    --strip ^
+    --optimize=2 ^
     --exclude-module=PyQt5 ^
     --exclude-module=PySide2 ^
     --exclude-module=PySide6 ^
@@ -38,48 +38,33 @@ python -m PyInstaller ^
     --exclude-module=tkinter ^
     --exclude-module=matplotlib ^
     --exclude-module=numpy ^
-    --exclude-module=numpy.core ^
-    --exclude-module=numpy.lib ^
-    --exclude-module=numpy.random ^
-    --exclude-module=numpy.fft ^
-    --exclude-module=numpy.linalg ^
-    --exclude-module=numpy.polynomial ^
     --exclude-module=scipy ^
-    --exclude-module=scipy.special ^
-    --exclude-module=scipy.spatial ^
-    --exclude-module=scipy.stats ^
-    --exclude-module=scipy.sparse ^
-    --exclude-module=scipy.linalg ^
-    --exclude-module=scipy.optimize ^
-    --exclude-module=scipy.signal ^
-    --exclude-module=scipy.fft ^
-    --exclude-module=scipy.integrate ^
-    --exclude-module=scipy.interpolate ^
-    --exclude-module=scipy.io ^
-    --exclude-module=scipy.ndimage ^
-    --exclude-module=scipy.odr ^
-    --exclude-module=scipy.fftpack ^
-    --exclude-module=scipy.misc ^
-    --exclude-module=scipy.cluster ^
-    --exclude-module=scipy.constants ^
-    --exclude-module=scipy.version ^
     --exclude-module=setuptools ^
     --exclude-module=distutils ^
     --exclude-module=pkg_resources ^
+    --exclude-module=test ^
+    --exclude-module=unittest ^
+    --exclude-module=pydoc ^
+    --exclude-module=doctest ^
     --exclude-module=PyQt6.QtQml ^
     --exclude-module=PyQt6.QtQuick ^
-    --exclude-module=PyQt6.QtMultimedia ^
-    --exclude-module=PyQt6.QtMultimediaWidgets ^
+    --exclude-module=PyQt6.QtQuickWidgets ^
     --exclude-module=PyQt6.QtWebEngineWidgets ^
     --exclude-module=PyQt6.QtWebEngineCore ^
+    --exclude-module=PyQt6.QtWebEngineQuick ^
     --exclude-module=PyQt6.QtDesigner ^
     --exclude-module=PyQt6.QtBluetooth ^
     --exclude-module=PyQt6.QtNetwork ^
+    --exclude-module=PyQt6.QtNetworkAuth ^
+    --exclude-module=PyQt6.QtNfc ^
     --exclude-module=PyQt6.QtPositioning ^
+    --exclude-module=PyQt6.QtLocation ^
     --exclude-module=PyQt6.QtSensors ^
     --exclude-module=PyQt6.QtSerialPort ^
+    --exclude-module=PyQt6.QtSerialBus ^
     --exclude-module=PyQt6.QtTest ^
     --exclude-module=PyQt6.QtOpenGL ^
+    --exclude-module=PyQt6.QtOpenGLWidgets ^
     --exclude-module=PyQt6.QtPrintSupport ^
     --exclude-module=PyQt6.QtSql ^
     --exclude-module=PyQt6.QtHelp ^
@@ -89,23 +74,33 @@ python -m PyInstaller ^
     --exclude-module=PyQt6.QtX11Extras ^
     --exclude-module=PyQt6.QtWinExtras ^
     --exclude-module=PyQt6.QtMacExtras ^
-    --collect-submodules=PyQt6.QtCore ^
-    --collect-submodules=PyQt6.QtGui ^
-    --collect-submodules=PyQt6.QtWidgets ^
-    --collect-submodules=PyQt6.QtSvg ^
-    --collect-submodules=PyQt6.QtXml ^
-    --collect-submodules=qfluentwidgets ^
-    --collect-data=qfluentwidgets ^
+    --exclude-module=PyQt6.QtPdf ^
+    --exclude-module=PyQt6.QtPdfWidgets ^
+    --exclude-module=PyQt6.QtCharts ^
+    --exclude-module=PyQt6.QtDataVisualization ^
+    --exclude-module=PyQt6.QtRemoteObjects ^
+    --exclude-module=PyQt6.QtSpatialAudio ^
+    --exclude-module=PyQt6.QtStateMachine ^
+    --exclude-module=PyQt6.QtTextToSpeech ^
+    --exclude-module=PyQt6.QtWebChannel ^
+    --exclude-module=PyQt6.QtWebSockets ^
+    --exclude-module=PyQt6.Qt3DCore ^
+    --exclude-module=PyQt6.Qt3DRender ^
+    --exclude-module=PyQt6.Qt3DInput ^
+    --exclude-module=PyQt6.Qt3DLogic ^
+    --exclude-module=PyQt6.Qt3DAnimation ^
+    --exclude-module=PyQt6.Qt3DExtras ^
     --add-data "src\gui;src\gui" ^
     --add-data "src\core;src\core" ^
     --hidden-import=PyQt6.QtCore ^
     --hidden-import=PyQt6.QtGui ^
     --hidden-import=PyQt6.QtWidgets ^
     --hidden-import=PyQt6.QtSvg ^
-    --hidden-import=PyQt6.QtXml ^
+    --hidden-import=PyQt6.QtMultimedia ^
+    --hidden-import=PyQt6.QtMultimediaWidgets ^
     --hidden-import=requests ^
-    --hidden-import=orjson ^
     --hidden-import=qfluentwidgets ^
+    --collect-data=qfluentwidgets ^
     src/main.py
 
 if errorlevel 1 (
@@ -116,8 +111,8 @@ if errorlevel 1 (
 
 echo.
 echo [build] ────────────────────────────────────────────────
-echo [done]  Output directory: dist\PiraChest\
-echo          Run: dist\PiraChest\PiraChest.exe
+echo [done]  Output file: dist\PiraChest.exe
+echo          Run: dist\PiraChest.exe
 echo          Started:  %START_TIME%
 echo          Finished: %time%
 echo [build] ────────────────────────────────────────────────

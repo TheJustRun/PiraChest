@@ -1,68 +1,48 @@
-name: Build PiraChest (Windows x64)
+# pyoxidizer.bzl - PiraChest configuration
 
-on:
-  push:
-    branches: [ main ]
-permissions:
-  contents: write
+def make_exe():
+    # Get Python distribution
+    dist = default_python_distribution()
+    
+    # Packaging policy
+    policy = dist.make_python_packaging_policy()
+    policy.include_test = False
+    policy.include_distribution_sources = False
+    policy.resources_location = "in-memory"
+    
+    # Python interpreter config
+    python_config = dist.make_python_interpreter_config()
+    python_config.run_module = "main"
+    
+    # Create executable
+    exe = dist.to_python_executable(
+        name="PiraChest",
+        packaging_policy=policy,
+        config=python_config,
+    )
+    
+    # Add your source code
+    exe.add_python_resources(
+        exe.read_package_root(
+            path="src",
+            exclude=[
+                "**/__pycache__",
+                "**/*.pyc",
+                "**/*.pyo",
+                "**/tests",
+            ]
+        )
+    )
+    
+    # Add data directories
+    exe.add_resources(
+        exe.read_directory("src/gui", "gui"),
+        exe.read_directory("src/core", "core"),
+    )
+    
+    return exe
 
-jobs:
-  build:
-    name: PyInstaller → Permanent Release
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
-
-      - name: Install project dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: Write version file
-        shell: pwsh
-        run: |
-          $runNumber = "${{ github.run_number }}"
-          $version = "0.1.$runNumber"
-          Set-Content -Path "VERSION" -Value $version -NoNewline
-
-      - name: Build with PyInstaller
-        run: |
-          pyinstaller --clean PiraChest.spec
-
-      - name: Rename executable
-        shell: pwsh
-        run: |
-          $exePath = "dist/PiraChest.exe"
-
-          if (-not (Test-Path $exePath)) {
-            Write-Error "Expected build output at $exePath but it does not exist."
-            exit 1
-          }
-
-          $runNumber = "${{ github.run_number }}"
-          $exeName   = "PiraChest-v0.1.${runNumber}-alpha-Windows-x64.exe"
-          $exePathOut = "${{ github.workspace }}\$exeName"
-
-          Copy-Item -Path $exePath -Destination $exePathOut -Force
-
-          echo "EXE_PATH=$exePathOut" >> $env:GITHUB_ENV
-
-      - name: Create Permanent GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "v0.1.${{ github.run_number }}-alpha"
-          name: "PiraChest v0.1.${{ github.run_number }} Alpha"
-          body: "Automated alpha build from commit ${{ github.sha }}."
-          draft: false
-          prerelease: true
-          files: ${{ env.EXE_PATH }}
+# Register the build target
+register_target("exe", make_exe)
+resolve_targets("exe")
+default_build_target = "exe"
