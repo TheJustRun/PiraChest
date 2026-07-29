@@ -28,11 +28,11 @@
 - [x] Multi-console support
 - [x] Download manager
 - [x] PC Games (Repacks..)
+- [x] Localization
+- [x] Linux (untested AppImage)
 - [ ] DAT Support
 - [ ] Updates & DLC (You can find some, but it isn't very reliable)
 - [ ] Media downloads (Music, Books, Courses..)
-- [ ] Localization
-- [ ] Linux *(never™)*
 - more ig
 
 ## Photos
