@@ -44,24 +44,21 @@ jobs:
         run: |
           Set-Content -Path "VERSION" -Value "${{ needs.version.outputs.version }}" -NoNewline
 
-      - name: Build with PyInstaller (UPX disabled)
+      - name: Build with PyInstaller
         shell: cmd
         run: |
-          pyinstaller --name=PiraChest --onefile --noconfirm --clean --noupx --exclude-module=PyQt5 --exclude-module=PySide2 --exclude-module=PySide6 --exclude-module=tkinter --exclude-module=matplotlib --exclude-module=numpy --exclude-module=scipy --exclude-module=setuptools --exclude-module=distutils --exclude-module=pkg_resources --hidden-import=PyQt6.QtCore --hidden-import=PyQt6.QtGui --hidden-import=PyQt6.QtWidgets --hidden-import=PyQt6.QtSvg --hidden-import=requests --hidden-import=qfluentwidgets --add-data "src/gui;src/gui" --add-data "src/core;src/core" src/main.py
+          pyinstaller --name=PiraChest --onefile --noconfirm --clean --noupx --icon=src/gui/icon.ico --exclude-module=PyQt5 --exclude-module=PySide2 --exclude-module=PySide6 --exclude-module=tkinter --exclude-module=matplotlib --exclude-module=numpy --exclude-module=scipy --exclude-module=setuptools --exclude-module=distutils --exclude-module=pkg_resources --hidden-import=PyQt6.QtCore --hidden-import=PyQt6.QtGui --hidden-import=PyQt6.QtWidgets --hidden-import=PyQt6.QtSvg --hidden-import=requests --hidden-import=qfluentwidgets --add-data "src/gui;src/gui" --add-data "src/core;src/core" src/main.py
 
       - name: Rename executable
         shell: pwsh
         run: |
           $exePath = "dist/PiraChest.exe"
-
           if (-not (Test-Path $exePath)) {
             Write-Error "Expected build output at $exePath but it does not exist."
             exit 1
           }
-
           $exeName    = "PiraChest-v${{ needs.version.outputs.version }}-alpha-Windows-x64.exe"
           $exePathOut = "${{ github.workspace }}\$exeName"
-
           Copy-Item -Path $exePath -Destination $exePathOut -Force
           echo "EXE_PATH=$exePathOut" >> $env:GITHUB_ENV
 
@@ -109,7 +106,7 @@ jobs:
       - name: Write version file
         run: echo -n "${{ needs.version.outputs.version }}" > VERSION
 
-      - name: Run PyInstaller (UPX disabled)
+      - name: Run PyInstaller
         run: |
           pyinstaller \
             --name=PiraChest \
@@ -119,6 +116,7 @@ jobs:
             --clean \
             --strip \
             --noupx \
+            --icon=src/gui/icon.ico \
             --exclude-module=PyQt5 \
             --exclude-module=PySide2 \
             --exclude-module=PySide6 \
@@ -159,7 +157,6 @@ jobs:
           mkdir -p AppDir/usr/bin
           cp dist/PiraChest AppDir/usr/bin/PiraChest
           chmod +x AppDir/usr/bin/PiraChest
-
           mkdir -p AppDir/usr/share/applications
           cat > AppDir/usr/share/applications/PiraChest.desktop <<'EOF'
           [Desktop Entry]
@@ -170,9 +167,10 @@ jobs:
           Categories=Network;FileTransfer;
           Terminal=false
           EOF
-
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
-          if [ -f src/gui/logo.png ]; then
+          if [ -f src/gui/icon.ico ]; then
+            convert src/gui/icon.ico[0] -resize 256x256 -gravity center -background none -extent 256x256 AppDir/usr/share/icons/hicolor/256x256/apps/PiraChest.png
+          elif [ -f src/gui/logo.png ]; then
             convert src/gui/logo.png -resize 256x256 -gravity center -background none -extent 256x256 AppDir/usr/share/icons/hicolor/256x256/apps/PiraChest.png
           else
             convert -size 256x256 xc:'#282828' AppDir/usr/share/icons/hicolor/256x256/apps/PiraChest.png
@@ -195,7 +193,6 @@ jobs:
             --desktop-file AppDir/usr/share/applications/PiraChest.desktop \
             --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/PiraChest.png \
             --output appimage
-
           APPIMAGE_FILE=$(ls PiraChest*.AppImage | head -n1)
           NEW_NAME="PiraChest-v${{ needs.version.outputs.version }}-alpha-Linux-x86_64.AppImage"
           mv "$APPIMAGE_FILE" "$NEW_NAME"
