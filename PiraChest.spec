@@ -23,8 +23,10 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [('O', None, 'OPTION'), ('O', None, 'OPTION')],
-    exclude_binaries=True,
+    exclude_binaries=False,
     name='PiraChest',
     debug=False,
     bootloader_ignore_signals=False,
@@ -37,13 +39,4 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['src\\gui\\icon.ico'],
-)
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=True,
-    upx=True,
-    upx_exclude=[],
-    name='PiraChest',
 )

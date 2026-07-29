@@ -51,7 +51,7 @@ jobs:
       - name: Rename executable
         shell: pwsh
         run: |
-          $exePath = "dist/PiraChest/PiraChest.exe"
+          $exePath = "dist/PiraChest.exe"
 
           if (-not (Test-Path $exePath)) {
             Write-Error "Expected build output at $exePath but it does not exist."
@@ -112,7 +112,7 @@ jobs:
         run: |
           ~/.local/bin/pyinstaller \
             --name=PiraChest \
-            --onedir \
+            --onefile \
             --windowed \
             --noconfirm \
             --clean \
@@ -154,7 +154,8 @@ jobs:
         run: |
           rm -rf AppDir
           mkdir -p AppDir/usr/bin
-          cp -r dist/PiraChest/* AppDir/usr/bin/
+          cp dist/PiraChest AppDir/usr/bin/PiraChest
+          chmod +x AppDir/usr/bin/PiraChest
 
           mkdir -p AppDir/usr/share/applications
           cat > AppDir/usr/share/applications/PiraChest.desktop <<'EOF'
@@ -174,17 +175,12 @@ jobs:
             convert -size 256x256 xc:'#282828' AppDir/usr/share/icons/hicolor/256x256/apps/PiraChest.png
           fi
 
-      - name: Fetch linuxdeploy tools
+      - name: Fetch linuxdeploy
         run: |
           curl -fL --retry 5 --retry-delay 5 --retry-all-errors \
             -o linuxdeploy-x86_64.AppImage \
             https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           chmod +x linuxdeploy-x86_64.AppImage
-
-          curl -fL --retry 5 --retry-delay 5 --retry-all-errors \
-            -o linuxdeploy-plugin-qt-x86_64.AppImage \
-            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
-          chmod +x linuxdeploy-plugin-qt-x86_64.AppImage
 
       - name: Build AppImage
         env:
@@ -196,7 +192,6 @@ jobs:
             --executable AppDir/usr/bin/PiraChest \
             --desktop-file AppDir/usr/share/applications/PiraChest.desktop \
             --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/PiraChest.png \
-            --plugin qt \
             --output appimage
 
           APPIMAGE_FILE=$(ls PiraChest*.AppImage | head -n1)
