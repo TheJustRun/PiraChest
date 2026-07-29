@@ -1,48 +1,234 @@
-# pyoxidizer.bzl - PiraChest configuration
+name: Build PiraChest (Windows x64 + Linux AppImage)
 
-def make_exe():
-    # Get Python distribution
-    dist = default_python_distribution()
-    
-    # Packaging policy
-    policy = dist.make_python_packaging_policy()
-    policy.include_test = False
-    policy.include_distribution_sources = False
-    policy.resources_location = "in-memory"
-    
-    # Python interpreter config
-    python_config = dist.make_python_interpreter_config()
-    python_config.run_module = "main"
-    
-    # Create executable
-    exe = dist.to_python_executable(
-        name="PiraChest",
-        packaging_policy=policy,
-        config=python_config,
-    )
-    
-    # Add your source code
-    exe.add_python_resources(
-        exe.read_package_root(
-            path="src",
-            exclude=[
-                "**/__pycache__",
-                "**/*.pyc",
-                "**/*.pyo",
-                "**/tests",
-            ]
-        )
-    )
-    
-    # Add data directories
-    exe.add_resources(
-        exe.read_directory("src/gui", "gui"),
-        exe.read_directory("src/core", "core"),
-    )
-    
-    return exe
+on:
+  push:
+    branches: [ main ]
 
-# Register the build target
-register_target("exe", make_exe)
-resolve_targets("exe")
-default_build_target = "exe"
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Compute shared version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - id: ver
+        run: echo "version=0.1.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+  build-windows:
+    name: PyInstaller (Windows x64)
+    needs: version
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install project dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Write version file
+        shell: pwsh
+        run: |
+          Set-Content -Path "VERSION" -Value "${{ needs.version.outputs.version }}" -NoNewline
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --clean PiraChest.spec
+
+      - name: Rename executable
+        shell: pwsh
+        run: |
+          $exePath = "dist/PiraChest/PiraChest.exe"
+
+          if (-not (Test-Path $exePath)) {
+            Write-Error "Expected build output at $exePath but it does not exist."
+            exit 1
+          }
+
+          $exeName    = "PiraChest-v${{ needs.version.outputs.version }}-alpha-Windows-x64.exe"
+          $exePathOut = "${{ github.workspace }}\$exeName"
+
+          Copy-Item -Path $exePath -Destination $exePathOut -Force
+          echo "EXE_PATH=$exePathOut" >> $env:GITHUB_ENV
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: ${{ env.EXE_PATH }}
+
+  build-linux-appimage:
+    name: PyInstaller (Linux AppImage)
+    needs: version
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-pip \
+            libfuse2 \
+            fuse \
+            imagemagick \
+            libgl1 \
+            libegl1 \
+            libxkbcommon0 \
+            libdbus-1-3
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install Python dependencies
+        run: |
+          pip install --user -r requirements.txt
+          pip install --user pyinstaller
+
+      - name: Write version file
+        run: echo -n "${{ needs.version.outputs.version }}" > VERSION
+
+      - name: Run PyInstaller
+        run: |
+          ~/.local/bin/pyinstaller \
+            --name=PiraChest \
+            --onedir \
+            --windowed \
+            --noconfirm \
+            --clean \
+            --exclude-module=PyQt5 \
+            --exclude-module=PySide2 \
+            --exclude-module=PySide6 \
+            --exclude-module=tkinter \
+            --exclude-module=matplotlib \
+            --exclude-module=numpy \
+            --exclude-module=scipy \
+            --exclude-module=setuptools \
+            --exclude-module=distutils \
+            --exclude-module=pkg_resources \
+            --exclude-module=PyQt6.QtQml \
+            --exclude-module=PyQt6.QtQuick \
+            --exclude-module=PyQt6.QtWebEngineWidgets \
+            --exclude-module=PyQt6.QtDesigner \
+            --exclude-module=PyQt6.QtNetwork \
+            --exclude-module=PyQt6.QtTest \
+            --exclude-module=PyQt6.QtOpenGL \
+            --collect-submodules=PyQt6.QtCore \
+            --collect-submodules=PyQt6.QtGui \
+            --collect-submodules=PyQt6.QtWidgets \
+            --collect-submodules=PyQt6.QtSvg \
+            --collect-submodules=qfluentwidgets \
+            --collect-data=qfluentwidgets \
+            --collect-data=PyQt6 \
+            --add-data "src/gui:src/gui" \
+            --add-data "src/core:src/core" \
+            --hidden-import=PyQt6.QtCore \
+            --hidden-import=PyQt6.QtGui \
+            --hidden-import=PyQt6.QtWidgets \
+            --hidden-import=PyQt6.QtSvg \
+            --hidden-import=requests \
+            --hidden-import=qfluentwidgets \
+            src/main.py
+
+      - name: Assemble AppDir
+        run: |
+          rm -rf AppDir
+          mkdir -p AppDir/usr/bin
+          cp -r dist/PiraChest/* AppDir/usr/bin/
+
+          mkdir -p AppDir/usr/share/applications
+          cat > AppDir/usr/share/applications/PiraChest.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=PiraChest
+          Exec=PiraChest
+          Icon=PiraChest
+          Categories=Network;FileTransfer;
+          Terminal=false
+          EOF
+
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          if [ -f src/gui/logo.png ]; then
+            cp src/gui/logo.png AppDir/usr/share/icons/hicolor/256x256/apps/PiraChest.png
+          else
+            convert -size 256x256 xc:'#282828' AppDir/usr/share/icons/hicolor/256x256/apps/PiraChest.png
+          fi
+
+      - name: Fetch linuxdeploy tools
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy-plugin-qt-x86_64.AppImage
+
+      - name: Build AppImage
+        env:
+          ARCH: x86_64
+          NO_STRIP: 1
+        run: |
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable AppDir/usr/bin/PiraChest \
+            --desktop-file AppDir/usr/share/applications/PiraChest.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/PiraChest.png \
+            --plugin qt \
+            --output appimage
+
+          APPIMAGE_FILE=$(ls PiraChest*.AppImage | head -n1)
+          NEW_NAME="PiraChest-v${{ needs.version.outputs.version }}-alpha-Linux-x86_64.AppImage"
+          mv "$APPIMAGE_FILE" "$NEW_NAME"
+          echo "APPIMAGE_PATH=$NEW_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: ${{ env.APPIMAGE_PATH }}
+
+  release:
+    name: Create Permanent GitHub Release
+    needs: [ version, build-windows, build-linux-appimage ]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: release-files
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-appimage
+          path: release-files
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ needs.version.outputs.version }}-alpha"
+          name: "PiraChest v${{ needs.version.outputs.version }} Alpha"
+          body: "Automated alpha build from commit ${{ github.sha }}."
+          draft: false
+          prerelease: true
+          files: release-files/*
