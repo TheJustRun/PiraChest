@@ -37,7 +37,7 @@ jobs:
       - name: Install project dependencies
         run: |
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install --upgrade pyinstaller
 
       - name: Write version file
         shell: pwsh
@@ -46,7 +46,7 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller --clean PiraChest.spec
+          pyinstaller --clean --upx=False PiraChest.spec
 
       - name: Rename executable
         shell: pwsh
@@ -104,7 +104,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --user -r requirements.txt
-          pip install --user pyinstaller
+          pip install --user --upgrade pyinstaller
 
       - name: Write version file
         run: echo -n "${{ needs.version.outputs.version }}" > VERSION
