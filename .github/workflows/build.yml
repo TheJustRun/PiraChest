@@ -44,9 +44,33 @@ jobs:
         run: |
           Set-Content -Path "VERSION" -Value "${{ needs.version.outputs.version }}" -NoNewline
 
-      - name: Build with PyInstaller
+      - name: Build with PyInstaller (UPX disabled)
         run: |
-          pyinstaller --clean --noupx PiraChest.spec
+          pyinstaller \
+            --name=PiraChest \
+            --onefile \
+            --noconfirm \
+            --clean \
+            --noupx \
+            --exclude-module=PyQt5 \
+            --exclude-module=PySide2 \
+            --exclude-module=PySide6 \
+            --exclude-module=tkinter \
+            --exclude-module=matplotlib \
+            --exclude-module=numpy \
+            --exclude-module=scipy \
+            --exclude-module=setuptools \
+            --exclude-module=distutils \
+            --exclude-module=pkg_resources \
+            --hidden-import=PyQt6.QtCore \
+            --hidden-import=PyQt6.QtGui \
+            --hidden-import=PyQt6.QtWidgets \
+            --hidden-import=PyQt6.QtSvg \
+            --hidden-import=requests \
+            --hidden-import=qfluentwidgets \
+            --add-data "src/gui:src/gui" \
+            --add-data "src/core:src/core" \
+            src/main.py
 
       - name: Rename executable
         shell: pwsh
@@ -95,29 +119,29 @@ jobs:
             libgl1 \
             libegl1 \
             libxkbcommon0 \
-            libdbus-1-3 \
-            upx-ucl
+            libdbus-1-3
 
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
       - name: Install Python dependencies
         run: |
-          pip install --user -r requirements.txt
-          pip install --user --upgrade pyinstaller
+          pip install -r requirements.txt
+          pip install --upgrade pyinstaller
 
       - name: Write version file
         run: echo -n "${{ needs.version.outputs.version }}" > VERSION
 
-      - name: Run PyInstaller
+      - name: Run PyInstaller (UPX disabled)
         run: |
-          ~/.local/bin/pyinstaller \
+          pyinstaller \
             --name=PiraChest \
             --onefile \
             --windowed \
             --noconfirm \
             --clean \
             --strip \
+            --noupx \
             --exclude-module=PyQt5 \
             --exclude-module=PySide2 \
             --exclude-module=PySide6 \
