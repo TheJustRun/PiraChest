@@ -46,7 +46,7 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller --clean --upx=False PiraChest.spec
+          pyinstaller --clean --noupx PiraChest.spec
 
       - name: Rename executable
         shell: pwsh
