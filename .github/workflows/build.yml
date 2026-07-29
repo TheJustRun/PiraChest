@@ -170,7 +170,7 @@ jobs:
 
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
           if [ -f src/gui/logo.png ]; then
-            cp src/gui/logo.png AppDir/usr/share/icons/hicolor/256x256/apps/PiraChest.png
+            convert src/gui/logo.png -resize 256x256 -gravity center -background none -extent 256x256 AppDir/usr/share/icons/hicolor/256x256/apps/PiraChest.png
           else
             convert -size 256x256 xc:'#282828' AppDir/usr/share/icons/hicolor/256x256/apps/PiraChest.png
           fi
