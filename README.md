@@ -37,7 +37,7 @@ A work-in-progress desktop GUI application for downloading ROMs from the Minerva
 * [x] Download manager
 * [x] PC Games (Repacks)
 * [x] Localization
-* [x] Linux (untested AppImage; Linux is not a priority at all)
+* [] Linux (absolutely never, fuck that shit)
 * [x] Media (Music, Books, Anime...)
 * [ ] DAT Support
 * [ ] Updates & DLC (You can find some, but it isn't very reliable)
