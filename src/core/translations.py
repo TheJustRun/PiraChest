@@ -6,9 +6,9 @@ import os
 import sys
 from typing import Optional
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PySide6.QtCore import QObject, Signal
 
-from .config import settings, apply_settings, save_settings, _PROJECT_ROOT
+from src.core.config import settings, apply_settings, save_settings, _PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -16,22 +16,17 @@ logger = logging.getLogger(__name__)
 def _resolve_lang_dir() -> str:
     base = getattr(sys, "_MEIPASS", None)
     if base:
-        candidate = os.path.join(base, "src", "core", "lang")
+        candidate = os.path.join(base, "src", "gui", "lang")
         if os.path.isdir(candidate):
             return candidate
-        candidate = os.path.join(base, "core", "lang")
+        candidate = os.path.join(base, "gui", "lang")
         if os.path.isdir(candidate):
             return candidate
-    return os.path.join(_PROJECT_ROOT, "src", "core", "lang")
+    return os.path.join(_PROJECT_ROOT, "src", "gui", "lang")
 
 
 _LANG_DIR = _resolve_lang_dir()
 _FALLBACK_LANG = "en"
-_RTL_LANGS = {"ar", "he", "fa", "ur"}
-
-
-def is_rtl() -> bool:
-    return current_language() in _RTL_LANGS
 
 _strings_cache: dict[str, dict[str, str]] = {}
 _meta_cache: Optional[dict[str, str]] = None
@@ -39,7 +34,7 @@ _available_files_cache: Optional[list[str]] = None
 
 
 class _LocaleSignal(QObject):
-    changed = pyqtSignal()
+    changed = Signal()
 
 
 locale_signal = _LocaleSignal()

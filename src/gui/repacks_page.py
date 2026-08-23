@@ -1,17 +1,18 @@
 from __future__ import annotations
+import bisect
 import gc
 import logging
 import re
-from PyQt6.QtCore import Qt, QSize, QSizeF, QRect, QPoint, QThread, QObject, pyqtSignal, pyqtProperty, QPropertyAnimation, QEasingCurve, QTimer, QVariantAnimation
-from PyQt6.QtGui import QColor
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLayout, QLayoutItem, QScrollArea, QDialog, QTreeWidgetItem, QHeaderView, QGridLayout, QLabel
+from PySide6.QtCore import Qt, QSize, QSizeF, QRect, QThread, QObject, Signal, Property, QPropertyAnimation, QEasingCurve, QTimer, QVariantAnimation
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLayout, QLayoutItem, QScrollArea, QDialog, QTreeWidgetItem, QHeaderView, QGridLayout, QLabel, QSizePolicy
 from qfluentwidgets import CardWidget, FluentIcon, Pivot, TitleLabel, SubtitleLabel, BodyLabel, StrongBodyLabel, CaptionLabel, TransparentToolButton, PushButton, PrimaryPushButton, ImageLabel, PillPushButton, FlowLayout as QFlowLayout, themeColor, SearchLineEdit, TreeWidget, MessageBoxBase, SmoothScrollArea, HyperlinkButton, qconfig, isDarkTheme
-from ..core.repacks.base import RepackEntry, RepackDetails, magnet_display_name
-from ..core.repacks.worker import fetch_page_async, fetch_details_async, fetch_upcoming_repacks_async, fetch_search_async
-from ..core.repacks.poster_downloader import PosterDownloader, VideoDownloader
-from ..core.download_manager import DownloadManager, DLState
-from ..core.theme import palette
-from ..core.translations import tr, register_locale_refresh, is_rtl
+from src.core.repacks.base import RepackEntry, RepackDetails, magnet_display_name
+from src.core.worker import fetch_page_async, fetch_details_async, fetch_upcoming_repacks_async, fetch_search_async, fetch_latest_repacks_async, fetch_popular_repacks_async, cancel as cancel_task
+from src.core.repacks.video_downloader import PosterDownloader
+from src.core.downloader import DownloadManager, DLState
+from src.core.theme import palette
+from src.core.translations import tr, register_locale_refresh
 _SOURCE_DONATION_URLS = {'fitgirl': 'https://fitgirl-repacks.site/donations/'}
 _SOURCE_UPCOMING_SUPPORTED = {'fitgirl'}
 logger = logging.getLogger(__name__)
@@ -60,6 +61,13 @@ class FlowLayout(QLayout):
 
     def addItem(self, item: QLayoutItem) -> None:
         self._items.append(item)
+
+    def insertWidget(self, index: int, widget: QWidget) -> None:
+        from PySide6.QtWidgets import QWidgetItem
+        self.addChildWidget(widget)
+        index = max(0, min(index, len(self._items)))
+        self._items.insert(index, QWidgetItem(widget))
+        self.invalidate()
 
     def count(self) -> int:
         return len(self._items)
@@ -127,11 +135,11 @@ class FlowLayout(QLayout):
         return y + line_height - rect.y() + bottom
 
 def _load_scaled_pixmap(path: str, target_w: int, target_h: int):
-    from PyQt6.QtGui import QImageReader, QPixmap, QPixmapCache
+    from PySide6.QtGui import QImageReader, QImage, QPixmap, QPixmapCache
     if _load_scaled_pixmap._cache_sized is False:
-        QPixmapCache.setCacheLimit(64 * 1024)
+        QPixmapCache.setCacheLimit(20 * 1024)
         _load_scaled_pixmap._cache_sized = True
-    cache_key = f'poster:{path}:{target_w}x{target_h}'
+    cache_key = f'poster:{path}:{target_w}x{target_h}:final'
     cached = QPixmapCache.find(cache_key)
     if cached is not None and (not cached.isNull()):
         return cached
@@ -146,8 +154,12 @@ def _load_scaled_pixmap(path: str, target_w: int, target_h: int):
     image = reader.read()
     if image.isNull():
         pix = QPixmap(path)
+        pix = pix.scaled(target_w, target_h, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
     else:
+        if not image.hasAlphaChannel():
+            image = image.convertToFormat(QImage.Format.Format_RGB16)
         pix = QPixmap.fromImage(image)
+    pix = _center_crop_pixmap(pix, target_w, target_h)
     QPixmapCache.insert(cache_key, pix)
     return pix
 _load_scaled_pixmap._cache_sized = False
@@ -161,12 +173,22 @@ def _center_crop_pixmap(pix, target_w: int, target_h: int):
     y = max(0, (pix.height() - target_h) // 2)
     return pix.copy(x, y, min(target_w, pix.width()), min(target_h, pix.height()))
 
+_dominant_color_cache: dict[str, object] = {}
+_DOMINANT_COLOR_CACHE_LIMIT = 200
+
 def _dominant_color(path: str):
-    from PyQt6.QtGui import QImage, QColor
-    image = QImage(path)
-    if image.isNull():
+    cached = _dominant_color_cache.get(path)
+    if cached is not None:
+        return cached if cached is not False else None
+
+    from PySide6.QtGui import QImageReader, QImage, QColor
+    reader = QImageReader(path)
+    reader.setScaledSize(QSize(48, 48))
+    small = reader.read()
+    if small.isNull():
+        _dominant_color_cache[path] = False
         return None
-    small = image.scaled(48, 48, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation).convertToFormat(QImage.Format.Format_RGB32)
+    small = small.convertToFormat(QImage.Format.Format_RGB32)
     buckets: dict[tuple[int, int, int], list[int]] = {}
     for y in range(small.height()):
         for x in range(small.width()):
@@ -187,9 +209,14 @@ def _dominant_color(path: str):
                 entry[2] += b
                 entry[3] += 1
     if not buckets:
+        _dominant_color_cache[path] = False
         return None
     r_sum, g_sum, b_sum, n = max(buckets.values(), key=lambda e: e[3])
-    return QColor(r_sum // n, g_sum // n, b_sum // n)
+    result = QColor(r_sum // n, g_sum // n, b_sum // n)
+    if len(_dominant_color_cache) >= _DOMINANT_COLOR_CACHE_LIMIT:
+        _dominant_color_cache.clear()
+    _dominant_color_cache[path] = result
+    return result
 
 def _stop_previous_movie(image_label) -> None:
     try:
@@ -199,11 +226,11 @@ def _stop_previous_movie(image_label) -> None:
     if movie is not None:
         movie.stop()
         movie.deleteLater()
-        from PyQt6.QtWidgets import QLabel
+        from PySide6.QtWidgets import QLabel
         QLabel.setMovie(image_label, None)
 
 class _SteppedAnimator(QObject):
-    finished = pyqtSignal()
+    finished = Signal()
 
     def __init__(self, setter, parent=None):
         super().__init__(parent)
@@ -266,7 +293,7 @@ class _AnimatedPosterMixin:
             self._animate_to(0, self._PRESS_MS)
 
 class PosterCard(_AnimatedPosterMixin, QWidget):
-    clicked_poster = pyqtSignal(object)
+    clicked_poster = Signal(object)
     POSTER_WIDTH = 150
     POSTER_HEIGHT = 210
     _HOVER_HEADROOM_PX = 8
@@ -341,8 +368,6 @@ class PosterCard(_AnimatedPosterMixin, QWidget):
                 self._poster_lbl.setStyleSheet('')
             _stop_previous_movie(self._poster_lbl)
             pix = _load_scaled_pixmap(path, self.POSTER_WIDTH, self.POSTER_HEIGHT)
-            pix = pix.scaled(self.POSTER_WIDTH, self.POSTER_HEIGHT, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            pix = _center_crop_pixmap(pix, self.POSTER_WIDTH, self.POSTER_HEIGHT)
             self._poster_lbl.setImage(pix)
             self._poster_lbl.setFixedSize(self.POSTER_WIDTH, self.POSTER_HEIGHT)
             self._poster_lbl.scaledToWidth(self.POSTER_WIDTH)
@@ -374,8 +399,8 @@ class PosterCard(_AnimatedPosterMixin, QWidget):
         super().mouseReleaseEvent(event)
 
 class PosterGrid(SmoothScrollArea):
-    poster_clicked = pyqtSignal(object)
-    near_bottom = pyqtSignal()
+    poster_clicked = Signal(object)
+    near_bottom = Signal()
     _NEAR_BOTTOM_THRESHOLD_PX = 400
     _VISIBILITY_MARGIN_PX = 600
     _VISIBILITY_DEBOUNCE_MS = 150
@@ -433,15 +458,21 @@ class PosterGrid(SmoothScrollArea):
         self.setWidget(self._container)
         self._entries: list[RepackEntry] = []
         self._entries_by_url: dict[str, RepackEntry] = {}
+        self._entry_index: dict[str, int] = {}
         self._cards_by_url: dict[str, PosterCard] = {}
         self._cards_by_poster_url: dict[str, PosterCard] = {}
+        self._live_positions: list[int] = []
+        self._card_order: list[str] = []
+        self._MAX_LIVE_CARDS = 260
+        self._EVICT_MARGIN_PX = 4000
+        self._MATERIALIZE_BUFFER_ROWS = 4
         self._latest_entries: list = []
         self._latest_page = 0
         self._latest_cards: list[PosterCard] = []
         self._poster_downloader = PosterDownloader(self)
         self._poster_downloader.poster_ready.connect(self._on_poster_ready)
         self._poster_downloader.poster_failed.connect(self._on_poster_failed)
-        from PyQt6.QtCore import QTimer
+        from PySide6.QtCore import QTimer
         self._visibility_timer = QTimer(self)
         self._visibility_timer.setSingleShot(True)
         self._visibility_timer.setInterval(self._VISIBILITY_DEBOUNCE_MS)
@@ -450,8 +481,25 @@ class PosterGrid(SmoothScrollArea):
         self._card_states: dict[str, bool] = {}
         self._card_geoms: dict[str, tuple[int, int]] = {}
         self._last_scroll_value = None
+        self._filter_query = ''
+        self._latest_visible_count = self.LATEST_PAGE_SIZE
         register_locale_refresh(self, self._apply_locale)
     LATEST_PAGE_SIZE = 5
+    LATEST_MIN_VISIBLE = 2
+    _LATEST_ROW_FIXED_OVERHEAD = 96
+
+    def _update_latest_visible_count(self) -> None:
+        row_width = self.viewport().width() - self._LATEST_ROW_FIXED_OVERHEAD
+        card_w = PosterCard.POSTER_WIDTH + self._latest_cards_row.spacing()
+        if card_w <= 0:
+            return
+        count = max(self.LATEST_MIN_VISIBLE, min(self.LATEST_PAGE_SIZE, row_width // card_w))
+        if count != self._latest_visible_count:
+            self._latest_visible_count = count
+            if self._latest_entries:
+                self._latest_page = 0
+                self._rebuild_latest_dots()
+                self._render_latest_page()
 
     def _apply_locale(self, *_args) -> None:
         self._latest_header_lbl.setText(tr('repacks.latest_repacks'))
@@ -463,6 +511,8 @@ class PosterGrid(SmoothScrollArea):
             self._latest_section.setVisible(False)
             return
         self._latest_section.setVisible(True)
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._update_latest_visible_count)
         self._rebuild_latest_dots()
         self._render_latest_page()
 
@@ -472,7 +522,7 @@ class PosterGrid(SmoothScrollArea):
     def _latest_page_count(self) -> int:
         if not self._latest_entries:
             return 0
-        return (len(self._latest_entries) + self.LATEST_PAGE_SIZE - 1) // self.LATEST_PAGE_SIZE
+        return (len(self._latest_entries) + self._latest_visible_count - 1) // self._latest_visible_count
 
     def _rebuild_latest_dots(self) -> None:
         for dot in self._latest_dot_widgets:
@@ -496,10 +546,12 @@ class PosterGrid(SmoothScrollArea):
             if isinstance(card, PosterCard):
                 card.unload_pixmap()
             self._latest_cards_row.removeWidget(card)
+            card.setVisible(False)
+            card.setParent(None)
             card.deleteLater()
         self._latest_cards.clear()
-        start = self._latest_page * self.LATEST_PAGE_SIZE
-        page_entries = self._latest_entries[start:start + self.LATEST_PAGE_SIZE]
+        start = self._latest_page * self._latest_visible_count
+        page_entries = self._latest_entries[start:start + self._latest_visible_count]
         for entry in page_entries:
             card = PosterCard(entry, self._container)
             card.clicked_poster.connect(self.poster_clicked.emit)
@@ -507,7 +559,7 @@ class PosterGrid(SmoothScrollArea):
             self._latest_cards.append(card)
             if entry.poster_url:
                 self._poster_downloader.request(entry.poster_url)
-        for _ in range(self.LATEST_PAGE_SIZE - len(page_entries)):
+        for _ in range(self._latest_visible_count - len(page_entries)):
             placeholder = QWidget(self._container)
             placeholder.setFixedSize(PosterCard.POSTER_WIDTH, PosterCard.POSTER_HEIGHT + PosterCard._HOVER_HEADROOM_PX)
             self._latest_cards_row.addWidget(placeholder)
@@ -529,8 +581,11 @@ class PosterGrid(SmoothScrollArea):
     def clear(self) -> None:
         self._entries = []
         self._entries_by_url = {}
+        self._entry_index = {}
         self._cards_by_url = {}
         self._cards_by_poster_url = {}
+        self._live_positions = []
+        self._card_order = []
         while self._flow_layout.count():
             item = self._flow_layout.takeAt(0)
             if item is not None and item.widget() is not None:
@@ -543,6 +598,7 @@ class PosterGrid(SmoothScrollArea):
         self._container.updateGeometry()
         self._card_geoms.clear()
         self._card_states.clear()
+        self._filter_query = ''
         gc.collect()
 
     def set_entries(self, entries: list[RepackEntry]) -> None:
@@ -553,19 +609,107 @@ class PosterGrid(SmoothScrollArea):
         self._container.updateGeometry()
 
     def append_entries(self, entries: list[RepackEntry]) -> None:
+        added_any = False
         for entry in entries:
-            if entry.url in self._cards_by_url:
+            if entry.url in self._entries_by_url:
                 continue
+            idx = len(self._entries)
             self._entries.append(entry)
             self._entries_by_url[entry.url] = entry
-            card = PosterCard(entry, self._container)
-            card.clicked_poster.connect(self.poster_clicked.emit)
-            self._flow_layout.addWidget(card)
-            self._cards_by_url[entry.url] = card
-            if entry.poster_url:
-                self._cards_by_poster_url[entry.poster_url] = card
+            self._entry_index[entry.url] = idx
+            added_any = True
+        if not added_any:
+            return
         self._card_geoms.clear()
+        self._flow_layout.invalidate()
+        self._flow_layout.update()
+        self._container.updateGeometry()
+        self._update_offscreen_cards()
         self._visibility_timer.start()
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._update_offscreen_cards)
+
+    def _materialize_card(self, entry: RepackEntry) -> PosterCard:
+        card = PosterCard(entry, self._container)
+        card.clicked_poster.connect(self.poster_clicked.emit)
+        idx = self._entry_index[entry.url]
+        insert_at = bisect.bisect_left(self._live_positions, idx)
+        self._flow_layout.insertWidget(insert_at, card)
+        self._live_positions.insert(insert_at, idx)
+        self._card_order.insert(insert_at, entry.url)
+        self._cards_by_url[entry.url] = card
+        if entry.poster_url:
+            self._cards_by_poster_url[entry.poster_url] = card
+        return card
+
+    def _evict_card(self, url: str) -> None:
+        card = self._cards_by_url.pop(url, None)
+        if card is None:
+            return
+        pos = self._entries_by_url.get(url)
+        if pos is not None and pos.poster_url:
+            self._cards_by_poster_url.pop(pos.poster_url, None)
+        try:
+            i = self._card_order.index(url)
+            self._card_order.pop(i)
+            self._live_positions.pop(i)
+        except ValueError:
+            pass
+        self._flow_layout.removeWidget(card)
+        card.setParent(None)
+        card.deleteLater()
+        self._card_geoms.pop(url, None)
+        self._card_states.pop(url, None)
+
+    def _row_metrics(self):
+        width = self._flow_container.width() or self.viewport().width()
+        if width <= 0:
+            width = self.width() or PosterCard.POSTER_WIDTH
+        spacing = self._flow_layout.spacing()
+        card_w = PosterCard.POSTER_WIDTH
+        cols = max(1, (width + spacing) // (card_w + spacing))
+        row_h = PosterCard.POSTER_HEIGHT + PosterCard._HOVER_HEADROOM_PX + spacing
+        return cols, row_h
+
+    def _materialize_visible_entries(self, viewport_top: int, viewport_bottom: int) -> None:
+        if not self._entries:
+            return
+        cols, row_h = self._row_metrics()
+        if row_h <= 0:
+            return
+        base_y = self._flow_container.y()
+        first_row = max(0, (viewport_top - base_y) // row_h - self._MATERIALIZE_BUFFER_ROWS)
+        last_row = (viewport_bottom - base_y) // row_h + self._MATERIALIZE_BUFFER_ROWS
+        start_idx = max(0, int(first_row) * cols)
+        end_idx = min(len(self._entries), (int(last_row) + 1) * cols)
+        for idx in range(start_idx, end_idx):
+            entry = self._entries[idx]
+            if entry.url not in self._cards_by_url:
+                self._materialize_card(entry)
+
+    def _evict_far_cards(self, viewport_top: int) -> None:
+        if len(self._card_order) <= self._MAX_LIVE_CARDS:
+            return
+        cols, row_h = self._row_metrics()
+        if row_h <= 0:
+            return
+        base_y = self._flow_container.y()
+        viewport_bottom = viewport_top + self.viewport().height() + self._VISIBILITY_MARGIN_PX
+        while len(self._card_order) > self._MAX_LIVE_CARDS:
+            front_url = self._card_order[0]
+            back_url = self._card_order[-1]
+            front_idx = self._entry_index.get(front_url, 0)
+            back_idx = self._entry_index.get(back_url, 0)
+            front_bottom = base_y + (front_idx // cols + 1) * row_h
+            back_top = base_y + (back_idx // cols) * row_h
+            front_far = front_bottom < viewport_top - self._EVICT_MARGIN_PX
+            back_far = back_top > viewport_bottom + self._EVICT_MARGIN_PX
+            if front_far and (not back_far or (viewport_top - front_bottom) >= (back_top - viewport_bottom)):
+                self._evict_card(front_url)
+            elif back_far:
+                self._evict_card(back_url)
+            else:
+                break
 
     def _request_poster_if_visible(self, entry: RepackEntry, card) -> bool:
         if not entry.poster_url or entry.poster_path:
@@ -609,10 +753,14 @@ class PosterGrid(SmoothScrollArea):
         self._card_geoms = {url: (card.y(), card.height()) for url, card in self._cards_by_url.items() if card.isVisible()}
 
     def _update_offscreen_cards(self) -> None:
-        if not self._card_geoms or len(self._card_geoms) != len(self._cards_by_url):
-            self._refresh_card_geoms()
+        if self._filter_query:
+            return
         viewport_top = self.verticalScrollBar().value() - self._VISIBILITY_MARGIN_PX
         viewport_bottom = viewport_top + self.viewport().height() + self._VISIBILITY_MARGIN_PX
+        self._materialize_visible_entries(viewport_top, viewport_bottom)
+        self._evict_far_cards(viewport_top)
+        if not self._card_geoms or len(self._card_geoms) != len(self._cards_by_url):
+            self._refresh_card_geoms()
         for url, (card_top, card_height) in self._card_geoms.items():
             card_bottom = card_top + card_height
             in_range = card_bottom >= viewport_top and card_top <= viewport_bottom
@@ -644,27 +792,50 @@ class PosterGrid(SmoothScrollArea):
         super().resizeEvent(event)
         if not self._visibility_timer.isActive():
             self._visibility_timer.start()
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._update_latest_visible_count)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._card_geoms.clear()
+        if not self._visibility_timer.isActive():
+            self._visibility_timer.start()
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._update_latest_visible_count)
 
     def filter_by_title(self, query: str) -> None:
         query = query.strip().lower()
+        self._filter_query = query
+        if not query:
+            self._card_geoms.clear()
+            self._update_offscreen_cards()
+            self._flow_layout.update()
+            self._visibility_timer.start()
+            return
         for entry in self._entries:
-            card = self._cards_by_url.get(entry.url)
-            if card is None:
-                continue
-            card.setVisible(not query or query in entry.title.lower())
+            if query in entry.title.lower():
+                if entry.url not in self._cards_by_url:
+                    self._materialize_card(entry)
+                card = self._cards_by_url[entry.url]
+                card.setVisible(True)
+                card.reload_pixmap_if_needed()
+                if entry.poster_url and not entry.poster_path:
+                    self._poster_downloader.request(entry.poster_url)
+            else:
+                card = self._cards_by_url.get(entry.url)
+                if card is not None:
+                    card.setVisible(False)
         self._flow_layout.update()
-        self._visibility_timer.start()
+        self._visibility_timer.stop()
 
 class MetaField(QWidget):
 
     def __init__(self, label: str, value: str, parent=None):
         super().__init__(parent)
-        if is_rtl():
-            self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
-        align = Qt.AlignmentFlag.AlignRight if is_rtl() else Qt.AlignmentFlag.AlignLeft
+        align = Qt.AlignmentFlag.AlignLeft
         label_lbl = CaptionLabel(label.upper())
         label_lbl.setAlignment(align)
         label_lbl.setStyleSheet(f'font-weight: 400; color: {_muted_text_color()};')
@@ -683,8 +854,8 @@ def make_tag_pill(text: str, parent=None) -> PillPushButton:
     return pill
 
 def _round_widget_corners(widget: QWidget, radius: int) -> None:
-    from PyQt6.QtGui import QRegion, QPainterPath
-    from PyQt6.QtCore import QRectF
+    from PySide6.QtGui import QRegion, QPainterPath
+    from PySide6.QtCore import QRectF
 
     def _apply_mask() -> None:
         path = QPainterPath()
@@ -707,7 +878,7 @@ class ScreenshotEnlargeDialog(MessageBoxBase):
         self.hideCancelButton()
         img = ImageLabel(image_path, self)
         img.setBorderRadius(8, 8, 8, 8)
-        from PyQt6.QtGui import QPixmap
+        from PySide6.QtGui import QPixmap
         pix = QPixmap(image_path)
         if not pix.isNull():
             max_w, max_h = (1100, 720)
@@ -734,7 +905,7 @@ class ScreenshotEnlargeDialog(MessageBoxBase):
 class _VideoThumb(QWidget):
     MAX_W = 280
     MAX_H = 280
-    clicked = pyqtSignal(str)
+    clicked = Signal(str)
 
     def __init__(self, video_url: str, downloader, parent=None):
         super().__init__(parent)
@@ -742,16 +913,29 @@ class _VideoThumb(QWidget):
         self._local_path: str | None = None
         self._started = False
         self._pending_play = False
+        self._requested = False
         self._downloader = downloader
         w, h = (self.MAX_W, round(self.MAX_W * 9 / 16))
         self.setFixedSize(w, h)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
-        from PyQt6.QtMultimedia import QMediaPlayer
-        from PyQt6.QtWidgets import QGraphicsScene, QGraphicsView
-        from PyQt6.QtGui import QPainter
+        self._w, self._h = (w, h)
+        self._scene = None
+        self._video_item = None
+        self._view = None
+        self._player = None
+        layout.addStretch(1)
+        self._layout = layout
+
+    def _ensure_pipeline(self) -> None:
+        if self._player is not None:
+            return
+        from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
+        from PySide6.QtMultimedia import QMediaPlayer
+        from PySide6.QtWidgets import QGraphicsScene, QGraphicsView
+        from PySide6.QtGui import QPainter
+        w, h = (self._w, self._h)
         self._scene = QGraphicsScene(self)
         self._video_item = QGraphicsVideoItem()
         self._video_item.setSize(QSizeF(w, h))
@@ -768,25 +952,61 @@ class _VideoThumb(QWidget):
         self._view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._view.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         _round_widget_corners(self._view, 8)
-        layout.addWidget(self._view)
+        self._layout.insertWidget(0, self._view)
         self._player = QMediaPlayer(self)
         self._player.setVideoOutput(self._video_item)
         self._player.setLoops(QMediaPlayer.Loops.Infinite)
+
+    def _release_pipeline(self) -> None:
+        if self._player is None:
+            return
+        from PySide6.QtCore import QUrl
+        try:
+            self._player.stop()
+            self._player.setVideoOutput(None)
+            self._player.setSource(QUrl())
+        except RuntimeError:
+            pass
+        self._layout.removeWidget(self._view)
+        self._view.deleteLater()
+        self._player.deleteLater()
+        self._view = None
+        self._player = None
+        self._video_item = None
+        self._scene = None
+        self._local_path = None
+        self._started = False
+        self._requested = False
+
+    def activate(self) -> None:
+        if self._requested:
+            return
+        self._requested = True
+        self._ensure_pipeline()
         self._downloader.video_ready.connect(self._on_video_ready)
-        self._downloader.request(video_url)
+        self._downloader.request(self._video_url)
+
+    def deactivate(self) -> None:
+        if not self._requested:
+            return
+        try:
+            self._downloader.video_ready.disconnect(self._on_video_ready)
+        except (TypeError, RuntimeError):
+            pass
+        self._release_pipeline()
 
     def _on_video_ready(self, url: str, path: str) -> None:
-        if url != self._video_url:
+        if url != self._video_url or self._player is None:
             return
         self._local_path = path
-        from PyQt6.QtCore import QUrl
+        from PySide6.QtCore import QUrl
         self._player.setSource(QUrl.fromLocalFile(path))
         if self._pending_play or self.isVisible():
             self._player.play()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        if self._local_path is None:
+        if self._player is None or self._local_path is None:
             self._pending_play = True
             return
         if not self._started:
@@ -800,13 +1020,19 @@ class _VideoThumb(QWidget):
         super().hideEvent(event)
 
     def pause(self) -> None:
-        self._player.pause()
+        if self._player is not None:
+            self._player.pause()
         self._pending_play = False
 
     def resume(self) -> None:
-        if self.isVisible() and self._local_path is not None:
+        if not self.isVisible():
+            return
+        if self._player is None:
+            self.activate()
+            self._pending_play = True
+        elif self._local_path is not None:
             self._player.play()
-        elif self.isVisible():
+        else:
             self._pending_play = True
 
     def mousePressEvent(self, event) -> None:
@@ -822,10 +1048,10 @@ class VideoEnlargeDialog(MessageBoxBase):
         self.hideCancelButton()
         self._video_url = video_url
         self._downloader = downloader
-        from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
-        from PyQt6.QtMultimedia import QMediaPlayer
-        from PyQt6.QtWidgets import QGraphicsScene, QGraphicsView
-        from PyQt6.QtGui import QPainter
+        from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
+        from PySide6.QtMultimedia import QMediaPlayer
+        from PySide6.QtWidgets import QGraphicsScene, QGraphicsView
+        from PySide6.QtGui import QPainter
         W, H = (900, 506)
         self._scene = QGraphicsScene(self)
         self._video_item = QGraphicsVideoItem()
@@ -853,12 +1079,12 @@ class VideoEnlargeDialog(MessageBoxBase):
     def _on_video_ready(self, url: str, path: str) -> None:
         if url != self._video_url:
             return
-        from PyQt6.QtCore import QUrl
+        from PySide6.QtCore import QUrl
         self._player.setSource(QUrl.fromLocalFile(path))
         self._player.play()
 
     def _stop_playback(self) -> None:
-        from PyQt6.QtCore import QUrl
+        from PySide6.QtCore import QUrl
         try:
             self._player.stop()
             self._player.setSource(QUrl())
@@ -884,9 +1110,9 @@ class _ScreenshotThumb(QWidget):
     MAX_W = 280
     MAX_H = 280
     FALLBACK_H = 158
-    clicked = pyqtSignal(str)
+    clicked = Signal(str)
 
-    def __init__(self, url: str, parent=None):
+    def __init__(self, url: str, downloader, parent=None):
         super().__init__(parent)
         self._url = url
         self._path: str | None = None
@@ -898,7 +1124,7 @@ class _ScreenshotThumb(QWidget):
         self._img.setBorderRadius(8, 8, 8, 8)
         self._img.setFixedSize(self.MAX_W, self.FALLBACK_H)
         layout.addWidget(self._img)
-        self._downloader = PosterDownloader(self)
+        self._downloader = downloader
         self._downloader.poster_ready.connect(self._on_ready)
         self._downloader.request(url)
 
@@ -906,7 +1132,7 @@ class _ScreenshotThumb(QWidget):
         if url != self._url:
             return
         self._path = path
-        from PyQt6.QtGui import QImageReader
+        from PySide6.QtGui import QImageReader
         reader = QImageReader(path)
         orig_size = reader.size()
         if orig_size.isValid() and orig_size.width() > 0 and (orig_size.height() > 0):
@@ -934,8 +1160,9 @@ class ScreenshotGallery(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._thumbs: list[QWidget] = []
-        from ..core.repacks.poster_downloader import VideoDownloader
+        from src.core.repacks.video_downloader import VideoDownloader
         self._video_downloader = VideoDownloader(self)
+        self._poster_downloader = PosterDownloader(self)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(10)
@@ -966,16 +1193,48 @@ class ScreenshotGallery(QWidget):
                 thumb = _VideoThumb(video_url, self._video_downloader, self)
                 thumb.clicked.connect(self._on_video_clicked)
             else:
-                thumb = _ScreenshotThumb(url, self)
+                thumb = _ScreenshotThumb(url, self._poster_downloader, self)
                 thumb.clicked.connect(self._on_thumb_clicked)
             self._stack_layout.addWidget(thumb)
             self._thumbs.append(thumb)
+        self.update_visible_videos()
 
     def clear(self) -> None:
         for thumb in self._thumbs:
+            if isinstance(thumb, _VideoThumb):
+                thumb.deactivate()
             self._stack_layout.removeWidget(thumb)
             thumb.deleteLater()
         self._thumbs.clear()
+
+    def update_visible_videos(self) -> None:
+        scroll = self._find_scroll_area()
+        if scroll is None:
+            for thumb in self._thumbs:
+                if isinstance(thumb, _VideoThumb):
+                    thumb.activate()
+            return
+        viewport_top = scroll.verticalScrollBar().value()
+        viewport_bottom = viewport_top + scroll.viewport().height()
+        margin = 300
+        for thumb in self._thumbs:
+            if not isinstance(thumb, _VideoThumb):
+                continue
+            top_left = thumb.mapTo(scroll.widget(), thumb.rect().topLeft())
+            thumb_top = top_left.y()
+            thumb_bottom = thumb_top + thumb.height()
+            if thumb_bottom >= viewport_top - margin and thumb_top <= viewport_bottom + margin:
+                thumb.activate()
+            else:
+                thumb.deactivate()
+
+    def _find_scroll_area(self):
+        widget = self.parentWidget()
+        while widget is not None:
+            if isinstance(widget, SmoothScrollArea):
+                return widget
+            widget = widget.parentWidget()
+        return None
 
     def _pause_all_videos(self) -> None:
         for thumb in self._thumbs:
@@ -1019,15 +1278,15 @@ class _RotatingChevron(QWidget):
     def set_angle(self, value: float) -> None:
         self._angle = value
         self.update()
-    angle = pyqtProperty(float, get_angle, set_angle)
+    angle = Property(float, get_angle, set_angle)
 
     def set_color(self, color: QColor) -> None:
         self._color = color
         self.update()
 
     def paintEvent(self, event):
-        from PyQt6.QtGui import QPainter, QPen, QPainterPath
-        from PyQt6.QtCore import QPointF
+        from PySide6.QtGui import QPainter, QPen, QPainterPath
+        from PySide6.QtCore import QPointF
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         pen = QPen(self._color)
@@ -1048,7 +1307,7 @@ class _RotatingChevron(QWidget):
 
 class CollapsibleSection(CardWidget):
     _ANIM_MS = 160
-    toggled = pyqtSignal(bool)
+    toggled = Signal(bool)
 
     def __init__(self, title: str, parent=None, expanded: bool=False):
         super().__init__(parent)
@@ -1111,7 +1370,7 @@ class CollapsibleSection(CardWidget):
             pass
 
     def _on_theme_changed(self, *_args) -> None:
-        from PyQt6.QtCore import QTimer
+        from PySide6.QtCore import QTimer
         self._update_header_style()
         QTimer.singleShot(0, self._update_header_style)
 
@@ -1148,7 +1407,7 @@ class CollapsibleSection(CardWidget):
     def set_body_html(self, html: str) -> None:
         self._body_lbl.setText(html)
         if self._expanded:
-            from PyQt6.QtCore import QTimer
+            from PySide6.QtCore import QTimer
             QTimer.singleShot(0, self._apply_expanded_height)
 
     def _apply_expanded_height(self) -> None:
@@ -1207,8 +1466,8 @@ class CollapsibleSection(CardWidget):
         return _qcolor_from_palette(palette()['section_card_border'])
 
     def paintEvent(self, event):
-        from PyQt6.QtGui import QPainter, QPainterPath
-        from PyQt6.QtCore import QRectF
+        from PySide6.QtGui import QPainter, QPainterPath
+        from PySide6.QtCore import QRectF
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         path = QPainterPath()
@@ -1483,7 +1742,7 @@ def resolve_selective_file_indices(entries: list[SelectiveDownloadEntry], select
     return sorted(indices)
 
 class _SourceOptionCard(CardWidget):
-    clicked_source = pyqtSignal(str)
+    clicked_source = Signal(str)
 
     def __init__(self, key: str, display_name: str, magnet_url: str | None, parent=None):
         super().__init__(parent)
@@ -1613,8 +1872,8 @@ class SelectiveDownloadDialog(MessageBoxBase):
         return selected
 
 class _FileListFetchThread(QThread):
-    finished_ok = pyqtSignal(list)
-    finished_err = pyqtSignal(str)
+    finished_ok = Signal(list)
+    finished_err = Signal(str)
 
     def __init__(self, manager: DownloadManager, source: str, parent=None):
         super().__init__(parent)
@@ -1662,7 +1921,7 @@ class DownloadActionWidget(QWidget):
         self._reapply_accent_color()
 
     def _deferred_reapply_accent_color(self) -> None:
-        from PyQt6.QtCore import QTimer
+        from PySide6.QtCore import QTimer
         self._reapply_accent_color()
         QTimer.singleShot(0, self._reapply_accent_color)
 
@@ -1704,13 +1963,57 @@ class DownloadActionWidget(QWidget):
             return
         self._start_selective_download(source)
 
+    _FILELIST_TIMEOUT_MS = 25000
+
     def _start_selective_download(self, source: str) -> None:
+        if self._filelist_thread is not None and self._filelist_thread.isRunning():
+            return
         self._button.setText(tr('repacks.loading_file_list'))
         self._button.setEnabled(False)
-        self._filelist_thread = _FileListFetchThread(self._manager, source, self)
-        self._filelist_thread.finished_ok.connect(lambda files: self._on_file_list_ready(source, files))
-        self._filelist_thread.finished_err.connect(lambda err: self._on_file_list_failed(source, err))
-        self._filelist_thread.start()
+        self._filelist_timed_out = False
+        thread = _FileListFetchThread(self._manager, source, self)
+        thread.finished_ok.connect(lambda files: self._on_file_list_ready(source, files))
+        thread.finished_err.connect(lambda err: self._on_file_list_failed(source, err))
+        thread.finished.connect(self._on_filelist_thread_finished)
+        self._filelist_thread = thread
+        watchdog = QTimer(self)
+        watchdog.setSingleShot(True)
+        watchdog.timeout.connect(lambda: self._on_filelist_timeout(source))
+        self._filelist_watchdog = watchdog
+        watchdog.start(self._FILELIST_TIMEOUT_MS)
+        thread.start()
+
+    def _on_filelist_timeout(self, source: str) -> None:
+        thread = self._filelist_thread
+        if thread is None or not thread.isRunning():
+            return
+        self._filelist_timed_out = True
+        try:
+            thread.finished_ok.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            thread.finished_err.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            thread.terminate()
+            thread.wait(2000)
+        except RuntimeError:
+            pass
+        self._filelist_thread = None
+        logger.warning('File list fetch timed out for source; falling back to full download')
+        self._on_file_list_failed(source, 'timeout')
+
+    def _on_filelist_thread_finished(self) -> None:
+        watchdog = getattr(self, '_filelist_watchdog', None)
+        if watchdog is not None:
+            watchdog.stop()
+            self._filelist_watchdog = None
+        thread = self._filelist_thread
+        self._filelist_thread = None
+        if thread is not None:
+            thread.deleteLater()
 
     def _on_file_list_failed(self, source: str, err: str) -> None:
         logger.error('Failed to fetch file list for selective download: %s', err)
@@ -1740,7 +2043,7 @@ class DownloadActionWidget(QWidget):
     def _queue_download(self, source: str, file_ids: list[int] | None) -> None:
         self._button.setText(tr('repacks.queuing'))
         self._button.setEnabled(False)
-        self._item_id = self._manager.add(torrent_file=source, file_id=file_ids[0] if file_ids else 1, file_ids=file_ids, game_name=self._details.title, console='PC', source='FitGirl')
+        self._item_id = self._manager.add(torrent_file=source, file_id=file_ids[0] if file_ids else 1, file_ids=file_ids, game_name=self._details.title, console='', source='FitGirl', category='repacks')
 
     def _on_item_updated(self, item_id: str) -> None:
         if item_id != self._item_id:
@@ -1760,8 +2063,20 @@ class DownloadActionWidget(QWidget):
         self._button.setText(tr('repacks.download'))
         self._button.setEnabled(True)
 
+    def shutdown(self) -> None:
+        thread = self._filelist_thread
+        self._filelist_thread = None
+        if thread is None:
+            return
+        try:
+            if thread.isRunning():
+                thread.quit()
+                thread.wait(2000)
+        except RuntimeError:
+            pass
+
 class RepackDetailsView(QWidget):
-    back_requested = pyqtSignal()
+    back_requested = Signal()
     COVER_WIDTH = 280
     COVER_HEIGHT = 392
     @property
@@ -1797,7 +2112,6 @@ class RepackDetailsView(QWidget):
         self._content_layout = QVBoxLayout(content)
         self._content_layout.setContentsMargins(4, 12, 24, 40)
         self._content_layout.setSpacing(24)
-        self.READING_WIDTH_MAX = 860
         self.SECTIONS_WIDTH = 300
         top_row = QHBoxLayout()
         top_row.setSpacing(40)
@@ -1839,10 +2153,15 @@ class RepackDetailsView(QWidget):
         cover_col.addWidget(self._cover_action_area, 0, Qt.AlignmentFlag.AlignTop)
         self._gallery = ScreenshotGallery(cover_container)
         cover_col.addWidget(self._gallery, 0, Qt.AlignmentFlag.AlignTop)
+        from PySide6.QtCore import QTimer
+        self._gallery_visibility_timer = QTimer(self)
+        self._gallery_visibility_timer.setSingleShot(True)
+        self._gallery_visibility_timer.setInterval(150)
+        self._gallery_visibility_timer.timeout.connect(self._gallery.update_visible_videos)
+        self._scroll.verticalScrollBar().valueChanged.connect(lambda _v: self._gallery_visibility_timer.start())
         cover_col.addStretch(1)
         top_row.addWidget(cover_container, 0, Qt.AlignmentFlag.AlignTop)
         info_col_container = QWidget()
-        info_col_container.setMaximumWidth(self.READING_WIDTH_MAX)
         info_col = QVBoxLayout(info_col_container)
         info_col.setContentsMargins(0, 0, 0, 0)
         info_col.setSpacing(20)
@@ -1850,7 +2169,7 @@ class RepackDetailsView(QWidget):
         self._title_lbl.setWordWrap(True)
         self._title_lbl.setStyleSheet(f'font-weight: 700; color: {palette()['primary_text']};')
         info_col.addWidget(self._title_lbl)
-        from PyQt6.QtWidgets import QGridLayout
+        from PySide6.QtWidgets import QGridLayout
         self._meta_grid = QGridLayout()
         self._meta_grid.setHorizontalSpacing(40)
         self._meta_grid.setVerticalSpacing(10)
@@ -1917,7 +2236,7 @@ class RepackDetailsView(QWidget):
         self._site_link_btn.setText(tr('repacks.view_on_website'))
 
     def _deferred_apply_site_link_style(self) -> None:
-        from PyQt6.QtCore import QTimer
+        from PySide6.QtCore import QTimer
         self._apply_site_link_style()
         QTimer.singleShot(0, self._apply_site_link_style)
 
@@ -1940,7 +2259,7 @@ class RepackDetailsView(QWidget):
             self._desc_lbl.setStyleSheet(self._desc_default_qss)
 
     def _on_theme_changed(self, *_args) -> None:
-        from PyQt6.QtCore import QTimer
+        from PySide6.QtCore import QTimer
         self._refresh_desc_theme()
         self._refresh_cover_fallback_theme()
         QTimer.singleShot(0, self._refresh_desc_theme)
@@ -2061,7 +2380,7 @@ class RepackDetailsView(QWidget):
             self._tags_layout.addWidget(pill)
             self._tag_widgets.append(pill)
         if genre_tags:
-            from PyQt6.QtCore import QTimer
+            from PySide6.QtCore import QTimer
             QTimer.singleShot(0, self._tags_layout.update)
         self._sections_header.setVisible(bool(extra_sections) or bool(extra.get('repack_features')) or bool(extra.get('game_updates_html')))
         game_updates_html = extra.pop('game_updates_html', '')
@@ -2117,6 +2436,11 @@ class RepackDetailsView(QWidget):
         self._gallery.setVisible(False)
         self._desc_lbl.setText(tr('repacks.failed_to_load', message=message))
 
+    def pause_media(self) -> None:
+        for thumb in self._gallery._thumbs:
+            if isinstance(thumb, _VideoThumb):
+                thumb.deactivate()
+
     def _clear_sections(self) -> None:
         self._sections_insert_index = self._sections_col.indexOf(self._sections_header) + 1
         for section in self._section_widgets:
@@ -2155,8 +2479,6 @@ class RepackDetailsView(QWidget):
         try:
             _stop_previous_movie(self._cover_lbl)
             pix = _load_scaled_pixmap(path, self.COVER_WIDTH, self.COVER_HEIGHT)
-            pix = pix.scaled(self.COVER_WIDTH, self.COVER_HEIGHT, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            pix = _center_crop_pixmap(pix, self.COVER_WIDTH, self.COVER_HEIGHT)
             self._cover_lbl.setImage(pix)
             self._cover_lbl.setFixedSize(self.COVER_WIDTH, self.COVER_HEIGHT)
             self._download_action.set_accent_color(_dominant_color(path))
@@ -2164,9 +2486,9 @@ class RepackDetailsView(QWidget):
             logger.warning('Failed to load cover image: %s', path)
 
 class _SidebarPosterCard(_AnimatedPosterMixin, QWidget):
-    clicked_poster = pyqtSignal(object)
-    THUMB_WIDTH = 120
-    THUMB_HEIGHT = 180
+    clicked_poster = Signal(object)
+    THUMB_WIDTH = 140
+    THUMB_HEIGHT = 196
     _HOVER_HEADROOM_PX = 8
 
     def __init__(self, entry: RepackEntry, parent=None):
@@ -2211,8 +2533,6 @@ class _SidebarPosterCard(_AnimatedPosterMixin, QWidget):
                 self._fallback_icon = None
                 self._poster_lbl.setStyleSheet('')
             pix = _load_scaled_pixmap(path, self.THUMB_WIDTH, self.THUMB_HEIGHT)
-            pix = pix.scaled(self.THUMB_WIDTH, self.THUMB_HEIGHT, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            pix = _center_crop_pixmap(pix, self.THUMB_WIDTH, self.THUMB_HEIGHT)
             self._poster_lbl.setImage(pix)
             self._poster_lbl.setFixedSize(self.THUMB_WIDTH, self.THUMB_HEIGHT)
             self._entry.poster_path = path
@@ -2242,8 +2562,8 @@ class _SidebarPosterCard(_AnimatedPosterMixin, QWidget):
         super().mouseReleaseEvent(event)
 
 class PopularRepacksSidebar(QWidget):
-    SIDEBAR_WIDTH = 268
-    poster_clicked = pyqtSignal(object)
+    SIDEBAR_WIDTH = 320
+    poster_clicked = Signal(object)
 
     def __init__(self, source_key: str, parent=None):
         super().__init__(parent)
@@ -2253,8 +2573,7 @@ class PopularRepacksSidebar(QWidget):
         self._poster_downloader.poster_ready.connect(self._on_poster_ready)
         self._poster_downloader.poster_failed.connect(self._on_poster_failed)
         self._url_to_cards: dict[str, list[_SidebarPosterCard]] = {}
-        self._thread = None
-        self._worker = None
+        self._task = None
         self.setFixedWidth(self.SIDEBAR_WIDTH)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -2284,7 +2603,7 @@ class PopularRepacksSidebar(QWidget):
         self._scroll.setWidget(scroll_content)
         outer.addWidget(self._scroll, 1)
         self.setVisible(False)
-        from PyQt6.QtCore import QTimer
+        from PySide6.QtCore import QTimer
         self._visibility_timer = QTimer(self)
         self._visibility_timer.setSingleShot(True)
         self._visibility_timer.setInterval(150)
@@ -2318,56 +2637,20 @@ class PopularRepacksSidebar(QWidget):
                 card.unload_pixmap()
 
     def load(self) -> None:
-        if self._thread is not None:
+        if self._task is not None:
             return
         self._fetch()
 
     def refresh(self) -> None:
         self._clear_cards()
-        self._thread = None
-        self._worker = None
+        self._task = None
         self._fetch()
 
     def _fetch(self) -> None:
-
-        class _PopularWorker(QObject):
-            done = pyqtSignal(object)
-
-            def __init__(self, source_key: str):
-                super().__init__()
-                self._source_key = source_key
-
-            def run(self):
-                try:
-                    source = None
-                    try:
-                        from ..core.repacks.sources import get_source
-                        source = get_source(self._source_key)
-                    except ImportError:
-                        source = None
-                    if source is None and self._source_key == 'fitgirl':
-                        from ..core.repacks.sources.fitgirl import FitGirlSource
-                        source = FitGirlSource()
-                    entries = source.fetch_popular_repacks(use_cache=True) if source is not None else []
-                except Exception:
-                    logger.exception('Failed to fetch popular repacks for %s', self._source_key)
-                    entries = []
-                self.done.emit(entries)
-        thread = QThread(self)
-        worker = _PopularWorker(self._source_key)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.done.connect(self._on_entries_loaded)
-        worker.done.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._thread = thread
-        self._worker = worker
-        thread.start()
+        self._task = fetch_popular_repacks_async(self._source_key, on_done=self._on_entries_loaded, use_cache=True)
 
     def _on_entries_loaded(self, entries: list) -> None:
-        self._thread = None
-        self._worker = None
+        self._task = None
         self._clear_cards()
         if not entries:
             self.setVisible(False)
@@ -2422,18 +2705,14 @@ class SourceTab(QWidget):
         self._has_more = True
         self._is_loading = False
         self._loaded_once = False
-        self._active_thread = None
-        self._active_worker = None
         self._search_query = ''
-        self._search_thread = None
-        self._search_worker = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 12, 0, 0)
         layout.setSpacing(8)
         self._status_lbl = CaptionLabel('')
         self._status_lbl.setVisible(False)
         layout.addWidget(self._status_lbl)
-        from PyQt6.QtWidgets import QStackedWidget
+        from PySide6.QtWidgets import QStackedWidget
         self._stack = QStackedWidget()
         grid_page = QWidget()
         grid_page_layout = QVBoxLayout(grid_page)
@@ -2471,56 +2750,18 @@ class SourceTab(QWidget):
         self._details = RepackDetailsView(manager)
         self._details.back_requested.connect(self._show_grid)
         self._stack.addWidget(self._details)
-        self._details_thread = None
-        self._details_worker = None
-        self._latest_thread = None
-        self._latest_worker = None
+        self._latest_task = None
         self._stack.setCurrentWidget(grid_page)
         self._popular_sidebar.load()
         self._load_latest_repacks()
 
     def _load_latest_repacks(self) -> None:
-        if self._latest_thread is not None:
+        if self._latest_task is not None:
             return
-
-        class _LatestWorker(QObject):
-            done = pyqtSignal(object)
-
-            def __init__(self, source_key: str):
-                super().__init__()
-                self._source_key = source_key
-
-            def run(self):
-                try:
-                    source = None
-                    try:
-                        from ..core.repacks.sources import get_source
-                        source = get_source(self._source_key)
-                    except ImportError:
-                        source = None
-                    if source is None and self._source_key == 'fitgirl':
-                        from ..core.repacks.sources.fitgirl import FitGirlSource
-                        source = FitGirlSource()
-                    entries = source.fetch_latest_repacks(use_cache=True) if source is not None else []
-                except Exception:
-                    logger.exception('Failed to fetch latest repacks for %s', self._source_key)
-                    entries = []
-                self.done.emit(entries)
-        thread = QThread(self)
-        worker = _LatestWorker(self._source_key)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.done.connect(self._on_latest_repacks_loaded)
-        worker.done.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._latest_thread = thread
-        self._latest_worker = worker
-        thread.start()
+        self._latest_task = fetch_latest_repacks_async(self._source_key, on_done=self._on_latest_repacks_loaded, use_cache=True)
 
     def _on_latest_repacks_loaded(self, entries: list) -> None:
-        self._latest_thread = None
-        self._latest_worker = None
+        self._latest_task = None
         if self._search_query:
             return
         self._grid.set_latest_entries(entries or [])
@@ -2534,6 +2775,10 @@ class SourceTab(QWidget):
             self._details._poster_downloader.shutdown()
         except Exception:
             logger.exception('Failed to shut down details poster downloader for %s', self._source_key)
+        try:
+            self._details._download_action.shutdown()
+        except Exception:
+            logger.exception('Failed to shut down file-list thread for %s', self._source_key)
         try:
             self._popular_sidebar.shutdown()
         except Exception:
@@ -2560,7 +2805,7 @@ class SourceTab(QWidget):
 
     def _run_search(self, query: str) -> None:
         self._set_status(f'Searching for "{query}"…')
-        self._search_thread, self._search_worker = fetch_search_async(self._source_key, query, 1, on_done=lambda result, q=query: self._on_search_done(q, result), on_error=lambda message, q=query: self._on_search_error(q, message), use_cache=False)
+        fetch_search_async(self._source_key, query, 1, on_done=lambda result, q=query: self._on_search_done(q, result), on_error=lambda message, q=query: self._on_search_error(q, message), use_cache=False)
 
     def _on_search_done(self, query: str, result) -> None:
         if query != self._search_query:
@@ -2598,8 +2843,8 @@ class SourceTab(QWidget):
         self.load_initial()
 
     def refresh(self) -> None:
-        from ..core.repacks import cache as repack_cache
-        repack_cache.clear_source_cache(self._source_key)
+        from src.core.repacks.base import clear_source_cache
+        clear_source_cache(self._source_key)
         self._grid.clear()
         self._current_page = 0
         self._has_more = True
@@ -2618,8 +2863,7 @@ class SourceTab(QWidget):
             return
         self._is_loading = True
         next_page = self._current_page + 1
-        self._set_status(f'Loading page {next_page}…')
-        self._active_thread, self._active_worker = fetch_page_async(self._source_key, next_page, on_done=self._on_page_loaded, on_error=self._on_page_error, use_cache=use_cache)
+        fetch_page_async(self._source_key, next_page, on_done=self._on_page_loaded, on_error=self._on_page_error, use_cache=use_cache)
 
     def _on_page_loaded(self, result) -> None:
         self._is_loading = False
@@ -2631,12 +2875,14 @@ class SourceTab(QWidget):
         else:
             self._set_status('')
         if self._has_more:
-            from PyQt6.QtCore import QTimer
-            QTimer.singleShot(0, self._fill_viewport_if_needed)
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(50, self._fill_viewport_if_needed)
 
     def _fill_viewport_if_needed(self) -> None:
         if self._is_loading or not self._has_more:
             return
+        self._grid._flow_layout.activate()
+        self._grid.updateGeometry()
         bar = self._grid.verticalScrollBar()
         if bar.maximum() <= 0:
             self._load_next_page(use_cache=True)
@@ -2650,10 +2896,53 @@ class SourceTab(QWidget):
         self._status_lbl.setText(text)
         self._status_lbl.setVisible(bool(text))
 
+    def _switch_stack_animated(self, widget) -> None:
+        from PySide6.QtWidgets import QGraphicsOpacityEffect
+        from PySide6.QtCore import QParallelAnimationGroup, QPoint
+        if self._stack.currentWidget() is widget:
+            return
+        old_group = getattr(self, '_stack_fade_anim', None)
+        if old_group is not None:
+            old_group.stop()
+            for i in range(self._stack.count()):
+                page = self._stack.widget(i)
+                page.setGraphicsEffect(None)
+                page.move(0, 0)
+            self._stack_fade_anim = None
+        self._stack.setCurrentWidget(widget)
+        widget.move(0, 0)
+        effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(effect)
+        widget.move(36, 0)
+
+        fade = QPropertyAnimation(effect, b'opacity', widget)
+        fade.setDuration(220)
+        fade.setStartValue(0.0)
+        fade.setEndValue(1.0)
+        fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        slide = QPropertyAnimation(widget, b'pos', widget)
+        slide.setDuration(220)
+        slide.setStartValue(QPoint(36, 0))
+        slide.setEndValue(QPoint(0, 0))
+        slide.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        group = QParallelAnimationGroup(widget)
+        group.addAnimation(fade)
+        group.addAnimation(slide)
+
+        def _cleanup():
+            widget.setGraphicsEffect(None)
+            widget.move(0, 0)
+            self._stack_fade_anim = None
+        group.finished.connect(_cleanup)
+        self._stack_fade_anim = group
+        group.start()
+
     def _show_details(self, entry: RepackEntry) -> None:
         self._details.show_loading(entry)
-        self._stack.setCurrentWidget(self._details)
-        self._details_thread, self._details_worker = fetch_details_async(self._source_key, entry, on_done=self._on_details_loaded, on_error=self._on_details_error, use_cache=True)
+        self._switch_stack_animated(self._details)
+        fetch_details_async(self._source_key, entry, on_done=self._on_details_loaded, on_error=self._on_details_error, use_cache=True)
 
     def _on_details_loaded(self, details) -> None:
         self._details.show_details(details)
@@ -2663,7 +2952,16 @@ class SourceTab(QWidget):
         logger.error('Repack details load failed for %s: %s', self._source_key, message)
 
     def _show_grid(self) -> None:
-        self._stack.setCurrentWidget(self._grid_row)
+        self._switch_stack_animated(self._grid_row)
+        self._details.pause_media()
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(230, self._refresh_grid_after_show)
+
+    def _refresh_grid_after_show(self) -> None:
+        self._grid._flow_layout.activate()
+        self._grid.updateGeometry()
+        self._grid._card_geoms.clear()
+        self._grid._update_offscreen_cards()
 
 class UpcomingRepacksCard(QWidget):
     CARD_WIDTH = 560
@@ -2710,6 +3008,7 @@ class UpcomingRepacksCard(QWidget):
             self._list_layout.removeWidget(lbl)
             lbl.deleteLater()
         self._entry_labels.clear()
+        game_titles = [t for t in game_titles if t and not t.strip().startswith('#')]
         if not game_titles:
             self._empty_lbl.setText(tr('repacks.no_upcoming_repacks'))
             self._empty_lbl.setVisible(True)
@@ -2744,8 +3043,8 @@ class UpcomingRepacksDialog(MessageBoxBase):
         self.finished.connect(self._force_repaint)
 
     def _force_repaint(self, *_):
-        from PyQt6.QtWidgets import QApplication
-        from PyQt6.QtCore import QTimer
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import QTimer
 
         def _repaint_all():
             for w in QApplication.topLevelWidgets():
@@ -2782,20 +3081,16 @@ class RepacksPage(QWidget):
         self.setObjectName('repacksPage')
         self.setStyleSheet('background: transparent;')
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(24, 20, 24, 20)
+        outer.setContentsMargins(24, 12, 24, 20)
         outer.setSpacing(12)
-        header = TitleLabel(tr('repacks.game_repacks'))
-        header.setStyleSheet(f'font-weight: 700; color: {palette()['primary_text']};')
-        outer.addWidget(header)
-        subheader = BodyLabel(tr('repacks.browse_subheader'))
-        subheader.setStyleSheet(f'color: {_muted_text_color()}; background: transparent; font-weight: 400;')
-        outer.addWidget(subheader)
         self._pivot = Pivot()
         outer.addWidget(self._pivot)
         self._search_bar = SearchLineEdit()
         self._search_bar.setPlaceholderText(tr('repacks.search_placeholder'))
-        self._search_bar.setFixedWidth(320)
-        from PyQt6.QtCore import QTimer
+        self._search_bar.setMinimumWidth(160)
+        self._search_bar.setMaximumWidth(320)
+        self._search_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        from PySide6.QtCore import QTimer
         self._search_debounce = QTimer(self)
         self._search_debounce.setSingleShot(True)
         self._search_debounce.setInterval(450)
@@ -2819,7 +3114,7 @@ class RepacksPage(QWidget):
         search_row.addWidget(self._refresh_btn, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addStretch(1)
         outer.addLayout(search_row)
-        from PyQt6.QtWidgets import QStackedWidget
+        from PySide6.QtWidgets import QStackedWidget
         self._stack = QStackedWidget()
         outer.addWidget(self._stack, 1)
         self._tabs: dict[str, SourceTab] = {}
@@ -2832,27 +3127,19 @@ class RepacksPage(QWidget):
             self._tabs[first_key].load_initial()
             self._update_donate_button(first_key)
             self._update_upcoming_button(first_key)
-        from PyQt6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._on_app_about_to_quit)
-        self._header_lbl = header
-        self._subheader_lbl = subheader
         qconfig.themeChanged.connect(self._on_global_theme_changed)
         register_locale_refresh(self, self._apply_locale)
 
     def _apply_locale(self, *_args) -> None:
-        self._header_lbl.setText(tr('repacks.game_repacks'))
-        self._subheader_lbl.setText(tr('repacks.browse_subheader'))
         self._search_bar.setPlaceholderText(tr('repacks.search_placeholder'))
         self._upcoming_btn.setText(tr('repacks.upcoming_repacks'))
         self._refresh_btn.setToolTip(tr('repacks.refresh_tooltip'))
 
     def _on_global_theme_changed(self, *_args) -> None:
-        try:
-            self._subheader_lbl.setStyleSheet(f'color: {_muted_text_color()}; background: transparent; font-weight: 400;')
-        except Exception:
-            pass
         self._repolish_subtree()
 
     def _repolish_subtree(self) -> None:
@@ -2866,21 +3153,17 @@ class RepacksPage(QWidget):
         self.update()
 
     def _on_app_about_to_quit(self) -> None:
-        thread = getattr(self, '_upcoming_thread', None)
-        try:
-            if thread is not None and thread.isRunning():
-                thread.quit()
-                thread.wait(2000)
-        except RuntimeError:
-            pass
+        task_id = getattr(self, '_upcoming_task', None)
+        if task_id is not None:
+            cancel_task(task_id)
         for tab in self._tabs.values():
             try:
                 tab.shutdown()
             except Exception:
                 logger.exception('Failed to shut down source tab %s', getattr(tab, '_source_key', '?'))
-        from ..core.repacks import cache as repack_cache
+        from src.core.repacks.base import clear_all_cache
         try:
-            repack_cache.clear_all_cache()
+            clear_all_cache()
         except Exception:
             logger.exception('Failed to clear repacks cache on shutdown')
 
@@ -2904,8 +3187,8 @@ class RepacksPage(QWidget):
         self._upcoming_btn.setVisible(key in _SOURCE_UPCOMING_SUPPORTED)
 
     def _on_donate_clicked(self) -> None:
-        from PyQt6.QtCore import QUrl
-        from PyQt6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
         current_key = self._pivot.currentRouteKey()
         url = _SOURCE_DONATION_URLS.get(current_key)
         if url:
@@ -2915,42 +3198,29 @@ class RepacksPage(QWidget):
         current_key = self._pivot.currentRouteKey()
         if current_key not in _SOURCE_UPCOMING_SUPPORTED:
             return
-        existing_thread = getattr(self, '_upcoming_thread', None)
-        if existing_thread is not None:
-            try:
-                if existing_thread.isRunning():
-                    return
-            except RuntimeError:
-                self._upcoming_thread = None
+        if getattr(self, '_upcoming_task', None) is not None:
+            return
         top_level = self.window()
         dialog = UpcomingRepacksDialog(top_level if top_level is not None else self)
         dialog.show_loading()
 
         def _safe_done(details):
+            self._upcoming_task = None
             if dialog.isVisible():
                 dialog.show_details(details)
 
         def _safe_error(message):
+            self._upcoming_task = None
             if dialog.isVisible():
                 dialog.show_error(message)
-        thread, worker = fetch_upcoming_repacks_async(current_key, on_done=_safe_done, on_error=_safe_error, use_cache=True)
-        self._upcoming_thread, self._upcoming_worker = (thread, worker)
+        self._upcoming_task = fetch_upcoming_repacks_async(current_key, on_done=_safe_done, on_error=_safe_error, use_cache=True)
 
-        def _clear_thread_ref():
-            if getattr(self, '_upcoming_thread', None) is thread:
-                self._upcoming_thread = None
-                self._upcoming_worker = None
-        thread.finished.connect(_clear_thread_ref)
-
-        def _cleanup_thread():
-            t = getattr(self, '_upcoming_thread', None)
-            try:
-                if t is not None and t.isRunning():
-                    t.quit()
-                    t.wait(3000)
-            except RuntimeError:
-                pass
-        dialog.finished.connect(_cleanup_thread)
+        def _cleanup_task():
+            task_id = getattr(self, '_upcoming_task', None)
+            if task_id is not None:
+                cancel_task(task_id)
+                self._upcoming_task = None
+        dialog.finished.connect(_cleanup_task)
         dialog.setModal(True)
         dialog.show()
         dialog.raise_()
@@ -2960,9 +3230,9 @@ class RepacksPage(QWidget):
         current_key = self._pivot.currentRouteKey()
         if not current_key or current_key not in self._tabs:
             return
-        from ..core.repacks import cache as repack_cache
+        from src.core.repacks.base import clear_source_cache
         try:
-            repack_cache.clear_source_cache(current_key)
+            clear_source_cache(current_key)
         except Exception:
             logger.exception('Failed to clear cache for %s during refresh', current_key)
         self._tabs[current_key].refresh()

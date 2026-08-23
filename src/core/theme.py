@@ -174,13 +174,13 @@ def settings_qss(page_object_names: tuple[str, ...] = ("#settingsPage", "#aboutP
 
         {card_sel} {{
             background-color: {c['card_bg']};
-            border: 1px solid {c['card_border']};
+            border: none;
             border-radius: {l['card_radius']};
             padding: {l['card_padding']};
         }}
         {card_hover_sel} {{
             background-color: {c['card_hover']};
-            border: 1px solid {c['card_border']};
+            border: none;
         }}
 
         {title_lbl_sel} {{
@@ -269,12 +269,12 @@ def card_qss(class_name: str, radius: int = 8) -> str:
     result = f"""
         {class_name} {{
             background-color: {c['card_bg']};
-            border: 1px solid {c['card_border']};
+            border: none;
             border-radius: {radius}px;
         }}
         {class_name}:hover {{
             background-color: {c['card_hover']};
-            border: 1px solid {c['card_border']};
+            border: none;
         }}
     """
     _qss_cache[cache_key] = result

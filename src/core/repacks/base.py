@@ -4,6 +4,39 @@ from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse, parse_qs, unquote_plus
 
+from ..cache import cache as _cache
+
+DEFAULT_TTL_SECONDS = 6 * 60 * 60
+
+
+def load_page(source_key: str, page, ttl_seconds: int = DEFAULT_TTL_SECONDS):
+    return _cache.load(f"repacks:{source_key}:pages", str(page), ttl_seconds=ttl_seconds)
+
+
+def save_page(source_key: str, page, entries: list, has_more: bool) -> None:
+    _cache.save(f"repacks:{source_key}:pages", str(page), {"entries": entries, "has_more": has_more})
+
+
+def load_details(source_key: str, key: str, ttl_seconds: int = DEFAULT_TTL_SECONDS):
+    return _cache.load(f"repacks:{source_key}:details", key, ttl_seconds=ttl_seconds)
+
+
+def save_details(source_key: str, key: str, details: dict) -> None:
+    _cache.save(f"repacks:{source_key}:details", key, details)
+
+
+def clear_source_cache(source_key: str) -> None:
+    _cache.clear_namespace(f"repacks:{source_key}:pages")
+    _cache.clear_namespace(f"repacks:{source_key}:details")
+
+
+_ALL_SOURCE_KEYS = ["fitgirl"]
+
+
+def clear_all_cache() -> None:
+    for key in _ALL_SOURCE_KEYS:
+        clear_source_cache(key)
+
 
 def magnet_display_name(magnet_url: Optional[str]) -> str:
     if not magnet_url:
