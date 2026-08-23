@@ -130,6 +130,7 @@ export PYINSTALLER_DISABLE_DISTUTILS_ALIAS=1
     --exclude-module=PySide6.Qt3DLogic \
     --exclude-module=PySide6.Qt3DAnimation \
     --exclude-module=PySide6.Qt3DExtras \
+    --collect-all=httpx \
     --collect-submodules=qfluentwidgets \
     --collect-submodules=sqlite3 \
     --collect-submodules=http \
@@ -151,7 +152,6 @@ export PYINSTALLER_DISABLE_DISTUTILS_ALIAS=1
     --hidden-import=orjson \
     --hidden-import=requests \
     --hidden-import=httpx \
-    --collect-submodules=httpx \
     --hidden-import=qfluentwidgets \
     --hidden-import=qframelesswindow \
     src/main.py

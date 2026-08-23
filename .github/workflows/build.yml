@@ -186,6 +186,7 @@ jobs:
             --exclude-module=PySide6.Qt3DLogic \
             --exclude-module=PySide6.Qt3DAnimation \
             --exclude-module=PySide6.Qt3DExtras \
+            --collect-all=httpx \
             --collect-submodules=qfluentwidgets \
             --collect-submodules=sqlite3 \
             --collect-submodules=http \
@@ -205,6 +206,7 @@ jobs:
             --hidden-import=libtorrent \
             --hidden-import=orjson \
             --hidden-import=requests \
+            --hidden-import=httpx \
             --hidden-import=qfluentwidgets \
             --hidden-import=qframelesswindow \
             src/main.py
