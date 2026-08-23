@@ -60,7 +60,8 @@ echo "[build] Installing Python requirements..."
 "$PIP" install -r requirements.txt
 
 echo "[build] Installing PyInstaller..."
-"$PIP" install pyinstaller==6.11.1
+"$PIP" install --upgrade pyinstaller
+"$PIP" check
 
 echo "[build] Running PyInstaller..."
 export PYTHONOPTIMIZE=2
@@ -135,7 +136,7 @@ export PYINSTALLER_DISABLE_DISTUTILS_ALIAS=1
     --exclude-module=PySide6.Qt3DAnimation \
     --exclude-module=PySide6.Qt3DExtras \
     --collect-submodules=qfluentwidgets \
-    --collect-data=qfluentwidgets \
+    --collect-binaries=PySide6 --collect-binaries=libtorrent --collect-data=qfluentwidgets \
     --add-data "src/gui:src/gui" \
     --add-data "src/core:src/core" \
     --hidden-import=PySide6.QtCore \
