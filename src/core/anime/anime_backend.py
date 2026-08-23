@@ -294,7 +294,7 @@ async def _anilist_query(query: str, variables: dict) -> dict:
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             "https://graphql.anilist.co",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": AL_UA},
             json={"query": query, "variables": variables},
         )
     if resp.status_code >= 400:
@@ -801,7 +801,7 @@ async def _fetch_anilist_relations(anilist_id: Any) -> Optional[dict]:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 "https://graphql.anilist.co",
-                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": AL_UA},
                 json={"query": _RELATIONS_QUERY, "variables": {"id": int(anilist_id)}},
             )
         if resp.status_code != 200:
