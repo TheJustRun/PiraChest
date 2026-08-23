@@ -60,7 +60,7 @@ echo "[build] Installing Python requirements..."
 "$PIP" install -r requirements.txt
 
 echo "[build] Installing PyInstaller..."
-"$PIP" install --upgrade pyinstaller
+"$PIP" install pyinstaller==6.11.1
 
 echo "[build] Running PyInstaller..."
 export PYTHONOPTIMIZE=2
