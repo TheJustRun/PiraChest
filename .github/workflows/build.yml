@@ -57,7 +57,7 @@ jobs:
             Write-Error "Expected build output at $exePath but it does not exist."
             exit 1
           }
-          $exeName    = "PiraChest-v${{ needs.version.outputs.version }}-alpha-Windows-x64.exe"
+          $exeName = "PiraChest-v${{ needs.version.outputs.version }}-alpha-Windows-x64.exe"
           $exePathOut = "${{ github.workspace }}\$exeName"
           Copy-Item -Path $exePath -Destination $exePathOut -Force
           echo "EXE_PATH=$exePathOut" >> $env:GITHUB_ENV
@@ -69,7 +69,7 @@ jobs:
           path: ${{ env.EXE_PATH }}
 
   release:
-    name: Create Permanent GitHub Release
+    name: Create Release
     needs: [ version, build-windows ]
     runs-on: ubuntu-latest
 
