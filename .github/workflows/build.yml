@@ -87,6 +87,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             python3-pip \
+            libsqlite3-dev \
             libfuse2 \
             fuse \
             imagemagick \
@@ -190,9 +191,12 @@ jobs:
             --exclude-module=PySide6.Qt3DAnimation \
             --exclude-module=PySide6.Qt3DExtras \
             --collect-submodules=qfluentwidgets \
+            --collect-submodules=sqlite3 \
             --collect-binaries=PySide6 --collect-binaries=libtorrent --collect-data=qfluentwidgets \
             --add-data "src/gui:src/gui" \
             --add-data "src/core:src/core" \
+            --hidden-import=sqlite3 \
+            --hidden-import=_sqlite3 \
             --hidden-import=PySide6.QtCore \
             --hidden-import=PySide6.QtGui \
             --hidden-import=PySide6.QtWidgets \

@@ -13,14 +13,14 @@ fi
 
 echo "[build] Detecting package manager..."
 if command -v dnf >/dev/null 2>&1; then
-    PKG_INSTALL="sudo dnf install -y python3-pip fuse ImageMagick curl libxcb libxkbcommon-x11 xcb-util-cursor mesa-libEGL"
+    PKG_INSTALL="sudo dnf install -y python3-pip fuse ImageMagick curl libxcb libxkbcommon-x11 xcb-util-cursor mesa-libEGL sqlite-devel"
 elif command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update
-    PKG_INSTALL="sudo apt-get install -y python3-pip python3-venv fuse imagemagick curl libgl1 libegl1 libxkbcommon0 libxkbcommon-x11-0 libdbus-1-3 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0"
+    PKG_INSTALL="sudo apt-get install -y python3-pip python3-venv fuse imagemagick curl libsqlite3-dev libgl1 libegl1 libxkbcommon0 libxkbcommon-x11-0 libdbus-1-3 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0"
 elif command -v pacman >/dev/null 2>&1; then
-    PKG_INSTALL="sudo pacman -Sy --noconfirm python-pip python-virtualenv fuse2 imagemagick curl libxcb libxkbcommon-x11 xcb-util-cursor"
+    PKG_INSTALL="sudo pacman -Sy --noconfirm python-pip python-virtualenv fuse2 imagemagick curl sqlite libxcb libxkbcommon-x11 xcb-util-cursor"
 elif command -v zypper >/dev/null 2>&1; then
-    PKG_INSTALL="sudo zypper install -y python3-pip python3-venv fuse imagemagick curl libxcb1 libxkbcommon-x11-0 xcb-util-cursor0"
+    PKG_INSTALL="sudo zypper install -y python3-pip python3-venv fuse imagemagick curl sqlite3-devel libxcb1 libxkbcommon-x11-0 xcb-util-cursor0"
 else
     echo "[build] No supported package manager found (dnf/apt/pacman/zypper)."
     echo "[build] Please install manually: python3-pip, python3-venv, fuse, imagemagick."
@@ -135,9 +135,12 @@ export PYINSTALLER_DISABLE_DISTUTILS_ALIAS=1
     --exclude-module=PySide6.Qt3DAnimation \
     --exclude-module=PySide6.Qt3DExtras \
     --collect-submodules=qfluentwidgets \
+    --collect-submodules=sqlite3 \
     --collect-binaries=PySide6 --collect-binaries=libtorrent --collect-data=qfluentwidgets \
     --add-data "src/gui:src/gui" \
     --add-data "src/core:src/core" \
+    --hidden-import=sqlite3 \
+    --hidden-import=_sqlite3 \
     --hidden-import=PySide6.QtCore \
     --hidden-import=PySide6.QtGui \
     --hidden-import=PySide6.QtWidgets \
