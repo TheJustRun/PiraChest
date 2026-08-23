@@ -147,7 +147,6 @@ jobs:
             --exclude-module=doctest \
             --exclude-module=av \
             --exclude-module=lxml \
-            --exclude-module=curl_cffi \
             --exclude-module=PySide6.QtQml \
             --exclude-module=PySide6.QtQuick \
             --exclude-module=PySide6.QtQuickWidgets \

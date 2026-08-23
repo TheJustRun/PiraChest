@@ -50,7 +50,6 @@ python -m PyInstaller ^
     --exclude-module=doctest ^
     --exclude-module=av ^
     --exclude-module=lxml ^
-    --exclude-module=curl_cffi ^
     --exclude-module=PySide6.QtQml ^
     --exclude-module=PySide6.QtQuick ^
     --exclude-module=PySide6.QtQuickWidgets ^
@@ -103,6 +102,7 @@ python -m PyInstaller ^
     --hidden-import=PySide6.QtMultimedia ^
     --hidden-import=PySide6.QtMultimediaWidgets ^
     --hidden-import=libtorrent ^
+    --hidden-import=curl_cffi ^
     --hidden-import=orjson ^
     --hidden-import=requests ^
     --hidden-import=qfluentwidgets ^

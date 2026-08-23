@@ -10,6 +10,7 @@ from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Optional
 
 import httpx
+from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
 from ..cache import cache
 
@@ -291,11 +292,12 @@ async def find_top_slugs(
     return scored[:n]
 
 async def _anilist_query(query: str, variables: dict) -> dict:
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with CurlAsyncSession(impersonate="chrome") as client:
         resp = await client.post(
             "https://graphql.anilist.co",
-            headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": AL_UA},
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
             json={"query": query, "variables": variables},
+            timeout=15,
         )
     if resp.status_code >= 400:
         raise RuntimeError(f"AniList HTTP {resp.status_code}")
@@ -503,12 +505,14 @@ _al_inflight = _BoundedInflight(limit=32)
 async def _fetch_from_anilist(client: httpx.AsyncClient, anilist_id: int, retries: int = 4) -> Optional[dict]:
     for attempt in range(retries + 1):
         try:
-            resp = await client.post(
-                "https://graphql.anilist.co",
-                headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": AL_UA},
-                json={"query": _FULL_QUERY, "variables": {"id": anilist_id}},
-            )
-        except httpx.HTTPError:
+            async with CurlAsyncSession(impersonate="chrome") as curl_client:
+                resp = await curl_client.post(
+                    "https://graphql.anilist.co",
+                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                    json={"query": _FULL_QUERY, "variables": {"id": anilist_id}},
+                    timeout=15,
+                )
+        except Exception:
             return None
 
         if resp.status_code == 429:
@@ -697,13 +701,14 @@ async def search_anime(query: str, limit: int = 20) -> list[dict]:
         "seasonYear startDate{year} coverImage{large medium} synonyms genres description}}}"
     )
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with CurlAsyncSession(impersonate="chrome") as client:
             resp = await client.post(
                 "https://graphql.anilist.co",
-                headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": AL_UA},
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
                 json={"query": query_gql, "variables": {"search": query, "perPage": limit}},
+                timeout=15,
             )
-    except httpx.HTTPError:
+    except Exception:
         return []
     if resp.status_code != 200:
         return []
@@ -798,17 +803,18 @@ async def _fetch_arm(anilist_id: Any) -> Optional[dict]:
 
 async def _fetch_anilist_relations(anilist_id: Any) -> Optional[dict]:
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with CurlAsyncSession(impersonate="chrome") as client:
             resp = await client.post(
                 "https://graphql.anilist.co",
-                headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": AL_UA},
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
                 json={"query": _RELATIONS_QUERY, "variables": {"id": int(anilist_id)}},
+                timeout=15,
             )
         if resp.status_code != 200:
             return None
         data = resp.json()
         return (data.get("data") or {}).get("Media")
-    except (httpx.HTTPError, ValueError):
+    except Exception:
         return None
 
 async def map_anime_ids(anilist_id: Any) -> dict:
