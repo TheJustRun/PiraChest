@@ -55,6 +55,10 @@ A work-in-progress desktop GUI application for downloading ROMs from the Minerva
     <td><img width="2500" height="1440" alt="Books Pages" src="https://github.com/user-attachments/assets/8fefb040-2a22-43e2-aa19-ab9ca73cce0a" /></td>
   </tr>
   <tr>
+    <td><img width="2500" height="1440" alt="Anime Page" src="https://github.com/user-attachments/assets/ee71c5a8-b086-49a4-accd-cf50737155e6" /></td>
+    <td><img width="2500" height="1440" alt="Anime Details" src="https://github.com/user-attachments/assets/db66e462-81d7-4ae8-abae-9216c77efc17" /></td>
+  </tr>
+  <tr>
     <td><img width="2500" height="1440" alt="Download Page" src="https://github.com/user-attachments/assets/253847af-8d58-4afe-a451-bb0ad41a5dab" /></td>
     <td><img width="2500" height="1440" alt="Settings Page" src="https://github.com/user-attachments/assets/f1bca3e2-1d6d-449a-85e7-e721e5a84ca5" /></td>
   </tr>
