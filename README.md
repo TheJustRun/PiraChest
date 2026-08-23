@@ -1,184 +1,86 @@
-# PiraChest: An all-in-one desktop free media downloader (WIP)
-<img width="2484" height="1200" alt="banner" src="https://github.com/user-attachments/assets/20c0fe91-385c-410a-94e0-7bf191610cab" />
- A Work in Progress desktop GUI application to download specific ROMs from the Minerva Archive : https://minerva-archive.org , and PC Game Repacks using libTorrent (With more sources and features coming!), with the hope of being a complete app for sailing the seven seas, downloading music, books, courses, and many more.
+# PiraChest: An All-in-One Desktop Free Media Downloader (WIP)
+
+<img width="1887" height="421" alt="t071snp" src="https://github.com/user-attachments/assets/5c6d937a-26b6-4da7-994a-02b20e7373bb" />
+
+A work-in-progress desktop GUI application for downloading ROMs from the Minerva Archive, PC game repacks, watching anime, listening to music, downloading books, watching TV channels and shows, and downloading YouTube videos.
 
 ## Features
 
-**DISCLAIMER**: This app is in **ALPHA**. I'm just releasing it as is right now to get feedback and contributions to help polish and improve the app over time, even the current features that are added may have bugs, issues, freezes, or just incomplete and not finished
+**DISCLAIMER:** This app is in **ALPHA**. I'm releasing it as-is right now to get feedback and contributions to help polish and improve it over time. Even the features that are already implemented may have bugs, issues, freezes, or may simply be incomplete.
 
-**DISCLAIMER²**: this app has been AI-assisted using a local LLM ( Qwen 3.6 35B ) to *help* with the backend, if without it, I wouldn't have gotten the torrent per-file downloading system working, and I would have shot myself dead
-- **ROM Browsing** : Browse a local SQLite-indexed ROM catalog covering 70+ console platforms. Filter by console, source (No-Intro, Redump, TOSEC, etc.), and per-console variants.
-- **Smart Torrent Engine**: Uses `libtorrent 2.0.13` to download only the requested ROM file from multi-gigabyte torrent dumps, via a persistent queue with pause/resume/retry/cancel controls.
-- **PC Repacks** : Browse and download PC Game Repacks ( Currently FitGirl for now )
-- **Download Manager**: Real-time download queue with drag-and-drop reordering, live speed/progress/seed stats, per-torrent settings (speed limits, peer caps, ratio/time limits, force recheck).
-- **Console-First Classification**: Automatic console detection from the Minerva archive naming scheme with per-console variant support (Retail, Encrypted/Decrypted, BIOS, Demo, Prototype, Homebrew, etc.).
-- **Dark & Light Theme**: Full Light/Dark/Auto theming via QFluentWidgets, with a shared palette so every widget stays in sync.
-- **Persistent Queue**: Download queue survives app restarts. Partially downloaded torrents resume from disk rather than starting from scratch.
-- **Per-Torrent Concurrency Controls**: Global and per-item download/upload speed limits, max peer caps, seed ratio and time limits.
+**DISCLAIMER²:** This app has been AI-assisted using a local LLM (Qwen 3.6 35B) to *help* with the backend. Without it, I probably wouldn't have gotten the torrent per-file downloading system working, and I would've shot myself dead.
+
+* **ROM Browsing:** Browse a local SQLite-indexed ROM catalog covering 70+ console platforms. Filter by console, source (No-Intro, Redump, TOSEC, etc.), and per-console variants.
+* **Smart Torrent Engine:** Uses `libtorrent 2.0.13` to download only the requested ROM file from multi-gigabyte torrent dumps, via a persistent queue with pause/resume/retry/cancel controls.
+* **PC Repacks:** Browse and download PC game repacks (currently FitGirl for now).
+* **Music:** Search, listen to, and download music in lossless quality or whatever quality you want. You can also listen to music directly in the app, with a customizable lyrics panel.
+* **Anime:** Watch and download anime episodes or entire seasons directly from the app.
+* **Books:** Currently a work in progress and proof of concept. You can download books from the app.
+* **YouTube Downloading:** Download YouTube videos in audio or video format with metadata.
+* **Download Manager:** Real-time download queue with drag-and-drop reordering, live speed/progress/seed stats, and per-torrent settings (speed limits, peer caps, ratio/time limits, force recheck).
+* **Console-First Classification:** Automatic console detection from the Minerva Archive naming scheme, with per-console variant support (Retail, Encrypted/Decrypted, BIOS, Demo, Prototype, Homebrew, etc.).
+* **Dark & Light Theme:** Full Light/Dark/Auto theming via QFluentWidgets, with a shared palette so every widget stays in sync.
+* **Persistent Queue:** The download queue survives app restarts. Partially downloaded torrents resume from disk instead of starting from scratch.
+* **Per-Torrent Concurrency Controls:** Global and per-item download/upload speed limits, max peer caps, seed ratio, and time limits.
 
 ## How It Works
 
-1. **Index Sync** — Downloads the `Caprico1/Minerva-archive-ids` markdown index from GitHub, parses console/provider/torrent/file-ID metadata, classifies each entry into the correct console family, deduplicates by provider, and bulk-inserts into a local SQLite database.
+1. **Index Sync** — Downloads the `Caprico1/Minerva-archive-ids` Markdown index from GitHub, parses console/provider/torrent/file-ID metadata, classifies each entry into the correct console family, deduplicates by provider, and bulk-inserts everything into a local SQLite database.
 2. **Browse & Search** — Queries the SQLite index by name, console, source, and variant with offset-based pagination (30 items per page).
 3. **Download** — Fetches the `.torrent` file from the Minerva CDN (`cdn.minerva-archive.org`), adds it to a libtorrent session, selects only the requested file from within the torrent, and writes the result into `downloads/{Console}/{Game Title}/`.
 
 ## Roadmap
-- [x] ROM downloading
-- [x] Torrent support
-- [x] Multi-console support
-- [x] Download manager
-- [x] PC Games (Repacks..)
-- [x] Localization
-- [x] Linux (untested AppImage)
-- [ ] DAT Support
-- [ ] Updates & DLC (You can find some, but it isn't very reliable)
-- [ ] Media downloads (Music, Books, Courses..)
-- more ig
+
+* [x] ROM downloading
+* [x] Torrent support
+* [x] Multi-console support
+* [x] Download manager
+* [x] PC Games (Repacks)
+* [x] Localization
+* [x] Linux (untested AppImage; Linux is not a priority at all)
+* [x] Media (Music, Books, Anime...)
+* [ ] DAT Support
+* [ ] Updates & DLC (You can find some, but it isn't very reliable)
+* [ ] More stuff, I guess
 
 ## Photos
 
 <table>
   <tr>
-    <td><img width="1552" height="900" alt="UI" src="https://github.com/user-attachments/assets/4b4aebc8-e76f-45b5-b4ad-f5e6144cc176" />
-</td>
-    <td><img width="1552" height="900" alt="Console Selection Screen" src="https://github.com/user-attachments/assets/1dd739c1-daf7-4fca-bf7a-ea6ecc11d8bd" />
-</td>
+    <td><img width="2500" height="1440" alt="Minverva Page" src="https://github.com/user-attachments/assets/1cec40d1-0c39-4337-a4fa-f42cac525a1d" /></td>
+    <td><img width="2500" height="1440" alt="Music Page" src="https://github.com/user-attachments/assets/25df2a04-965e-4d78-b276-fb79cf3c26d7" /></td>
   </tr>
   <tr>
-    <td><img width="1552" height="900" alt="Download Manager" src="https://github.com/user-attachments/assets/0f32cab9-a0cb-4210-ad37-3b582d9f3cab" />
-</td>
-    <td><img width="1552" height="900" alt="Settings" src="https://github.com/user-attachments/assets/6f80bc53-44d4-4d79-b125-bd4d35763e3f" />
-</td>
+    <td><img width="2500" height="1440" alt="Music Lyrics" src="https://github.com/user-attachments/assets/e66e24b0-03f5-4d7e-b001-7c012a7ba3f4" /></td>
+    <td><img width="2500" height="1440" alt="Books Pages" src="https://github.com/user-attachments/assets/8fefb040-2a22-43e2-aa19-ab9ca73cce0a" /></td>
   </tr>
   <tr>
-    <td><img width="1552" height="900" alt="Repacks grid view" src="https://github.com/user-attachments/assets/c99da4c4-ef43-4195-b03b-66159e3e47ce" />
-</td>
-    <td><img width="1552" height="900" alt="Upcoming Games" src="https://github.com/user-attachments/assets/455d4dd5-169d-47b3-8d8e-d520118a6b97" />
-
-</td>
- </tr>
+    <td><img width="2500" height="1440" alt="Download Page" src="https://github.com/user-attachments/assets/253847af-8d58-4afe-a451-bb0ad41a5dab" /></td>
+    <td><img width="2500" height="1440" alt="Settings Page" src="https://github.com/user-attachments/assets/f1bca3e2-1d6d-449a-85e7-e721e5a84ca5" /></td>
+  </tr>
   <tr>
-    <td><img width="1552" height="900" alt="Game Details" src="https://github.com/user-attachments/assets/b9b0cd0e-be0a-4b98-b549-1e6c610748c9" />
-
-</td>
-    <td><img width="1552" height="900" alt="Selective Downloading" src="https://github.com/user-attachments/assets/35bd253a-8942-4199-adf2-404494c668c7" />
-
-</td>
- </tr>
- 
+    <td><img width="2500" height="1440" alt="Repacks grid view" src="https://github.com/user-attachments/assets/7d79a53b-7515-462c-a587-67a5826191ee" /></td>
+    <td><img width="2500" height="1440" alt="Upcoming Games" src="https://github.com/user-attachments/assets/15d198aa-373b-4c34-bef2-d0f0e0b668cf" /></td>
+  </tr>
+  <tr>
+    <td><img width="2500" height="1440" alt="Game Details" src="https://github.com/user-attachments/assets/b9e04b64-53b4-4971-a4a0-896cf411669f" /></td>
+    <td><img width="2500" height="1440" alt="Selective Downloading" src="https://github.com/user-attachments/assets/35a7ca92-1c16-43e7-a806-f75ff5652175" /></td>
+  </tr>
 </table>
 
-## Supported Sources
-- [x] Minerva Archive
-- [x] FitGirl Repacks
-- [ ] More... like nopaystation.. etc
-
 ## **Current** Issues and Quirks
-- Not all Consoles have their variant system working yet
-- Download manager is still quirky with a lot of files, currently it is recommended to download about 3 files at once. Needs more testing ( it's improving )
-- The accent color option is a placeholder
-- Light mode sucks
-- And more idk? I need more testing, that's why I'm releasing it in alpha, so I get more feedback on the thing rather than just blindly making it.
 
+* Not all consoles have their variant system working yet.
+* Light mode sucks.
+* And more, I guess? I need more testing. That's why I'm releasing it in alpha: so I can get more feedback on the app instead of just blindly making it.
+* Probably a bunch of other bugs I haven't found yet.
 
-## Requirements
-- **Python 3.10+**
-## Installation
-
-### 1. Install Python dependencies
-```bash
-pip install -r requirements.txt
-```
-### 2. Build the ROM index (required once, then periodically)
-You can do that in the GUI or with commands
-```bash
-python src/core/indexer.py --sync
-```
-This downloads the latest index markdown files, parses them, and populates `src/data/minerva_index.db`.
-It is also recommended to resync every release, not only that will insure you have the latest files, 
-but also if there is a change in anything list related in the app, you will be updated as well
-
-## Usage
-### Launch the GUI
-```bash
-python src/main.py
-```
-or just open the exe in releases
-
-### CLI index management
-
-```bash
-# Sync the index (clone + parse + upsert)
-python src/core/indexer.py --sync
-
-# Search for a ROM from the command line
-python src/core/indexer.py --search "Mario"
-
-# Show index statistics
-python src/core/indexer.py --stats
-```
-
-### Build a standalone executable (optional)
-
-```bash
-# Windows
-build.bat
-```
-
-The output will be in `dist/PiraChest/`.
-
-## Configuration
-
-Settings are stored in `.config/pirachest_settings.json` relative to the project root. You can edit them manually or use the built-in **Settings** dialog.
-
-| Setting | Default | Description |
-|---|---|---|
-| `download_dir` | `downloads/` | Root folder for all ROM downloads |
-| `seed_time` | `0` | Minutes to seed after download completes |
-| `speed_limit` | `0` | Download speed cap in KB/s (0 = unlimited) |
-| `upload_speed_limit` | `500` | Upload speed cap in KB/s (0 = unlimited) |
-| `auto_download` | `false` | Start download immediately when a ROM is selected |
-| `delete_torrent_after` | `true` | Remove cached `.torrent` file after download |
-| `theme_mode` | `Dark` | `Dark`, `Light`, or `Auto` (follows system theme) |
-
-## Project Structure
-
-```
-├── src/
-│   ├── main.py                  # Application entry point
-│   ├── core/
-│   │   ├── config.py            # Centralised configuration (paths, libtorrent defaults, settings)
-│   │   ├── console_mapper.py    # Console classification from archive torrent names
-│   │   ├── console_variants.py  # Per-console variant metadata (Retail, BIOS, etc.)
-│   │   ├── database.py          # SQLite schema, connection, queries, and pagination
-│   │   ├── download_manager.py  # libtorrent 2.0.13 queue engine with persistence
-│   │   ├── indexer.py           # GitHub markdown index fetch, parse, and DB sync
-│   │   ├── sync.py              # Background sync worker (QThread)
-│   │   └── theme.py             # Shared colour palette for Light/Dark mode
-│   └── gui/
-│       ├── main_window.py       # FluentWindow with Home, Download Manager, Settings pages
-│       ├── settings_dialog.py   # Settings modal (download dir, seeding, speed limits)
-│       ├── splash.py            # Splash screen icon lookup
-│       ├── download_manager_panel.py  # Download queue page with live stats
-│       ├── rom_details_panel.py     # Right-side ROM metadata card (local DB only)
-│       └── rom_table_model.py       # Paginated QAbstractTableModel for ROM table      
-├── build.bat  
-├── PiraChest.spec  # PyInstaller spec file
-├── requirements.txt
-└── README.md
-```
-Also, special thanks to [spicysaltysparty](https://www.reddit.com/user/spicysaltysparty/) for creating the logo
+Also, special thanks to [spicysaltysparty](https://www.reddit.com/user/spicysaltysparty/) for creating the logo!
 
 ## Disclaimer
 
 > **For educational and archival purposes only.**
 >
-> This tool is designed to interact with the Minerva Archive, a community
-> repository of ROMs distributed for educational and archival purposes. Users
-> are responsible for ensuring that their use of downloaded ROMs complies with
-> all applicable laws and regulations in their jurisdiction.
+> This tool is designed to interact with the Minerva Archive, a community repository of ROMs distributed for educational and archival purposes. Users are responsible for ensuring that their use of downloaded ROMs complies with all applicable laws and regulations in their jurisdiction.
 >
-> The Minerva Archive and its contributors do not endorse or encourage
-> copyright infringement. Please only download ROMs for software you own a
-> legal copy of, or for software that is in the public domain.
-
+> The Minerva Archive and its contributors do not endorse or encourage copyright infringement. Please only download ROMs for software you own a legal copy of, or for software that is in the public domain.
