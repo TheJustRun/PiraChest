@@ -187,28 +187,27 @@ jobs:
             --exclude-module=PySide6.Qt3DAnimation \
             --exclude-module=PySide6.Qt3DExtras \
             --collect-all=httpx \
-            --collect-submodules=qfluentwidgets \
+            --collect-all=curl_cffi \
+            --collect-all=musicdl \
+            --collect-all=yt_dlp \
+            --collect-all=libgen_api_enhanced \
+            --collect-all=qfluentwidgets \
+            --collect-all=qframelesswindow \
             --collect-submodules=sqlite3 \
             --collect-submodules=http \
-            --collect-binaries=PySide6 --collect-binaries=libtorrent --collect-data=qfluentwidgets \
+            --copy-metadata=yt-dlp \
+            --copy-metadata=httpx \
+            --copy-metadata=curl-cffi \
+            --collect-binaries=PySide6 \
+            --collect-binaries=libtorrent \
             --add-data "src/gui:src/gui" \
             --add-data "src/core:src/core" \
             --hidden-import=sqlite3 \
             --hidden-import=_sqlite3 \
             --hidden-import=http.server \
-            --hidden-import=PySide6.QtCore \
-            --hidden-import=PySide6.QtGui \
-            --hidden-import=PySide6.QtWidgets \
-            --hidden-import=PySide6.QtSvg \
-            --hidden-import=PySide6.QtNetwork \
-            --hidden-import=PySide6.QtMultimedia \
-            --hidden-import=PySide6.QtMultimediaWidgets \
-            --hidden-import=libtorrent \
-            --hidden-import=orjson \
-            --hidden-import=requests \
-            --hidden-import=httpx \
-            --hidden-import=qfluentwidgets \
-            --hidden-import=qframelesswindow \
+            --hidden-import=curl_cffi \
+            --hidden-import=mutagen \
+            --hidden-import=Crypto \
             src/main.py
 
       - name: Assemble AppDir

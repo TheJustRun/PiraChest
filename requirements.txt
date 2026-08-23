@@ -10,3 +10,4 @@ PySide6-Fluent-Widgets==1.11.3
 PySideSix-Frameless-Window==0.8.2
 Requests==2.34.2
 yt_dlp==2026.7.4
+curl-cffi
