@@ -86,10 +86,6 @@ export PYINSTALLER_DISABLE_DISTUTILS_ALIAS=1
     --exclude-module=scipy \
     --exclude-module=setuptools \
     --exclude-module=pkg_resources \
-    --exclude-module=test \
-    --exclude-module=unittest \
-    --exclude-module=pydoc \
-    --exclude-module=doctest \
     --exclude-module=av \
     --exclude-module=lxml \
     --exclude-module=PySide6.QtQml \
@@ -136,11 +132,13 @@ export PYINSTALLER_DISABLE_DISTUTILS_ALIAS=1
     --exclude-module=PySide6.Qt3DExtras \
     --collect-submodules=qfluentwidgets \
     --collect-submodules=sqlite3 \
+    --collect-submodules=http \
     --collect-binaries=PySide6 --collect-binaries=libtorrent --collect-data=qfluentwidgets \
     --add-data "src/gui:src/gui" \
     --add-data "src/core:src/core" \
     --hidden-import=sqlite3 \
     --hidden-import=_sqlite3 \
+    --hidden-import=http.server \
     --hidden-import=PySide6.QtCore \
     --hidden-import=PySide6.QtGui \
     --hidden-import=PySide6.QtWidgets \
