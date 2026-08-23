@@ -130,6 +130,7 @@ export PYINSTALLER_DISABLE_DISTUTILS_ALIAS=1
     --exclude-module=PySide6.Qt3DLogic \
     --exclude-module=PySide6.Qt3DAnimation \
     --exclude-module=PySide6.Qt3DExtras \
+    --collect-all=PySide6 \
     --collect-all=httpx \
     --collect-all=curl_cffi \
     --collect-all=musicdl \
@@ -142,7 +143,6 @@ export PYINSTALLER_DISABLE_DISTUTILS_ALIAS=1
     --copy-metadata=yt-dlp \
     --copy-metadata=httpx \
     --copy-metadata=curl-cffi \
-    --collect-binaries=PySide6 \
     --collect-binaries=libtorrent \
     --add-data "src/gui:src/gui" \
     --add-data "src/core:src/core" \
