@@ -23,7 +23,7 @@ A work-in-progress desktop GUI application for downloading ROMs from the Minerva
 * **Dark & Light Theme:** Full Light/Dark/Auto theming via QFluentWidgets, with a shared palette so every widget stays in sync.
 * **Persistent Queue:** The download queue survives app restarts. Partially downloaded torrents resume from disk instead of starting from scratch.
 * **Per-Torrent Concurrency Controls:** Global and per-item download/upload speed limits, max peer caps, seed ratio, and time limits.
-* 
+
 ## Roadmap
 
 * [x] ROM downloading
