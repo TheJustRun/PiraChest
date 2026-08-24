@@ -17,18 +17,13 @@ A work-in-progress desktop GUI application for downloading ROMs from the Minerva
 * **Anime:** Watch and download anime episodes or entire seasons directly from the app.
 * **Books:** Currently a work in progress and proof of concept. You can download books from the app.
 * **YouTube Downloading:** Download YouTube videos in audio or video format with metadata.
+* **TV**: Watch and download Movies, Series, Sports and TV Channels live from the app 
 * **Download Manager:** Real-time download queue with drag-and-drop reordering, live speed/progress/seed stats, and per-torrent settings (speed limits, peer caps, ratio/time limits, force recheck).
 * **Console-First Classification:** Automatic console detection from the Minerva Archive naming scheme, with per-console variant support (Retail, Encrypted/Decrypted, BIOS, Demo, Prototype, Homebrew, etc.).
 * **Dark & Light Theme:** Full Light/Dark/Auto theming via QFluentWidgets, with a shared palette so every widget stays in sync.
 * **Persistent Queue:** The download queue survives app restarts. Partially downloaded torrents resume from disk instead of starting from scratch.
 * **Per-Torrent Concurrency Controls:** Global and per-item download/upload speed limits, max peer caps, seed ratio, and time limits.
-
-## How It Works
-
-1. **Index Sync** — Downloads the `Caprico1/Minerva-archive-ids` Markdown index from GitHub, parses console/provider/torrent/file-ID metadata, classifies each entry into the correct console family, deduplicates by provider, and bulk-inserts everything into a local SQLite database.
-2. **Browse & Search** — Queries the SQLite index by name, console, source, and variant with offset-based pagination (30 items per page).
-3. **Download** — Fetches the `.torrent` file from the Minerva CDN (`cdn.minerva-archive.org`), adds it to a libtorrent session, selects only the requested file from within the torrent, and writes the result into `downloads/{Console}/{Game Title}/`.
-
+* 
 ## Roadmap
 
 * [x] ROM downloading
