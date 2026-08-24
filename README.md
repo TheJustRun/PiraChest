@@ -76,10 +76,11 @@ A work-in-progress desktop GUI application for downloading ROMs from the Minerva
 
 Also, special thanks to [spicysaltysparty](https://www.reddit.com/user/spicysaltysparty/) for creating the logo!
 
-## Disclaimer
+# Disclaimer
 
-> **For educational and archival purposes only.**
+> **For legal and educational purposes only.**
 >
-> This tool is designed to interact with the Minerva Archive, a community repository of ROMs distributed for educational and archival purposes. Users are responsible for ensuring that their use of downloaded ROMs complies with all applicable laws and regulations in their jurisdiction.
+> This application does not host, distribute, or endorse copyrighted content. It merely provides tools to access third-party sources. You are solely responsible for how you use this software and for complying with all applicable laws.
 >
-> The Minerva Archive and its contributors do not endorse or encourage copyright infringement. Please only download ROMs for software you own a legal copy of, or for software that is in the public domain.
+> **If you misuse it, that's your responsibility. Fuck you.**
+
