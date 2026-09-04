@@ -59,12 +59,12 @@ class _FfmpegDownloadJob(QRunnable):
     def _is_cancelled(self) -> bool:
         return self._cancelled
 
-    def _on_progress(self, downloaded: int, total: int) -> None:
+    def _on_progress(self, stage: str, downloaded: int, total: int) -> None:
         self._signals.progress.emit(downloaded, total)
 
     def run(self) -> None:
         try:
-            yt_provider.download_ffmpeg(self._on_progress, is_cancelled=self._is_cancelled)
+            yt_provider.download_yt_tools(self._on_progress, is_cancelled=self._is_cancelled)
         except yt_provider.YtError as exc:
             if self._cancelled:
                 return
@@ -277,7 +277,7 @@ class YtPage(QWidget):
 
         register_locale_refresh(self, self._apply_locale)
 
-        if yt_provider.has_ffmpeg():
+        if yt_provider.has_yt_tools():
             self._stack.setCurrentWidget(self._content_widget)
         else:
             self._stack.setCurrentWidget(self._gate_widget)

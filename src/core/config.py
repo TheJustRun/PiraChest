@@ -71,10 +71,10 @@ class Paths:
     torrent_cache: str = field(default_factory=lambda: os.path.join(_APP_DATA_DIR, 'downloads', 'torrents'))
     cache_dir: str = field(default_factory=lambda: os.path.join(_APP_DATA_DIR, 'cache'))
     config_dir: str = field(default_factory=lambda: os.path.join(_APP_DATA_DIR, 'config'))
-    ffmpeg_dir: str = field(default_factory=lambda: os.path.join(_APP_DATA_DIR, 'ffmpeg'))
+    yt_dir: str = field(default_factory=lambda: os.path.join(_APP_DATA_DIR, 'yt'))
 
     def ensure_dirs(self) -> None:
-        for d in (self.app_data_dir, self.data_dir, self.download_root, self.torrent_cache, self.cache_dir, self.config_dir):
+        for d in (self.app_data_dir, self.data_dir, self.download_root, self.torrent_cache, self.cache_dir, self.config_dir, self.yt_dir):
             try:
                 os.makedirs(d, exist_ok=True)
             except OSError as exc:
@@ -114,6 +114,8 @@ class Settings:
     download_dir_music: str = field(default_factory=lambda: os.path.join(Paths().download_root, 'music'))
     download_dir_anime: str = field(default_factory=lambda: os.path.join(Paths().download_root, 'anime'))
     download_dir_youtube: str = field(default_factory=lambda: os.path.join(Paths().download_root, 'youtube'))
+    download_dir_manga: str = field(default_factory=lambda: os.path.join(Paths().download_root, 'manga'))
+    download_dir_books: str = field(default_factory=lambda: os.path.join(Paths().download_root, 'books'))
     speed_limit: int = 0
     upload_speed_limit: int = 500
     seed_time: int = 0
@@ -135,7 +137,9 @@ class Settings:
     close_to_tray: bool = False
     admin_mode: bool = False
     show_console: bool = False
+    log_to_file: bool = False
     language: str = 'en'
+    on_finish_action: str = 'nothing'
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}

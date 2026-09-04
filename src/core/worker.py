@@ -6,6 +6,7 @@ import uuid
 from enum import IntEnum
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
+from shiboken6 import isValid as _qt_is_valid
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +44,19 @@ class _Task(QRunnable):
         except Exception as exc:
             if not self._cancel_event.is_set():
                 logger.exception("Task %s failed", self._task_id)
-                self._signals.failed.emit(self._task_id, str(exc))
+                if _qt_is_valid(self._signals):
+                    try:
+                        self._signals.failed.emit(self._task_id, str(exc))
+                    except RuntimeError:
+                        pass
             return
         if self._cancel_event.is_set():
             return
-        self._signals.finished.emit(self._task_id, result)
+        if _qt_is_valid(self._signals):
+            try:
+                self._signals.finished.emit(self._task_id, result)
+            except RuntimeError:
+                pass
 
 
 class TaskManager(QObject):
@@ -75,7 +84,12 @@ class TaskManager(QObject):
 
     def wrap_callback(self, callback):
         def _proxy(*args, **kwargs) -> None:
-            self._signals.progress.emit((callback, args, kwargs))
+            if not _qt_is_valid(self._signals):
+                return
+            try:
+                self._signals.progress.emit((callback, args, kwargs))
+            except RuntimeError:
+                pass
         return _proxy
 
     def _on_progress(self, payload) -> None:
@@ -158,6 +172,9 @@ def _resolve_repack_source(source_key: str):
     if source_key == "fitgirl":
         from src.core.repacks.sources.fitgirl import FitGirlSource
         source = FitGirlSource()
+    elif source_key == "gog":
+        from src.core.repacks.sources.gog import GogRevivedSource
+        source = GogRevivedSource()
 
     if source is not None:
         _repack_source_instances[source_key] = source

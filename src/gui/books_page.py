@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import re
 import weakref
 from collections import OrderedDict
 from PySide6.QtCore import (
@@ -17,9 +18,13 @@ from qfluentwidgets import (
     SmoothScrollBar, SmoothScrollArea, ImageLabel, PillPushButton,
     FluentIcon, HyperlinkButton, qconfig, isDarkTheme, themeColor,
     FlowLayout as QFlowLayout, MessageBoxBase, InfoBar, InfoBarPosition,
+    Pivot, TransparentToolButton,
 )
+
 from src.core.worker import submit, cancel
 from src.core.books import manager as books_manager
+from src.core.books.manga import manager as manga_manager
+from src.core.books.manga.manager import MangaItem as MangaEntry, MangaChapter, MangaDownloadBridge
 from src.core.models import BookItem
 from src.core.artwork import artwork, thumb_path as artwork_thumb_path, has_thumb as artwork_has_thumb, full_path as artwork_full_path, has_full as artwork_has_full
 from src.core.theme import palette
@@ -28,6 +33,7 @@ from .repacks_page import (
     MetaField, make_tag_pill, render_description_html,
     _load_scaled_pixmap, _dominant_color, _stop_previous_movie,
     _muted_text_color, _body_text_color, _surface_tint_color,
+    _center_crop_pixmap, FlowLayout,
 )
 
 logger = logging.getLogger(__name__)
@@ -1047,7 +1053,856 @@ class BookSourceFilterDialog(MessageBoxBase):
         return [source for source, cb in self._checks.items() if cb.isChecked()]
 
 
-class BooksPage(QWidget):
+class MangaCoverLabel(QLabel):
+    """Small helper label that lazily loads a MangaDex cover via the shared artwork cache."""
+
+    COVER_W = 150
+    COVER_H = 210
+
+    _pixmap_cache: "OrderedDict[str, QPixmap]" = OrderedDict()
+    _PIXMAP_CACHE_LIMIT = 256
+
+    def __init__(self, url: str, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.COVER_W, self.COVER_H)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet(f'background-color: {_surface_tint_color(14)}; border-radius: 8px;')
+        self._url = url
+        self._connected = False
+        cached = self._cache_get(url) if url else None
+        if cached is not None and not cached.isNull():
+            self.setPixmap(cached)
+        elif url:
+            self._set_placeholder()
+            artwork.thumb_ready.connect(self._on_thumb_ready)
+            artwork.failed.connect(self._on_failed)
+            self._connected = True
+            if artwork_has_thumb('manga', url):
+                self._apply_path(artwork_thumb_path('manga', url))
+            else:
+                artwork.request('manga', url)
+        else:
+            self._set_placeholder()
+
+    @classmethod
+    def _cache_get(cls, url: str) -> QPixmap | None:
+        pix = cls._pixmap_cache.get(url)
+        if pix is not None:
+            cls._pixmap_cache.move_to_end(url)
+        return pix
+
+    @classmethod
+    def _cache_put(cls, url: str, pix: QPixmap) -> None:
+        cls._pixmap_cache[url] = pix
+        cls._pixmap_cache.move_to_end(url)
+        while len(cls._pixmap_cache) > cls._PIXMAP_CACHE_LIMIT:
+            cls._pixmap_cache.popitem(last=False)
+
+    def _set_placeholder(self) -> None:
+        icon = _book_fallback_icon()
+        if icon is not None:
+            self.setPixmap(icon.icon(color=QColor(_muted_text_color())).pixmap(48, 48))
+        else:
+            self.setPixmap(QPixmap())
+
+    def _apply_path(self, path: str) -> None:
+        pix = QPixmap(path)
+        if pix.isNull():
+            self._set_placeholder()
+            return
+        scale = max(self.COVER_W / max(pix.width(), 1), self.COVER_H / max(pix.height(), 1))
+        scaled = pix.scaled(
+            max(1, round(pix.width() * scale)), max(1, round(pix.height() * scale)),
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation,
+        )
+        cropped = _center_crop_pixmap(scaled, self.COVER_W, self.COVER_H)
+        self._cache_put(self._url, cropped)
+        self.setPixmap(cropped)
+
+    def _on_thumb_ready(self, kind: str, url: str, path: str) -> None:
+        if kind != 'manga' or url != self._url:
+            return
+        self._apply_path(path)
+
+    def _on_failed(self, kind: str, url: str, _error: str) -> None:
+        if kind != 'manga' or url != self._url:
+            return
+        self._set_placeholder()
+
+    def shutdown(self) -> None:
+        if self._connected:
+            try:
+                artwork.thumb_ready.disconnect(self._on_thumb_ready)
+                artwork.failed.disconnect(self._on_failed)
+            except (TypeError, RuntimeError):
+                pass
+            self._connected = False
+
+
+
+class MangaCard(QWidget):
+    """A single cover + title tile in the manga grid."""
+
+    clicked = Signal(object)
+
+    def __init__(self, item: MangaEntry, parent=None):
+        super().__init__(parent)
+        self._item = item
+        self.setFixedWidth(MangaCoverLabel.COVER_W)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self._cover = MangaCoverLabel(item.cover_url, self)
+        layout.addWidget(self._cover)
+        title_lbl = CaptionLabel(item.title, self)
+        title_lbl.setWordWrap(True)
+        title_lbl.setFixedWidth(MangaCoverLabel.COVER_W)
+        title_lbl.setMaximumHeight(34)
+        layout.addWidget(title_lbl)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._item)
+        super().mousePressEvent(event)
+
+    def shutdown(self) -> None:
+        self._cover.shutdown()
+
+
+_MANGA_DESC_CUTOFF_RE = re.compile(r'\n\s*-{3,}\s*\n')
+_MANGA_DESC_LINKS_RE = re.compile(r'(?im)^\s*\**links?:?\**\s*$.*', re.DOTALL)
+_MANGA_MD_LINK_RE = re.compile(r'\[([^\]]+)\]\([^)]*\)')
+_MANGA_BARE_URL_RE = re.compile(r'https?://\S+')
+
+
+def _clean_manga_description(text: str) -> str:
+    if not text:
+        return ''
+    match = _MANGA_DESC_CUTOFF_RE.search(text)
+    if match:
+        text = text[:match.start()]
+    text = _MANGA_DESC_LINKS_RE.sub('', text)
+    text = _MANGA_MD_LINK_RE.sub(lambda m: m.group(1), text)
+    text = _MANGA_BARE_URL_RE.sub('', text)
+    return text.strip()
+
+
+class MangaGridView(ScrollArea):
+    """Simple flow-layout grid of manga covers, auto-paginated by scroll position."""
+
+    manga_clicked = Signal(object)
+    near_bottom = Signal()
+    near_top = Signal()
+    _NEAR_BOTTOM_THRESHOLD_PX = 400
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.setStyleSheet('background: transparent; border: none;')
+        self.viewport().setStyleSheet('background: transparent;')
+
+        self._container = QWidget()
+        self._container.setStyleSheet('background: transparent;')
+        self._flow = FlowLayout(self._container, margin=0, spacing=16)
+        self.setWidget(self._container)
+
+        self._cards: list[MangaCard] = []
+
+        self._empty_lbl = BodyLabel(tr('books.manga_no_results'), self._container)
+        self._empty_lbl.setStyleSheet(f'color: {_muted_text_color()};')
+        self._empty_lbl.setVisible(False)
+        self._flow.addWidget(self._empty_lbl)
+
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
+
+    def _on_scroll_value_changed(self, value: int) -> None:
+        bar = self.verticalScrollBar()
+        if bar.maximum() - value <= self._NEAR_BOTTOM_THRESHOLD_PX:
+            self.near_bottom.emit()
+        if value <= 0:
+            self.near_top.emit()
+
+    def clear(self) -> None:
+        for card in self._cards:
+            card.shutdown()
+            self._flow.removeWidget(card)
+            card.deleteLater()
+        self._cards.clear()
+        self._empty_lbl.setVisible(False)
+
+    def add_entries(self, entries: list[MangaEntry]) -> None:
+        self._flow.removeWidget(self._empty_lbl)
+        for entry in entries:
+            card = MangaCard(entry, self._container)
+            card.clicked.connect(self.manga_clicked.emit)
+            self._flow.addWidget(card)
+            self._cards.append(card)
+        self._flow.addWidget(self._empty_lbl)
+        self._empty_lbl.setVisible(not self._cards)
+
+    def set_has_more(self, has_more: bool, loading: bool = False) -> None:
+        pass
+
+
+class MangaChapterSelectDialog(MessageBoxBase):
+
+    _WARN_THRESHOLD = 20
+
+    def __init__(self, chapters: list[MangaChapter], parent=None):
+        super().__init__(parent)
+        self._checks: list[tuple[CheckBox, MangaChapter]] = []
+        self.titleLabel = SubtitleLabel(tr('books.manga_choose_chapters'), self)
+        self.viewLayout.addWidget(self.titleLabel)
+
+        select_row = QHBoxLayout()
+        self._select_all_btn = PushButton(tr('books.manga_select_all'), self)
+        self._select_all_btn.clicked.connect(self._toggle_select_all)
+        select_row.addWidget(self._select_all_btn)
+        select_row.addStretch(1)
+        self.viewLayout.addLayout(select_row)
+
+        self._warning_lbl = CaptionLabel(tr('books.manga_bulk_download_warning'), self)
+        self._warning_lbl.setWordWrap(True)
+        self._warning_lbl.setStyleSheet('color: #d68a1f;')
+        self._warning_lbl.setVisible(False)
+        self.viewLayout.addWidget(self._warning_lbl)
+
+        scroll = ScrollArea(self)
+        scroll.setFixedHeight(min(360, 36 * max(1, len(chapters)) + 16))
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet('background: transparent; border: none;')
+        container = QWidget(scroll)
+        container.setStyleSheet('background: transparent;')
+        col = QVBoxLayout(container)
+        col.setSpacing(4)
+        for chapter in chapters:
+            label = chapter.label
+            if chapter.scanlation_group:
+                label = f'{label}  ·  {chapter.scanlation_group}'
+            cb = CheckBox(label, container)
+            cb.setChecked(True)
+            cb.stateChanged.connect(self._update_warning)
+            self._checks.append((cb, chapter))
+            col.addWidget(cb)
+        col.addStretch(1)
+        scroll.setWidget(container)
+        self.viewLayout.addWidget(scroll)
+
+        self.yesButton.setText(tr('books.manga_download_selected'))
+        self.cancelButton.setText(tr('books.cancel'))
+        self.widget.setMinimumWidth(360)
+        self._update_warning()
+
+    def _toggle_select_all(self) -> None:
+        any_unchecked = any(not cb.isChecked() for cb, _ in self._checks)
+        for cb, _ in self._checks:
+            cb.setChecked(any_unchecked)
+
+    def _update_warning(self, *_args) -> None:
+        selected_count = sum(1 for cb, _ in self._checks if cb.isChecked())
+        self._warning_lbl.setVisible(selected_count > self._WARN_THRESHOLD)
+
+    def selected_chapters(self) -> list[MangaChapter]:
+        return [chapter for cb, chapter in self._checks if cb.isChecked()]
+
+
+class MangaDownloadActionWidget(QWidget):
+
+    _DEFAULT_BUTTON_COLOR = QColor('#00b7c3')
+
+    def __init__(self, download_bridge: MangaDownloadBridge, parent=None):
+        super().__init__(parent)
+        self._download_bridge = download_bridge
+        self._entry: MangaEntry | None = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self._button = PrimaryPushButton(tr('books.manga_download_button'), self)
+        self._button.setFixedHeight(32)
+        self._button.clicked.connect(self._on_click)
+        layout.addWidget(self._button)
+        self._current_accent_color: QColor | None = None
+        qconfig.themeColorChanged.connect(self._deferred_reapply_accent_color)
+        qconfig.themeChanged.connect(self._deferred_reapply_accent_color)
+
+    def set_accent_color(self, color) -> None:
+        self._current_accent_color = color
+        self._reapply_accent_color()
+
+    def _deferred_reapply_accent_color(self) -> None:
+        self._reapply_accent_color()
+        QTimer.singleShot(0, self._reapply_accent_color)
+
+    def _reapply_accent_color(self) -> None:
+        color = self._current_accent_color
+        if color is None:
+            color = self._DEFAULT_BUTTON_COLOR
+        luminance = 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
+        text_color = '#1a1a1a' if luminance > 150 else '#ffffff'
+        hover = color.lighter(112)
+        pressed = color.darker(112)
+        self._button.setStyleSheet(
+            f'PrimaryPushButton {{ background-color: rgb({color.red()}, {color.green()}, {color.blue()}); '
+            f'color: {text_color}; border: none; border-radius: 8px; }} '
+            f'PrimaryPushButton:hover {{ background-color: rgb({hover.red()}, {hover.green()}, {hover.blue()}); color: {text_color}; }} '
+            f'PrimaryPushButton:pressed {{ background-color: rgb({pressed.red()}, {pressed.green()}, {pressed.blue()}); color: {text_color}; }}'
+        )
+
+    def set_entry(self, entry: MangaEntry | None) -> None:
+        self._entry = entry
+        downloadable = bool(entry and any(c.is_downloadable for c in entry.chapters))
+        self.setVisible(downloadable)
+
+    def _on_click(self) -> None:
+        if self._entry is None:
+            return
+        downloadable = [c for c in self._entry.chapters if c.is_downloadable]
+        if not downloadable:
+            return
+        dialog = MangaChapterSelectDialog(downloadable, parent=self.window())
+        if not dialog.exec():
+            return
+        for chapter in dialog.selected_chapters():
+            try:
+                self._download_bridge.download_chapter(self._entry.title, chapter)
+            except Exception as exc:
+                logger.warning('Failed to queue manga chapter download: %s', exc)
+
+    def shutdown(self) -> None:
+        pass
+
+
+class MangaDetailsView(QWidget):
+
+    back_requested = Signal()
+
+    COVER_WIDTH = 220
+    COVER_HEIGHT = 310
+
+    def __init__(self, download_bridge: MangaDownloadBridge, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet('background: transparent;')
+        self._download_bridge = download_bridge
+        self._current_manga_title = ''
+        self._cover_url = ''
+        artwork.full_ready.connect(self._on_cover_ready)
+        artwork.failed.connect(self._on_cover_failed)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 4, 0, 0)
+        outer.setSpacing(10)
+
+        back_btn = PushButton(FluentIcon.RETURN, tr('books.back_to_grid'))
+        back_btn.setFixedHeight(32)
+        back_btn.clicked.connect(self.back_requested.emit)
+        outer.addWidget(back_btn, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self._scroll = SmoothScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._scroll.setStyleSheet('background: transparent; border: none;')
+        outer.addWidget(self._scroll, 1)
+
+        content = QWidget()
+        self._scroll.setWidget(content)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(4, 12, 24, 40)
+        content_layout.setSpacing(24)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(40)
+        top_row.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        cover_container = QWidget()
+        cover_container.setFixedWidth(self.COVER_WIDTH)
+        cover_col = QVBoxLayout(cover_container)
+        cover_col.setContentsMargins(0, 0, 0, 0)
+        cover_col.setSpacing(12)
+        self._cover_lbl = ImageLabel(cover_container)
+        self._cover_lbl.setBorderRadius(10, 10, 10, 10)
+        self._cover_lbl.setFixedSize(self.COVER_WIDTH, self.COVER_HEIGHT)
+        cover_col.addWidget(self._cover_lbl, 0, Qt.AlignmentFlag.AlignTop)
+
+        self._download_action = MangaDownloadActionWidget(download_bridge, cover_container)
+        cover_col.addWidget(self._download_action, 0, Qt.AlignmentFlag.AlignTop)
+
+        self._open_btn = HyperlinkButton('', tr('books.manga_view_on_mangadex'), cover_container)
+        self._open_btn.setFixedHeight(32)
+        self._apply_open_btn_style()
+        qconfig.themeColorChanged.connect(self._deferred_apply_open_btn_style)
+        qconfig.themeChanged.connect(self._deferred_apply_open_btn_style)
+        cover_col.addWidget(self._open_btn, 0)
+        cover_col.addStretch(1)
+        top_row.addWidget(cover_container, 0, Qt.AlignmentFlag.AlignTop)
+
+        info_col_container = QWidget()
+        info_col = QVBoxLayout(info_col_container)
+        info_col.setContentsMargins(0, 0, 0, 0)
+        info_col.setSpacing(16)
+
+        self._title_lbl = TitleLabel('')
+        self._title_lbl.setWordWrap(True)
+        self._title_lbl.setStyleSheet(f'font-weight: 700; color: {palette()["primary_text"]};')
+        info_col.addWidget(self._title_lbl)
+
+        self._meta_grid = QGridLayout()
+        self._meta_grid.setHorizontalSpacing(40)
+        self._meta_grid.setVerticalSpacing(10)
+        info_col.addLayout(self._meta_grid)
+
+        tags_header = CaptionLabel(tr('books.subjects_genres'))
+        tags_header.setStyleSheet(f'font-weight: 400; color: {_muted_text_color()};')
+        info_col.addWidget(tags_header)
+        self._tags_container = QWidget()
+        self._tags_layout = QFlowLayout(self._tags_container, needAni=False, isTight=True)
+        self._tags_layout.setContentsMargins(0, 0, 0, 0)
+        self._tags_layout.setHorizontalSpacing(8)
+        self._tags_layout.setVerticalSpacing(8)
+        info_col.addWidget(self._tags_container)
+        self._tag_widgets: list[QWidget] = []
+
+        desc_header = StrongBodyLabel(tr('repacks.description'))
+        desc_header.setStyleSheet(f'font-size: 16px; font-weight: 600; color: {palette()["primary_text"]};')
+        info_col.addWidget(desc_header)
+        self._desc_lbl = BodyLabel('')
+        self._desc_lbl.setWordWrap(True)
+        self._desc_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._desc_lbl.setOpenExternalLinks(True)
+        self._desc_lbl.setStyleSheet(f'font-size: 15px; font-weight: 500; line-height: 170%; color: {_body_text_color()};')
+        info_col.addWidget(self._desc_lbl)
+        info_col.addStretch(1)
+        top_row.addWidget(info_col_container, 1, Qt.AlignmentFlag.AlignTop)
+        content_layout.addLayout(top_row)
+
+        chapters_header = StrongBodyLabel(tr('books.manga_chapters'))
+        chapters_header.setStyleSheet(f'font-size: 16px; font-weight: 600; color: {palette()["primary_text"]};')
+        content_layout.addWidget(chapters_header)
+        self._chapters_container = QWidget()
+        self._chapters_layout = QVBoxLayout(self._chapters_container)
+        self._chapters_layout.setContentsMargins(0, 0, 0, 0)
+        self._chapters_layout.setSpacing(6)
+        content_layout.addWidget(self._chapters_container)
+        content_layout.addStretch(1)
+
+        self._loading_lbl = BodyLabel(tr('books.loading_details'), self)
+        self._loading_lbl.setStyleSheet(f'color: {_muted_text_color()};')
+        content_layout.addWidget(self._loading_lbl)
+
+    def _deferred_apply_open_btn_style(self) -> None:
+        self._apply_open_btn_style()
+        QTimer.singleShot(0, self._apply_open_btn_style)
+
+    def _apply_open_btn_style(self) -> None:
+        color = themeColor()
+        base_alpha = 55 if isDarkTheme() else 40
+        hover_alpha = 85 if isDarkTheme() else 65
+        text_color = palette()['primary_text']
+        self._open_btn.setStyleSheet(
+            f'HyperlinkButton {{ background-color: rgba({color.red()}, {color.green()}, {color.blue()}, {base_alpha}); '
+            f'border-radius: 8px; padding: 6px 16px; font-weight: 600; color: {text_color}; }} '
+            f'HyperlinkButton:hover {{ background-color: rgba({color.red()}, {color.green()}, {color.blue()}, {hover_alpha}); color: {text_color}; }}'
+        )
+
+    def _chapter_button_qss(self) -> tuple[str, str]:
+        color = themeColor()
+        base_alpha = 55 if isDarkTheme() else 40
+        hover_alpha = 85 if isDarkTheme() else 65
+        text_color = palette()['primary_text']
+        read_qss = (
+            f'HyperlinkButton {{ background-color: rgba({color.red()}, {color.green()}, {color.blue()}, {base_alpha}); '
+            f'border-radius: 6px; padding: 4px 12px; font-weight: 600; color: {text_color}; }} '
+            f'HyperlinkButton:hover {{ background-color: rgba({color.red()}, {color.green()}, {color.blue()}, {hover_alpha}); color: {text_color}; }}'
+        )
+        neutral = QColor(_muted_text_color())
+        neutral_base_alpha = 45 if isDarkTheme() else 35
+        neutral_hover_alpha = 75 if isDarkTheme() else 55
+        download_qss = (
+            f'TransparentToolButton {{ background-color: rgba({neutral.red()}, {neutral.green()}, {neutral.blue()}, {neutral_base_alpha}); border-radius: 6px; }} '
+            f'TransparentToolButton:hover {{ background-color: rgba({neutral.red()}, {neutral.green()}, {neutral.blue()}, {neutral_hover_alpha}); }}'
+        )
+        return read_qss, download_qss
+
+    def show_loading(self, entry: MangaEntry) -> None:
+        self._title_lbl.setText(entry.title)
+        self._cover_lbl.setImage(QPixmap())
+        self._desc_lbl.setText('')
+        self._clear_meta()
+        self._clear_tags()
+        self._clear_chapters()
+        self._open_btn.setUrl(entry.web_url)
+        self._download_action.set_accent_color(None)
+        self._download_action.set_entry(None)
+        self._loading_lbl.setVisible(True)
+        cover_url = entry.cover_url_full or entry.cover_url
+        self._cover_url = cover_url
+        if not cover_url:
+            return
+        if artwork_has_full('manga', cover_url):
+            self._apply_cover_path(artwork_full_path('manga', cover_url))
+        else:
+            artwork.request('manga', cover_url, want_full=True)
+
+    def _on_cover_ready(self, kind: str, url: str, path: str) -> None:
+        if kind != 'manga' or url != self._cover_url:
+            return
+        self._apply_cover_path(path)
+
+    def _on_cover_failed(self, kind: str, url: str, _error: str) -> None:
+        if kind != 'manga' or url != self._cover_url:
+            return
+
+    def _apply_cover_path(self, path: str) -> None:
+        pix = _load_scaled_pixmap(path, self.COVER_WIDTH, self.COVER_HEIGHT)
+        if pix is None or pix.isNull():
+            return
+        self._cover_lbl.setImage(pix)
+        self._cover_lbl.setFixedSize(self.COVER_WIDTH, self.COVER_HEIGHT)
+        self._download_action.set_accent_color(_dominant_color(path))
+
+    def show_details(self, entry: MangaEntry) -> None:
+        self._loading_lbl.setVisible(False)
+        self._title_lbl.setText(entry.title)
+        self._current_manga_title = entry.title
+        self._open_btn.setUrl(entry.web_url)
+        self._download_action.set_entry(entry)
+        self._desc_lbl.setText(render_description_html(_clean_manga_description(entry.description)) or tr('books.no_description'))
+
+        self._clear_meta()
+        row = 0
+        if entry.status:
+            self._meta_grid.addWidget(MetaField(tr('books.manga_status'), entry.status), 0, row)
+            row += 1
+        if entry.year:
+            self._meta_grid.addWidget(MetaField(tr('books.manga_year'), str(entry.year)), 0, row)
+            row += 1
+        if entry.content_rating:
+            self._meta_grid.addWidget(MetaField(tr('books.manga_content_rating'), entry.content_rating), 0, row)
+            row += 1
+
+        self._clear_tags()
+        seen_tags: set[str] = set()
+        for tag in entry.tags:
+            key = tag.strip().lower()
+            if not key or key in seen_tags:
+                continue
+            seen_tags.add(key)
+            pill = make_tag_pill(tag, self._tags_container)
+            pill.adjustSize()
+            self._tags_layout.addWidget(pill)
+            self._tag_widgets.append(pill)
+        if self._tag_widgets:
+            QTimer.singleShot(0, self._tags_layout.update)
+
+        self._clear_chapters()
+        if not entry.chapters:
+            empty_lbl = CaptionLabel(tr('books.manga_no_chapters'), self._chapters_container)
+            empty_lbl.setStyleSheet(f'color: {_muted_text_color()};')
+            self._chapters_layout.addWidget(empty_lbl)
+        else:
+            for chapter in entry.chapters:
+                self._chapters_layout.addWidget(self._build_chapter_row(entry.title, chapter))
+
+    def _build_chapter_row(self, manga_title: str, chapter: MangaChapter) -> QWidget:
+        row = QWidget(self._chapters_container)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(12)
+        label_text = chapter.label
+        if chapter.scanlation_group:
+            label_text = f'{label_text}  ·  {chapter.scanlation_group}'
+        lbl = BodyLabel(label_text, row)
+        lbl.setStyleSheet(f'color: {_body_text_color()};')
+        row_layout.addWidget(lbl, 1)
+
+        read_btn = HyperlinkButton(chapter.web_url, tr('books.manga_read'), row)
+        row_layout.addWidget(read_btn, 0)
+
+        read_qss, download_qss = self._chapter_button_qss()
+        read_btn.setStyleSheet(read_qss)
+
+        if chapter.is_downloadable:
+            status_lbl = CaptionLabel('', row)
+            status_lbl.setStyleSheet(f'color: {_muted_text_color()};')
+            row_layout.addWidget(status_lbl, 0)
+
+            download_btn = TransparentToolButton(FluentIcon.DOWNLOAD, row)
+            download_btn.setFixedSize(28, 28)
+            download_btn.setStyleSheet(download_qss)
+            download_btn.setToolTip(tr('books.manga_download'))
+            download_btn.clicked.connect(
+                lambda _checked=False, c=chapter, s=status_lbl, b=download_btn: self._start_chapter_download(manga_title, c, s, b)
+            )
+            row_layout.addWidget(download_btn, 0, Qt.AlignmentFlag.AlignRight)
+        return row
+
+    def _start_chapter_download(self, manga_title: str, chapter: MangaChapter, status_lbl: QLabel, btn: TransparentToolButton) -> None:
+        btn.setEnabled(False)
+        try:
+            self._download_bridge.download_chapter(manga_title, chapter)
+        except Exception as exc:
+            logger.warning('Failed to queue manga chapter download: %s', exc)
+            status_lbl.setText(tr('books.manga_download_failed'))
+            btn.setEnabled(True)
+            return
+        status_lbl.setText(tr('books.manga_downloading'))
+        btn.setEnabled(True)
+
+    def show_error(self, _message: str) -> None:
+        self._loading_lbl.setVisible(False)
+        self._desc_lbl.setText(tr('books.failed_to_load'))
+
+    def _clear_meta(self) -> None:
+        while self._meta_grid.count():
+            item = self._meta_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _clear_tags(self) -> None:
+        for tag in self._tag_widgets:
+            self._tags_layout.removeWidget(tag)
+            tag.deleteLater()
+        self._tag_widgets.clear()
+
+    def _clear_chapters(self) -> None:
+        while self._chapters_layout.count():
+            item = self._chapters_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def shutdown(self) -> None:
+        try:
+            artwork.full_ready.disconnect(self._on_cover_ready)
+            artwork.failed.disconnect(self._on_cover_failed)
+        except (TypeError, RuntimeError):
+            pass
+
+
+class MangaBrowserTab(QWidget):
+    """Browse/search MangaDex, backed by https://api.mangadex.org."""
+
+    def __init__(self, download_manager, parent=None, manga_download_bridge=None):
+        super().__init__(parent)
+        self.setStyleSheet('background: transparent;')
+        self._download_bridge = manga_download_bridge or MangaDownloadBridge(download_manager, self)
+        self._query = ''
+        self._page = 1
+        self._has_more = True
+        self._loading = False
+        self._task_id: str | None = None
+        self._details_task_id: str | None = None
+        self._details_cache: "OrderedDict[str, MangaEntry]" = OrderedDict()
+        self._current_details_key: str | None = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(14)
+
+        header_row = QHBoxLayout()
+        self._search_edit = SearchLineEdit(self)
+        self._search_edit.setMinimumWidth(140)
+        self._search_edit.setMaximumWidth(280)
+        self._search_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._search_edit.setPlaceholderText(tr('books.manga_search_placeholder'))
+        self._search_edit.returnPressed.connect(self._on_search)
+        self._search_edit.searchSignal.connect(self._on_search)
+        self._search_edit.clearSignal.connect(self._on_search_cleared)
+        header_row.addWidget(self._search_edit)
+        header_row.addStretch(1)
+        outer.addLayout(header_row)
+
+        self._stack = QStackedWidget()
+        outer.addWidget(self._stack, 1)
+
+        self._grid = MangaGridView(self)
+        self._grid.manga_clicked.connect(self._show_details)
+        self._grid.near_bottom.connect(self._on_near_bottom)
+        self._grid.near_top.connect(self._on_near_top)
+        self._stack.addWidget(self._grid)
+
+        self._details = MangaDetailsView(self._download_bridge, self)
+        self._details.back_requested.connect(self._show_grid)
+        self._stack.addWidget(self._details)
+
+        self._stack.setCurrentWidget(self._grid)
+        self._load_page(reset=True)
+
+    def _on_search(self) -> None:
+        query = self._search_edit.text().strip()
+        if query == self._query:
+            return
+        self._query = query
+        self._load_page(reset=True)
+
+    def _on_search_cleared(self) -> None:
+        if not self._query:
+            return
+        self._query = ''
+        self._load_page(reset=True)
+
+    def _on_near_bottom(self) -> None:
+        if not self._loading and self._has_more:
+            self._load_page(reset=False)
+
+    def _on_near_top(self) -> None:
+        if self._loading or self._page <= 2:
+            return
+        self._task_id and cancel(self._task_id)
+        self._task_id = None
+        self._loading = False
+        self._has_more = True
+        self._page = 1
+        self._grid.clear()
+        self._load_page(reset=False)
+
+    def _load_page(self, reset: bool) -> None:
+        if self._task_id is not None:
+            cancel(self._task_id)
+            self._task_id = None
+        if reset:
+            self._page = 1
+            self._has_more = True
+            self._grid.clear()
+        self._loading = True
+        self._grid.set_has_more(self._has_more, loading=True)
+        page = self._page
+        if self._query:
+            self._task_id = submit(
+                manga_manager.search_all, args=(self._query, page),
+                on_done=lambda result: self._on_page_loaded(page, result),
+                on_error=self._on_page_error,
+            )
+        else:
+            self._task_id = submit(
+                manga_manager.browse_all, args=(page,),
+                on_done=lambda result: self._on_page_loaded(page, result),
+                on_error=self._on_page_error,
+            )
+
+    def _on_page_loaded(self, page: int, result) -> None:
+        self._task_id = None
+        self._loading = False
+        self._has_more = result.has_more
+        self._page = page + 1
+        self._grid.add_entries(result.entries)
+        self._grid.set_has_more(self._has_more, loading=False)
+
+    def _on_page_error(self, message: str) -> None:
+        logger.warning('MangaDex page load failed: %s', message)
+        self._task_id = None
+        self._loading = False
+        self._has_more = False
+        self._grid.set_has_more(False, loading=False)
+        InfoBar.error(
+            title=tr('books.manga_load_failed_title'),
+            content=str(message),
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=4000,
+            parent=self.window(),
+        )
+
+    def _switch_stack_animated(self, widget) -> None:
+        if self._stack.currentWidget() is widget:
+            return
+        old_group = getattr(self, '_stack_fade_anim', None)
+        if old_group is not None:
+            old_group.stop()
+            for i in range(self._stack.count()):
+                page = self._stack.widget(i)
+                page.setGraphicsEffect(None)
+                page.move(0, 0)
+            self._stack_fade_anim = None
+        self._stack.setCurrentWidget(widget)
+        widget.move(0, 0)
+        effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(effect)
+        widget.move(36, 0)
+
+        fade = QPropertyAnimation(effect, b'opacity', widget)
+        fade.setDuration(220)
+        fade.setStartValue(0.0)
+        fade.setEndValue(1.0)
+        fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        slide = QPropertyAnimation(widget, b'pos', widget)
+        slide.setDuration(220)
+        slide.setStartValue(QPoint(36, 0))
+        slide.setEndValue(QPoint(0, 0))
+        slide.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        group = QParallelAnimationGroup(widget)
+        group.addAnimation(fade)
+        group.addAnimation(slide)
+
+        def _cleanup():
+            widget.setGraphicsEffect(None)
+            widget.move(0, 0)
+            self._stack_fade_anim = None
+        group.finished.connect(_cleanup)
+        self._stack_fade_anim = group
+        group.start()
+
+    def _show_details(self, entry: MangaEntry) -> None:
+        if self._details_task_id is not None:
+            cancel(self._details_task_id)
+            self._details_task_id = None
+        self._current_details_key = entry.key
+        self._details.show_loading(entry)
+        self._switch_stack_animated(self._details)
+
+        cached = self._details_cache.get(entry.key)
+        if cached is not None:
+            self._details_cache.move_to_end(entry.key)
+            self._details.show_details(cached)
+            return
+
+        self._details_task_id = submit(
+            manga_manager.details_for_entry, args=(entry,),
+            on_done=lambda details, k=entry.key: self._on_details_loaded(k, details),
+            on_error=lambda error, k=entry.key: self._on_details_error(k, error),
+        )
+
+    def _on_details_loaded(self, key: str, details) -> None:
+        self._details_task_id = None
+        if key != self._current_details_key:
+            return
+        if details is None:
+            self._details.show_error('not found')
+            return
+        self._details_cache[key] = details
+        self._details_cache.move_to_end(key)
+        while len(self._details_cache) > 25:
+            self._details_cache.popitem(last=False)
+        self._details.show_details(details)
+
+    def _on_details_error(self, key: str, message: str) -> None:
+        self._details_task_id = None
+        if key != self._current_details_key:
+            return
+        logger.warning('Manga details load failed: %s', message)
+        self._details.show_error(message)
+
+    def _show_grid(self) -> None:
+        if self._details_task_id is not None:
+            cancel(self._details_task_id)
+            self._details_task_id = None
+        self._current_details_key = None
+        self._switch_stack_animated(self._grid)
+
+    def shutdown(self) -> None:
+        if self._task_id is not None:
+            cancel(self._task_id)
+        if self._details_task_id is not None:
+            cancel(self._details_task_id)
+        self._details.shutdown()
+        self._grid.clear()
+
+
+class BooksBrowserTab(QWidget):
 
     _DETAILS_CACHE_LIMIT = 25
 
@@ -1066,7 +1921,7 @@ class BooksPage(QWidget):
         self._selected_sources: list[str] = list(self._all_sources)
         self.setStyleSheet('background: transparent;')
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(20, 12, 20, 20)
+        outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(14)
         header_row = QHBoxLayout()
         self._search_edit = SearchLineEdit(self)
@@ -1296,5 +2151,56 @@ class BooksPage(QWidget):
             pass
         self._grid.shutdown()
         self._download_bridge.shutdown()
+
+
+class BooksPage(QWidget):
+    """Top-level page hosting the Books and Manga tabs."""
+
+    def __init__(self, download_manager, parent=None, manga_download_bridge=None):
+        super().__init__(parent)
+        self.setObjectName('booksPage')
+        self.setStyleSheet('background: transparent;')
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 12, 20, 20)
+        outer.setSpacing(14)
+
+        self._pivot = Pivot()
+        outer.addWidget(self._pivot)
+
+        self._section_stack = QStackedWidget()
+        outer.addWidget(self._section_stack, 1)
+
+        self._tabs: dict[str, QWidget] = {}
+
+        self._books_tab = BooksBrowserTab(download_manager, self)
+        self._add_tab('books', 'Books', self._books_tab)
+
+        self._manga_tab = MangaBrowserTab(
+            download_manager, self, manga_download_bridge=manga_download_bridge
+        )
+        self._add_tab('manga', 'Manga', self._manga_tab)
+
+        self._pivot.currentItemChanged.connect(self._on_tab_changed)
+        self._pivot.setCurrentItem('books')
+        self._section_stack.setCurrentWidget(self._books_tab)
+
+    def _add_tab(self, key: str, display_name: str, widget: QWidget) -> None:
+        self._tabs[key] = widget
+        self._section_stack.addWidget(widget)
+        self._pivot.addItem(routeKey=key, text=display_name)
+
+    def _on_tab_changed(self, key: str) -> None:
+        widget = self._tabs.get(key)
+        if widget is not None:
+            self._section_stack.setCurrentWidget(widget)
+
+    def shutdown(self) -> None:
+        for tab in self._tabs.values():
+            shutdown_fn = getattr(tab, 'shutdown', None)
+            if callable(shutdown_fn):
+                try:
+                    shutdown_fn()
+                except Exception:
+                    logger.exception('Failed to shut down books sub-tab')
 
 

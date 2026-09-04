@@ -30,7 +30,7 @@ def clear_source_cache(source_key: str) -> None:
     _cache.clear_namespace(f"repacks:{source_key}:details")
 
 
-_ALL_SOURCE_KEYS = ["fitgirl"]
+_ALL_SOURCE_KEYS = ["fitgirl", "gog"]
 
 
 def clear_all_cache() -> None:

@@ -1,21 +1,11 @@
 from __future__ import annotations
-
 import logging
 import random
-
 from PySide6.QtCore import QObject, QUrl, Signal
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-
 from src.core.models import MusicItem as Song
-
 logger = logging.getLogger(__name__)
-
-_PLAYBACK_STATE_LABELS = {
-    QMediaPlayer.PlaybackState.PlayingState: "playing",
-    QMediaPlayer.PlaybackState.PausedState: "paused",
-    QMediaPlayer.PlaybackState.StoppedState: "stopped",
-}
-
+_PLAYBACK_STATE_LABELS = {QMediaPlayer.PlaybackState.PlayingState: 'playing', QMediaPlayer.PlaybackState.PausedState: 'paused', QMediaPlayer.PlaybackState.StoppedState: 'stopped'}
 
 class MusicPreviewPlayer(QObject):
     state_changed = Signal(str)
@@ -50,7 +40,7 @@ class MusicPreviewPlayer(QObject):
         self._rebuild_order(current)
         self.queue_changed.emit()
 
-    def _rebuild_order(self, keep_song: Song | None = None) -> None:
+    def _rebuild_order(self, keep_song: Song | None=None) -> None:
         n = len(self._queue)
         self._order = list(range(n))
         if self._shuffle:
@@ -76,7 +66,7 @@ class MusicPreviewPlayer(QObject):
     def shuffle(self) -> bool:
         return self._shuffle
 
-    def play_song(self, song: Song, url: str, queue: list[Song] | None = None, urls: dict[str, str] | None = None) -> None:
+    def play_song(self, song: Song, url: str, queue: list[Song] | None=None, urls: dict[str, str] | None=None) -> None:
         if queue is not None:
             self.set_queue(queue, urls or {song.key: url})
         elif song not in self._queue:
@@ -89,12 +79,12 @@ class MusicPreviewPlayer(QObject):
         self._play_current()
 
     def _play_current(self) -> None:
-        if not (0 <= self._index < len(self._order)):
+        if not 0 <= self._index < len(self._order):
             return
         song = self._queue[self._order[self._index]]
         url = self._urls.get(song.key)
         if not url:
-            self.error.emit("No preview available for this track")
+            self.error.emit('No preview available for this track')
             return
         self._current_song = song
         self._player.setSource(QUrl(url))
@@ -126,7 +116,7 @@ class MusicPreviewPlayer(QObject):
 
     @property
     def has_next(self) -> bool:
-        return (self._index + 1) < len(self._order) or self._repeat
+        return self._index + 1 < len(self._order) or self._repeat
 
     @property
     def has_previous(self) -> bool:
@@ -187,7 +177,7 @@ class MusicPreviewPlayer(QObject):
         return self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
 
     def _on_state_changed(self, state) -> None:
-        self.state_changed.emit(_PLAYBACK_STATE_LABELS.get(state, "stopped"))
+        self.state_changed.emit(_PLAYBACK_STATE_LABELS.get(state, 'stopped'))
 
     def _on_media_status_changed(self, status) -> None:
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
@@ -197,5 +187,5 @@ class MusicPreviewPlayer(QObject):
                 self.stop()
 
     def _on_error(self, error, error_string: str) -> None:
-        logger.warning("Music preview player error: %s", error_string)
+        logger.warning('Music preview player error: %s', error_string)
         self.error.emit(error_string)

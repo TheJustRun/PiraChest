@@ -53,6 +53,10 @@ def _download_dir_for_category(category: str) -> str:
         return getattr(settings, 'download_dir_anime', os.path.join(settings.download_dir, 'anime'))
     if category == 'youtube':
         return getattr(settings, 'download_dir_youtube', os.path.join(settings.download_dir, 'youtube'))
+    if category == 'manga':
+        return getattr(settings, 'download_dir_manga', os.path.join(settings.download_dir, 'manga'))
+    if category == 'books':
+        return getattr(settings, 'download_dir_books', os.path.join(settings.download_dir, 'books'))
     return getattr(settings, 'download_dir_minerva', settings.download_dir)
 
 def _human_bytes(n: float) -> str:
@@ -163,6 +167,7 @@ class DownloadManager(QObject):
     item_removed = Signal(str)
     stats_changed = Signal()
     order_changed = Signal()
+    all_downloads_finished = Signal()
 
     def __init__(self, parent: Optional[QObject]=None) -> None:
         super().__init__(parent)
@@ -197,6 +202,7 @@ class DownloadManager(QObject):
         self._timer.timeout.connect(self._poll)
         self._save_counter = 0
         self._dirty = False
+        self._had_downloading_work = False
         self._load_state()
         self._timer.start()
         self._try_start_next()
@@ -386,6 +392,24 @@ class DownloadManager(QObject):
         self._save_state()
         self._try_start_next()
 
+    def pause_all(self) -> None:
+        with self._lock:
+            ids = [i for i, it in self._items.items() if it.state in (DLState.queued, DLState.downloading, DLState.verifying, DLState.seeding)]
+        for item_id in ids:
+            self.pause(item_id)
+
+    def resume_all(self) -> None:
+        with self._lock:
+            ids = [i for i, it in self._items.items() if it.state == DLState.paused]
+        for item_id in ids:
+            self.resume(item_id)
+
+    def remove_all(self, delete_files: bool=False) -> None:
+        with self._lock:
+            ids = list(self._order)
+        for item_id in ids:
+            self.remove(item_id, delete_files=delete_files)
+
     def retry(self, item_id: str) -> None:
         with self._lock:
             item = self._items.get(item_id)
@@ -550,7 +574,20 @@ class DownloadManager(QObject):
                 return True
         return False
 
+    def _has_downloading_work(self) -> bool:
+        for item_id in self._order:
+            item = self._items.get(item_id)
+            if item is not None and item.state in (DLState.queued, DLState.downloading, DLState.verifying):
+                return True
+        return False
+
     def _sync_timer_state(self) -> None:
+        is_downloading = self._has_downloading_work()
+        if is_downloading:
+            self._had_downloading_work = True
+        elif self._had_downloading_work:
+            self._had_downloading_work = False
+            self.all_downloads_finished.emit()
         if self._has_pending_work():
             if not self._timer.isActive():
                 self._timer.start()
@@ -690,7 +727,7 @@ class DownloadManager(QObject):
             if handle is not None:
                 try:
                     if remove_files and lt is not None:
-                        self._session.remove_torrent(handle, lt.options_t.delete_files)
+                        self._session.remove_torrent(handle, lt.session.delete_files)
                     else:
                         self._session.remove_torrent(handle)
                 except Exception:
@@ -731,6 +768,9 @@ class DownloadManager(QObject):
             by_stem = self._find_file_by_stem(base_dir, item.game_name)
             if by_stem:
                 candidates.append(by_stem)
+            fuzzy = self._find_dir_by_fuzzy_name(base_dir, item.game_name)
+            if fuzzy:
+                candidates.append(fuzzy)
         deleted_any = False
         for path in candidates:
             if not path or not os.path.exists(path):
@@ -745,6 +785,21 @@ class DownloadManager(QObject):
                 logger.exception('Failed to delete files for %s at %s', item_id, path)
         if not deleted_any:
             logger.warning('No files found to delete for %s (checked: %s)', item_id, candidates)
+
+    def _find_dir_by_fuzzy_name(self, base_dir: str, game_name: str) -> Optional[str]:
+        if not game_name or not os.path.isdir(base_dir):
+            return None
+        target = re.sub('[^a-z0-9]+', '', game_name.lower())
+        if not target:
+            return None
+        for name in os.listdir(base_dir):
+            full = os.path.join(base_dir, name)
+            if not os.path.isdir(full):
+                continue
+            candidate = re.sub('[^a-z0-9]+', '', name.lower())
+            if candidate == target or target in candidate or candidate in target:
+                return full
+        return None
 
     def _poll(self) -> None:
         for item_id in list(self._handles.keys()):
@@ -918,9 +973,9 @@ class DownloadManager(QObject):
         self.item_updated.emit(item_id)
         self._save_state()
 
-    def fetch_file_list(self, torrent_file: str, timeout_secs: float=30.0) -> list[tuple[str, int]]:
+    def fetch_file_list(self, torrent_file: str, timeout_secs: float=20.0, category: str='repacks') -> list[tuple[str, int]]:
         source = self._resolve_torrent(torrent_file)
-        handle = self._add_torrent(source, settings.download_dir)
+        handle = self._add_torrent(source, _download_dir_for_category(category))
         try:
             start = time.time()
             while not handle.status().has_metadata:
@@ -941,9 +996,12 @@ class DownloadManager(QObject):
             except Exception:
                 pass
             try:
-                self._session.remove_torrent(handle)
+                self._session.remove_torrent(handle, lt.session.delete_files)
             except Exception:
-                pass
+                try:
+                    self._session.remove_torrent(handle)
+                except Exception:
+                    pass
 
     def _add_torrent(self, torrent_source: str, save_path: str):
         if torrent_source.startswith('magnet:'):

@@ -106,7 +106,7 @@ class CacheManager:
         self._mem_set(mem_key, fetched_at, value)
         path = self._path(namespace, key)
         payload = json.dumps({"fetched_at": fetched_at, "value": value}, separators=_JSON_SEPARATORS, ensure_ascii=False).encode("utf-8")
-        tmp_path = path + ".tmp"
+        tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         try:
             with open(tmp_path, "wb") as raw:
                 with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=_GZIP_LEVEL) as fh:
@@ -180,7 +180,7 @@ class CacheManager:
             self._entry_index.setdefault(namespace, set()).add(key)
 
         path = self._path(namespace, key)
-        tmp_path = path + ".tmp"
+        tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         payload = json.dumps(entry, separators=_JSON_SEPARATORS, ensure_ascii=False, default=_entry_json_default).encode("utf-8")
         try:
             with open(tmp_path, "wb") as raw:

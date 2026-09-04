@@ -3,13 +3,14 @@ import logging
 import os
 import subprocess
 import sys
-from PySide6.QtCore import Qt, QSize, Signal
-from PySide6.QtGui import QColor, QPainter
-from PySide6.QtWidgets import QAbstractItemView, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QVBoxLayout, QWidget
-from qfluentwidgets import CaptionLabel, CardWidget, CheckBox, CompactSpinBox, DoubleSpinBox, FluentIcon, IconWidget, InfoBar, InfoBarPosition, MessageBox, MessageBoxBase, PrimaryPushButton, ProgressBar, PushButton, StrongBodyLabel, ToolButton, qconfig
+from PySide6.QtCore import Qt, QSize, Signal, QThread, QTimer, QUrl
+from PySide6.QtGui import QColor, QPainter, QDragEnterEvent, QDropEvent
+from PySide6.QtWidgets import QAbstractItemView, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QVBoxLayout, QWidget
+from qfluentwidgets import CaptionLabel, CardWidget, CheckBox, CompactSpinBox, DoubleSpinBox, FluentIcon, IconWidget, InfoBar, InfoBarPosition, LineEdit, MessageBox, MessageBoxBase, PrimaryPushButton, ProgressBar, PushButton, StrongBodyLabel, SubtitleLabel, ToolButton, TransparentToolButton, themeColor, qconfig
 from src.core.downloader import DLState, DownloadItem, DownloadManager
 from src.core.theme import palette, scroll_area_qss
 from src.core.translations import tr, register_locale_refresh
+from .repacks_page import SelectiveDownloadDialog, build_selective_entries_from_torrent, resolve_selective_file_indices, _FileListFetchThread
 logger = logging.getLogger(__name__)
 _STATE_COLOR_KEYS = {DLState.queued: 'state_queued', DLState.downloading: 'state_downloading', DLState.verifying: 'state_verifying', DLState.paused: 'state_paused', DLState.seeding: 'state_seeding', DLState.completed: 'state_completed', DLState.error: 'state_error', DLState.cancelled: 'state_cancelled'}
 _STATE_LABEL_KEYS = {DLState.queued: 'download.state_queued', DLState.downloading: 'download.state_downloading', DLState.verifying: 'download.state_verifying', DLState.paused: 'download.state_paused', DLState.seeding: 'download.state_seeding', DLState.completed: 'download.state_completed', DLState.error: 'download.state_error', DLState.cancelled: 'download.state_cancelled'}
@@ -86,6 +87,151 @@ class TorrentSettingsDialog(QDialog):
 
     def values(self) -> dict:
         return {'seed_after': self.chk_seed.isChecked(), 'max_down_kbps': self.spin_down.value(), 'max_up_kbps': self.spin_up.value(), 'max_peers': self.spin_peers.value(), 'ratio_limit': self.spin_ratio.value(), 'seed_time_limit_min': self.spin_seed_time.value()}
+
+class _DropZone(QFrame):
+    files_dropped = Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setFixedHeight(120)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(6)
+        icon = IconWidget(FluentIcon.DOWNLOAD)
+        icon.setFixedSize(28, 28)
+        icon_row = QHBoxLayout()
+        icon_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_row.addWidget(icon)
+        layout.addLayout(icon_row)
+        label = CaptionLabel(tr('download.drop_hint'))
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet(f'color: {_muted_color()};')
+        layout.addWidget(label)
+        self._refresh_style()
+        qconfig.themeChanged.connect(lambda *_: self._refresh_style())
+
+    def _refresh_style(self, active: bool=False) -> None:
+        c = palette()
+        border = c['card_hover'] if active else c['card_border']
+        self.setStyleSheet(f'_DropZone {{ background-color: {c["surface_tint"]}; border: 2px dashed {border}; border-radius: 10px; }}')
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            self._refresh_style(active=True)
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event) -> None:
+        self._refresh_style(active=False)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        self._refresh_style(active=False)
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.toLocalFile().lower().endswith('.torrent')]
+        if paths:
+            self.files_dropped.emit(paths)
+        event.acceptProposedAction()
+
+class AddTorrentDialog(MessageBoxBase):
+    torrent_file_chosen = Signal(str)
+    magnet_submitted = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.titleLabel = SubtitleLabel(tr('download.add_torrent'), self)
+        self.viewLayout.addWidget(self.titleLabel)
+        self._drop_zone = _DropZone(self)
+        self._drop_zone.files_dropped.connect(self._on_files_dropped)
+        self.viewLayout.addWidget(self._drop_zone)
+        browse_row = QHBoxLayout()
+        browse_row.addStretch(1)
+        self._browse_btn = PushButton(tr('download.browse_torrent_file'))
+        self._browse_btn.clicked.connect(self._on_browse)
+        browse_row.addWidget(self._browse_btn)
+        browse_row.addStretch(1)
+        self.viewLayout.addLayout(browse_row)
+        self.viewLayout.addSpacing(8)
+        magnet_label = CaptionLabel(tr('download.magnet_hint'))
+        magnet_label.setStyleSheet(f'color: {_muted_color()};')
+        self.viewLayout.addWidget(magnet_label)
+        self._magnet_edit = LineEdit(self)
+        self._magnet_edit.setPlaceholderText(tr('download.magnet_placeholder'))
+        self._magnet_edit.setClearButtonEnabled(True)
+        self.viewLayout.addWidget(self._magnet_edit)
+        self.yesButton.setText(tr('download.add'))
+        self.cancelButton.setText(tr('download.cancel'))
+        self.widget.setMinimumWidth(440)
+        self._chosen_file = ''
+
+    def _on_files_dropped(self, paths: list) -> None:
+        self._chosen_file = paths[0]
+        self._magnet_edit.clear()
+        self.accept()
+
+    def _on_browse(self) -> None:
+        path, _f = QFileDialog.getOpenFileName(self, tr('download.browse_torrent_file'), '', 'Torrent Files (*.torrent)')
+        if path:
+            self._chosen_file = path
+            self._magnet_edit.clear()
+            self.accept()
+
+    def accept(self) -> None:
+        if self._chosen_file:
+            self.torrent_file_chosen.emit(self._chosen_file)
+            super().accept()
+            return
+        magnet = self._magnet_edit.text().strip()
+        if magnet:
+            self.magnet_submitted.emit(magnet)
+            super().accept()
+
+class DonateDialog(MessageBoxBase):
+    WALLET_ADDRESS = 'TRF43NXf4rQTpKZT5oc6rf38j9PJ8RgGNs'
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.titleLabel = SubtitleLabel(tr('download.support_with_crypto'), self)
+        self.titleLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.viewLayout.addWidget(self.titleLabel)
+        sub = CaptionLabel('USDT (TRC-20)')
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setStyleSheet(f'color: {themeColor().name()}; font-weight: 700;')
+        self.viewLayout.addWidget(sub)
+        self.viewLayout.addSpacing(6)
+        from PySide6.QtGui import QPixmap
+        qr_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'photos', 'donate_qr.png')
+        qr_lbl = QLabel(self)
+        qr_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pix = QPixmap(qr_path)
+        if not pix.isNull():
+            qr_lbl.setPixmap(pix.scaled(220, 220, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        qr_row = QHBoxLayout()
+        qr_row.addStretch(1)
+        qr_row.addWidget(qr_lbl)
+        qr_row.addStretch(1)
+        self.viewLayout.addLayout(qr_row)
+        self.viewLayout.addSpacing(10)
+        addr_card = CardWidget(self)
+        addr_layout = QHBoxLayout(addr_card)
+        addr_layout.setContentsMargins(14, 10, 14, 10)
+        addr_lbl = CaptionLabel(self.WALLET_ADDRESS)
+        addr_lbl.setWordWrap(True)
+        addr_layout.addWidget(addr_lbl, 1)
+        copy_btn = TransparentToolButton(FluentIcon.COPY, addr_card)
+        copy_btn.setFixedSize(26, 26)
+        copy_btn.clicked.connect(self._copy_address)
+        addr_layout.addWidget(copy_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        addr_card.setCursor(Qt.CursorShape.PointingHandCursor)
+        addr_card.mousePressEvent = lambda _e: self._copy_address()
+        self.viewLayout.addWidget(addr_card)
+        self.yesButton.setText(tr('download.close'))
+        self.hideCancelButton()
+        self.widget.setMinimumWidth(360)
+
+    def _copy_address(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(self.WALLET_ADDRESS)
+        InfoBar.success(title=tr('download.copied'), content='', orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=1500, parent=self.window())
 
 class _StatusDot(QWidget):
 
@@ -262,7 +408,7 @@ class DownloadItemWidget(CardWidget):
             self._speed_label.setText(f'↓ {item.speed_down}   ↑ {item.speed_up}')
             self._extra_label.setStyleSheet(f'color: {muted};')
             self._extra_label.setText(tr('download.eta_peers', eta=item.eta, peers=item.peers))
-        can_pause = not is_external and item.state in (DLState.downloading, DLState.verifying)
+        can_pause = not is_external and item.state in (DLState.downloading, DLState.verifying, DLState.seeding)
         can_resume = not is_external and item.state == DLState.paused
         can_retry = item.state in (DLState.error, DLState.cancelled)
         can_cancel = item.state in (DLState.downloading, DLState.verifying, DLState.queued, DLState.paused, DLState.seeding)
@@ -275,6 +421,7 @@ class DownloadItemWidget(CardWidget):
         else:
             self._btn_open_file.setIcon(FluentIcon.DOCUMENT)
             self._btn_open_file.setToolTip(tr('download.open_file'))
+        self._btn_pause.setToolTip(tr('download.pause_seeding') if item.state == DLState.seeding else tr('download.pause'))
         self._btn_pause.setVisible(can_pause)
         self._btn_resume.setVisible(can_resume)
         self._btn_retry.setVisible(can_retry)
@@ -353,7 +500,9 @@ class DownloadManagerPage(QWidget):
     def __init__(self, manager: DownloadManager, parent=None):
         super().__init__(parent)
         self.setStyleSheet('background: transparent;')
+        self.setAcceptDrops(True)
         self._manager = manager
+        self._filelist_thread: _FileListFetchThread | None = None
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 12, 32, 24)
         root.setSpacing(18)
@@ -362,6 +511,26 @@ class DownloadManagerPage(QWidget):
         stats_row.setSpacing(12)
         self._stats = StatsBar()
         stats_row.addWidget(self._stats, 1)
+        self._btn_add = ToolButton(FluentIcon.ADD)
+        self._btn_add.setFixedSize(32, 32)
+        self._btn_add.setToolTip(tr('download.add_torrent'))
+        self._btn_add.clicked.connect(self._on_add_clicked)
+        stats_row.addWidget(self._btn_add, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._btn_pause_all = ToolButton(FluentIcon.PAUSE)
+        self._btn_pause_all.setFixedSize(32, 32)
+        self._btn_pause_all.setToolTip(tr('download.pause_all'))
+        self._btn_pause_all.clicked.connect(self._on_pause_all_clicked)
+        stats_row.addWidget(self._btn_pause_all, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._btn_resume_all = ToolButton(FluentIcon.PLAY)
+        self._btn_resume_all.setFixedSize(32, 32)
+        self._btn_resume_all.setToolTip(tr('download.resume_all'))
+        self._btn_resume_all.clicked.connect(self._on_resume_all_clicked)
+        stats_row.addWidget(self._btn_resume_all, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._btn_delete_all = ToolButton(FluentIcon.DELETE)
+        self._btn_delete_all.setFixedSize(32, 32)
+        self._btn_delete_all.setToolTip(tr('download.delete_all'))
+        self._btn_delete_all.clicked.connect(self._on_delete_all_clicked)
+        stats_row.addWidget(self._btn_delete_all, 0, Qt.AlignmentFlag.AlignVCenter)
         self._btn_open_downloads_root = PushButton(FluentIcon.FOLDER, tr('download.open_downloads_folder'))
         self._btn_open_downloads_root.clicked.connect(self._on_open_downloads_root)
         stats_row.addWidget(self._btn_open_downloads_root, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -402,6 +571,9 @@ class DownloadManagerPage(QWidget):
 
     def _on_locale_changed(self) -> None:
         self._btn_open_downloads_root.setText(tr('download.open_downloads_folder'))
+        self._btn_pause_all.setToolTip(tr('download.pause_all'))
+        self._btn_resume_all.setToolTip(tr('download.resume_all'))
+        self._btn_delete_all.setToolTip(tr('download.delete_all'))
         self._empty_title_lbl.setText(tr('download.no_downloads_yet'))
         self._empty_sub_lbl.setText(tr('download.empty_hint'))
         self._stats.retranslate()
@@ -584,6 +756,113 @@ class DownloadManagerPage(QWidget):
         if choice['value'] == 'cancel':
             return
         self._manager.remove(item_id, delete_files=(choice['value'] == 'delete'))
+
+    def _on_pause_all_clicked(self) -> None:
+        self._manager.pause_all()
+
+    def _on_resume_all_clicked(self) -> None:
+        self._manager.resume_all()
+
+    def _on_delete_all_clicked(self) -> None:
+        if not self._manager.items_in_order():
+            return
+        box = MessageBoxBase(self.window())
+        box_layout = QVBoxLayout()
+        box_layout.addWidget(StrongBodyLabel(tr('download.delete_all_title')))
+        content_lbl = CaptionLabel(tr('download.delete_all_content'))
+        content_lbl.setWordWrap(True)
+        box_layout.addWidget(content_lbl)
+        box.viewLayout.addLayout(box_layout)
+        choice = {'value': 'cancel'}
+
+        def _pick(val):
+            choice['value'] = val
+            box.accept()
+        try:
+            box.yesButton.clicked.disconnect()
+        except TypeError:
+            pass
+        try:
+            box.cancelButton.clicked.disconnect()
+        except TypeError:
+            pass
+        box.yesButton.setText(tr('download.delete_file'))
+        box.yesButton.clicked.connect(lambda: _pick('delete'))
+        box.cancelButton.setText(tr('download.keep_file'))
+        box.cancelButton.clicked.connect(lambda: _pick('keep'))
+        cancel_btn = PushButton(tr('download.cancel_action'))
+        cancel_btn.clicked.connect(lambda: _pick('cancel'))
+        button_row = None
+        try:
+            button_row = box.cancelButton.parentWidget().layout()
+        except Exception:
+            button_row = None
+        if button_row is not None:
+            button_row.insertWidget(0, cancel_btn)
+        else:
+            box.viewLayout.addWidget(cancel_btn)
+        box.exec()
+        if choice['value'] == 'cancel':
+            return
+        self._manager.remove_all(delete_files=(choice['value'] == 'delete'))
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls() and any(u.toLocalFile().lower().endswith('.torrent') for u in event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.toLocalFile().lower().endswith('.torrent')]
+        for path in paths:
+            self._start_selective_add(path)
+        event.acceptProposedAction()
+
+    def _on_add_clicked(self) -> None:
+        dlg = AddTorrentDialog(self.window())
+        dlg.torrent_file_chosen.connect(self._start_selective_add)
+        dlg.magnet_submitted.connect(self._start_selective_add)
+        dlg.exec()
+
+    def _start_selective_add(self, source: str) -> None:
+        if self._filelist_thread is not None and self._filelist_thread.isRunning():
+            InfoBar.warning(title=tr('download.loading_file_list'), content='', orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=2000, parent=self.window())
+            return
+        thread = _FileListFetchThread(self._manager, source, None)
+        thread.finished_ok.connect(lambda files: self._on_add_file_list_ready(source, files))
+        thread.finished_err.connect(lambda err: self._on_add_file_list_failed(source, err))
+        thread.finished.connect(self._on_add_filelist_finished)
+        self._filelist_thread = thread
+        thread.start()
+
+    def _on_add_filelist_finished(self) -> None:
+        thread = self._filelist_thread
+        self._filelist_thread = None
+        if thread is not None:
+            thread.deleteLater()
+
+    def _on_add_file_list_failed(self, source: str, err: str) -> None:
+        logger.error('Failed to fetch file list for added torrent: %s', err)
+        self._queue_new_download(source, file_ids=None)
+
+    def _on_add_file_list_ready(self, source: str, torrent_files: list) -> None:
+        if not torrent_files:
+            self._queue_new_download(source, file_ids=None)
+            return
+        paths = [p for p, _size in torrent_files]
+        sizes = [s for _p, s in torrent_files]
+        entries = build_selective_entries_from_torrent(paths, sizes)
+        dialog = SelectiveDownloadDialog(entries, parent=self.window())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected_labels = dialog.selected_labels()
+        file_ids = resolve_selective_file_indices(entries, selected_labels, paths)
+        if not file_ids:
+            file_ids = None
+        self._queue_new_download(source, file_ids=file_ids)
+
+    def _queue_new_download(self, source: str, file_ids: list | None) -> None:
+        name = os.path.splitext(os.path.basename(source))[0] if not source.startswith('magnet:') else tr('download.rom_fallback')
+        self._manager.add(torrent_file=source, file_id=file_ids[0] if file_ids else 1, file_ids=file_ids, game_name=name, console=tr('download.unknown'), source='Manual')
+        InfoBar.success(title=tr('download.added_to_queue_title'), content=tr('download.added_to_queue_single', title=name), orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=2500, parent=self.window())
 
     def _on_open_downloads_root(self) -> None:
         from src.core.config import paths

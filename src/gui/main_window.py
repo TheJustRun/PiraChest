@@ -49,6 +49,44 @@ def _load_bundled_figtree_fonts() -> bool:
                     loaded = True
     return loaded
 
+_LOG_FILE_HANDLER: Optional[logging.FileHandler] = None
+_PREV_EXCEPTHOOK = None
+
+def _log_file_path() -> str:
+    from src.core.config import paths
+    return os.path.join(paths.app_data_dir, 'logs', 'app.log')
+
+def _crash_excepthook(exc_type, exc_value, exc_tb) -> None:
+    logging.getLogger().critical('Unhandled exception', exc_info=(exc_type, exc_value, exc_tb))
+    if _PREV_EXCEPTHOOK is not None:
+        _PREV_EXCEPTHOOK(exc_type, exc_value, exc_tb)
+
+def set_file_logging_enabled(enabled: bool) -> None:
+    global _LOG_FILE_HANDLER, _PREV_EXCEPTHOOK
+    root_logger = logging.getLogger()
+    if enabled:
+        if _LOG_FILE_HANDLER is not None:
+            return
+        path = _log_file_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        handler = logging.FileHandler(path, encoding='utf-8')
+        handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s — %(message)s'))
+        handler.setLevel(logging.NOTSET)
+        root_logger.addHandler(handler)
+        root_logger.setLevel(min(root_logger.level or logging.WARNING, logging.INFO))
+        _LOG_FILE_HANDLER = handler
+        root_logger.info('File logging enabled: %s', path)
+        if _PREV_EXCEPTHOOK is None:
+            _PREV_EXCEPTHOOK = sys.excepthook
+            sys.excepthook = _crash_excepthook
+    elif _LOG_FILE_HANDLER is not None:
+        root_logger.removeHandler(_LOG_FILE_HANDLER)
+        _LOG_FILE_HANDLER.close()
+        _LOG_FILE_HANDLER = None
+        if _PREV_EXCEPTHOOK is not None:
+            sys.excepthook = _PREV_EXCEPTHOOK
+            _PREV_EXCEPTHOOK = None
+
 def _get_all_consoles() -> list[str]:
     try:
         return db.get_all_consoles()
@@ -208,19 +246,21 @@ class _LazyTVPage(QWidget):
 _UPDATE_THREADS_IN_FLIGHT: set = set()
 
 class _LazyBooksPage(QWidget):
-    __slots__ = ('_download_manager', '_real_page', '_layout')
+    __slots__ = ('_download_manager', '_real_page', '_layout', '_manga_bridge')
 
     def __init__(self, download_manager, parent=None):
         super().__init__(parent)
         self._download_manager = download_manager
         self._real_page: Optional[QWidget] = None
+        from src.core.books.manga.manager import MangaDownloadBridge
+        self._manga_bridge = MangaDownloadBridge(download_manager, self)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self._layout = layout
 
     def showEvent(self, event):
         if self._real_page is None:
-            self._real_page = BooksPage(self._download_manager)
+            self._real_page = BooksPage(self._download_manager, manga_download_bridge=self._manga_bridge)
             self._layout.addWidget(self._real_page)
         super().showEvent(event)
 
@@ -378,7 +418,7 @@ class SettingsPage(QWidget):
         self._dl_group = SettingCardGroup(tr('settings.group_download_locations'), self)
         self._download_dir_widgets: dict[str, tuple[LineEdit, PushButton]] = {}
         self._download_dir_cards: list[tuple[Any, str, str]] = []
-        for category, icon, title_key, content_key, attr in (('repacks', FluentIcon.GAME, 'settings.download_folder_repacks_title', 'settings.download_folder_repacks_content', 'download_dir_repacks'), ('music', FluentIcon.MUSIC, 'settings.download_folder_music_title', 'settings.download_folder_music_content', 'download_dir_music'), ('anime', FluentIcon.VIDEO, 'settings.download_folder_anime_title', 'settings.download_folder_anime_content', 'download_dir_anime'), ('youtube', FluentIcon.PLAY, 'settings.download_folder_youtube_title', 'settings.download_folder_youtube_content', 'download_dir_youtube'), ('minerva', FluentIcon.LIBRARY, 'settings.download_folder_minerva_title', 'settings.download_folder_minerva_content', 'download_dir_minerva')):
+        for category, icon, title_key, content_key, attr in (('repacks', FluentIcon.GAME, 'settings.download_folder_repacks_title', 'settings.download_folder_repacks_content', 'download_dir_repacks'), ('music', FluentIcon.MUSIC, 'settings.download_folder_music_title', 'settings.download_folder_music_content', 'download_dir_music'), ('anime', FluentIcon.VIDEO, 'settings.download_folder_anime_title', 'settings.download_folder_anime_content', 'download_dir_anime'), ('youtube', FluentIcon.PLAY, 'settings.download_folder_youtube_title', 'settings.download_folder_youtube_content', 'download_dir_youtube'), ('books', FluentIcon.BOOK_SHELF, 'settings.download_folder_books_title', 'settings.download_folder_books_content', 'download_dir_books'), ('manga', FluentIcon.DOCUMENT, 'settings.download_folder_manga_title', 'settings.download_folder_manga_content', 'download_dir_manga'), ('minerva', FluentIcon.LIBRARY, 'settings.download_folder_minerva_title', 'settings.download_folder_minerva_content', 'download_dir_minerva')):
             txt = LineEdit()
             txt.setReadOnly(True)
             txt.setMinimumWidth(220)
@@ -431,6 +471,14 @@ class SettingsPage(QWidget):
         self._chk_close_to_tray = SwitchSettingCard(icon=FluentIcon.MINIMIZE, title=tr('settings.close_to_tray_title'), content=tr('settings.close_to_tray_content'))
         self._connect_switch(self._chk_close_to_tray, self._on_close_to_tray_toggled)
         self._perf_group.addSettingCard(self._chk_close_to_tray)
+        self._finish_combo = ComboBox()
+        self._finish_combo.addItems([tr('settings.finish_action_nothing'), tr('settings.finish_action_shutdown'), tr('settings.finish_action_sleep')])
+        self._finish_combo.setMinimumWidth(140)
+        self._finish_combo.currentIndexChanged.connect(self._on_finish_action_changed)
+        self._finish_card = SettingCard(FluentIcon.POWER_BUTTON, tr('settings.on_finish_title'), tr('settings.on_finish_content'), self)
+        self._finish_card.hBoxLayout.addWidget(self._finish_combo, 0, Qt.AlignmentFlag.AlignRight)
+        self._finish_card.hBoxLayout.addSpacing(4)
+        self._perf_group.addSettingCard(self._finish_card)
         layout.addWidget(self._perf_group)
         layout.addSpacing(16)
         self._feature_group = SettingCardGroup(tr('settings.group_features'), self)
@@ -467,6 +515,9 @@ class SettingsPage(QWidget):
         self._chk_show_console = SwitchSettingCard(icon=FluentIcon.CODE, title=tr('settings.show_console_title'), content=tr('settings.show_console_content'))
         self._connect_switch(self._chk_show_console, self._on_show_console_toggled)
         self._adv_group.addSettingCard(self._chk_show_console)
+        self._chk_log_to_file = SwitchSettingCard(icon=FluentIcon.SAVE, title=tr('settings.log_to_file_title'), content=tr('settings.log_to_file_content'))
+        self._connect_switch(self._chk_log_to_file, self._on_log_to_file_toggled)
+        self._adv_group.addSettingCard(self._chk_log_to_file)
         from src.core.updater import __version__ as _app_version
         self._app_version = _app_version
         self._update_status_lbl = CaptionLabel('')
@@ -545,6 +596,14 @@ class SettingsPage(QWidget):
         self._chk_delete_torrent.setContent(tr('settings.delete_torrent_content'))
         self._chk_close_to_tray.setTitle(tr('settings.close_to_tray_title'))
         self._chk_close_to_tray.setContent(tr('settings.close_to_tray_content'))
+        self._finish_card.setTitle(tr('settings.on_finish_title'))
+        self._finish_card.setContent(tr('settings.on_finish_content'))
+        finish_idx = self._finish_combo.currentIndex()
+        self._finish_combo.blockSignals(True)
+        self._finish_combo.clear()
+        self._finish_combo.addItems([tr('settings.finish_action_nothing'), tr('settings.finish_action_shutdown'), tr('settings.finish_action_sleep')])
+        self._finish_combo.setCurrentIndex(finish_idx)
+        self._finish_combo.blockSignals(False)
         self._feature_group.titleLabel.setText(tr('settings.group_features'))
         self._chk_minerva.setTitle(tr('settings.minerva_title'))
         self._chk_minerva.setContent(tr('settings.minerva_content'))
@@ -565,6 +624,8 @@ class SettingsPage(QWidget):
         self._chk_admin_mode.setContent(tr('settings.admin_mode_content'))
         self._chk_show_console.setTitle(tr('settings.show_console_title'))
         self._chk_show_console.setContent(tr('settings.show_console_content'))
+        self._chk_log_to_file.setTitle(tr('settings.log_to_file_title'))
+        self._chk_log_to_file.setContent(tr('settings.log_to_file_content'))
         self._btn_check_update.setText(tr('settings.check_for_updates'))
         self._update_card.setTitle(tr('settings.software_updates_title'))
         self._update_card.setContent(tr('settings.current_version', version=self._app_version))
@@ -622,6 +683,12 @@ class SettingsPage(QWidget):
 
     def _on_close_to_tray_toggled(self, checked: bool):
         self._toggle_setting('close_to_tray', checked)
+
+    def _on_finish_action_changed(self, index: int):
+        actions = ['nothing', 'shutdown', 'sleep']
+        if not 0 <= index < len(actions):
+            return
+        self._apply_setting('on_finish_action', actions[index])
 
     def _on_console_structure_toggled(self, checked: bool):
         self._apply_setting('_console_structure', checked)
@@ -864,6 +931,13 @@ class SettingsPage(QWidget):
         except Exception:
             logger.exception('Failed to toggle debug console')
 
+    def _on_log_to_file_toggled(self, checked: bool):
+        self._toggle_setting('log_to_file', checked)
+        try:
+            set_file_logging_enabled(checked)
+        except Exception:
+            logger.exception('Failed to toggle file logging')
+
     def _browse_download_dir_for(self, attr: str, txt: LineEdit):
         path = QFileDialog.getExistingDirectory(self, 'Select Download Directory', txt.text())
         if path:
@@ -893,8 +967,11 @@ class SettingsPage(QWidget):
         self._chk_close_to_tray.setChecked(getattr(_s, 'close_to_tray', False))
         self._chk_admin_mode.setChecked(getattr(_s, 'admin_mode', False))
         self._chk_show_console.setChecked(getattr(_s, 'show_console', False))
+        self._chk_log_to_file.setChecked(getattr(_s, 'log_to_file', False))
         mode_map = {'Dark': 0, 'Light': 1, 'Auto': 2}
         self._theme_combo.setCurrentIndex(mode_map.get(_s.theme_mode, 0))
+        finish_map = {'nothing': 0, 'shutdown': 1, 'sleep': 2}
+        self._finish_combo.setCurrentIndex(finish_map.get(getattr(_s, 'on_finish_action', 'nothing'), 0))
         lang_code = current_language()
         if lang_code in self._lang_codes:
             self._lang_combo.setCurrentIndex(self._lang_codes.index(lang_code))
@@ -994,6 +1071,40 @@ class AboutPage(QWidget):
         author_layout.addWidget(self._profile_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(author_card)
 
+        self._reze_card = CardWidget()
+        self._reze_card.setMinimumHeight(76)
+        reze_layout = QVBoxLayout(self._reze_card)
+        reze_layout.setContentsMargins(16, 12, 16, 12)
+        reze_layout.setSpacing(6)
+        self._reze_title_lbl = StrongBodyLabel('')
+        self._reze_title_lbl.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self._reze_title_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        reze_layout.addWidget(self._reze_title_lbl)
+        self._reze_content_lbl = CaptionLabel('')
+        self._reze_content_lbl.setStyleSheet(f'color: {palette()["muted"]};')
+        self._reze_content_lbl.setWordWrap(True)
+        self._reze_content_lbl.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self._reze_content_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        reze_layout.addWidget(self._reze_content_lbl)
+        layout.addWidget(self._reze_card)
+
+        self._mangadex_card = CardWidget()
+        self._mangadex_card.setMinimumHeight(76)
+        mangadex_layout = QVBoxLayout(self._mangadex_card)
+        mangadex_layout.setContentsMargins(16, 12, 16, 12)
+        mangadex_layout.setSpacing(6)
+        self._mangadex_title_lbl = StrongBodyLabel('')
+        self._mangadex_title_lbl.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self._mangadex_title_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        mangadex_layout.addWidget(self._mangadex_title_lbl)
+        self._mangadex_content_lbl = CaptionLabel('')
+        self._mangadex_content_lbl.setStyleSheet(f'color: {palette()["muted"]};')
+        self._mangadex_content_lbl.setWordWrap(True)
+        self._mangadex_content_lbl.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self._mangadex_content_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        mangadex_layout.addWidget(self._mangadex_content_lbl)
+        layout.addWidget(self._mangadex_card)
+
         self._thanks_card = CardWidget()
         self._thanks_card.setMinimumHeight(76)
         thanks_layout = QHBoxLayout(self._thanks_card)
@@ -1047,6 +1158,14 @@ class AboutPage(QWidget):
         self._thanks_title_lbl.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
         self._thanks_content_lbl.setText(tr('about.logo_credit', name=self.LOGO_ARTIST_REDDIT_USER))
         self._thanks_content_lbl.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self._reze_title_lbl.setText(tr('about.reze_credit_title'))
+        self._reze_title_lbl.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self._reze_content_lbl.setText(tr('about.reze_credit_content'))
+        self._reze_content_lbl.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self._mangadex_title_lbl.setText(tr('about.mangadex_credit_title'))
+        self._mangadex_title_lbl.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self._mangadex_content_lbl.setText(tr('about.mangadex_credit_content'))
+        self._mangadex_content_lbl.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
 
     def _build_hero_card(self) -> QWidget:
         from PySide6.QtGui import QPixmap
@@ -1342,6 +1461,7 @@ class MainWindow(FluentWindow):
         if logo_path:
             self.setWindowIcon(QIcon(logo_path))
         self._enlarge_title_bar_branding()
+        self._add_donate_button()
         self.splashScreen = _IconSplashScreen(self.windowIcon(), self)
         self.showMaximized()
         QApplication.processEvents()
@@ -1371,6 +1491,7 @@ class MainWindow(FluentWindow):
         self.download_page = DownloadManagerPage(self.download_manager, self)
         self.download_page.setObjectName('downloadPage')
         self._nav_downloads = self.addSubInterface(self.download_page, FluentIcon.DOWNLOAD, tr('nav.downloads'), position=NavigationItemPosition.BOTTOM)
+        self.download_manager.all_downloads_finished.connect(self._on_all_downloads_finished)
         self.download_manager.item_added.connect(self._schedule_downloads_badge_update)
         self.download_manager.item_updated.connect(self._schedule_downloads_badge_update)
         self.download_manager.item_removed.connect(self._schedule_downloads_badge_update)
@@ -1404,6 +1525,52 @@ class MainWindow(FluentWindow):
         _maybe_show_alpha_disclaimer(self)
         _maybe_show_feature_onboarding(self)
         QTimer.singleShot(0, gc.collect)
+
+    def _on_all_downloads_finished(self) -> None:
+        from src.core.config import settings as _s
+        action = getattr(_s, 'on_finish_action', 'nothing')
+        if action not in ('shutdown', 'sleep'):
+            return
+        title = tr('settings.finish_action_shutdown') if action == 'shutdown' else tr('settings.finish_action_sleep')
+        countdown = {'seconds': 60}
+        box = MessageBoxBase(self)
+        box.titleLabel = SubtitleLabel(tr('settings.finish_confirm_title', action=title), box)
+        box.viewLayout.addWidget(box.titleLabel)
+        content_lbl = CaptionLabel(tr('settings.finish_confirm_content', action=title, seconds=countdown['seconds']))
+        content_lbl.setWordWrap(True)
+        box.viewLayout.addWidget(content_lbl)
+        box.yesButton.setText(tr('settings.finish_confirm_proceed'))
+        box.cancelButton.setText(tr('download.cancel'))
+        timer = QTimer(box)
+        timer.setInterval(1000)
+
+        def _tick():
+            countdown['seconds'] -= 1
+            if countdown['seconds'] <= 0:
+                timer.stop()
+                box.accept()
+                return
+            content_lbl.setText(tr('settings.finish_confirm_content', action=title, seconds=countdown['seconds']))
+        timer.timeout.connect(_tick)
+        timer.start()
+        result = box.exec()
+        timer.stop()
+        if not result:
+            return
+        self._perform_finish_action(action)
+
+    def _perform_finish_action(self, action: str) -> None:
+        import subprocess
+        try:
+            if sys.platform == 'win32':
+                cmd = ['shutdown', '/s', '/t', '0'] if action == 'shutdown' else ['rundll32.exe', 'powrprof.dll,SetSuspendState', '0,1,0']
+            elif sys.platform == 'darwin':
+                cmd = ['osascript', '-e', 'tell app "System Events" to shut down'] if action == 'shutdown' else ['pmset', 'sleepnow']
+            else:
+                cmd = ['systemctl', 'poweroff'] if action == 'shutdown' else ['systemctl', 'suspend']
+            subprocess.Popen(cmd)
+        except Exception:
+            logger.exception('Failed to perform finish action: %s', action)
 
     def _schedule_downloads_badge_update(self, *_args) -> None:
         self._downloads_badge_timer.start()
@@ -1468,6 +1635,49 @@ class MainWindow(FluentWindow):
             self.raise_()
             self.activateWindow()
 
+    def _add_donate_button(self) -> None:
+        title_bar = getattr(self, 'titleBar', None)
+        if title_bar is None:
+            return
+        try:
+            from .download_page import DonateDialog
+            widget = QFrame(title_bar)
+            widget.setObjectName('donateChip')
+            widget.setCursor(Qt.CursorShape.PointingHandCursor)
+            widget.setStyleSheet('QFrame#donateChip { background-color: rgba(128, 128, 128, 60); border-radius: 11px; }')
+            layout = QHBoxLayout(widget)
+            layout.setContentsMargins(10, 4, 10, 4)
+            layout.setSpacing(5)
+            layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon_label = QLabel(widget)
+            icon_label.setPixmap(FluentIcon.HEART.icon(color=QColor('#ffffff')).pixmap(11, 11))
+            text_label = CaptionLabel(tr('download.donate'), widget)
+            layout.addWidget(icon_label, 0, Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(text_label, 0, Qt.AlignmentFlag.AlignCenter)
+            widget.setToolTip(tr('download.donate'))
+            widget.mousePressEvent = lambda e: DonateDialog(self).exec() if e.button() == Qt.MouseButton.LeftButton else None
+            container = QWidget(title_bar)
+            container.setFixedHeight(max(32, title_bar.height()))
+            container_layout = QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(0)
+            container_layout.addStretch(1)
+            container_layout.addWidget(widget)
+            container_layout.addStretch(1)
+            title_bar_layout = title_bar.hBoxLayout
+            title_label = getattr(title_bar, 'titleLabel', None)
+            insert_at = 0
+            for i in range(title_bar_layout.count()):
+                item = title_bar_layout.itemAt(i)
+                w = item.widget() if item is not None else None
+                if w is not None and w is title_label:
+                    insert_at = i + 1
+                    break
+            title_bar_layout.insertSpacing(insert_at, 8)
+            title_bar_layout.insertWidget(insert_at + 1, container, 0, Qt.AlignmentFlag.AlignVCenter)
+        except Exception:
+            logger.exception('Failed to add donate button to title bar')
+
     def _enlarge_title_bar_branding(self) -> None:
         title_bar = getattr(self, 'titleBar', None)
         if title_bar is None:
@@ -1486,7 +1696,12 @@ class MainWindow(FluentWindow):
         if title_label is not None:
             try:
                 font = title_label.font()
-                font.setPointSize(font.pointSize() + 2)
+                base_pt = font.pointSize()
+                if base_pt > 0:
+                    font.setPointSize(base_pt + 2)
+                else:
+                    base_px = font.pixelSize()
+                    font.setPixelSize(base_px + 2 if base_px > 0 else 18)
                 font.setBold(True)
                 title_label.setFont(font)
             except Exception:
@@ -1642,6 +1857,12 @@ class MainWindow(FluentWindow):
         except Exception:
             pass
         try:
+            for thread, _worker in list(_UPDATE_THREADS_IN_FLIGHT):
+                thread.quit()
+                thread.wait(3000)
+        except Exception:
+            pass
+        try:
             inner = getattr(self.music_page, '_real_page', None)
             if inner is not None:
                 inner.shutdown()
@@ -1657,6 +1878,12 @@ class MainWindow(FluentWindow):
             inner = getattr(self.yt_page, '_real_page', None)
             if inner is not None:
                 inner.shutdown()
+        except Exception:
+            pass
+        try:
+            bridge = getattr(self.books_page, '_manga_bridge', None)
+            if bridge is not None:
+                bridge.shutdown()
         except Exception:
             pass
         try:
@@ -2015,4 +2242,10 @@ def create_application(argv: Optional[list]=None):
     base_font = _build_app_font()
     app.setFont(base_font)
     setFont(app, fontSize=base_font.pointSize())
+    try:
+        from src.core.config import settings as _s
+        if getattr(_s, 'log_to_file', False):
+            set_file_logging_enabled(True)
+    except Exception:
+        logger.exception('Failed to initialize file logging')
     return app

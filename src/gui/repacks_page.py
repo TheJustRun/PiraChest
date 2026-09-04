@@ -4,6 +4,7 @@ import gc
 import logging
 import re
 from PySide6.QtCore import Qt, QSize, QSizeF, QRect, QThread, QObject, Signal, Property, QPropertyAnimation, QEasingCurve, QTimer, QVariantAnimation
+from shiboken6 import isValid as _qt_is_valid
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLayout, QLayoutItem, QScrollArea, QDialog, QTreeWidgetItem, QHeaderView, QGridLayout, QLabel, QSizePolicy
 from qfluentwidgets import CardWidget, FluentIcon, Pivot, TitleLabel, SubtitleLabel, BodyLabel, StrongBodyLabel, CaptionLabel, TransparentToolButton, PushButton, PrimaryPushButton, ImageLabel, PillPushButton, FlowLayout as QFlowLayout, themeColor, SearchLineEdit, TreeWidget, MessageBoxBase, SmoothScrollArea, HyperlinkButton, qconfig, isDarkTheme
@@ -112,27 +113,48 @@ class FlowLayout(QLayout):
     def _do_layout(self, rect: QRect, test_only: bool) -> int:
         left, top, right, bottom = self.getContentsMargins()
         effective_rect = rect.adjusted(left, top, -right, -bottom)
-        x = effective_rect.x()
+        base_spacing = self.spacing()
+        visible_items = [item for item in self._items if item.widget() is None or item.widget().isVisible()]
+        row: list[QLayoutItem] = []
         y = effective_rect.y()
         line_height = 0
-        spacing = self.spacing()
-        for item in self._items:
-            widget = item.widget()
-            if widget is not None and (not widget.isVisible()):
-                continue
+        available_w = effective_rect.width()
+
+        def _flush_row(is_last: bool) -> None:
+            nonlocal y, line_height
+            if not row:
+                return
+            n = len(row)
+            items_w = sum(it.sizeHint().width() for it in row)
+            if n > 1 and not is_last:
+                gap = max(base_spacing, (available_w - items_w) / (n - 1))
+            else:
+                gap = base_spacing
+            x = effective_rect.x()
+            row_line_h = 0
+            for it in row:
+                iw = it.sizeHint().width()
+                ih = it.sizeHint().height()
+                if not test_only:
+                    it.setGeometry(QRect(round(x), y, iw, ih))
+                x += iw + gap
+                row_line_h = max(row_line_h, ih)
+            line_height = row_line_h
+            y += line_height + base_spacing
+
+        for item in visible_items:
             item_width = item.sizeHint().width()
-            item_height = item.sizeHint().height()
-            next_x = x + item_width + spacing
-            if next_x - spacing > effective_rect.right() and line_height > 0:
-                x = effective_rect.x()
-                y = y + line_height + spacing
-                next_x = x + item_width + spacing
-                line_height = 0
-            if not test_only:
-                item.setGeometry(QRect(x, y, item_width, item_height))
-            x = next_x
-            line_height = max(line_height, item_height)
-        return y + line_height - rect.y() + bottom
+            items_w_if_added = sum(it.sizeHint().width() for it in row) + item_width
+            gaps_if_added = len(row) * base_spacing
+            if row and items_w_if_added + gaps_if_added > available_w:
+                _flush_row(is_last=False)
+                row = [item]
+            else:
+                row.append(item)
+        if row:
+            _flush_row(is_last=True)
+        total_h = (y - base_spacing - effective_rect.y()) if line_height else 0
+        return total_h + top + bottom
 
 def _load_scaled_pixmap(path: str, target_w: int, target_h: int):
     from PySide6.QtGui import QImageReader, QImage, QPixmap, QPixmapCache
@@ -266,10 +288,26 @@ class _AnimatedPosterMixin:
         self._pos_anim = _SteppedAnimator(self._apply_lift_offset)
 
     def _apply_lift_offset(self, offset_y: float) -> None:
+        # The animation delivers queued valueChanged callbacks asynchronously,
+        # so the card/label may already have been destroyed by Qt by the time
+        # this runs (e.g. card removed from the list while hover/press
+        # animation was still in flight). Bail out quietly instead of
+        # crashing with "Internal C++ object already deleted".
+        poster_lbl = getattr(self, '_poster_lbl', None)
+        if poster_lbl is None or not _qt_is_valid(self) or not _qt_is_valid(poster_lbl):
+            self._stop_poster_animation()
+            return
         base = self._anim_base_pos
-        self._poster_lbl.move(base.x(), round(base.y() - offset_y))
+        poster_lbl.move(base.x(), round(base.y() - offset_y))
+
+    def _stop_poster_animation(self) -> None:
+        pos_anim = getattr(self, '_pos_anim', None)
+        if pos_anim is not None and _qt_is_valid(pos_anim):
+            pos_anim.stop()
 
     def _animate_to(self, offset_y: int, duration: int) -> None:
+        if not _qt_is_valid(self) or not _qt_is_valid(self._poster_lbl):
+            return
         current_offset = self._anim_base_pos.y() - self._poster_lbl.pos().y()
         self._pos_anim.stop()
         self._pos_anim.setDuration(duration)
@@ -291,6 +329,13 @@ class _AnimatedPosterMixin:
             self._animate_to(self._LIFT_PX, self._PRESS_MS)
         else:
             self._animate_to(0, self._PRESS_MS)
+
+    def hideEvent(self, event) -> None:
+        # Cards are frequently removed/hidden from scroll lists while a
+        # hover/press lift animation is still running. Stop it here so no
+        # further valueChanged callbacks arrive after the widget is torn down.
+        self._stop_poster_animation()
+        super().hideEvent(event)
 
 class PosterCard(_AnimatedPosterMixin, QWidget):
     clicked_poster = Signal(object)
@@ -416,10 +461,12 @@ class PosterGrid(SmoothScrollArea):
             self.setSmoothMode(SmoothMode.LINEAR)
         except Exception:
             pass
+        self.setViewportMargins(0, 0, 0, 0)
+        self.verticalScrollBar().setFixedWidth(6)
         self._container = QWidget()
         self._container.setStyleSheet('background: transparent;')
         container_layout = QVBoxLayout(self._container)
-        container_layout.setContentsMargins(4, 4, 4, 4)
+        container_layout.setContentsMargins(4, 4, 0, 4)
         container_layout.setSpacing(20)
         self._latest_section = QWidget(self._container)
         latest_layout = QVBoxLayout(self._latest_section)
@@ -453,6 +500,7 @@ class PosterGrid(SmoothScrollArea):
         self._latest_section.setVisible(False)
         container_layout.addWidget(self._latest_section)
         self._flow_container = QWidget(self._container)
+        self._flow_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._flow_layout = FlowLayout(self._flow_container, margin=0, spacing=14)
         container_layout.addWidget(self._flow_container)
         self.setWidget(self._container)
@@ -790,6 +838,8 @@ class PosterGrid(SmoothScrollArea):
     def resizeEvent(self, event):
         self._card_geoms.clear()
         super().resizeEvent(event)
+        bar = self.verticalScrollBar()
+        bar.move(self.width() - bar.width(), bar.y())
         if not self._visibility_timer.isActive():
             self._visibility_timer.start()
         from PySide6.QtCore import QTimer
@@ -1819,8 +1869,11 @@ class SelectiveDownloadDialog(MessageBoxBase):
         self.viewLayout.addWidget(info)
         self._tree = TreeWidget(self)
         self._tree.setHeaderLabels([tr('repacks.include'), tr('repacks.size')])
+        self._tree.header().setStretchLastSection(False)
         self._tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self._tree.setColumnWidth(1, 92)
+        self._tree.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._tree.setRootIsDecorated(True)
         self._tree.setBorderVisible(True)
         self._tree.setBorderRadius(8)
@@ -1841,13 +1894,12 @@ class SelectiveDownloadDialog(MessageBoxBase):
             cat_item.setFont(0, font)
             for entry in by_category[cat]:
                 child = QTreeWidgetItem([entry.label, entry.size_hint])
+                child.setToolTip(0, entry.label)
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 child.setCheckState(0, Qt.CheckState.Checked if entry.required else Qt.CheckState.Unchecked)
                 cat_item.addChild(child)
                 self._checkboxes[entry.label] = child
             cat_item.setExpanded(True)
-        self._tree.resizeColumnToContents(1)
-        self._tree.setColumnWidth(1, self._tree.columnWidth(1) + 16)
         self._size_by_label: dict[str, int] = {e.label: e.size_bytes for e in entries}
         self._total_lbl = StrongBodyLabel('', self)
         self.viewLayout.addWidget(self._total_lbl)
@@ -1882,7 +1934,7 @@ class _FileListFetchThread(QThread):
 
     def run(self) -> None:
         try:
-            files = self._manager.fetch_file_list(self._source)
+            files = self._manager.fetch_file_list(self._source, category='repacks')
         except Exception as exc:
             self.finished_err.emit(str(exc))
             return
@@ -1890,9 +1942,10 @@ class _FileListFetchThread(QThread):
 
 class DownloadActionWidget(QWidget):
 
-    def __init__(self, manager: DownloadManager, parent=None):
+    def __init__(self, manager: DownloadManager, source_key: str | None = None, parent=None):
         super().__init__(parent)
         self._manager = manager
+        self._source_key = source_key
         self._details: RepackDetails | None = None
         self._item_id: str | None = None
         self._filelist_thread: _FileListFetchThread | None = None
@@ -1963,7 +2016,10 @@ class DownloadActionWidget(QWidget):
             return
         self._start_selective_download(source)
 
-    _FILELIST_TIMEOUT_MS = 25000
+    _FILELIST_TIMEOUT_MS = 15000
+
+    def _nothing_found_text(self) -> str:
+        return tr('repacks.dead_link_gog') if self._source_key == 'gog' else tr('repacks.nothing_found')
 
     def _start_selective_download(self, source: str) -> None:
         if self._filelist_thread is not None and self._filelist_thread.isRunning():
@@ -1971,7 +2027,7 @@ class DownloadActionWidget(QWidget):
         self._button.setText(tr('repacks.loading_file_list'))
         self._button.setEnabled(False)
         self._filelist_timed_out = False
-        thread = _FileListFetchThread(self._manager, source, self)
+        thread = _FileListFetchThread(self._manager, source, None)
         thread.finished_ok.connect(lambda files: self._on_file_list_ready(source, files))
         thread.finished_err.connect(lambda err: self._on_file_list_failed(source, err))
         thread.finished.connect(self._on_filelist_thread_finished)
@@ -1997,13 +2053,14 @@ class DownloadActionWidget(QWidget):
         except (TypeError, RuntimeError):
             pass
         try:
-            thread.terminate()
-            thread.wait(2000)
-        except RuntimeError:
+            thread.finished.disconnect()
+        except (TypeError, RuntimeError):
             pass
+        thread.finished.connect(thread.deleteLater)
         self._filelist_thread = None
-        logger.warning('File list fetch timed out for source; falling back to full download')
-        self._on_file_list_failed(source, 'timeout')
+        logger.warning('File list fetch timed out for source; giving up')
+        self._button.setText(self._nothing_found_text())
+        self._button.setEnabled(False)
 
     def _on_filelist_thread_finished(self) -> None:
         watchdog = getattr(self, '_filelist_watchdog', None)
@@ -2017,9 +2074,8 @@ class DownloadActionWidget(QWidget):
 
     def _on_file_list_failed(self, source: str, err: str) -> None:
         logger.error('Failed to fetch file list for selective download: %s', err)
-        self._button.setText(tr('repacks.download'))
-        self._button.setEnabled(True)
-        self._queue_download(source, file_ids=None)
+        self._button.setText(self._nothing_found_text())
+        self._button.setEnabled(False)
 
     def _on_file_list_ready(self, source: str, torrent_files: list[tuple[str, int]]) -> None:
         self._button.setText(tr('repacks.download'))
@@ -2081,11 +2137,11 @@ class RepackDetailsView(QWidget):
     COVER_HEIGHT = 392
     @property
     def _META_LABELS(self):
-        return (('repack_size', tr('repacks.repack_size')), ('original_size', tr('repacks.original_size')), ('company', tr('repacks.company')), ('languages', tr('repacks.languages')))
+        return (('repack_size', tr('repacks.repack_size')), ('original_size', tr('repacks.original_size')), ('company', tr('repacks.company')), ('languages', tr('repacks.languages')), ('rating', tr('repacks.rating')))
 
-    def __init__(self, manager: DownloadManager, parent=None):
+    def __init__(self, manager: DownloadManager, source_key: str | None = None, parent=None):
         super().__init__(parent)
-        self._download_action = DownloadActionWidget(manager)
+        self._download_action = DownloadActionWidget(manager, source_key)
         self._poster_downloader = PosterDownloader(self)
         self._poster_downloader.poster_ready.connect(self._on_cover_ready)
         self._poster_downloader.poster_failed.connect(self._on_cover_failed)
@@ -2339,6 +2395,9 @@ class RepackDetailsView(QWidget):
         self._raw_intro_text = intro_text
         self._desc_lbl.setText(render_description_html(intro_text) or tr('repacks.no_description'))
         extra = dict(details.extra or {})
+        system_requirements_text = extra.get('system_requirements')
+        if system_requirements_text:
+            extra_sections.append((tr('repacks.system_requirements'), system_requirements_text))
         is_announcement = bool(extra.pop('is_announcement', False))
         self._is_announcement = is_announcement
         self._download_action.setVisible(not is_announcement)
@@ -2564,6 +2623,7 @@ class _SidebarPosterCard(_AnimatedPosterMixin, QWidget):
 class PopularRepacksSidebar(QWidget):
     SIDEBAR_WIDTH = 320
     poster_clicked = Signal(object)
+    content_changed = Signal(bool)
 
     def __init__(self, source_key: str, parent=None):
         super().__init__(parent)
@@ -2574,6 +2634,9 @@ class PopularRepacksSidebar(QWidget):
         self._poster_downloader.poster_failed.connect(self._on_poster_failed)
         self._url_to_cards: dict[str, list[_SidebarPosterCard]] = {}
         self._task = None
+        self._collapsed = False
+        self._has_content = False
+        self._width_anim: QPropertyAnimation | None = None
         self.setFixedWidth(self.SIDEBAR_WIDTH)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -2611,6 +2674,59 @@ class PopularRepacksSidebar(QWidget):
         self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
         self._card_states: dict[int, bool] = {}
         register_locale_refresh(self, self._apply_locale)
+
+    def is_collapsed(self) -> bool:
+        return self._collapsed
+
+    def has_content(self) -> bool:
+        return self._has_content
+
+    def set_collapsed(self, collapsed: bool, animated: bool=True) -> None:
+        """Slide the sidebar closed/open. Reuses a single QPropertyAnimation
+        driving the widget's built-in `maximumWidth` Qt property, so no new
+        widgets/effects are allocated and layout of the neighbouring poster
+        grid reflows on every frame via the normal resize path, letting the
+        cards immediately reclaim the freed space."""
+        if collapsed == self._collapsed:
+            return
+        self._collapsed = collapsed
+        if not self._has_content:
+            return
+        target_width = 0 if collapsed else self.SIDEBAR_WIDTH
+        if self._width_anim is not None:
+            self._width_anim.stop()
+            self._width_anim = None
+        if not animated:
+            self.setMinimumWidth(0)
+            self.setMaximumWidth(target_width)
+            self.setVisible(not collapsed)
+            if not collapsed:
+                self.setFixedWidth(self.SIDEBAR_WIDTH)
+            return
+        if not collapsed:
+            self.setVisible(True)
+        start_width = self.width() if self.isVisible() else (0 if collapsed else self.SIDEBAR_WIDTH)
+        # Loosen the minimum only for the duration of the slide so the
+        # layout can actually shrink us; a fully expanded sidebar is
+        # re-pinned to a hard SIDEBAR_WIDTH below so the 2-column poster
+        # grid inside never gets squeezed by neighbouring widgets.
+        self.setMinimumWidth(0)
+        anim = QPropertyAnimation(self, b'maximumWidth', self)
+        anim.setDuration(220)
+        anim.setStartValue(start_width)
+        anim.setEndValue(target_width)
+        anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        def _on_finished() -> None:
+            if self._collapsed:
+                self.setVisible(False)
+            else:
+                self.setFixedWidth(self.SIDEBAR_WIDTH)
+            if self._width_anim is anim:
+                self._width_anim = None
+        anim.finished.connect(_on_finished)
+        self._width_anim = anim
+        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
 
     def _apply_locale(self, *_args) -> None:
         self._header.setText(tr('repacks.most_popular_this_week'))
@@ -2653,9 +2769,14 @@ class PopularRepacksSidebar(QWidget):
         self._task = None
         self._clear_cards()
         if not entries:
+            self._has_content = False
             self.setVisible(False)
+            self.content_changed.emit(False)
             return
-        self.setVisible(True)
+        self._has_content = True
+        if not self._collapsed:
+            self.setFixedWidth(self.SIDEBAR_WIDTH)
+            self.setVisible(True)
         row = 0
         col = 0
         for entry in entries:
@@ -2671,6 +2792,7 @@ class PopularRepacksSidebar(QWidget):
                 col = 0
                 row += 1
         self._visibility_timer.start()
+        self.content_changed.emit(True)
 
     def _on_poster_ready(self, url: str, path: str) -> None:
         for card in self._url_to_cards.get(url, []):
@@ -2689,6 +2811,9 @@ class PopularRepacksSidebar(QWidget):
         self._card_states.clear()
 
     def shutdown(self) -> None:
+        if self._width_anim is not None:
+            self._width_anim.stop()
+            self._width_anim = None
         try:
             self._poster_downloader.shutdown()
         except Exception:
@@ -2727,8 +2852,37 @@ class SourceTab(QWidget):
         self._grid.poster_clicked.connect(self._show_details)
         self._grid.near_bottom.connect(self._on_near_bottom)
         grid_row_layout.addWidget(self._grid, 1)
+        self._sidebar_toggle_btn = TransparentToolButton(FluentIcon.RIGHT_ARROW)
+        self._sidebar_toggle_btn.setFixedSize(28, 28)
+        self._sidebar_toggle_btn.setIconSize(QSize(12, 12))
+        self._sidebar_toggle_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._sidebar_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sidebar_toggle_btn.setStyleSheet(f'''
+            TransparentToolButton {{
+                background-color: {_surface_tint_color(14)};
+                border: 1px solid {_surface_border_color()};
+                border-radius: 14px;
+            }}
+            TransparentToolButton:hover {{
+                background-color: {_hover_tint_color()};
+            }}
+            TransparentToolButton:pressed {{
+                background-color: {_surface_tint_color(14)};
+            }}
+        ''')
+        self._sidebar_toggle_btn.setToolTip('Hide popular this week')
+        self._sidebar_toggle_btn.setVisible(False)
+        self._sidebar_toggle_btn.clicked.connect(self._on_toggle_popular_sidebar)
+        toggle_wrap = QWidget()
+        toggle_wrap_layout = QVBoxLayout(toggle_wrap)
+        toggle_wrap_layout.setContentsMargins(0, 0, 0, 0)
+        toggle_wrap_layout.addStretch(1)
+        toggle_wrap_layout.addWidget(self._sidebar_toggle_btn, 0, Qt.AlignmentFlag.AlignHCenter)
+        toggle_wrap_layout.addStretch(1)
+        grid_row_layout.addWidget(toggle_wrap, 0)
         self._popular_sidebar = PopularRepacksSidebar(source_key)
         self._popular_sidebar.poster_clicked.connect(self._show_details)
+        self._popular_sidebar.content_changed.connect(self._on_popular_content_changed)
         grid_row_layout.addWidget(self._popular_sidebar, 0)
         grid_page_layout.addWidget(grid_row, 1)
         self._stack.addWidget(grid_page)
@@ -2747,7 +2901,7 @@ class SourceTab(QWidget):
         loading_layout.addStretch(1)
         self._stack.addWidget(self._search_loading_page)
         layout.addWidget(self._stack, 1)
-        self._details = RepackDetailsView(manager)
+        self._details = RepackDetailsView(manager, source_key)
         self._details.back_requested.connect(self._show_grid)
         self._stack.addWidget(self._details)
         self._latest_task = None
@@ -2939,6 +3093,17 @@ class SourceTab(QWidget):
         self._stack_fade_anim = group
         group.start()
 
+    def _on_popular_content_changed(self, has_content: bool) -> None:
+        self._sidebar_toggle_btn.setVisible(has_content)
+        if not has_content:
+            self._sidebar_toggle_btn.setIcon(FluentIcon.RIGHT_ARROW)
+
+    def _on_toggle_popular_sidebar(self) -> None:
+        collapsing = not self._popular_sidebar.is_collapsed()
+        self._popular_sidebar.set_collapsed(collapsing)
+        self._sidebar_toggle_btn.setIcon(FluentIcon.LEFT_ARROW if collapsing else FluentIcon.RIGHT_ARROW)
+        self._sidebar_toggle_btn.setToolTip('Show popular this week' if collapsing else 'Hide popular this week')
+
     def _show_details(self, entry: RepackEntry) -> None:
         self._details.show_loading(entry)
         self._switch_stack_animated(self._details)
@@ -3106,11 +3271,14 @@ class RepacksPage(QWidget):
         self._refresh_btn.setToolTip(tr('repacks.refresh_tooltip'))
         self._refresh_btn.setFixedSize(32, 32)
         self._refresh_btn.clicked.connect(self._on_refresh_clicked)
+        self._discord_btn = PushButton(FluentIcon.CHAT, tr('repacks.gog_discord'))
+        self._discord_btn.clicked.connect(self._on_discord_clicked)
         search_row = QHBoxLayout()
         search_row.setSpacing(8)
         search_row.addWidget(self._search_bar, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addWidget(self._donate_btn, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addWidget(self._upcoming_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        search_row.addWidget(self._discord_btn, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addWidget(self._refresh_btn, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addStretch(1)
         outer.addLayout(search_row)
@@ -3118,15 +3286,20 @@ class RepacksPage(QWidget):
         self._stack = QStackedWidget()
         outer.addWidget(self._stack, 1)
         self._tabs: dict[str, SourceTab] = {}
+        self._tab_fade_anim: QPropertyAnimation | None = None
+        self._current_tab_key: str | None = None
         self._add_source_tab('fitgirl', 'FitGirl Repacks')
+        self._add_source_tab('gog', 'GOG Revived')
         self._pivot.currentItemChanged.connect(self._on_tab_changed)
         if self._tabs:
             first_key = next(iter(self._tabs))
             self._pivot.setCurrentItem(first_key)
             self._stack.setCurrentWidget(self._tabs[first_key])
+            self._current_tab_key = first_key
             self._tabs[first_key].load_initial()
             self._update_donate_button(first_key)
             self._update_upcoming_button(first_key)
+            self._update_discord_button(first_key)
         from PySide6.QtWidgets import QApplication
         app = QApplication.instance()
         if app is not None:
@@ -3153,6 +3326,9 @@ class RepacksPage(QWidget):
         self.update()
 
     def _on_app_about_to_quit(self) -> None:
+        if self._tab_fade_anim is not None:
+            self._tab_fade_anim.stop()
+            self._tab_fade_anim = None
         task_id = getattr(self, '_upcoming_task', None)
         if task_id is not None:
             cancel_task(task_id)
@@ -3168,11 +3344,52 @@ class RepacksPage(QWidget):
             logger.exception('Failed to clear repacks cache on shutdown')
 
     def _on_tab_changed(self, key: str) -> None:
-        self._stack.setCurrentWidget(self._tabs[key])
+        self._switch_tab_animated(key)
         self._tabs[key].load_initial()
         self._tabs[key].filter_grid(self._search_bar.text())
         self._update_donate_button(key)
         self._update_upcoming_button(key)
+        self._update_discord_button(key)
+
+    def _switch_tab_animated(self, key: str) -> None:
+        """Cross-fade between source tabs. Uses a single reusable
+        QGraphicsOpacityEffect that is removed as soon as the animation
+        finishes, so idle rendering stays on Qt's normal fast paint path
+        (no permanent extra compositing buffer, no timers left running)."""
+        target = self._tabs.get(key)
+        if target is None:
+            return
+        if self._current_tab_key == key and self._stack.currentWidget() is target:
+            return
+        self._current_tab_key = key
+        if self._tab_fade_anim is not None:
+            self._tab_fade_anim.stop()
+            self._tab_fade_anim = None
+        prev_widget = self._stack.currentWidget()
+        if prev_widget is not None and prev_widget is not target:
+            prev_widget.setGraphicsEffect(None)
+        from PySide6.QtWidgets import QGraphicsOpacityEffect
+        effect = QGraphicsOpacityEffect(target)
+        effect.setOpacity(0.0)
+        target.setGraphicsEffect(effect)
+        self._stack.setCurrentWidget(target)
+        anim = QPropertyAnimation(effect, b'opacity', self)
+        anim.setDuration(160)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        def _cleanup() -> None:
+            try:
+                if _qt_is_valid(target) and target.graphicsEffect() is effect:
+                    target.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+            if self._tab_fade_anim is anim:
+                self._tab_fade_anim = None
+        anim.finished.connect(_cleanup)
+        self._tab_fade_anim = anim
+        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
 
     def _update_donate_button(self, key: str) -> None:
         url = _SOURCE_DONATION_URLS.get(key)
@@ -3185,6 +3402,14 @@ class RepacksPage(QWidget):
 
     def _update_upcoming_button(self, key: str) -> None:
         self._upcoming_btn.setVisible(key in _SOURCE_UPCOMING_SUPPORTED)
+
+    def _update_discord_button(self, key: str) -> None:
+        self._discord_btn.setVisible(key == 'gog')
+
+    def _on_discord_clicked(self) -> None:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl('https://discord.gg/qXtqrkVXaT'))
 
     def _on_donate_clicked(self) -> None:
         from PySide6.QtCore import QUrl
