@@ -4,6 +4,12 @@
 
 A work-in-progress desktop GUI application for downloading ROMs from the Minerva Archive, PC game repacks, watching anime, listening to music, downloading books, watching TV channels and shows, and downloading YouTube videos.
 
+## Donations
+Consider Donating to the app (USDT TRC-20), it will **REALLY** help :) 
+
+<img width="400" height="400" alt="donate_qr" src="https://github.com/user-attachments/assets/458ff27b-e03c-4e09-9dab-75895f718a8a" />
+
+
 ## Features
 
 **DISCLAIMER:** This app is in **ALPHA**. I'm releasing it as-is right now to get feedback and contributions to help polish and improve it over time. Even the features that are already implemented may have bugs, issues, freezes, or may simply be incomplete.
