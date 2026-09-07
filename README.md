@@ -6,7 +6,7 @@
 [![GitHub Downloads](https://img.shields.io/github/downloads/TheJustRun/PiraChest/total?style=flat-square)](https://github.com/TheJustRun/PiraChest/releases)
 [![GitHub Stars](https://img.shields.io/github/stars/TheJustRun/PiraChest?style=flat-square)](https://github.com/TheJustRun/PiraChest/stargazers)
 [![GitHub Issues](https://img.shields.io/github/issues/TheJustRun/PiraChest?style=flat-square)](https://github.com/TheJustRun/PiraChest/issues)
-[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg)](https://github.com/TheJustRun/PiraChest/blob/main/LICENSE.md)
 
 A work-in-progress desktop GUI application for downloading ROMs from the Minerva Archive, PC game repacks, watching anime, listening to music, downloading books, watching TV channels and shows, and downloading YouTube videos.
 
