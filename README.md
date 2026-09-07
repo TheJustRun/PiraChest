@@ -2,11 +2,11 @@
 
 <img width="1887" height="421" alt="t071snp" src="https://github.com/user-attachments/assets/5c6d937a-26b6-4da7-994a-02b20e7373bb" />
 
-[![GitHub Release](https://img.shields.io/github/v/release/TheJustRun/PiraChest?style=flat-square)](https://github.com/TheJustRun/PiraChest/releases)
+[![GitHub Release](https://img.shields.io/github/v/release/TheJustRun/PiraChest?include_prereleases&style=flat-square&cacheSeconds=1)](https://github.com/TheJustRun/PiraChest/releases)
 [![GitHub Downloads](https://img.shields.io/github/downloads/TheJustRun/PiraChest/total?style=flat-square)](https://github.com/TheJustRun/PiraChest/releases)
 [![GitHub Stars](https://img.shields.io/github/stars/TheJustRun/PiraChest?style=flat-square)](https://github.com/TheJustRun/PiraChest/stargazers)
 [![GitHub Issues](https://img.shields.io/github/issues/TheJustRun/PiraChest?style=flat-square)](https://github.com/TheJustRun/PiraChest/issues)
-[![License](https://img.shields.io/github/license/TheJustRun/PiraChest?style=flat-square)](https://github.com/TheJustRun/PiraChest/blob/main/LICENSE.md)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
 
 A work-in-progress desktop GUI application for downloading ROMs from the Minerva Archive, PC game repacks, watching anime, listening to music, downloading books, watching TV channels and shows, and downloading YouTube videos.
 
