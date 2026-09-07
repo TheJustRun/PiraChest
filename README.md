@@ -2,13 +2,37 @@
 
 <img width="1887" height="421" alt="t071snp" src="https://github.com/user-attachments/assets/5c6d937a-26b6-4da7-994a-02b20e7373bb" />
 
+[![GitHub Release](https://img.shields.io/github/v/release/TheJustRun/PiraChest?style=flat-square)](https://github.com/TheJustRun/PiraChest/releases)
+[![GitHub Downloads](https://img.shields.io/github/downloads/TheJustRun/PiraChest/total?style=flat-square)](https://github.com/TheJustRun/PiraChest/releases)
+[![GitHub Stars](https://img.shields.io/github/stars/TheJustRun/PiraChest?style=flat-square)](https://github.com/TheJustRun/PiraChest/stargazers)
+[![GitHub Issues](https://img.shields.io/github/issues/TheJustRun/PiraChest?style=flat-square)](https://github.com/TheJustRun/PiraChest/issues)
+[![License](https://img.shields.io/github/license/TheJustRun/PiraChest?style=flat-square)](https://github.com/TheJustRun/PiraChest/blob/main/LICENSE.md)
+
 A work-in-progress desktop GUI application for downloading ROMs from the Minerva Archive, PC game repacks, watching anime, listening to music, downloading books, watching TV channels and shows, and downloading YouTube videos.
 
+## Download
+
+### Windows
+
+Download the latest version from GitHub Releases:
+
+**[Download PiraChest](https://github.com/TheJustRun/PiraChest/releases/latest)**
+
+### Chocolatey
+
+Chocolatey support is planned.
+
+Once the package is published, PiraChest will be installable with:
+
+```powershell
+choco install pirachest
+```
+
 ## Donations
-Consider Donating to the app (USDT TRC-20), it will **REALLY** help :) 
+
+Consider donating to the app (USDT TRC-20), it will **REALLY** help :)
 
 <img width="400" height="400" alt="donate_qr" src="https://github.com/user-attachments/assets/458ff27b-e03c-4e09-9dab-75895f718a8a" />
-
 
 ## Features
 
@@ -18,12 +42,12 @@ Consider Donating to the app (USDT TRC-20), it will **REALLY** help :)
 
 * **ROM Browsing:** Browse a local SQLite-indexed ROM catalog covering 70+ console platforms. Filter by console, source (No-Intro, Redump, TOSEC, etc.), and per-console variants.
 * **Smart Torrent Engine:** Uses `libtorrent 2.0.13` to download only the requested ROM file from multi-gigabyte torrent dumps, via a persistent queue with pause/resume/retry/cancel controls.
-* **PC Repacks:** Browse and download PC game repacks (currently FitGirl for now).
+* **PC Repacks:** Browse and download PC game repacks from multiple sources.
 * **Music:** Search, listen to, and download music in lossless quality or whatever quality you want. You can also listen to music directly in the app, with a customizable lyrics panel.
 * **Anime:** Watch and download anime episodes or entire seasons directly from the app.
 * **Books:** Currently a work in progress and proof of concept. You can download books from the app.
 * **YouTube Downloading:** Download YouTube videos in audio or video format with metadata.
-* **TV**: Watch and download Movies, Series, Sports and TV Channels live from the app 
+* **TV:** Watch and download Movies, Series, Sports and TV Channels live from the app.
 * **Download Manager:** Real-time download queue with drag-and-drop reordering, live speed/progress/seed stats, and per-torrent settings (speed limits, peer caps, ratio/time limits, force recheck).
 * **Console-First Classification:** Automatic console detection from the Minerva Archive naming scheme, with per-console variant support (Retail, Encrypted/Decrypted, BIOS, Demo, Prototype, Homebrew, etc.).
 * **Dark & Light Theme:** Full Light/Dark/Auto theming via QFluentWidgets, with a shared palette so every widget stays in sync.
@@ -73,20 +97,34 @@ Consider Donating to the app (USDT TRC-20), it will **REALLY** help :)
   </tr>
 </table>
 
-## **Current** Issues and Quirks
+## Current Issues and Quirks
 
 * Not all consoles have their variant system working yet.
 * Light mode sucks.
 * And more, I guess? I need more testing. That's why I'm releasing it in alpha: so I can get more feedback on the app instead of just blindly making it.
 * Probably a bunch of other bugs I haven't found yet.
 
-Also, special thanks to [spicysaltysparty](https://www.reddit.com/user/spicysaltysparty/) for creating the logo!
+## Credits
 
-# Disclaimer
+Special thanks to [spicysaltysparty](https://www.reddit.com/user/spicysaltysparty/) for creating the logo!
+
+## License
+
+PiraChest is licensed under the **PolyForm Noncommercial License 1.0.0**.
+
+You may use, modify, and redistribute PiraChest for permitted noncommercial purposes, subject to the terms of the license.
+
+**Commercial use is not permitted under this license.** Commercial use requires separate permission from the copyright holder.
+
+See the [`LICENSE`](LICENSE) file for the complete license terms.
+
+Official license:
+https://polyformproject.org/licenses/noncommercial/1.0.0
+
+## Disclaimer
 
 > **For legal and educational purposes only.**
 >
 > This application does not host, distribute, or endorse copyrighted content. It merely provides tools to access third-party sources. You are solely responsible for how you use this software and for complying with all applicable laws.
 >
 > **If you misuse it, that's your responsibility. Fuck you.**
-
