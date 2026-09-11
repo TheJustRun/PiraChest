@@ -16,3 +16,4 @@ jobs:
           username: "GitHub"
           footer_title: "PiraChest Changelog"
           reduce_headings: true
+          content: "<@&1548027659337080903>"
