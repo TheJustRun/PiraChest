@@ -1,325 +1,262 @@
 # PiraChest
 
+![PiraChest Banner](https://github.com/user-attachments/assets/5c6d937a-26b6-4da7-994a-02b20e7373bb)
+
 <p align="center">
-  <img width="1887" height="421" alt="PiraChest" src="https://github.com/user-attachments/assets/5c6d937a-26b6-4da7-994a-02b20e7373bb" />
+  <a href="https://justrun.is-a.dev/pirachest/"><img src="https://img.shields.io/badge/🌐%20Website-PiraChest-blue?style=for-the-badge" alt="Website"></a>
+  <a href="https://discord.gg/kkPbmpgMTF"><img src="https://img.shields.io/badge/Discord-Join%20the%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 <p align="center">
-  <a href="https://justrun.is-a.dev/pirachest/">
-    <img src="https://img.shields.io/badge/🌐%20Website-PiraChest-blue?style=for-the-badge" alt="PiraChest Website">
-  </a>
-  <a href="https://discord.gg/kkPbmpgMTF">
-    <img src="https://img.shields.io/badge/Discord-Join%20the%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the PiraChest Discord">
-  </a>
+  <img src="https://img.shields.io/github/v/release/TheJustRun/PiraChest?include_prereleases&label=Latest%20Release" alt="Latest Release">
+  <img src="https://img.shields.io/github/downloads/TheJustRun/PiraChest/total?label=Downloads" alt="Downloads">
+  <img src="https://img.shields.io/github/stars/TheJustRun/PiraChest?label=Stars" alt="Stars">
+  <img src="https://img.shields.io/github/issues/TheJustRun/PiraChest?label=Issues" alt="Issues">
+  <img src="https://img.shields.io/badge/Status-Alpha-orange" alt="Alpha">
+  <img src="https://img.shields.io/badge/Platform-Windows-blue" alt="Windows">
+  <img src="https://img.shields.io/badge/License-PolyForm%20Noncommercial-lightgrey" alt="License">
 </p>
 
-<p align="center">
-  <a href="https://github.com/TheJustRun/PiraChest/releases">
-    <img src="https://img.shields.io/github/v/release/TheJustRun/PiraChest?include_prereleases&style=flat-square" alt="GitHub Release">
-  </a>
-  <a href="https://github.com/TheJustRun/PiraChest/releases">
-    <img src="https://img.shields.io/github/downloads/TheJustRun/PiraChest/total?style=flat-square" alt="Downloads">
-  </a>
-  <a href="https://github.com/TheJustRun/PiraChest/stargazers">
-    <img src="https://img.shields.io/github/stars/TheJustRun/PiraChest?style=flat-square" alt="Stars">
-  </a>
-  <a href="https://github.com/TheJustRun/PiraChest/issues">
-    <img src="https://img.shields.io/github/issues/TheJustRun/PiraChest?style=flat-square" alt="Issues">
-  </a>
-  <img src="https://img.shields.io/badge/status-alpha-orange?style=flat-square" alt="Status: Alpha">
-  <img src="https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square&logo=windows&logoColor=white" alt="Windows">
-  <img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue?style=flat-square" alt="License">
-</p>
+**PiraChest is an all-in-one Windows app for games, ROMs, music, anime, manga, downloads, torrents, and a whole lot of customization.**
 
-<p align="center">
-  <strong>An all-in-one desktop application for browsing, watching, listening to, and downloading media from third-party sources.</strong>
-</p>
+The idea is simple: stop jumping between a million different apps and websites when you can have the stuff you actually use in one place.
+
+And yes, you can customize the hell out of it.
 
 > [!WARNING]
-> **PiraChest is alpha software.** Expect bugs, crashes, incomplete features, and unreliable third-party sources.
-
-> [!IMPORTANT]
-> PiraChest does not host or distribute copyrighted content. You are responsible for how you use the software and for complying with applicable laws.
-
----
+> PiraChest is still in alpha. Expect bugs, unfinished features, questionable decisions, and the occasional thing that worked yesterday suddenly deciding it doesn't want to work today.
 
 ## Download
 
-<p align="center">
-  <a href="https://github.com/TheJustRun/PiraChest/releases/latest">
-    <img src="https://img.shields.io/badge/Download-Latest%20Release-2ea44f?style=for-the-badge&logo=github&logoColor=white" alt="Download Latest Release">
-  </a>
-</p>
+Get the latest build from [GitHub Releases](https://github.com/TheJustRun/PiraChest/releases).
 
-PiraChest currently targets Windows. Get the latest version from [GitHub Releases](https://github.com/TheJustRun/PiraChest/releases).
+[![Download](https://img.shields.io/badge/Download-Latest%20Release-brightgreen?style=for-the-badge)](https://github.com/TheJustRun/PiraChest/releases)
 
-Chocolatey support is planned.
+Chocolatey support is planned. Eventually, installing it should be as simple as:
 
 ```powershell
 choco install pirachest
 ```
 
----
-
 ## Features
 
-### 🎮 ROMs
+### ROMs
 
-Browse a local SQLite-indexed ROM catalog covering **70+ console platforms**.
+A local SQLite-indexed catalog covering **70+ console platforms**. Filters include:
 
-* Console and source filtering
 * No-Intro, Redump, and TOSEC
-* Retail releases and BIOS files
+* Retail games and BIOS files
 * Demos, prototypes, and homebrew
-* Encrypted and decrypted variants
+* Encrypted and decrypted ROMs
 
-### ⚡ Torrenting Engine
+Because manually sorting thousands of ROMs sounds like a fantastic way to waste an entire weekend.
 
-Powered by **libtorrent 2.1**, the torrent engine supports selective downloading from large torrent collections without downloading every file.
+### PC Game Repacks
+
+Browse games in a grid, check game details, look at upcoming releases, and choose which files to download.
+
+* Grid view and game details
+* Upcoming games page
+* Selective downloads
+* Torrent integration
+
+### Music
+
+Search for music, play tracks, choose audio quality, and customize the lyrics panel.
+
+### Anime
+
+Search, browse details, watch episodes, and download episodes or entire seasons.
+
+### Manga and Books
+
+Browse manga and books from available sources. Manga is considerably more developed; books are limited because finding reliable sources is a pain.
+
+### Movies and TV
+
+Browse movies, TV shows, series, and TV channels with metadata and details.
+
+> [!NOTE]
+> Video playback isn't implemented yet. You can browse the stuff, but don't expect PiraChest to turn into a cinema just yet.
+
+### YouTube
+
+Download videos or audio with metadata and quality selection.
+
+### The Black Hole Bay (TBHB)
+
+TBHB is currently the only torrent aggregator integrated into PiraChest, with its own dedicated page. More aggregators are planned.
+
+### Download Manager
+
+* Drag-and-drop queue reordering
+* Live download speed and progress
+* Seeding statistics
+* Per-download settings
+* Pause, resume, retry, and cancel
+* Persistent downloads between sessions
+
+### Torrent Engine
 
 * Selective file downloading
-* Persistent download queue
+* Persistent queue
 * Pause, resume, retry, and cancel
 * Download and upload speed limits
 * Peer limits
 * Seeding ratio and time limits
 * Force recheck
 
-### 🌐 The Black Hole Bay
+### Customization
 
-**The Black Hole Bay (TBHB)** has its own dedicated page for torrent discovery and downloading.
+This is one of the things I care about most. I don't want you stuck with the same interface everyone else has.
 
-More aggregators are planned. The long-term goal is a unified **Torrenting** page, with TBHB and future aggregators available as separate tabs.
+You can customize things like:
 
-### 🎮 PC Games
+* Themes and interface styling
+* GPU shaders
+* Photos and images
+* GIFs and videos
+* Custom title bars
+* Sounds and icons
+* Other visual details
 
-Browse and download PC game repacks.
+Make it look like your own app, not something you downloaded and forgot you could change.
 
-* Game grid and details
-* Upcoming games
-* Selective downloading
-* Download management
+Want to share your theme or show off what you've made? There's a [Discord server](https://discord.gg/kkPbmpgMTF) for that. Guides and documentation are on the [website](https://justrun.is-a.dev/pirachest/).
 
-### 🎵 Music
+### Sports
 
-Search, listen to, and download music.
-
-* Quality selection
-* Built-in audio playback
-* Customizable lyrics panel
-
-### 🍿 Anime
-
-Search, watch, and download anime episodes or entire seasons.
-
-### 📚 Manga & Books
-
-Browse and access manga and books. **Manga support is more developed**, while books remain limited by the availability of reliable sources.
-
-### 🎬 Movies & TV
-
-Search and browse movies, TV shows, series, and TV channels, with metadata available.
-
-> [!NOTE]
-> Video playback is not implemented yet.
-
-### 🏟️ Sports
-
-Not implemented yet.
-
-### ▶️ YouTube
-
-Download YouTube videos or audio with metadata and quality selection.
-
-### 📥 Download Manager
-
-Manage downloads across supported sections with:
-
-* Drag-and-drop queue reordering
-* Live speed and progress
-* Seeding statistics
-* Per-download settings
-* Pause, resume, retry, and cancel
-* Persistent downloads across restarts
-
-### 🎨 Deep Customization & Themes
-
-PiraChest offers extensive customization beyond basic color schemes.
-
-* **Custom themes:** Deep control over the application's appearance
-* **GPU shaders:** Customize GPU-powered visual effects
-* **Images, GIFs, and videos:** Personalize supported interface backgrounds and visuals
-* **Custom title bars:** Customize the window chrome
-* **Custom sounds:** Change interface sounds
-* **Custom icons:** Customize supported application icons
-* **Interface styling:** Customize colors, widgets, and other visual elements
-
-#### Community Themes & Documentation
-
-Share your themes, discover community creations, and exchange ideas in the [PiraChest Discord server](https://discord.gg/kkPbmpgMTF).
-
-Visit the [PiraChest website](https://justrun.is-a.dev/pirachest/) for documentation and guides.
-
----
+Not implemented yet. One thing at a time.
 
 ## Roadmap
 
-| Feature                                     | Status |
-| ------------------------------------------- | :----: |
-| ROM catalog and downloading                 |    ✅   |
-| Torrent engine                              |    ✅   |
-| The Black Hole Bay integration              |    ✅   |
-| Unified torrenting page and aggregator tabs |    ⬜   |
-| Multi-console support                       |    ✅   |
-| Download manager                            |    ✅   |
-| PC games and repacks                        |    ✅   |
-| Localization                                |    ✅   |
-| Music                                       |    ✅   |
-| Anime                                       |    ✅   |
-| Manga                                       |    ✅   |
-| Books                                       |   🟡   |
-| Movie and TV search and metadata            |    ✅   |
-| Movie and TV playback                       |    ⬜   |
-| Sports                                      |    ⬜   |
-| Deep theme customization                    |    ✅   |
-| GPU shaders                                 |    ✅   |
-| Custom title bars, sounds, and icons        |    ✅   |
-| Image, GIF, and video customization         |    ✅   |
-| More sources                                |   🔨   |
-| Linux support                               |    ❌   |
+Stuff that's done, stuff that's planned, and stuff that might take longer than I'd like.
 
-**Legend:** ✅ Implemented · 🟡 Limited or in progress · 🔨 Active development · ⬜ Not implemented · ❌ Not currently supported or planned
+* [x] ROM catalog and platform filters
+* [x] PC game repacks browsing
+* [x] Upcoming games page
+* [x] Selective downloads
+* [x] Music search and playback
+* [x] Anime browsing and downloads
+* [x] YouTube downloads
+* [x] Download manager
+* [x] Torrent engine
+* [x] The Black Hole Bay integration
+* [x] Advanced customization
+* [ ] One unified Torrenting page
+* [ ] Multiple torrent aggregators as tabs
+* [ ] Sports section
+* [ ] Chocolatey support
+* [ ] More fixes, improvements, and features
 
----
+> [!IMPORTANT]
+> A checked box means the feature is implemented, not that it's flawless. And an unchecked box doesn't mean it'll magically appear next Tuesday.
 
 ## Screenshots
 
-<table>
-  <tr>
-    <td><img width="2500" height="1440" alt="Minverva Page" src="https://github.com/user-attachments/assets/1cec40d1-0c39-4337-a4fa-f42cac525a1d" /></td>
-    <td><img width="2500" height="1440" alt="Music Page" src="https://github.com/user-attachments/assets/25df2a04-965e-4d78-b276-fb79cf3c26d7" /></td>
-  </tr>
-  <tr>
-    <td><img width="2500" height="1440" alt="Music Lyrics" src="https://github.com/user-attachments/assets/e66e24b0-03f5-4d7e-b001-7c012a7ba3f4" /></td>
-    <td><img width="2500" height="1440" alt="Books Pages" src="https://github.com/user-attachments/assets/8fefb040-2a22-43e2-aa19-ab9ca73cce0a" /></td>
-  </tr>
-  <tr>
-    <td><img width="2500" height="1440" alt="Anime Page" src="https://github.com/user-attachments/assets/ee71c5a8-b086-49a4-accd-cf50737155e6" /></td>
-    <td><img width="2500" height="1440" alt="Anime Details" src="https://github.com/user-attachments/assets/db66e462-81d7-4ae8-abae-9216c77efc17" /></td>
-  </tr>
-  <tr>
-    <td><img width="2500" height="1440" alt="Download Page" src="https://github.com/user-attachments/assets/253847af-8d58-4afe-a451-bb0ad41a5dab" /></td>
-    <td><img width="2500" height="1440" alt="Settings Page" src="https://github.com/user-attachments/assets/f1bca3e2-1d6d-449a-85e7-e721e5a84ca5" /></td>
-  </tr>
-  <tr>
-    <td><img width="2500" height="1440" alt="Repacks grid view" src="https://github.com/user-attachments/assets/7d79a53b-7515-462c-a587-67a5826191ee" /></td>
-    <td><img width="2500" height="1440" alt="Upcoming Games" src="https://github.com/user-attachments/assets/15d198aa-373b-4c34-bef2-d0f0e0b668cf" /></td>
-  </tr>
-  <tr>
-    <td><img width="2500" height="1440" alt="Game Details" src="https://github.com/user-attachments/assets/b9e04b64-53b4-4971-a4a0-896cf411669f" /></td>
-    <td><img width="2500" height="1440" alt="Selective Downloading" src="https://github.com/user-attachments/assets/35a7ca92-1c16-43e7-a806-f75ff5652175" /></td>
-  </tr>
-</table>
+### ROMs
 
----
+![Minverva Page](https://github.com/user-attachments/assets/1cec40d1-0c39-4337-a4fa-f42cac525a1d)
+
+### Music
+
+![Music Page](https://github.com/user-attachments/assets/25df2a04-965e-4d78-b276-fb79cf3c26d7)
+
+![Music Lyrics](https://github.com/user-attachments/assets/e66e24b0-03f5-4d7e-b001-7c012a7ba3f4)
+
+### Manga and Books
+
+![Books Pages](https://github.com/user-attachments/assets/8fefb040-2a22-43e2-aa19-ab9ca73cce0a)
+
+### Anime
+
+![Anime Page](https://github.com/user-attachments/assets/ee71c5a8-b086-49a4-accd-cf50737155e6)
+
+![Anime Details](https://github.com/user-attachments/assets/db66e462-81d7-4ae8-abae-9216c77efc17)
+
+### PC Game Repacks
+
+![Repacks Grid View](https://github.com/user-attachments/assets/7d79a53b-7515-462c-a587-67a5826191ee)
+
+![Upcoming Games](https://github.com/user-attachments/assets/15d198aa-373b-4c34-bef2-d0f0e0b668cf)
+
+![Game Details](https://github.com/user-attachments/assets/b9e04b64-53b4-4971-a4a0-896cf411669f)
+
+![Selective Downloading](https://github.com/user-attachments/assets/35a7ca92-1c16-43e7-a806-f75ff5652175)
+
+### Downloads
+
+![Download Page](https://github.com/user-attachments/assets/253847af-8d58-4afe-a451-bb0ad41a5dab)
+
+### Settings
+
+![Settings Page](https://github.com/user-attachments/assets/f1bca3e2-1d6d-449a-85e7-e721e5a84ca5)
 
 ## Current Limitations
 
-* Some console variant systems are incomplete.
-* Reliable book sources are limited.
-* Movie and TV playback is unavailable.
-* Sports support is not implemented.
-* Third-party sources may change or become unavailable.
+PiraChest is in alpha. Here's what isn't ready yet:
 
-> [!TIP]
-> Found a bug? [Open an issue](https://github.com/TheJustRun/PiraChest/issues) with logs, screenshots, and reproduction steps where possible.
+* Movies and TV have browsing and metadata, but no video playback.
+* Book sources are limited.
+* TBHB is currently the only integrated torrent aggregator.
+* Some parts of the app are still rough or incomplete.
 
----
+That's the honest version. I'd rather tell you what's missing than pretend everything is finished.
+
+## Privacy
+
+> [!IMPORTANT]
+> **PiraChest itself collects no personal data and sends no telemetry.** No built-in analytics tracking what you do, no usage reports sent back to me. Your app activity isn't being secretly shipped off to the developer.
+
+There is a difference between PiraChest itself and the services it connects to, though.
+
+* External websites and services may log your IP address, requests, and other information needed to provide their services.
+* Your ISP can see network activity and may be subject to local laws and data-retention requirements.
+* Downloading or accessing something through PiraChest doesn't make that activity invisible.
+
+> [!CAUTION]
+> **PiraChest is not a VPN, proxy, or anonymity tool.** It does not hide you from your ISP, your government, or copyright enforcement. It does not protect you from copyright law, and it does not make illegal activity legal.
+>
+> Your connection is still your connection. Don't confuse an app that collects no telemetry with an app that makes you anonymous.
 
 ## AI-Assisted Development
 
-PiraChest has been developed with assistance from a **local Qwen 3.6 35B model**, primarily for backend development, debugging, investigation, and parts of the torrent infrastructure.
-
-AI assistance does not guarantee correct code; development still involves investigation, testing, and debugging.
-
----
+This app has been AI-assisted using a local LLM (Qwen 3.6 35B) to help with the backend. Without it, I probably wouldn't have gotten the torrent per-file downloading system working, and I would've shot myself dead.
+tho things by it can break stuff or introduce issues, that's why i don't rely on it a lot.
 
 ## Donations
 
-Donations are appreciated if you want to support development and hosting costs.
+Want to support development? You can use the donation QR below.
 
-**USDT TRC-20**
+![Donation QR Code](https://github.com/user-attachments/assets/458ff27b-e03c-4e09-9dab-75895f718a8a)
 
-<p align="center">
-  <img width="400" height="400" alt="USDT TRC-20 Donation QR Code" src="https://github.com/user-attachments/assets/458ff27b-e03c-4e09-9dab-75895f718a8a" />
-</p>
-
----
+Donations are optional. You don't have to pay anything to use PiraChest.
 
 ## Credits
 
-Special thanks to [spicysaltysparty](https://www.reddit.com/user/spicysaltysparty/) for creating the PiraChest logo.
-
----
+* **Logo:** [spicysaltysparty](https://www.reddit.com/user/spicysaltysparty/)
+* **Torrent engine:** [libtorrent 2.1](https://www.libtorrent.org/)
 
 ## License
 
-PiraChest is licensed under the **PolyForm Noncommercial License 1.0.0**.
+PiraChest uses the **[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)**. The `LICENSE` file is included in the repository.
 
-You may use, modify, and redistribute PiraChest for permitted noncommercial purposes under the license terms. **Commercial use requires separate permission from the copyright holder.**
+You can use, modify, and share the project under the license terms. **Commercial use requires separate permission.**
 
-See [`LICENSE`](LICENSE) for the complete terms.
-
-Official license: https://polyformproject.org/licenses/noncommercial/1.0.0
-
----
+> [!IMPORTANT]
+> If you want to use PiraChest commercially, read the license and get permission first. Don't just assume it's fine.
 
 ## Disclaimer
 
-> [!CAUTION]
-> PiraChest is a tool. It does not host, upload, or distribute copyrighted content itself.
->
-> It may interact with third-party websites, services, archives, torrents, and other sources. Their content, availability, and legality are outside the project's control.
->
-> You are responsible for complying with applicable laws, copyrights, licenses, and terms of service. The developers and contributors do not encourage or endorse copyright infringement, piracy, or unauthorized distribution.
+PiraChest does not host, upload, or distribute copyrighted content itself. It provides tools that interact with third-party websites, sources, and services.
+
+I'm not encouraging piracy or copyright infringement. You're responsible for what you access, download, and do with the software, and for following the laws that apply where you live.
+
+> [!WARNING]
+> PiraChest doesn't magically erase the law because you clicked a button in an app. Use your brain, check your local laws, and understand what you're doing.
 >
 > If you misuse the software, **that's your responsibility. Fuck you.**
 
----
+## Project Stats
 
-## 📊 Project Stats
-
-### ⭐ Star History
-
-<p align="center">
-  <a href="https://star-history.com/#TheJustRun/PiraChest&Date">
-    <img src="https://api.star-history.com/svg?repos=TheJustRun/PiraChest&type=Date" alt="PiraChest Star History" width="800">
-  </a>
-</p>
-
-### 📥 Downloads
-
-<p align="center">
-  <img src="https://img.shields.io/github/downloads/TheJustRun/PiraChest/total?style=for-the-badge&label=Total%20Downloads" alt="Total Downloads">
-</p>
-
-<p align="center">
-  <a href="https://github.com/TheJustRun/PiraChest/releases">
-    <img src="https://img.shields.io/github/downloads/TheJustRun/PiraChest/latest/total?style=flat-square&label=Latest%20Release%20Downloads" alt="Latest Release Downloads">
-  </a>
-</p>
-
----
-
-<p align="center">
-  <a href="https://github.com/TheJustRun/PiraChest">
-    <img src="https://img.shields.io/github/stars/TheJustRun/PiraChest?style=for-the-badge&logo=github&label=Star%20PiraChest" alt="Star PiraChest">
-  </a>
-  <a href="https://github.com/TheJustRun/PiraChest/releases">
-    <img src="https://img.shields.io/github/downloads/TheJustRun/PiraChest/total?style=for-the-badge&logo=github&label=Downloads" alt="PiraChest Downloads">
-  </a>
-</p>
-
-<p align="center">
-  Made with questionable amounts of code, debugging, and a local LLM.
-</p>
+[![Star History](https://api.star-history.com/svg?repos=TheJustRun/PiraChest\&type=Date)](https://star-history.com/#TheJustRun/PiraChest&Date)
