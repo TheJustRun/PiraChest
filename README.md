@@ -1,5 +1,3 @@
-# PiraChest
-
 ![PiraChest Banner](https://github.com/user-attachments/assets/5c6d937a-26b6-4da7-994a-02b20e7373bb)
 
 <p align="center">
