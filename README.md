@@ -233,11 +233,52 @@ There is a difference between PiraChest itself and the services it connects to, 
 This app has been AI-assisted using a local LLM (Qwen 3.6 35B) to help with the backend. Without it, I probably wouldn't have gotten the torrent per-file downloading system working, and I would've shot myself dead.
 tho things by it can break stuff or introduce issues, that's why i don't rely on it a lot.
 
-## Donations
 
-Want to support development? You can use the donation QR below.
+## Support PiraChest
 
-![Donation QR Code](https://github.com/user-attachments/assets/458ff27b-e03c-4e09-9dab-75895f718a8a)
+If you find PiraChest useful, consider supporting its development.
+
+<table>
+  <tr>
+    <td align="center" width="33%">
+      <strong>Bitcoin (BTC)</strong><br><br>
+      <img src="https://github.com/user-attachments/assets/5d4220bc-2a6d-4eba-ac21-b92b10430380" width="140" alt="Bitcoin donation QR code"><br>
+      <code>bc1qkghdq757u9lwntjr3029ljg3phwv9yffj926vv</code>
+    </td>
+    <td align="center" width="33%">
+      <strong>Ethereum (ETH)</strong><br><br>
+      <img src="https://github.com/user-attachments/assets/499a6be1-158a-434e-8727-93f3788ab8cc" width="140" alt="Ethereum donation QR code"><br>
+      <code>0xD8e4d1408aF248B97C2cdCe85afbeD83e61Cc3f8xv</code>
+    </td>
+    <td align="center" width="33%">
+      <strong>Litecoin (LTC)</strong><br><br>
+      <img src="https://github.com/user-attachments/assets/ed9ed961-90dd-4a2d-8893-e49eaa45f5f7" width="140" alt="Litecoin donation QR code"><br>
+      <code>Lb3qSpBgc8Bb1xAnBKpPvuCSEwFjMNeuPm</code>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <strong>Solana (SOL)</strong><br><br>
+      <img src="https://github.com/user-attachments/assets/0dec7f9c-4537-410b-8972-7d62be2e9240" width="140" alt="Solana donation QR code"><br>
+      <code>Fe1JqgUTPkq45r7aSx9BYtz2nAbH6cPMSWztBJYu7Mc8</code>
+    </td>
+    <td align="center" width="33%">
+      <strong>USD Coin (USDC)</strong><br><br>
+      <img src="https://github.com/user-attachments/assets/ab47780b-b9cb-4e34-879b-3a104713d0ee" width="140" alt="USDC donation QR code"><br>
+      <code>0xD8e4d1408aF248B97C2cdCe85afbeD83e61Cc3f8</code>
+    </td>
+    <td align="center" width="33%">
+      <strong>Tether (USDT)</strong><br><br>
+      <img src="https://github.com/user-attachments/assets/27570992-d974-42dc-82fc-79ea8be60f42" width="140" alt="USDT donation QR code"><br>
+      <code>0xD8e4d1408aF248B97C2cdCe85afbeD83e61Cc3f8</code>
+    </td>
+  </tr>
+</table>
+
+**Please verify the cryptocurrency and network before sending.** USDC and USDT may use different networks, even when the receiving address is identical.
+
+
+
 
 Donations are optional. You don't have to pay anything to use PiraChest.
 
