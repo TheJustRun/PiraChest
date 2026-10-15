@@ -1,4 +1,4 @@
-![PiraChest Banner](https://github.com/user-attachments/assets/5c6d937a-26b6-4da7-994a-02b20e7373bb)
+![PiraChest Banner](https://github.com/user-attachments/assets/9ec37694-bbe5-410c-80bb-191f57f63eb1)
 
 <p align="center">
   <a href="https://justrun.is-a.dev/pirachest/"><img src="https://img.shields.io/badge/🌐%20Website-PiraChest-blue?style=for-the-badge" alt="Website"></a>
@@ -154,41 +154,52 @@ Stuff that's done, stuff that's planned, and stuff that might take longer than I
 
 ### ROMs
 
-![Minverva Page](https://github.com/user-attachments/assets/1cec40d1-0c39-4337-a4fa-f42cac525a1d)
+![Minverva Page](https://github.com/user-attachments/assets/18cc647b-147a-401c-8f2f-f1aff07e06e9)
 
 ### Music
 
-![Music Page](https://github.com/user-attachments/assets/25df2a04-965e-4d78-b276-fb79cf3c26d7)
+![Music Page](https://github.com/user-attachments/assets/e19d3ab9-4d03-4e94-9905-77dbb5e6513e)
 
-![Music Lyrics](https://github.com/user-attachments/assets/e66e24b0-03f5-4d7e-b001-7c012a7ba3f4)
+![Music Lyrics](https://github.com/user-attachments/assets/3ed7f395-e014-4e72-8ae7-0df9e0c69977)
 
 ### Manga and Books
 
-![Books Pages](https://github.com/user-attachments/assets/8fefb040-2a22-43e2-aa19-ab9ca73cce0a)
+![Manga Pages](https://github.com/user-attachments/assets/915348f1-d7e4-47aa-9510-1d74646abf9c>)
 
 ### Anime
 
-![Anime Page](https://github.com/user-attachments/assets/ee71c5a8-b086-49a4-accd-cf50737155e6)
+![Anime Page](https://github.com/user-attachments/assets/9e868df6-6ba7-4a78-b2ab-4043c4d36fdd)
 
-![Anime Details](https://github.com/user-attachments/assets/db66e462-81d7-4ae8-abae-9216c77efc17)
+### IPTV
+
+![IPTV](https://github.com/user-attachments/assets/f204ef8c-c171-4c05-9c92-e3acf2b3eaaf)
+
+### TV Shows & Movies (Playback not implemented yet)
+
+![TV Shows](https://github.com/user-attachments/assets/94fafa10-6ac4-4ed7-a9aa-2378f1f4840e)
+
+![Movies](https://github.com/user-attachments/assets/b53cedb2-e1f2-4dc2-aaf1-7fbe4eb220e8)
+
 
 ### PC Game Repacks
 
-![Repacks Grid View](https://github.com/user-attachments/assets/7d79a53b-7515-462c-a587-67a5826191ee)
+![FitGirl Grid View](https://github.com/user-attachments/assets/fdf7d536-2ce9-4507-8b1d-7a75712a4298)
 
-![Upcoming Games](https://github.com/user-attachments/assets/15d198aa-373b-4c34-bef2-d0f0e0b668cf)
+![GOG Revived Grid View](https://github.com/user-attachments/assets/6ba9c93c-154e-4d4d-9a4f-150a2a814cb0)
 
-![Game Details](https://github.com/user-attachments/assets/b9e04b64-53b4-4971-a4a0-896cf411669f)
+![Upcoming Games](https://github.com/user-attachments/assets/ec0f8157-9d0d-43ca-92e9-47acfd98b800)
 
-![Selective Downloading](https://github.com/user-attachments/assets/35a7ca92-1c16-43e7-a806-f75ff5652175)
+![Game Details](https://github.com/user-attachments/assets/1dc29233-3f65-433c-99f0-0a75a2d58183)
+
+![Selective Downloading](https://github.com/user-attachments/assets/df5a9b44-c507-4ac2-96a5-ff8445817ab7)
 
 ### Downloads
 
-![Download Page](https://github.com/user-attachments/assets/253847af-8d58-4afe-a451-bb0ad41a5dab)
+![Download Page](https://github.com/user-attachments/assets/b7264199-6d25-4431-b808-00dc93b9fa8d)
 
 ### Settings
 
-![Settings Page](https://github.com/user-attachments/assets/f1bca3e2-1d6d-449a-85e7-e721e5a84ca5)
+![Settings Page](https://github.com/user-attachments/assets/3b42cc3c-eede-4165-bde9-7fdc33cf065f)
 
 ## Current Limitations
 
