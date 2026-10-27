@@ -10,19 +10,19 @@
   <img src="https://img.shields.io/github/downloads/TheJustRun/PiraChest/total?label=Downloads" alt="Downloads">
   <img src="https://img.shields.io/github/stars/TheJustRun/PiraChest?label=Stars" alt="Stars">
   <img src="https://img.shields.io/github/issues/TheJustRun/PiraChest?label=Issues" alt="Issues">
-  <img src="https://img.shields.io/badge/Status-Alpha-orange" alt="Alpha">
+  <img src="https://img.shields.io/badge/Status-Beta-blue" alt="Beta">
   <img src="https://img.shields.io/badge/Platform-Windows-blue" alt="Windows">
   <img src="https://img.shields.io/badge/License-PolyForm%20Noncommercial-lightgrey" alt="License">
 </p>
 
-**PiraChest is an all-in-one Windows app for games, ROMs, music, anime, manga, downloads, torrents, and a whole lot of customization.**
+**PiraChest is an all-in-one Windows app for games, ROMs, music, anime, manga, movies, TV, downloads, torrents, and a whole lot of customization.**
 
 The idea is simple: stop jumping between a million different apps and websites when you can have the stuff you actually use in one place.
 
 And yes, you can customize the hell out of it.
 
 > [!WARNING]
-> PiraChest is still in alpha. Expect bugs, unfinished features, questionable decisions, and the occasional thing that worked yesterday suddenly deciding it doesn't want to work today.
+> PiraChest is in beta now. That's a big step up from alpha, but it's still not finished. Expect bugs, unfinished features, and the occasional thing that worked yesterday suddenly deciding it doesn't want to work today. Especially Debrid, which is still very much a work in progress.
 
 ## Download
 
@@ -37,6 +37,14 @@ choco install pirachest
 ```
 
 ## Features
+
+### Home
+
+There's a new Home page that acts as a central starting point for discovering content and getting to the main parts of PiraChest.
+
+### Sailseek
+
+A fast global search system that lets you search across the content and functionality PiraChest offers from one compact interface — movies, shows, games, music, anime, manga, settings, and more. Result cards show relevant metadata like artwork, name, source, and date where available. There's a customizable keyboard shortcut for opening it too.
 
 ### ROMs
 
@@ -64,7 +72,7 @@ Search for music, play tracks, choose audio quality, and customize the lyrics pa
 
 ### Anime
 
-Search, browse details, watch episodes, and download episodes or entire seasons.
+Search, browse details, watch episodes, and download episodes or entire seasons. Anime discovery is in now too, and AniPub is the default streamer.
 
 ### Manga and Books
 
@@ -72,10 +80,7 @@ Browse manga and books from available sources. Manga is considerably more develo
 
 ### Movies and TV
 
-Browse movies, TV shows, series, and TV channels with metadata and details.
-
-> [!NOTE]
-> Video playback isn't implemented yet. You can browse the stuff, but don't expect PiraChest to turn into a cinema just yet.
+Browse and watch movies, TV shows, series, and TV channels with metadata and details. Playback works now, and Watch Later is supported.
 
 ### YouTube
 
@@ -116,15 +121,29 @@ You can customize things like:
 * GIFs and videos
 * Custom title bars
 * Sounds and icons
+* Application backgrounds (with blur and darkness controls)
 * Other visual details
 
-Make it look like your own app, not something you downloaded and forgot you could change.
+Themes can now control their own appearance independently instead of being stuck to the global accent color, and they can follow your accent color if you want. They can also bring their own configurable settings, custom icons, images, GIFs, videos, and GPU shaders. Want to share your theme or show off what you've made? There's a [Discord server](https://discord.gg/kkPbmpgMTF) for that. Guides and documentation are on the [website](https://justrun.is-a.dev/pirachest/).
 
-Want to share your theme or show off what you've made? There's a [Discord server](https://discord.gg/kkPbmpgMTF) for that. Guides and documentation are on the [website](https://justrun.is-a.dev/pirachest/).
+## What's New in Beta
 
-### Sports
+The big focus for beta was making the app faster, more polished, more customizable, easier to use, and much more stable. A lot of that work isn't immediately visible — navigation, caching, threading, rendering, resource management, stability, and internal architecture all got significant improvements.
 
-Not implemented yet. One thing at a time.
+Some highlights:
+
+* **Sailseek**: global search across movies, shows, games, music, anime, manga, settings, and more, with a customizable keyboard shortcut.
+* **Picture-in-Picture**: the video player supports PiP now, and the PiP window can stay above other windows.
+* **Movie and TV playback**: movies and shows actually play now, and Watch Later is in.
+* **Unified Downloads page**: one dedicated place for download management with better controls and more consistent state handling.
+* **Settings backup and restore**: back up and restore your PiraChest configuration.
+* **Better updates**: changelogs show before you accept an update, plus a Don't Show Again option and a proper cancel option. Updates preserve your settings and downloads.
+* **RSS checking**: PiraChest can check supported RSS sources for updates/content.
+* **Context menus**: quicker access to relevant actions across many parts of the app.
+* **Keyboard navigation**: broader keyboard navigation and customizable shortcuts throughout the interface.
+* **Experimental features**: an Experimental settings category with stuff still being tested, like install-on-download and a theme maker.
+* **Debrid**: initial Debrid integration is in, but it's unfinished and needs testing. Expect things to break or change.
+* **Localization**: added Russian and Dutch.
 
 ## Roadmap
 
@@ -141,10 +160,9 @@ Stuff that's done, stuff that's planned, and stuff that might take longer than I
 * [x] Torrent engine
 * [x] The Black Hole Bay integration
 * [x] Advanced customization
+* [x] Chocolatey support
 * [ ] One unified Torrenting page
 * [ ] Multiple torrent aggregators as tabs
-* [ ] Sports section
-* [ ] Chocolatey support
 * [ ] More fixes, improvements, and features
 
 > [!IMPORTANT]
@@ -152,60 +170,67 @@ Stuff that's done, stuff that's planned, and stuff that might take longer than I
 
 ## Screenshots
 
-### ROMs
+### Home
 
-![Minverva Page](https://github.com/user-attachments/assets/18cc647b-147a-401c-8f2f-f1aff07e06e9)
+![Home](https://github.com/user-attachments/assets/63da344d-f6d1-4155-ba71-37446c2386f8)
 
-### Music
+### Sailseek
 
-![Music Page](https://github.com/user-attachments/assets/e19d3ab9-4d03-4e94-9905-77dbb5e6513e)
-
-![Music Lyrics](https://github.com/user-attachments/assets/3ed7f395-e014-4e72-8ae7-0df9e0c69977)
-
-### Manga and Books
-
-![Manga Pages](https://github.com/user-attachments/assets/915348f1-d7e4-47aa-9510-1d74646abf9c>)
-
-### Anime
-
-![Anime Page](https://github.com/user-attachments/assets/9e868df6-6ba7-4a78-b2ab-4043c4d36fdd)
-
-### IPTV
-
-![IPTV](https://github.com/user-attachments/assets/f204ef8c-c171-4c05-9c92-e3acf2b3eaaf)
-
-### TV Shows & Movies (Playback not implemented yet)
-
-![TV Shows](https://github.com/user-attachments/assets/94fafa10-6ac4-4ed7-a9aa-2378f1f4840e)
-
-![Movies](https://github.com/user-attachments/assets/b53cedb2-e1f2-4dc2-aaf1-7fbe4eb220e8)
-
+![Sailseek](https://github.com/user-attachments/assets/22b1c541-5fbc-4941-ac78-e52fac67b7f5)
 
 ### PC Game Repacks
 
-![FitGirl Grid View](https://github.com/user-attachments/assets/fdf7d536-2ce9-4507-8b1d-7a75712a4298)
+![Repacks](https://github.com/user-attachments/assets/87745b5d-50af-4b9a-be20-c4f91e2dda29)
 
-![GOG Revived Grid View](https://github.com/user-attachments/assets/6ba9c93c-154e-4d4d-9a4f-150a2a814cb0)
+![Repacks Selective Download](https://github.com/user-attachments/assets/eb7b18a3-0772-42c5-b649-abc208a83a6f)
 
-![Upcoming Games](https://github.com/user-attachments/assets/ec0f8157-9d0d-43ca-92e9-47acfd98b800)
+![Repacks Details](https://github.com/user-attachments/assets/76336ec8-4e68-4512-9b01-f602e551429c)
 
-![Game Details](https://github.com/user-attachments/assets/1dc29233-3f65-433c-99f0-0a75a2d58183)
+![Repack Sources](https://github.com/user-attachments/assets/224a4474-69c0-422b-8c43-60e8d32fc1bc)
 
-![Selective Downloading](https://github.com/user-attachments/assets/df5a9b44-c507-4ac2-96a5-ff8445817ab7)
+![GOG](https://github.com/user-attachments/assets/29680df6-3954-44ce-b4af-d0b793eeedff)
+
+![Upcoming](https://github.com/user-attachments/assets/e3b07b4c-7c93-43b4-8321-5bfb226ba71c)
+
+### Music
+
+![Music](https://github.com/user-attachments/assets/ee4cd666-7cb0-4b56-8c6d-57540bc6b24b)
+
+### Minerva
+
+![Minerva](https://github.com/user-attachments/assets/bf773d12-1a87-48dd-8171-22c6ff44104b)
 
 ### Downloads
 
-![Download Page](https://github.com/user-attachments/assets/b7264199-6d25-4431-b808-00dc93b9fa8d)
+![Downloads](https://github.com/user-attachments/assets/9e48aff8-474f-4bf0-8586-1f19eb32a91b)
+
+### Books
+
+![Books](https://github.com/user-attachments/assets/3c5b7893-e5b5-4a79-a2a9-274199d9d261)
 
 ### Settings
 
-![Settings Page](https://github.com/user-attachments/assets/3b42cc3c-eede-4165-bde9-7fdc33cf065f)
+![Settings](https://github.com/user-attachments/assets/b5ba2962-207a-4864-bdc8-21257c4b8cdb)
+
+### YouTube
+
+![YouTube](https://github.com/user-attachments/assets/d5036c06-b8d8-4c61-a9de-8388eb168ac1)
+
+### Movies and TV
+
+![TV](https://github.com/user-attachments/assets/464ca861-de93-43fa-8cf3-1a4a6a78a21b)
+
+### The Black Hole Bay (TBHB)
+
+![TBHB Search](https://github.com/user-attachments/assets/9e9e07d8-50b1-466b-8972-728c8d333ab3)
+
+![TBHB Results](https://github.com/user-attachments/assets/fff44a0a-97e0-4659-a635-dcda5c718809)
 
 ## Current Limitations
 
-PiraChest is in alpha. Here's what isn't ready yet:
+PiraChest is in beta. Here's what isn't ready yet:
 
-* Movies and TV have browsing and metadata, but no video playback.
+* Debrid support is unfinished and needs testing.
 * Book sources are limited.
 * TBHB is currently the only integrated torrent aggregator.
 * Some parts of the app are still rough or incomplete.
@@ -232,7 +257,6 @@ There is a difference between PiraChest itself and the services it connects to, 
 
 This app has been AI-assisted using a local LLM (Qwen 3.6 35B) to help with the backend. Without it, I probably wouldn't have gotten the torrent per-file downloading system working, and I would've shot myself dead.
 tho things by it can break stuff or introduce issues, that's why i don't rely on it a lot.
-
 
 ## Support PiraChest
 
@@ -277,9 +301,6 @@ If you find PiraChest useful, consider supporting its development.
 
 **Please verify the cryptocurrency and network before sending.** USDC and USDT may use different networks, even when the receiving address is identical.
 
-
-
-
 Donations are optional. You don't have to pay anything to use PiraChest.
 
 ## Credits
@@ -309,4 +330,4 @@ I'm not encouraging piracy or copyright infringement. You're responsible for wha
 
 ## Project Stats
 
-[![Star History](https://api.star-history.com/svg?repos=TheJustRun/PiraChest\&type=Date)](https://star-history.com/#TheJustRun/PiraChest&Date)
+[![Star History](https://api.star-history.com/svg?repos=TheJustRun/PiraChest&type=Date)](https://star-history.com/#TheJustRun/PiraChest&Date)
