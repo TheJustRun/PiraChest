@@ -1,375 +1,164 @@
-import argparse
-import gc
-import glob
+from __future__ import annotations
+
 import logging
-import os
+import posixpath
 import re
 import shutil
-import urllib.request
+import tempfile
 import urllib.error
+import urllib.parse
+import urllib.request
 import zipfile
-from typing import Optional
+from functools import lru_cache
+from io import TextIOWrapper
+from typing import Iterator, Optional
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-)
+from .console_mapper import _CONSOLE_CANONICAL, _normalize_db_console, classify_torrent_name
+from .console_variants import guess_variant
+from .database import init_db, replace_roms_streaming
+from ..config import network
+
 logger = logging.getLogger(__name__)
 
-INDEX_RAW_ZIP_URL = "https://github.com/Caprico1/Minerva-archive-ids/archive/refs/heads/main.zip"
-
-from ..config import paths as _paths
-_CLONE_DIR = os.path.join(_paths.app_data_dir, "tmp", "minerva-index-clone")
-
-_RE_TABLE_HEADER = re.compile(r"^\|\s*ID\s*")
+INDEX_ZIP_URL = "https://github.com/Caprico1/Minerva-archive-ids/archive/refs/heads/main.zip"
+TORRENTS_URL = network.cdn_base.rstrip("/") + "/"
+_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 _SKIP_PROVIDERS = frozenset({
-    "bitsavers",
-    "Internet Archive",
-    "Laserdisc Collection",
-    "Hardware Target Game Database",
-    "Total DOS Collection",
-    "Touhou Project Collection",
-    "eXo",
-    "Exo",
-    "Eggman's Arcade Repository",
-    "Lost Level",
-    "Outliers",
-    "Miscellaneous",
-    "T-En Collection",
-    "RetroAchievements",
-    "MAME",
-    "HBMAME",
-    "FinalBurn Neo",
+    "bitsavers", "Internet Archive", "Laserdisc Collection", "Hardware Target Game Database",
+    "Total DOS Collection", "Touhou Project Collection", "eXo", "Exo", "Eggman's Arcade Repository",
+    "Lost Level", "Outliers", "Miscellaneous", "T-En Collection", "RetroAchievements",
+    "MAME", "HBMAME", "FinalBurn Neo",
 })
+_BARE_BRAND_PROVIDERS = frozenset({"TOSEC", "TOSEC-ISO", "TOSEC-PIX"})
+_CANONICAL_PREFIXES = tuple(set(_CONSOLE_CANONICAL.values()))
 
-def _parse_table(content: str) -> list[dict]:
-    records: list[dict] = []
-    lines = content.splitlines()
+_RE_TORRENT_HREF = re.compile(r'href="([^"]+\.torrent)"', re.IGNORECASE)
+_RE_NON_ALNUM = re.compile(r"[\W_]+")
 
-    header_line_idx = None
-    for idx, line in enumerate(lines):
-        if _RE_TABLE_HEADER.match(line):
-            header_line_idx = idx
-            break
 
-    if header_line_idx is None:
-        return records
+def _torrent_key(name: str) -> str:
+    return _RE_NON_ALNUM.sub("", name.removesuffix(".torrent").lower())
 
-    for line in lines[header_line_idx + 1:]:
-        line = line.strip()
-        if not line:
+
+def _fetch_torrent_names() -> dict[str, str]:
+    try:
+        req = urllib.request.Request(TORRENTS_URL, headers=_HEADERS)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError) as exc:
+        logger.warning("Torrent listing unavailable (%s) — keeping index spellings", exc)
+        return {}
+    names = (urllib.parse.unquote(href).rpartition("/")[2] for href in _RE_TORRENT_HREF.findall(html))
+    return {_torrent_key(n): n for n in names}
+
+
+def _download_index():
+    logger.info("Downloading index from %s", INDEX_ZIP_URL)
+    tmp = tempfile.TemporaryFile()
+    try:
+        req = urllib.request.Request(INDEX_ZIP_URL, headers=_HEADERS)
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            shutil.copyfileobj(resp, tmp, 1 << 20)
+    except (urllib.error.URLError, OSError) as exc:
+        tmp.close()
+        raise RuntimeError(f"Failed to download index ZIP: {exc}") from exc
+    return tmp
+
+
+@lru_cache(maxsize=None)
+def _is_valid_console(name: str) -> bool:
+    if name.startswith(_CANONICAL_PREFIXES):
+        return True
+    words = name.split()
+    if len(words) >= 2:
+        return all(w.isalpha() or w.isdigit() for w in words)
+    return len(words) == 1 and len(words[0]) >= 3 and words[0].isalpha()
+
+
+@lru_cache(maxsize=None)
+def _brand_console(console: str, sub: str) -> str:
+    return _normalize_db_console(f"{console} {sub}")
+
+
+def _file_rows(fh, member: str, torrents: dict[str, str], skipped: list[str]) -> Iterator[tuple]:
+    header = fh.readline().strip()
+    torrent_name = header[2:].strip() if header.startswith("# ") else \
+        posixpath.basename(member).replace("-ids.md", "")
+    cls = classify_torrent_name(torrent_name)
+    provider, console = cls.provider, cls.console
+    if provider in _SKIP_PROVIDERS:
+        return
+    if not _is_valid_console(console):
+        skipped.append(f"{torrent_name} -> {console!r}")
+        return
+
+    canonical = _normalize_db_console(console)
+    variant = guess_variant(canonical, list(cls.variant_parts))
+
+    torrent_file = torrent_name if torrent_name.endswith(".torrent") else f"{torrent_name}.torrent"
+    if torrents:
+        real = torrents.get(_torrent_key(torrent_file))
+        if real is None:
+            logger.warning("%s is not in the CDN torrent listing", torrent_file)
+        else:
+            torrent_file = real
+
+    bare_brand = provider in _BARE_BRAND_PROVIDERS and len(console.split()) <= 1
+
+    for line in fh:
+        if not line.startswith("|"):
             continue
-        if all(c in "-|: " for c in line):
-            continue
-
-        parts = [p.strip() for p in line.split("|") if p.strip()]
-        if len(parts) < 2:
-            continue
-
+        cell, _, path = line[1:].partition("|")
         try:
-            file_id = int(parts[0])
+            file_id = int(cell)
         except ValueError:
             continue
-
-        original_path = parts[1]
-        game_name = original_path.rstrip("/").split("/")[-1] if original_path else ""
-
-        if not game_name:
+        path = path.strip().removesuffix("|").rstrip()
+        title = path.rstrip("/").rpartition("/")[2]
+        if not title:
             continue
 
-        records.append({
-            "name": game_name,
-            "file_id": file_id,
-            "original_path": original_path,
-        })
+        row_console = canonical
+        if bare_brand:
+            bits = path.split("/")
+            if len(bits) > 4 and bits[4].strip():
+                row_console = _brand_console(console, bits[4].strip())
 
-    return records
+        yield title, row_console, provider, torrent_file, file_id, variant
 
-def _extract_torrent_name_from_md(filepath: str) -> str:
-    with open(filepath, "r", encoding="utf-8") as fh:
-        first_line = fh.readline().strip()
 
-    header_match = re.match(r"^#\s+(.+)$", first_line)
-    if header_match:
-        return header_match.group(1).strip()
-
-    base = os.path.basename(filepath)
-    name = base.replace("-ids.md", "")
-    return name
-
-def _parse_markdown_file(filepath: str) -> tuple[str, str, str, list[dict]]:
-    with open(filepath, "r", encoding="utf-8") as fh:
-        content = fh.read()
-
-    torrent_name = _extract_torrent_name_from_md(filepath)
-
-    classification = _classify_torrent_name(torrent_name)
-    provider = classification.provider
-
-    if provider in _SKIP_PROVIDERS:
-        return classification.console, provider, "", []
-
-    records = _parse_table(content)
-
-    if not records:
-        return classification.console, provider, "", []
-
-    if torrent_name.endswith(".torrent"):
-        torrent_file = torrent_name
-    else:
-        torrent_file = f"{torrent_name}.torrent"
-
-    return classification.console, provider, torrent_file, records
-
-def _classify_torrent_name(torrent_name: str) -> "Classification":
-    from .console_mapper import classify_torrent_name
-    return classify_torrent_name(torrent_name)
-
-def download_index_zip(target_dir: str) -> str:
-    logger.info("Downloading index repository from %s", INDEX_RAW_ZIP_URL)
-
-    os.makedirs(target_dir, exist_ok=True)
-    zip_path = os.path.join(target_dir, "index.zip")
-
-    try:
-        urllib.request.urlretrieve(INDEX_RAW_ZIP_URL, zip_path)
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Failed to download index ZIP: {exc}") from exc
-
-    logger.info("Extracting ZIP to %s", target_dir)
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(target_dir)
-
-    extracted = os.path.join(target_dir, "Minerva-archive-ids-main")
-    if not os.path.isdir(extracted):
-        dirs = [
-            d for d in os.listdir(target_dir)
-            if os.path.isdir(os.path.join(target_dir, d))
-        ]
-        if dirs:
-            extracted = os.path.join(target_dir, dirs[0])
-        else:
-            raise RuntimeError(f"No directory found in extracted ZIP at {target_dir}")
-
-    os.remove(zip_path)
-    logger.info("Index downloaded and extracted to %s", extracted)
-    return extracted
-
-def download_index_git_fallback(target_dir: str) -> str:
-    logger.info("Falling back to git clone for %s", INDEX_RAW_ZIP_URL)
-
-    import subprocess
-
-    os.makedirs(target_dir, exist_ok=True)
-    try:
-        subprocess.run(
-            ["git", "clone", INDEX_RAW_ZIP_URL, target_dir],
-            check=True,
-            capture_output=True,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            "git not found in PATH. Install git or ensure the ZIP download succeeds."
-        ) from None
-    except subprocess.CalledProcessError as exc:
-        stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else "unknown"
-        raise RuntimeError(f"git clone failed: {stderr}") from exc
-
-    logger.info("Index cloned to %s", target_dir)
-    return target_dir
-
-def clone_index(target_dir: str) -> str:
-    try:
-        return download_index_zip(target_dir)
-    except Exception as exc:
-        logger.warning("ZIP download failed (%s), trying git fallback…", exc)
+def _iter_rows(zf: zipfile.ZipFile, torrents: dict[str, str]) -> Iterator[tuple]:
+    members = sorted(
+        n for n in zf.namelist()
+        if n.endswith(".md") and posixpath.basename(n) != "README.md"
+    )
+    logger.info("Parsing %d markdown file(s)", len(members))
+    skipped: list[str] = []
+    for member in members:
         try:
-            return download_index_git_fallback(target_dir)
-        except Exception as exc2:
-            raise RuntimeError(
-                f"Could not download index: {exc2}"
-            ) from exc2
+            with TextIOWrapper(zf.open(member), encoding="utf-8") as fh:
+                yield from _file_rows(fh, member, torrents, skipped)
+        except Exception as exc:
+            logger.warning("Failed to parse %s: %s", member, exc)
+    if skipped:
+        logger.info("Skipped %d torrent(s): non-game or unrecognised consoles", len(skipped))
+        for item in skipped:
+            logger.debug("  skipped %s", item)
 
-def _is_valid_console(console_name: str) -> bool:
-    from .console_mapper import _CONSOLE_CANONICAL
-    canonical_values = set(_CONSOLE_CANONICAL.values())
-
-    if console_name in canonical_values:
-        return True
-
-    if console_name == "MAME":
-        return True
-
-    for known in canonical_values:
-        if console_name.startswith(known):
-            return True
-
-    words = console_name.split()
-    if len(words) >= 2 and all(w.isalpha() or w.isdigit() for w in words):
-        return True
-
-    if len(words) == 1 and len(words[0]) >= 3 and words[0].isalpha():
-        return True
-
-    return False
 
 def sync_index(
     db_path: Optional[str] = None,
     batch_size: int = 2000,
     on_progress=None,
 ) -> int:
-    from .database import clear_roms, init_db, upsert_roms_streaming
-    from .console_variants import guess_variant
-    from .console_mapper import _normalize_db_console
-
-    logger.info("Starting ROM index sync (Console-first architecture)")
-    logger.info("=" * 60)
-
     init_db(db_path)
-    clear_roms(db_path)
-    logger.info("Database cleared and ready for upsert")
-
-    clone_dir = clone_index(_CLONE_DIR)
-
-    try:
-        md_files = sorted(glob.glob(os.path.join(clone_dir, "**", "*.md"), recursive=True))
-
-        if not md_files:
-            logger.warning("No .md files found in %s index may be empty", clone_dir)
-            return 0
-
-        logger.info("Found %d markdown file(s) to parse", len(md_files))
-
-        total_parsed = 0
-
-        def _record_generator():
-            nonlocal total_parsed
-            for md_file in md_files:
-                basename = os.path.basename(md_file)
-                if basename == "README.md":
-                    continue
-
-                try:
-                    console_name, provider, torrent_file, records = _parse_markdown_file(md_file)
-                except Exception as exc:
-                    logger.warning("Failed to parse %s: %s", basename, exc)
-                    continue
-
-                if not records or not _is_valid_console(console_name):
-                    continue
-
-                classification = _classify_torrent_name(
-                    _extract_torrent_name_from_md(md_file)
-                )
-                canonical_console_name = _normalize_db_console(console_name)
-                variant = guess_variant(canonical_console_name, list(classification.variant_parts))
-
-                is_bare_brand = (
-                    provider in ("TOSEC", "TOSEC-ISO", "TOSEC-PIX")
-                    and len(console_name.split()) <= 1
-                )
-
-                for rec in records:
-                    rec_console_name = canonical_console_name
-
-                    if is_bare_brand:
-                        path_bits = rec.get("original_path", "").split("/")
-                        if len(path_bits) > 4 and path_bits[4].strip():
-                            rec_console_name = _normalize_db_console(
-                                f"{console_name} {path_bits[4].strip()}"
-                            )
-
-                    total_parsed += 1
-                    yield {
-                        "title": rec["name"],
-                        "author": "",
-                        "date": None,
-                        "console": rec_console_name,
-                        "source": provider,
-                        "file_size": None,
-                        "file_size_bytes": 0,
-                        "download_url": None,
-                        "region": None,
-                        "lang": None,
-                        "torrent_file": torrent_file,
-                        "file_id": rec.get("file_id", 1),
-                        "variant": variant,
-                    }
-                records.clear()
-
-        total = upsert_roms_streaming(
-            _record_generator(),
+    with _download_index() as tmp, zipfile.ZipFile(tmp) as zf:
+        total = replace_roms_streaming(
+            _iter_rows(zf, _fetch_torrent_names()),
             db_path,
             batch_size=batch_size,
             on_batch=on_progress,
         )
-
-        logger.info(
-            "Total ROM records: %d in database (parsed %d rows, duplicates autoskipped by DB constraint)",
-            total, total_parsed,
-        )
-        logger.info("Sync complete. %d ROMs in database.", total)
-        return total
-    finally:
-        shutil.rmtree(_CLONE_DIR, ignore_errors=True)
-        gc.collect()
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Minerva Archive ROM Indexer, sync, search, or show stats.",
-    )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--sync",
-        action="store_true",
-        help="Download, parse, and populate the ROM index database.",
-    )
-    group.add_argument(
-        "--search",
-        type=str,
-        metavar="QUERY",
-        help="Search the ROM index and print results.",
-    )
-    group.add_argument(
-        "--stats",
-        action="store_true",
-        help="Show index statistics.",
-    )
-
-    args = parser.parse_args()
-
-    if args.sync:
-        total = sync_index()
-        print(f"\n[OK] Sync complete. {total} ROMs in database.")
-
-    elif args.search:
-        from .database import search_roms, init_db
-
-        init_db()
-        results = search_roms(args.search)
-        if not results:
-            print(f"No ROMs matching '{args.search}'.")
-        else:
-            print(f"\nFound {len(results)} ROM(s) matching '{args.search}':\n")
-            print(f"{'Console':<45} {'Source':<18} {'File ID':>8}  {'Game Name'}")
-            print("-" * 110)
-            for rom in results:
-                print(
-                    f"{rom['console']:<45} {rom['source']:<18} "
-                    f"{rom['file_id']:>8}  {rom['title']}"
-                )
-            print(f"\n({len(results)} result(s))")
-
-    elif args.stats:
-        from .database import get_stats, init_db
-
-        init_db()
-        stats = get_stats()
-        print("\nROM Index Statistics:")
-        print(f"  Total ROMs : {stats['total_roms']}")
-        print(f"  Consoles   : {stats['consoles']}")
-        print(f"  Sources    : {stats['sources']}")
-
-if __name__ == "__main__":
-    main()
+    logger.info("Sync complete. %d ROMs in database.", total)
+    return total

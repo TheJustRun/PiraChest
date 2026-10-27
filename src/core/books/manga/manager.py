@@ -127,9 +127,6 @@ class MangaBrowseResult:
     def from_dict(cls, d: dict[str, Any]) -> 'MangaBrowseResult':
         return cls(entries=[MangaItem.from_dict(e) for e in d.get('entries') or []], has_more=bool(d.get('has_more')))
 
-class MangaDownloadCancelled(Exception):
-    pass
-
 _session: Optional[requests.Session] = None
 
 def _get_session() -> requests.Session:
@@ -296,7 +293,6 @@ def chapter_page_urls(chapter_id: str, data_saver: bool = False) -> list[str]:
     return [f'{base_url}/{quality_dir}/{chapter_hash}/{filename}' for filename in filenames]
 
 class MangaChapterDownloadJob(QRunnable):
-
     def __init__(self, manga_title: str, chapter: MangaChapter, dest_dir: str, item_id: str, download_manager):
         super().__init__()
         self._manga_title = manga_title
@@ -388,7 +384,6 @@ class MangaChapterDownloadJob(QRunnable):
         dm.complete_external(self._item_id, cbz_path)
 
 class MangaDownloadBridge(QObject):
-
     def __init__(self, download_manager, parent=None):
         super().__init__(parent)
         from src.core.downloader import DLState

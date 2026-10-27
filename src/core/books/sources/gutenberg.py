@@ -129,4 +129,3 @@ class GutenbergProvider(BookProvider):
             subjects=(subjects + bookshelves)[:20],
             language=languages[0] if languages else '',
         )
-

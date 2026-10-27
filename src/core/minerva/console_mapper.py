@@ -3,11 +3,19 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 _CONSOLE_CANONICAL: dict[str, str] = {
+    "gp2x": "GamePark GP2X",
+    "gp32": "GamePark GP32",
+    "j2me": "Mobile J2ME",
+    "c128": "Commodore 128",
+    "c65": "Commodore 65",
+    "c64dtv": "Commodore 64 DTV",
+    "bx256_80hp": "Commodore BX256-80HP",
+    "radio_86rk": "Radio-86RK",
+    "aleck64": "Seta Aleck64",
     "nes": "Nintendo Entertainment System",
     "nintendo_entertainment_system": "Nintendo Entertainment System",
     "family_computer": "Nintendo Family Computer",
@@ -265,39 +273,6 @@ def _extract_provider(raw: str) -> str:
             return _KNOWN_PROVIDERS_NORM[provider_key]
     return "Unknown"
 
-def _normalize_provider_name(raw: str) -> str:
-    raw = raw.lower().strip()
-    return _KNOWN_PROVIDERS_NORM.get(raw, raw.title().replace("_", "-"))
-
-_VARIANT_TOKENS: frozenset[str] = frozenset({
-    "decrypted", "encrypted", "digital", "cdn", "headered", "headerless",
-    "bigendian", "byteswapped", "padded",
-    "bios", "demo", "demos", "prototypes", "prototype", "beta", "betas",
-    "kiosk", "homebrew", "aftermarket", "unlicensed", "hack", "hacks",
-    "translations", "translation", "magazine", "sampler", "dlc", "update",
-    "updates", "patch", "patches", "bootleg", "bootlegs", "demoscene",
-    "music", "c64_music", "demodisc", "demodiscs", "wads", "wad",
-    "minis", "umd_video", "umd_music", "nonpdrm", "npdp", "npdp_carts",
-    "bs_manuals", "st_games", "sd_cards", "dsvision", "photopi",
-    "smartmedia", "disk", "gd_rom", "mil_cd", "e_reader", "video",
-    "multiboot", "play_yan",
-    "roms", "chds", "samples", "devices",
-    "cue", "ccd", "img", "iso", "chd", "mds", "toc", "ssf", "sub",
-    "cbz", "zip", "rar", "nfo", "md5", "torrent",
-    "rom", "bin", "cof", "bll", "lnx", "lyx", "pp", "gz", "7z",
-    "sd", "cards", "no", "mario", "sbi", "subchannels", "net", "jet",
-})
-
-def _is_variant_token(token: str) -> bool:
-    norm = _normalize_token_v2(token)
-    if norm in _VARIANT_TOKENS:
-        return True
-    if len(token) == 1 and token.isalpha():
-        return True
-    if re.fullmatch(r"\d+[-_]\d+", norm):
-        return True
-    return False
-
 _NON_GAME_PREFIXES: frozenset[str] = frozenset({
     "Source Code", "source code",
     "Wallpapers", "wallpapers",
@@ -365,7 +340,7 @@ _NON_GAME_SUBSTRINGS: frozenset[str] = frozenset({
     " net jet", " purikura", " megatouch",
     " python 2", " hasbro ion", " polymega",
     " electronic book", " zaurus", " satellite terminal",
-    " disc keys", " wux", " nkit", " gdi files", " bios images",
+    " disc keys",
     " lotcheck", " starlight",
 })
 
@@ -384,8 +359,6 @@ def _looks_like_non_game(raw_parts: list[str]) -> bool:
 class Classification:
     provider: str
     console: str
-    console_key: str
-    original_path: str
     variant_parts: tuple = field(default_factory=tuple)
 
 def classify_torrent_name(torrent_name: str) -> Classification:
@@ -401,8 +374,6 @@ def classify_torrent_name(torrent_name: str) -> Classification:
         return Classification(
             provider="Unknown",
             console="Unknown",
-            console_key="unknown",
-            original_path="",
         )
 
     provider = _extract_provider(parts[0])
@@ -417,8 +388,6 @@ def classify_torrent_name(torrent_name: str) -> Classification:
         return Classification(
             provider=provider,
             console=console,
-            console_key=_normalize_token_v2(console),
-            original_path="",
             variant_parts=(),
         )
 
@@ -427,8 +396,6 @@ def classify_torrent_name(torrent_name: str) -> Classification:
         return Classification(
             provider=provider,
             console=combined,
-            console_key=_normalize_token_v2(combined),
-            original_path="",
             variant_parts=tuple(console_parts),
         )
 
@@ -462,7 +429,7 @@ def classify_torrent_name(torrent_name: str) -> Classification:
         if not candidates:
             return None, set()
 
-        best_length, best_start, best_key, best_indices = max(
+        _, _, best_key, best_indices = max(
             candidates, key=lambda c: (c[0], c[1])
         )
 
@@ -472,7 +439,6 @@ def classify_torrent_name(torrent_name: str) -> Classification:
     if key:
         console_display = _CONSOLE_CANONICAL[key]
         min_idx = min(indices) if indices else 0
-        max_idx = max(indices) if indices else 0
 
         leftover_parts: list[str] = []
         for i, p in enumerate(console_parts):
@@ -488,8 +454,6 @@ def classify_torrent_name(torrent_name: str) -> Classification:
         return Classification(
             provider=provider,
             console=console_display,
-            console_key=key,
-            original_path="",
             variant_parts=tuple(leftover_parts),
         )
 
@@ -511,8 +475,6 @@ def classify_torrent_name(torrent_name: str) -> Classification:
             return Classification(
                 provider=provider,
                 console=console_display,
-                console_key=key,
-                original_path="",
                 variant_parts=tuple(leftover_parts),
             )
 
@@ -520,154 +482,152 @@ def classify_torrent_name(torrent_name: str) -> Classification:
     return Classification(
         provider=provider,
         console=combined.replace("_", " ").title(),
-        console_key=combined,
-        original_path="",
         variant_parts=tuple(console_parts[1:]) if len(console_parts) > 1 else (),
     )
 
-_DB_CONSOLE_MAPPERS: list[tuple[str, str]] = [
-    ("Nintendo DS (NDS)", "Nintendo DS (NDS)"),
-    ("Nintendo DSi", "Nintendo DSi"),
-    ("Nintendo 3DS", "Nintendo 3DS"),
-    ("New Nintendo 3DS", "New Nintendo 3DS"),
-    ("Nintendo 64", "Nintendo 64"),
-    ("Nintendo 64DD", "Nintendo 64DD"),
-    ("Nintendo GameCube (GC)", "Nintendo GameCube (GC)"),
-    ("Nintendo Wii U", "Nintendo Wii U"),
-    ("Nintendo Game & Watch", "Nintendo Game & Watch"),
-    ("Virtual Boy (VB)", "Virtual Boy (VB)"),
-    ("Satellaview", "Satellaview"),
-    ("Sufami Turbo", "Sufami Turbo"),
-    ("Pokemon Mini", "Pokemon Mini"),
-    ("Game Boy (GB)", "Game Boy (GB)"),
-    ("Game Boy Color (GBC)", "Game Boy Color (GBC)"),
-    ("Game Boy Advance (GBA)", "Game Boy Advance (GBA)"),
-    ("Family Computer (FC)", "Family Computer (FC)"),
-    ("Family Computer Disk System (FDS)", "Family Computer Disk System (FDS)"),
-    ("Famicom Terebikko", "Famicom Terebikko"),
-    ("Nintendo Entertainment System (NES)", "Nintendo Entertainment System (NES)"),
-    ("Super Nintendo Entertainment System (SNES)", "Super Nintendo Entertainment System (SNES)"),
-    ("Super Famicom (SFC)", "Super Famicom (SFC)"),
-    ("Sony PlayStation", "Sony PlayStation"),
-    ("PlayStation 2 (PS2)", "PlayStation 2 (PS2)"),
-    ("PlayStation 3 (PS3)", "PlayStation 3 (PS3)"),
-    ("PlayStation Portable (PSP)", "PlayStation Portable (PSP)"),
-    ("Sony PlayStation Vita", "Sony PlayStation Vita"),
-    ("PS One", "Sony PlayStation"),
-    ("PSone", "Sony PlayStation"),
-    ("Microsoft Xbox", "Microsoft Xbox"),
-    ("Microsoft Xbox 360", "Microsoft Xbox 360"),
-    ("Microsoft Xbox One", "Microsoft Xbox One"),
-    ("Microsoft Xbox Series X and Series S", "Microsoft Xbox Series X and Series S"),
-    ("Sega Genesis", "Sega Genesis"),
-    ("Sega Master System", "Sega Master System"),
-    ("Sega Game Gear", "Sega Game Gear"),
-    ("Sega Saturn", "Sega Saturn"),
-    ("Sega 32X", "Sega 32X"),
-    ("Sega Mega-CD", "Sega Mega-CD"),
-    ("Sega Mega-CD 32X", "Sega Mega-CD 32X"),
-    ("Sega Dreamcast", "Sega Dreamcast"),
-    ("Sega NAOMI Arcade System", "Sega NAOMI Arcade System"),
-    ("Sega NAOMI 2 Arcade System", "Sega NAOMI 2 Arcade System"),
-    ("Sega Lindbergh Arcade System", "Sega Lindbergh Arcade System"),
-    ("Sega RingEdge Arcade System", "Sega RingEdge Arcade System"),
-    ("Sega Triforce Arcade System", "Sega Triforce Arcade System"),
-    ("Sega SG-1000", "Sega SG-1000"),
-    ("Sega Pico", "Sega Pico"),
-    ("Sega Beena", "Sega Beena"),
-    ("Atari 2600", "Atari 2600"),
-    ("Atari 5200", "Atari 5200"),
-    ("Atari 7800", "Atari 7800"),
-    ("Atari Jaguar", "Atari Jaguar"),
-    ("Atari Jaguar CD", "Atari Jaguar CD"),
-    ("Atari Lynx", "Atari Lynx"),
-    ("Atari ST", "Atari ST"),
-    ("Atari 8-bit Family", "Atari 8-bit Family"),
-    ("Commodore Amiga", "Commodore Amiga"),
-    ("Commodore Amiga CD32", "Commodore Amiga CD32"),
-    ("Commodore Amiga CDTV", "Commodore Amiga CDTV"),
-    ("Commodore 64", "Commodore 64"),
-    ("Commodore VIC-20", "Commodore VIC-20"),
-    ("Commodore Plus/4", "Commodore Plus/4"),
-    ("Commodore Pet", "Commodore Pet"),
-    ("IBM PC Compatible", "IBM PC Compatible"),
-    ("MSX", "MSX"),
-    ("MSX2", "MSX2"),
-    ("Arcade", "Arcade"),
-    ("MAME", "MAME"),
-    ("Panasonic 3DO", "Panasonic 3DO"),
-    ("Philips CD-i", "Philips CD-i"),
-    ("SNK Neo Geo", "SNK Neo Geo"),
-    ("SNK Neo Geo CD", "SNK Neo Geo CD"),
-    ("SNK Neo Geo Pocket", "SNK Neo Geo Pocket"),
-    ("SNK Neo Geo Pocket Color", "SNK Neo Geo Pocket Color"),
-    ("Bandai WonderSwan", "Bandai WonderSwan"),
-    ("Bandai WonderSwan Color", "Bandai WonderSwan Color"),
-    ("Bandai Pippin", "Bandai Pippin"),
-    ("Panic Playdate", "Panic Playdate"),
-    ("Sharp X68000", "Sharp X68000"),
-    ("Watara Supervision", "Watara Supervision"),
-    ("NEC PC Engine and TurboGrafx-16", "NEC PC Engine and TurboGrafx-16"),
-    ("NEC PC Engine CD and TurboGrafx-CD", "NEC PC Engine CD and TurboGrafx-CD"),
-    ("NEC PC-FX AV", "NEC PC-FX AV"),
-    ("NEC PC-8801", "NEC PC-8801"),
-    ("NEC PC-9801", "NEC PC-9801"),
-    ("Nintendo Wii", "Nintendo Wii"),
-    ("Sinclair", "Sinclair"),
-    ("Ibm", "IBM PC Compatible"),
-    ("Nec", "NEC PC Engine and TurboGrafx-16"),
-    ("Sony", "Sony PlayStation"),
-    ("Apple", "Apple II"),
-    ("Ique Ique Cdn", "Ique"),
-    ("Ique Ique Decrypted", "Ique"),
-    ("Ique", "Ique"),
-    ("Multi Format", "Multi Format"),
-    ("Obscure Gamers", "Obscure Gamers"),
-    ("Project Egg", "Project Egg"),
-    ("Acorn", "Acorn"),
-    ("Texas Instruments", "Texas Instruments"),
-    ("Bally", "Bally"),
-    ("Casio", "Casio"),
-    ("Fujitsu", "Fujitsu"),
-    ("Microsoft", "Microsoft Xbox"),
-    ("Tandy / TRS-80", "Tandy / TRS-80"),
-    ("Tangerine", "Tangerine"),
-    ("Enterprise", "Enterprise"),
-    ("Thomson", "Thomson"),
-    ("Audio Cd", "Audio CD"),
-    ("Cd Rom", "CD-ROM"),
-    ("Photo Cd", "Photo CD"),
-    ("Dvd Video", "DVD Video"),
-    ("Bd Video", "Blu-ray Video"),
-    ("Dvd Rom", "DVD-ROM"),
-    ("Video Game Osts Hardware Recordings", "Video Game OSTs"),
-    ("Video Game Scans Raw", "Video Game Scans"),
-    ("Video Game Magazine Scans Raw", "Video Game Magazine Scans"),
-    ("Video Game Magazine Scans Cbz", "Video Game Magazine Scans"),
-    ("Video Game Osts Digital Raw", "Video Game OSTs"),
-    ("Super Mario Maker Courses Warc", "Super Mario Maker Courses"),
-    ("Ouya Ouya", "Ouya"),
-    ("Robotron", "Robotron"),
-    ("Mgt", "MGT"),
-    ("Microkey", "Microkey"),
-    ("Cce", "CCE"),
-    ("Nintendo Misc", "Nintendo Misc"),
-    ("Nintendo Sdks", "Nintendo SDKs"),
-    ("Nintendo Wallpapers", "Nintendo Wallpapers"),
-    ("Nintendo Kiosk Video Compact Flash Cardimage", "Nintendo Kiosk Video"),
-    ("Nintendo Kiosk Video Compact Flash Extracted", "Nintendo Kiosk Video"),
-    ("Nintendo Wii Nkit Rvz", "Nintendo Wii"),
-    ("Nintendo Wii Nkit_Rvz", "Nintendo Wii"),
-    ("Nintendo Wii U Wux", "Nintendo Wii U"),
-]
+_DB_CONSOLE_MAPPERS: dict[str, str] = {
+    "Nintendo DS (NDS)": "Nintendo DS (NDS)",
+    "Nintendo DSi": "Nintendo DSi",
+    "Nintendo 3DS": "Nintendo 3DS",
+    "New Nintendo 3DS": "New Nintendo 3DS",
+    "Nintendo 64": "Nintendo 64",
+    "Nintendo 64DD": "Nintendo 64DD",
+    "Nintendo GameCube (GC)": "Nintendo GameCube (GC)",
+    "Nintendo Wii U": "Nintendo Wii U",
+    "Nintendo Game & Watch": "Nintendo Game & Watch",
+    "Virtual Boy (VB)": "Virtual Boy (VB)",
+    "Satellaview": "Satellaview",
+    "Sufami Turbo": "Sufami Turbo",
+    "Pokemon Mini": "Pokemon Mini",
+    "Game Boy (GB)": "Game Boy (GB)",
+    "Game Boy Color (GBC)": "Game Boy Color (GBC)",
+    "Game Boy Advance (GBA)": "Game Boy Advance (GBA)",
+    "Family Computer (FC)": "Family Computer (FC)",
+    "Family Computer Disk System (FDS)": "Family Computer Disk System (FDS)",
+    "Famicom Terebikko": "Famicom Terebikko",
+    "Nintendo Entertainment System (NES)": "Nintendo Entertainment System (NES)",
+    "Super Nintendo Entertainment System (SNES)": "Super Nintendo Entertainment System (SNES)",
+    "Super Famicom (SFC)": "Super Famicom (SFC)",
+    "Sony PlayStation": "Sony PlayStation",
+    "PlayStation 2 (PS2)": "PlayStation 2 (PS2)",
+    "PlayStation 3 (PS3)": "PlayStation 3 (PS3)",
+    "PlayStation Portable (PSP)": "PlayStation Portable (PSP)",
+    "Sony PlayStation Vita": "Sony PlayStation Vita",
+    "PS One": "Sony PlayStation",
+    "PSone": "Sony PlayStation",
+    "Microsoft Xbox": "Microsoft Xbox",
+    "Microsoft Xbox 360": "Microsoft Xbox 360",
+    "Microsoft Xbox One": "Microsoft Xbox One",
+    "Microsoft Xbox Series X and Series S": "Microsoft Xbox Series X and Series S",
+    "Sega Genesis": "Sega Genesis",
+    "Sega Master System": "Sega Master System",
+    "Sega Game Gear": "Sega Game Gear",
+    "Sega Saturn": "Sega Saturn",
+    "Sega 32X": "Sega 32X",
+    "Sega Mega-CD": "Sega Mega-CD",
+    "Sega Mega-CD 32X": "Sega Mega-CD 32X",
+    "Sega Dreamcast": "Sega Dreamcast",
+    "Sega NAOMI Arcade System": "Sega NAOMI Arcade System",
+    "Sega NAOMI 2 Arcade System": "Sega NAOMI 2 Arcade System",
+    "Sega Lindbergh Arcade System": "Sega Lindbergh Arcade System",
+    "Sega RingEdge Arcade System": "Sega RingEdge Arcade System",
+    "Sega Triforce Arcade System": "Sega Triforce Arcade System",
+    "Sega SG-1000": "Sega SG-1000",
+    "Sega Pico": "Sega Pico",
+    "Sega Beena": "Sega Beena",
+    "Atari 2600": "Atari 2600",
+    "Atari 5200": "Atari 5200",
+    "Atari 7800": "Atari 7800",
+    "Atari Jaguar": "Atari Jaguar",
+    "Atari Jaguar CD": "Atari Jaguar CD",
+    "Atari Lynx": "Atari Lynx",
+    "Atari ST": "Atari ST",
+    "Atari 8-bit Family": "Atari 8-bit Family",
+    "Commodore Amiga": "Commodore Amiga",
+    "Commodore Amiga CD32": "Commodore Amiga CD32",
+    "Commodore Amiga CDTV": "Commodore Amiga CDTV",
+    "Commodore 64": "Commodore 64",
+    "Commodore VIC-20": "Commodore VIC-20",
+    "Commodore Plus/4": "Commodore Plus/4",
+    "Commodore Pet": "Commodore Pet",
+    "IBM PC Compatible": "IBM PC Compatible",
+    "MSX": "MSX",
+    "MSX2": "MSX2",
+    "Arcade": "Arcade",
+    "MAME": "MAME",
+    "Panasonic 3DO": "Panasonic 3DO",
+    "Philips CD-i": "Philips CD-i",
+    "SNK Neo Geo": "SNK Neo Geo",
+    "SNK Neo Geo CD": "SNK Neo Geo CD",
+    "SNK Neo Geo Pocket": "SNK Neo Geo Pocket",
+    "SNK Neo Geo Pocket Color": "SNK Neo Geo Pocket Color",
+    "Bandai WonderSwan": "Bandai WonderSwan",
+    "Bandai WonderSwan Color": "Bandai WonderSwan Color",
+    "Bandai Pippin": "Bandai Pippin",
+    "Panic Playdate": "Panic Playdate",
+    "Sharp X68000": "Sharp X68000",
+    "Watara Supervision": "Watara Supervision",
+    "NEC PC Engine and TurboGrafx-16": "NEC PC Engine and TurboGrafx-16",
+    "NEC PC Engine CD and TurboGrafx-CD": "NEC PC Engine CD and TurboGrafx-CD",
+    "NEC PC-FX AV": "NEC PC-FX AV",
+    "NEC PC-8801": "NEC PC-8801",
+    "NEC PC-9801": "NEC PC-9801",
+    "Nintendo Wii": "Nintendo Wii",
+    "Sinclair": "Sinclair",
+    "Ibm": "IBM PC Compatible",
+    "Nec": "NEC PC Engine and TurboGrafx-16",
+    "Sony": "Sony PlayStation",
+    "Apple": "Apple II",
+    "Ique Ique Cdn": "Ique",
+    "Ique Ique Decrypted": "Ique",
+    "Ique": "Ique",
+    "Multi Format": "Multi Format",
+    "Obscure Gamers": "Obscure Gamers",
+    "Project Egg": "Project Egg",
+    "Acorn": "Acorn",
+    "Texas Instruments": "Texas Instruments",
+    "Bally": "Bally",
+    "Casio": "Casio",
+    "Fujitsu": "Fujitsu",
+    "Microsoft": "Microsoft Xbox",
+    "Tandy / TRS-80": "Tandy / TRS-80",
+    "Tangerine": "Tangerine",
+    "Enterprise": "Enterprise",
+    "Thomson": "Thomson",
+    "Audio Cd": "Audio CD",
+    "Cd Rom": "CD-ROM",
+    "Photo Cd": "Photo CD",
+    "Dvd Video": "DVD Video",
+    "Bd Video": "Blu-ray Video",
+    "Dvd Rom": "DVD-ROM",
+    "Video Game Osts Hardware Recordings": "Video Game OSTs",
+    "Video Game Scans Raw": "Video Game Scans",
+    "Video Game Magazine Scans Raw": "Video Game Magazine Scans",
+    "Video Game Magazine Scans Cbz": "Video Game Magazine Scans",
+    "Video Game Osts Digital Raw": "Video Game OSTs",
+    "Super Mario Maker Courses Warc": "Super Mario Maker Courses",
+    "Ouya Ouya": "Ouya",
+    "Robotron": "Robotron",
+    "Mgt": "MGT",
+    "Microkey": "Microkey",
+    "Cce": "CCE",
+    "Nintendo Misc": "Nintendo Misc",
+    "Nintendo Sdks": "Nintendo SDKs",
+    "Nintendo Wallpapers": "Nintendo Wallpapers",
+    "Nintendo Kiosk Video Compact Flash Cardimage": "Nintendo Kiosk Video",
+    "Nintendo Kiosk Video Compact Flash Extracted": "Nintendo Kiosk Video",
+    "Nintendo Wii Nkit Rvz": "Nintendo Wii",
+    "Nintendo Wii Nkit_Rvz": "Nintendo Wii",
+    "Nintendo Wii U Wux": "Nintendo Wii U",
+}
 
 def _normalize_db_console(raw: str) -> str:
     if not raw:
         return "Unknown"
 
-    for pattern, canonical in _DB_CONSOLE_MAPPERS:
-        if raw == pattern:
-            return canonical
+    mapped = _DB_CONSOLE_MAPPERS.get(raw)
+    if mapped is not None:
+        return mapped
 
     if raw.startswith("Nintendo Wii_(Digital)"):
         return "Nintendo Wii"
@@ -778,9 +738,3 @@ def _normalize_db_console(raw: str) -> str:
         return "TI-99/4A"
 
     return raw
-
-def get_all_known_consoles() -> list[str]:
-    return sorted(set(_CONSOLE_CANONICAL.values()))
-
-def get_known_console_keys() -> dict[str, str]:
-    return {v: k for k, v in _CONSOLE_CANONICAL.items()}

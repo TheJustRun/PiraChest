@@ -3,14 +3,9 @@ import copy
 import html as _html
 import logging
 import re
+import threading
 import time
-import requests
 from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-try:
-    from urllib3.util.retry import Retry
-except ImportError:
-    from requests.packages.urllib3.util.retry import Retry
 from ..base import (
     RepackEntry,
     RepackPage,
@@ -18,37 +13,34 @@ from ..base import (
     RepackSource,
     magnet_display_name,
     DEFAULT_TTL_SECONDS,
+    fetch_page_image,
+    http_get,
+    submit_ctx,
     load_page,
     save_page,
     load_details,
     save_details,
 )
+import importlib.util
 logger = logging.getLogger(__name__)
-try:
-    import lxml
-    _PARSER = 'lxml'
-except ImportError:
-    _PARSER = 'html.parser'
+_PARSER = 'lxml' if importlib.util.find_spec('lxml') else 'html.parser'
 from concurrent.futures import ThreadPoolExecutor
-_POSTER_EXECUTOR = ThreadPoolExecutor(max_workers=12)
+_POSTER_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix='fitgirl-posters')
+
+
+def shutdown_executor(wait: bool = True) -> None:
+    try:
+        _POSTER_EXECUTOR.shutdown(wait=wait, cancel_futures=True)
+    except Exception:
+        logger.warning('Failed to shut down FitGirl poster executor', exc_info=True)
 _BASE_URL = 'https://fitgirl-repacks.site'
 _API_POSTS_URL = f'{_BASE_URL}/wp-json/wp/v2/posts'
 _PAGE_URL_TMPL = f'{_BASE_URL}/page/{{page}}/'
-_PER_PAGE = 20
-_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36', 'Accept': 'application/json, text/html;q=0.9,*/*;q=0.8'}
+_PER_PAGE = 100
 _SLUG_RE = re.compile('/([a-z0-9\\-]+)/?$')
 _WP_SIZE_SUFFIX_RE = re.compile('-(\\d+)x(\\d+)(\\.\\w+)$')
 
-_session = requests.Session()
-_retry = Retry(total=2, backoff_factor=0.2, status_forcelist=(502, 503, 504), allowed_methods=('GET',))
-_adapter = HTTPAdapter(pool_connections=24, pool_maxsize=24, max_retries=_retry)
-_session.mount('https://', _adapter)
-_session.mount('http://', _adapter)
-_session.headers.update(_HEADERS)
-
-def _get(url: str, **kwargs):
-    kwargs.pop('headers', None)
-    return _session.get(url, **kwargs)
+_get = http_get
 
 def _upgrade_to_original(url: str) -> str:
     match = _WP_SIZE_SUFFIX_RE.search(url)
@@ -69,33 +61,29 @@ def _is_excluded_post_title(title: str) -> bool:
         return True
     return False
 
-_RIOTPIXELS_P_RE = re.compile('<p[^>]*style="[^"]*height\\s*:\\s*\\d+px[^"]*"[^>]*>(.*?)</p>', re.IGNORECASE | re.DOTALL)
-_A_TAG_RE = re.compile('<a\\b([^>]*)>', re.IGNORECASE)
-_HREF_RE = re.compile('href=["\\\']([^"\\\']+)["\\\']', re.IGNORECASE)
-
-def _extract_riotpixels_fallback_link(html: str) -> str | None:
-    for p_match in _RIOTPIXELS_P_RE.finditer(html):
-        inner = p_match.group(1)
-        a_match = _A_TAG_RE.search(inner)
-        if not a_match:
-            continue
-        attrs = a_match.group(1)
-        if 'noopener' not in attrs or 'target=' not in attrs:
-            continue
-        href_match = _HREF_RE.search(attrs)
-        if href_match and 'riotpixels.com/games/' in href_match.group(1):
-            return href_match.group(1)
-    return None
-
 def _slug_from_url(url: str) -> str:
     match = _SLUG_RE.search(url.rstrip('/') + '/')
     return match.group(1) if match else url
 
 _SEARCH_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
-_OG_IMAGE_RE = re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE)
-_IMG_TAG_RE = re.compile(r'<img[^>]+(?:data-src|src)=["\']([^"\']+)["\']', re.IGNORECASE)
 _IMG_EXT_RE = re.compile(r'\.(jpg|jpeg|png|webp|gif)(\?|$)', re.IGNORECASE)
 _BG_URL_RE = re.compile('url\\(["\\\']?(.*?)["\\\']?\\)')
+_ARROW_PREFIX_RE = re.compile(r'^[\u21E2\u2192\u2013\u2014\-•]\s*')
+_UPCOMING_SKIP_SUBSTRINGS = ('more switch', 'more ps3', 'do not ask', 'never serve', 'latest repacks')
+_GREEN_COLOR_RE = re.compile(r'#339966', re.IGNORECASE)
+_TITLE_ENTITY_TAIL_RE = re.compile('&#8211;.*$')
+_TITLE_BRACKET_TAIL_RE = re.compile(r'\s*\[[^\]]*\]\s*$')
+_TITLE_REPACK_TAIL_RE = re.compile(r'\s*[-–]\s*(RePack|Repack).*$', re.IGNORECASE)
+_TITLE_PLUS_RE = re.compile(r'\s+\+\s*')
+_TITLE_PAREN_JUNK_RE = re.compile(
+    r'\s*\((?=[^)]*(?:\d|multi\d*|dlc|build|update|hotfix|patch|repack))[^)]*\)\s*$', re.IGNORECASE)
+_TITLE_DASH_TAIL_RE = re.compile(
+    r'\s*[-–—]\s*(?:v[\d][\w.\-]*|build\s+[\w.]+|update(?:\s+[\w.]+)?|'
+    r'hotfix\s+[\w.]+|patch\s+[\w.]+|\d[\d.,]*.*)\s*$', re.IGNORECASE)
+def _page_key(page: int) -> str:
+    return f'p{_PER_PAGE}-{page}'
+_HOMEPAGE_TTL_S = 30.0
+_POPULAR_KEY, _LATEST_KEY, _UPCOMING_KEY = '__popular_repacks__', '__latest_repacks__', '__upcoming_repacks__'
 
 _STOP_HEADINGS = ('download mirrors', 'download mirror', 'screenshots', 'system requirements', 'changelog', 'torrent', 'magnet', 'direct links')
 _REPACK_FEATURE_HEADINGS = ('repack features', 'backwards compatibility', 'installation notes', 'included dlcs', 'included dlc')
@@ -115,6 +103,14 @@ _BARE_SIZE_FRAGMENT_RE = re.compile(
     r'^(?:from\s+)?\d+\.?\d*\s*(?:/\s*\d+\.?\d*\s*)?(?:GB|MB|TB)\s*(?:\[\s*Selective Download\s*\])?$',
     re.IGNORECASE,
 )
+
+def _strip_repeatedly(rx, text: str) -> str:
+    while True:
+        new = rx.sub('', text)
+        if new == text:
+            return text
+        text = new
+
 
 def _normalize_for_search(text: str) -> str:
     return _SEARCH_NORMALIZE_RE.sub(' ', text.lower()).strip()
@@ -136,11 +132,16 @@ def _title_match_score(query: str, title: str) -> int | None:
         return 90
     return 70
 
-def _extract_download_links(soup) -> dict:
+_QUOTE_RE = re.compile(r"['\u2018\u2019\u201c\u201d]")
 
+def _search_param(query: str) -> str:
+    return _QUOTE_RE.sub(' ', query).strip()
+
+def _extract_download_links(soup) -> dict:
     sources: dict[str, dict] = {}
     magnet_url = None
     torrent_url = None
+    download_links: list[dict] = []
 
     list_items = soup.find_all('li')
     for li in list_items:
@@ -151,16 +152,28 @@ def _extract_download_links(soup) -> dict:
         source_page_url = None
         li_magnet = None
         li_torrent = None
+        li_direct: list[dict] = []
         for a in links:
-            href = a['href'].strip()
+            raw_href = (a.get('href') or '').strip()
+            if not raw_href:
+                continue
+            href = raw_href
+            low = href.lower()
             label = a.get_text(strip=True)
-            if href.startswith('magnet:'):
+            low_label = label.lower()
+            if low.startswith('magnet:'):
                 if li_magnet is None:
                     li_magnet = href
                 continue
-            if href.lower().endswith('.torrent') or 'torrent file only' in label.lower():
+
+
+            if '.torrent' in low.split('?')[0] or 'torrent file only' in low_label:
                 if li_torrent is None:
                     li_torrent = href
+                continue
+
+            if low.startswith(('http://', 'https://')) and low_label.endswith(('.rar', '.zip', '.7z')):
+                li_direct.append({'url': href, 'label': label, 'host': ''})
                 continue
             if source_name is None and label and len(label) <= 30:
                 source_name = label
@@ -178,14 +191,22 @@ def _extract_download_links(soup) -> dict:
                 magnet_url = li_magnet
             if torrent_url is None and li_torrent:
                 torrent_url = li_torrent
+        elif li_direct:
+            host = (source_name or '').strip()
+            for d in li_direct:
+                d['host'] = host
+            download_links.extend(li_direct)
 
     if not sources:
         for a in soup.find_all('a', href=True):
-            href = a['href'].strip()
-            if not magnet_url and href.startswith('magnet:'):
-                magnet_url = href
-            elif not torrent_url and href.lower().endswith('.torrent'):
-                torrent_url = href
+            raw_href = (a.get('href') or '').strip()
+            if not raw_href:
+                continue
+            low = raw_href.lower()
+            if not magnet_url and low.startswith('magnet:'):
+                magnet_url = raw_href
+            elif not torrent_url and '.torrent' in low.split('?')[0]:
+                torrent_url = raw_href
             if magnet_url and torrent_url:
                 break
 
@@ -199,8 +220,11 @@ def _extract_download_links(soup) -> dict:
                 for data in sources.values()
             ),
         )
+    elif magnet_url or torrent_url or download_links:
+        logger.info('Parsed fallback links (magnet=%s, torrent=%s, direct=%d)',
+                    bool(magnet_url), bool(torrent_url), len(download_links))
     else:
-        logger.warning('No per-source download links parsed from post body (magnet_url=%s, torrent_url=%s)', bool(magnet_url), bool(torrent_url))
+        logger.debug('No download links in post body (likely announcement)')
 
     result: dict = {}
     if magnet_url:
@@ -209,6 +233,8 @@ def _extract_download_links(soup) -> dict:
         result['torrent_url'] = torrent_url
     if sources:
         result['download_sources'] = sources
+    if download_links:
+        result['download_links'] = download_links[:12]
     return result
 
 def _extract_game_updates(soup) -> str | None:
@@ -231,7 +257,7 @@ def _extract_game_updates(soup) -> str | None:
 
     wrapper = soup.new_tag('div')
     for el in collected:
-        wrapper.append(el.extract())
+        wrapper.append(copy.copy(el))
 
     for tag in wrapper.find_all(True):
         for attr in ('style', 'class', 'id', 'target', 'rel'):
@@ -242,19 +268,9 @@ def _extract_game_updates(soup) -> str | None:
         if tag.name == 'img':
             tag.decompose()
 
-    body_text = wrapper.get_text(strip=True)
-    if not body_text:
+    if not wrapper.get_text(strip=True):
         return None
     return str(wrapper)
-
-def _parse_post_body(content_html: str):
-    if not content_html:
-        return (None, None, None)
-    base_soup = BeautifulSoup(content_html, _PARSER)
-    desc_soup = copy.deepcopy(base_soup)
-    updates_soup = copy.deepcopy(base_soup)
-    return (desc_soup, base_soup, updates_soup)
-
 
 
 class FitGirlSource(RepackSource):
@@ -263,60 +279,83 @@ class FitGirlSource(RepackSource):
 
     def __init__(self, ttl_seconds: int=DEFAULT_TTL_SECONDS):
         self._ttl_seconds = ttl_seconds
-        self._homepage_soup_cache: tuple[float, object] | None = None
+        self._home_lock = threading.Lock()
+        self._home_memo: tuple[float, dict] | None = None
 
-    def _get_homepage_soup(self):
-        now = time.monotonic()
-        cached = self._homepage_soup_cache
-        if cached is not None and now - cached[0] < 5.0:
-            return cached[1]
-        resp = _get(_BASE_URL + '/', timeout=15)
-        if resp.status_code != 200:
-            raise RuntimeError(f'homepage request returned status {resp.status_code}')
-        soup = BeautifulSoup(resp.text, _PARSER)
-        self._homepage_soup_cache = (now, soup)
-        return soup
+    def _homepage(self) -> dict:
+        with self._home_lock:
+            memo = self._home_memo
+            if memo is not None and time.monotonic() - memo[0] < _HOMEPAGE_TTL_S:
+                return memo[1]
+            resp = _get(_BASE_URL + '/', timeout=8)
+            if resp.status_code != 200:
+                raise RuntimeError(f'homepage request returned status {resp.status_code}')
+            soup = BeautifulSoup(resp.text, _PARSER)
+            data = {'popular': self._parse_popular(soup), 'latest': self._parse_latest(soup),
+                    'upcoming': self._parse_upcoming(soup)}
+            del soup
+            save_page(self.key, _POPULAR_KEY, [e.to_dict() for e in data['popular']], False)
+            save_page(self.key, _LATEST_KEY, [e.to_dict() for e in data['latest']], False)
+            if data['upcoming'] is not None:
+                save_details(self.key, _UPCOMING_KEY, data['upcoming'].to_dict())
+            self._home_memo = (time.monotonic(), data)
+            return data
 
-    def fetch_page(self, page: int, use_cache: bool=True) -> RepackPage:
-        if use_cache:
-            cached = load_page(self.key, page, ttl_seconds=self._ttl_seconds)
-            if cached is not None:
-                entries = [RepackEntry.from_dict(e) for e in cached['entries']]
-                return RepackPage(entries=entries, page=page, has_more=cached['has_more'])
-        entries, has_more = self._fetch_via_api(page)
-        if entries is None:
-            entries, has_more = self._fetch_via_html(page)
-        entries = entries or []
-        save_page(self.key, page, [e.to_dict() for e in entries], has_more)
-        return RepackPage(entries=entries, page=page, has_more=has_more)
-
-    def fetch_upcoming_repacks(self, use_cache: bool=True) -> RepackDetails | None:
-        cache_key = '__upcoming_repacks__'
-        if use_cache:
-            cached = load_details(self.key, cache_key, ttl_seconds=self._ttl_seconds)
-            if cached is not None:
-                return RepackDetails.from_dict(cached)
-        details = self._fetch_upcoming_repacks_via_html()
-        if details is not None:
-            save_details(self.key, cache_key, details.to_dict())
-        return details
-
-    def fetch_popular_repacks(self, use_cache: bool=True) -> list[RepackEntry]:
-        cache_key = '__popular_repacks__'
+    def _homepage_entries(self, which: str, cache_key: str, use_cache: bool) -> list[RepackEntry]:
         if use_cache:
             cached = load_page(self.key, cache_key, ttl_seconds=self._ttl_seconds)
             if cached is not None:
                 return [RepackEntry.from_dict(e) for e in cached['entries']]
-        entries = self._fetch_popular_repacks_via_html()
-        save_page(self.key, cache_key, [e.to_dict() for e in entries], False)
-        return entries
-
-    def _fetch_popular_repacks_via_html(self) -> list[RepackEntry]:
         try:
-            soup = self._get_homepage_soup()
+            return self._homepage()[which]
         except Exception as exc:
-            logger.warning('FitGirl popular-repacks request failed: %s', exc)
+            logger.warning('FitGirl %s-repacks request failed: %s', which, exc)
             return []
+
+    def fetch_popular_repacks(self, use_cache: bool=True) -> list[RepackEntry]:
+        return self._homepage_entries('popular', _POPULAR_KEY, use_cache)
+
+    def fetch_latest_repacks(self, use_cache: bool=True) -> list[RepackEntry]:
+        return self._homepage_entries('latest', _LATEST_KEY, use_cache)
+
+    def fetch_upcoming_repacks(self, use_cache: bool=True) -> RepackDetails | None:
+        if use_cache:
+            cached = load_details(self.key, _UPCOMING_KEY, ttl_seconds=self._ttl_seconds)
+            if cached is not None:
+                return RepackDetails.from_dict(cached)
+        try:
+            return self._homepage()['upcoming']
+        except Exception as exc:
+            logger.warning('FitGirl upcoming-repacks request failed: %s', exc)
+            return None
+
+    def fetch_page(self, page: int, use_cache: bool=True) -> RepackPage:
+        cache_key = _page_key(page)
+        if use_cache:
+            cached = load_page(self.key, cache_key, ttl_seconds=self._ttl_seconds)
+            if cached is not None:
+                entries = [RepackEntry.from_dict(e) for e in cached['entries']]
+                if self._resolve_page_posters(entries):
+                    save_page(self.key, cache_key, [e.to_dict() for e in entries], cached['has_more'])
+                return RepackPage(entries=entries, page=page, has_more=cached['has_more'])
+        entries, has_more = self._fetch_via_api(page)
+        if entries is None:
+            entries, has_more = self._fetch_via_html(page)
+        if entries is None:
+            raise RuntimeError(f'FitGirl page {page} temporarily unavailable')
+        self._resolve_page_posters(entries)
+        save_page(self.key, cache_key, [e.to_dict() for e in entries], has_more)
+        return RepackPage(entries=entries, page=page, has_more=has_more)
+
+    def _resolve_page_posters(self, entries: list[RepackEntry]) -> bool:
+        todo = [e for e in entries if not e.poster_url and e.url and not e.extra.get('poster_tried')]
+        if not todo:
+            return False
+        before = [(bool(e.poster_url), bool(e.extra.get('poster_tried'))) for e in todo]
+        self._resolve_missing_posters(todo, timeout=5, deadline=5)
+        return before != [(bool(e.poster_url), bool(e.extra.get('poster_tried'))) for e in todo]
+
+    def _parse_popular(self, soup) -> list[RepackEntry]:
         widget = soup.select_one('.jetpack_top_posts_widget')
         if widget is None:
             return []
@@ -343,22 +382,7 @@ class FitGirlSource(RepackSource):
             entries.append(RepackEntry(source=self.key, title=title, url=url, poster_url=poster_url, slug=slug))
         return entries
 
-    def fetch_latest_repacks(self, use_cache: bool=True) -> list[RepackEntry]:
-        cache_key = '__latest_repacks__'
-        if use_cache:
-            cached = load_page(self.key, cache_key, ttl_seconds=self._ttl_seconds)
-            if cached is not None:
-                return [RepackEntry.from_dict(e) for e in cached['entries']]
-        entries = self._fetch_latest_repacks_via_html()
-        save_page(self.key, cache_key, [e.to_dict() for e in entries], False)
-        return entries
-
-    def _fetch_latest_repacks_via_html(self) -> list[RepackEntry]:
-        try:
-            soup = self._get_homepage_soup()
-        except Exception as exc:
-            logger.warning('FitGirl latest-repacks request failed: %s', exc)
-            return []
+    def _parse_latest(self, soup) -> list[RepackEntry]:
         widget = soup.select_one('.wplp_outside') or soup.select_one('[class*="wplp_widget"]')
         if widget is None:
             return []
@@ -394,12 +418,7 @@ class FitGirlSource(RepackSource):
             entries.append(RepackEntry(source=self.key, title=title, url=url, poster_url=poster_url, slug=slug))
         return entries
 
-    def _fetch_upcoming_repacks_via_html(self) -> RepackDetails | None:
-        try:
-            soup = self._get_homepage_soup()
-        except Exception as exc:
-            logger.warning('FitGirl upcoming-repacks HTML request failed: %s', exc)
-            return None
+    def _parse_upcoming(self, soup) -> RepackDetails | None:
         for article in soup.select('article'):
             link_tag = article.select_one('h1.entry-title a, h2.entry-title a')
             if link_tag is None:
@@ -421,10 +440,6 @@ class FitGirlSource(RepackSource):
             return []
         soup = BeautifulSoup(content_html, _PARSER)
 
-        _ARROW_PREFIX_RE = re.compile(r'^[\u21E2\u2192\u2013\u2014\-•]\s*')
-        _SKIP_SUBSTRINGS = ('more switch', 'more ps3', 'do not ask', 'never serve', 'latest repacks')
-        _GREEN_COLOR_RE = re.compile(r'#339966', re.IGNORECASE)
-
         titles: list[str] = []
         seen: set[str] = set()
 
@@ -436,7 +451,7 @@ class FitGirlSource(RepackSource):
             if cleaned.startswith('#'):
                 return
             lowered = cleaned.lower()
-            if any(marker in lowered for marker in _SKIP_SUBSTRINGS):
+            if any(marker in lowered for marker in _UPCOMING_SKIP_SUBSTRINGS):
                 return
             if lowered in seen:
                 return
@@ -464,128 +479,54 @@ class FitGirlSource(RepackSource):
         query = (query or '').strip()
         if not query:
             return RepackPage(entries=[], page=page, has_more=False)
-        scored_entries: list[tuple[int, RepackEntry]] = []
-        pages_to_scan = 3 if page == 1 else 1
-        last_has_more = False
-        for offset in range(pages_to_scan):
-            current_page = page + offset
-            params = {'s': query}
-            if current_page > 1:
-                params['paged'] = current_page
-            try:
-                resp = _get(_BASE_URL + '/', params=params, timeout=15)
-            except Exception as exc:
-                logger.warning('FitGirl search request failed: %s', exc)
-                if offset == 0:
-                    raise
-                break
-            if resp.status_code != 200:
-                logger.warning('FitGirl search page returned status %s for query %r', resp.status_code, query)
-                if offset == 0:
-                    raise RuntimeError(f'FitGirl search returned HTTP {resp.status_code}')
-                break
-            soup = BeautifulSoup(resp.text, _PARSER)
-            articles = soup.select('article')
-            if not articles:
-                break
-            for article in articles:
-                link_tag = article.select_one('h1.entry-title a, h2.entry-title a')
-                if link_tag is None:
-                    continue
-                title = self._clean_title(link_tag.get_text(strip=True))
-                url = link_tag.get('href', '')
-                if not title or not url:
-                    continue
-                if _is_excluded_post_title(title):
-                    continue
-                score = _title_match_score(query, title)
-                if score is None:
-                    continue
-                entry = RepackEntry(source=self.key, title=title, url=url, poster_url=None, slug=_slug_from_url(url))
-                scored_entries.append((score, entry))
-            last_has_more = soup.select_one('.nav-previous a, a.next, .pagination .next') is not None
-            if not last_has_more:
-                break
-        seen_urls: set[str] = set()
-        deduped: list[tuple[int, RepackEntry]] = []
-        for score, entry in scored_entries:
-            if entry.url in seen_urls:
-                continue
-            seen_urls.add(entry.url)
-            deduped.append((score, entry))
-        deduped.sort(key=lambda pair: pair[0], reverse=True)
-        entries = [entry for _, entry in deduped]
-        has_more = last_has_more
 
-        if not entries and page == 1:
-            entries = self._search_cached_catalog(query)
-            has_more = False
 
-        self._resolve_missing_posters(entries[:24], max_workers=12, timeout=6)
-        return RepackPage(entries=entries, page=page, has_more=has_more)
+        _status, posts, total_pages = self._api_posts({
+            'search': _search_param(query), 'search_columns[]': 'post_title',
+            'page': page, 'per_page': _PER_PAGE})
+        if posts is None:
+            raise RuntimeError('FitGirl search is unavailable')
+        scored: list[tuple[int, RepackEntry]] = []
+        for entry in self._posts_to_entries(posts):
+            score = _title_match_score(query, entry.title)
+            if score is not None:
+                scored.append((score, entry))
+        if not scored and page == 1:
+            return RepackPage(entries=self._search_cached_catalog(query), page=page, has_more=False)
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return RepackPage(entries=[entry for _, entry in scored], page=page,
+                          has_more=total_pages is not None and page < total_pages)
 
     @staticmethod
-    def _resolve_missing_posters(entries: list[RepackEntry], max_workers: int = 8, timeout: int = 8, max_bytes: int = 393216, retries: int = 1) -> None:
-        from concurrent.futures import as_completed
+    def _resolve_missing_posters(entries: list[RepackEntry], timeout: int = 4, max_bytes: int = 131072, deadline: float = 5) -> None:
+        from concurrent.futures import wait
         targets = [e for e in entries if not e.poster_url and e.url]
         if not targets:
             return
 
-        def _fetch(entry: RepackEntry) -> tuple[str, str | None]:
-            for attempt in range(retries + 1):
-                try:
-                    with _get(entry.url, timeout=timeout, stream=True, allow_redirects=True) as resp:
-                        if resp.status_code != 200:
-                            logger.warning('Poster fetch for %s returned status %s', entry.url, resp.status_code)
-                            continue
-                        buffer = b''
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            buffer += chunk
-                            text = buffer.decode('utf-8', errors='ignore')
-                            match = _OG_IMAGE_RE.search(text)
-                            if match:
-                                return (entry.url, _upgrade_to_original(match.group(1)))
-                            if '</head>' in text:
-                                break
-                            if len(buffer) >= max_bytes:
-                                break
-                        text = buffer.decode('utf-8', errors='ignore')
-                        match = _OG_IMAGE_RE.search(text)
-                        if match:
-                            return (entry.url, _upgrade_to_original(match.group(1)))
-                        match = _IMG_TAG_RE.search(text)
-                        if match:
-                            return (entry.url, _upgrade_to_original(match.group(1)))
-                except Exception as exc:
-                    logger.warning('Failed to fetch poster for %s (attempt %d): %s', entry.url, attempt, exc)
-                    continue
-                break
-            try:
-                full_resp = _get(entry.url, timeout=timeout)
-                if full_resp.status_code == 200:
-                    riot_url = _extract_riotpixels_fallback_link(full_resp.text)
-                    if riot_url:
-                        riot_resp = _get(riot_url, timeout=timeout)
-                        if riot_resp.status_code == 200:
-                            riot_match = _OG_IMAGE_RE.search(riot_resp.text)
-                            if riot_match:
-                                return (entry.url, riot_match.group(1))
-            except Exception as exc:
-                logger.warning('Riotpixels fallback poster fetch failed for %s: %s', entry.url, exc)
-            return (entry.url, None)
+        def _one(entry: RepackEntry):
+            return entry, fetch_page_image(entry.url, timeout=timeout, max_bytes=max_bytes)
 
-        by_url = {e.url: e for e in targets}
-        futures = [_POSTER_EXECUTOR.submit(_fetch, entry) for entry in targets]
-        for future in as_completed(futures):
-            url, poster_url = future.result()
-            if poster_url:
-                by_url[url].poster_url = poster_url
+        futures = [submit_ctx(_POSTER_EXECUTOR, _one, e) for e in targets]
+        done, not_done = wait(futures, timeout=deadline)
+        for f in not_done:
+            f.cancel()
+        for future in done:
+            if future.cancelled():
+                continue
+            try:
+                entry, url = future.result()
+            except Exception:
+                continue
+            entry.extra['poster_tried'] = True
+            if url:
+                entry.poster_url = _upgrade_to_original(url)
 
     def _search_cached_catalog(self, query: str, max_pages: int=10) -> list[RepackEntry]:
         scored: list[tuple[int, RepackEntry]] = []
         seen_urls: set[str] = set()
         for page_num in range(1, max_pages + 1):
-            cached = load_page(self.key, page_num, ttl_seconds=self._ttl_seconds)
+            cached = load_page(self.key, _page_key(page_num), ttl_seconds=self._ttl_seconds)
             if cached is None:
                 break
             for entry_dict in cached.get('entries', []):
@@ -601,42 +542,44 @@ class FitGirlSource(RepackSource):
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [entry for _, entry in scored]
 
-    def _fetch_via_api(self, page: int):
-        params = {'page': page, 'per_page': _PER_PAGE, '_embed': 'wp:featuredmedia'}
+    def _api_posts(self, params: dict, timeout: int = 10):
         try:
-            resp = _get(_API_POSTS_URL, params=params, timeout=15)
+            resp = _get(_API_POSTS_URL, params=params, timeout=timeout)
         except Exception as exc:
             logger.warning('FitGirl API request failed: %s', exc)
-            return (None, False)
-        if resp.status_code == 400:
-            return ([], False)
+            return 0, None, None
         if resp.status_code != 200:
-            logger.warning('FitGirl API returned status %s', resp.status_code)
-            return (None, False)
+            level = logger.info if resp.status_code == 400 else logger.warning
+            level('FitGirl API returned status %s', resp.status_code)
+            return resp.status_code, None, None
         try:
             posts = resp.json()
         except ValueError:
             logger.warning('FitGirl API returned invalid JSON')
-            return (None, False)
-        total_pages_header = resp.headers.get('X-WP-TotalPages')
+            return resp.status_code, None, None
         try:
-            total_pages = int(total_pages_header) if total_pages_header else None
+            total_pages = int(resp.headers.get('X-WP-TotalPages') or 0) or None
         except ValueError:
             total_pages = None
+        return resp.status_code, posts, total_pages
+
+    def _posts_to_entries(self, posts: list) -> list[RepackEntry]:
         entries: list[RepackEntry] = []
         for post in posts:
-            title = post.get('title', {}).get('rendered', '').strip()
+            title = ((post.get('title') or {}).get('rendered') or '').strip()
             url = post.get('link', '')
-            slug = post.get('slug') or _slug_from_url(url)
-            poster_url = self._extract_featured_image(post)
-            if not title or not url:
+            if not title or not url or _is_excluded_post_title(title):
                 continue
-            if _is_excluded_post_title(title):
-                continue
-            entries.append(RepackEntry(source=self.key, title=self._clean_title(title), url=url, poster_url=poster_url, slug=slug))
-        has_more = total_pages is None or page < total_pages
-        self._resolve_missing_posters(entries, max_workers=12, timeout=6)
-        return (entries, has_more)
+            entries.append(RepackEntry(source=self.key, title=self._clean_title(title), url=url,
+                                       poster_url=self._extract_featured_image(post),
+                                       slug=post.get('slug') or _slug_from_url(url)))
+        return entries
+
+    def _fetch_via_api(self, page: int):
+        _status, posts, total_pages = self._api_posts({'page': page, 'per_page': _PER_PAGE})
+        if posts is None:
+            return (None, False)
+        return (self._posts_to_entries(posts), total_pages is None or page < total_pages)
 
     def fetch_details(self, entry: RepackEntry, use_cache: bool=True) -> RepackDetails:
         slug = entry.slug or _slug_from_url(entry.url)
@@ -647,127 +590,101 @@ class FitGirlSource(RepackSource):
         details = self._fetch_details_via_api(entry, slug)
         if details is None:
             details = self._fetch_details_via_html(entry, slug)
+        if details is None:
+            return RepackDetails(source=self.key, url=entry.url, title=entry.title, cover_url=entry.poster_url, description='', size_info=None)
         if details.screenshot_urls:
             details.screenshot_urls = self._resolve_screenshot_images(details.screenshot_urls)
         save_details(self.key, slug, details.to_dict())
         return details
 
     @staticmethod
-    def _resolve_screenshot_images(page_urls: list[str], limit: int = 8) -> list[str]:
-        resolved: list[str] = []
-        for candidate in page_urls[:limit]:
+    def _resolve_screenshot_images(page_urls: list[str], limit: int = 6) -> list[str]:
+        from concurrent.futures import wait as _wait
+        ordered = list(page_urls[:limit])
+        fast: dict[str, str] = {}
+        need: list[str] = []
+        for candidate in ordered:
             if candidate.startswith('video::'):
-                if candidate not in resolved:
-                    resolved.append(candidate)
-                continue
-            if _IMG_EXT_RE.search(candidate):
-                upgraded = _upgrade_to_original(candidate)
-                if upgraded not in resolved:
-                    resolved.append(upgraded)
-                continue
-            try:
-                resp = _get(candidate, timeout=8)
-            except Exception as exc:
-                logger.warning('Failed to fetch screenshot page %s: %s', candidate, exc)
-                continue
-            if resp.status_code != 200:
-                logger.warning('Screenshot page %s returned status %s', candidate, resp.status_code)
-                continue
-            try:
-                soup = BeautifulSoup(resp.text, _PARSER)
-            except Exception:
-                continue
-            img = (
-                soup.select_one('meta[property="og:image"]')
-                or soup.select_one('.screenshot img')
-                or soup.select_one('#screenshot img')
-                or soup.select_one('.image-holder img')
-                or soup.select_one('article img')
-                or soup.select_one('img')
-            )
-            if img is None:
-                logger.warning('No image found on screenshot page %s', candidate)
-                continue
-            if img.name == 'meta':
-                src = img.get('content')
+                fast[candidate] = candidate
+            elif _IMG_EXT_RE.search(candidate):
+                fast[candidate] = _upgrade_to_original(candidate)
             else:
-                src = img.get('data-src') or img.get('src')
-            if src and src not in resolved:
-                resolved.append(_upgrade_to_original(src))
+                need.append(candidate)
+
+        def _fetch_one(url: str) -> tuple[str, str | None]:
+            src = fetch_page_image(url, timeout=5, scan_body=True)
+            return (url, _upgrade_to_original(src) if src else None)
+
+        if need:
+            futures = {submit_ctx(_POSTER_EXECUTOR, _fetch_one, u): u for u in need}
+            done, not_done = _wait(list(futures.keys()), timeout=6)
+            for f in not_done:
+                f.cancel()
+            for f in done:
+                try:
+                    if f.cancelled():
+                        continue
+                    url, src = f.result()
+                    if src:
+                        fast[url] = src
+                except Exception:
+                    pass
+        resolved: list[str] = []
+        for candidate in ordered:
+            val = fast.get(candidate)
+            if val and val not in resolved:
+                resolved.append(val)
         return resolved
 
     def _fetch_details_via_api(self, entry: RepackEntry, slug: str):
-        params = {'slug': slug, '_embed': 'wp:featuredmedia'}
-        try:
-            resp = _get(_API_POSTS_URL, params=params, timeout=15)
-        except Exception as exc:
-            logger.warning('FitGirl API details request failed: %s', exc)
-            return None
-        if resp.status_code != 200:
-            return None
-        try:
-            posts = resp.json()
-        except ValueError:
-            return None
+        _status, posts, _pages = self._api_posts({'slug': slug})
         if not posts:
             return None
         post = posts[0]
-        title = self._clean_title(post.get('title', {}).get('rendered', '').strip()) or entry.title
-        content_html = post.get('content', {}).get('rendered', '')
+        title = self._clean_title(((post.get('title') or {}).get('rendered') or '').strip()) or entry.title
         cover_url = self._extract_featured_image(post) or entry.poster_url
-        if not cover_url:
-            fallback_entry = RepackEntry(source=self.key, title=title, url=entry.url, poster_url=None)
-            self._resolve_missing_posters([fallback_entry], max_workers=1, timeout=8)
-            cover_url = fallback_entry.poster_url
-        desc_soup, links_soup, updates_soup = _parse_post_body(content_html)
-        description, size_info, metadata = self._parse_description_and_size(desc_soup)
-        if not metadata and (not size_info):
-            metadata = dict(metadata)
-            metadata['is_announcement'] = True
-        if links_soup is not None:
-            metadata.update(_extract_download_links(links_soup))
-        game_updates_html = _extract_game_updates(updates_soup) if updates_soup is not None else None
-        if game_updates_html:
-            metadata['game_updates_html'] = game_updates_html
-        screenshot_urls = metadata.pop('screenshot_urls', [])
-        details = RepackDetails(source=self.key, url=entry.url, title=title, cover_url=cover_url, description=description, size_info=size_info, extra=metadata)
-        details.screenshot_urls = screenshot_urls
-        return details
+        return self._build_details(entry, title, cover_url, (post.get('content') or {}).get('rendered', ''))
 
-    def _fetch_details_via_html(self, entry: RepackEntry, slug: str) -> RepackDetails:
+    def _fetch_details_via_html(self, entry: RepackEntry, slug: str) -> RepackDetails | None:
         try:
-            resp = _get(entry.url, timeout=15)
+            resp = _get(entry.url, timeout=10)
         except Exception as exc:
             logger.warning('FitGirl HTML details request failed: %s', exc)
-            return RepackDetails(source=self.key, url=entry.url, title=entry.title, cover_url=entry.poster_url, description='', size_info=None)
+            return None
         if resp.status_code != 200:
-            return RepackDetails(source=self.key, url=entry.url, title=entry.title, cover_url=entry.poster_url, description='', size_info=None)
+            return None
         soup = BeautifulSoup(resp.text, _PARSER)
         title_tag = soup.select_one('h1.entry-title')
         title = self._clean_title(title_tag.get_text(strip=True)) if title_tag else entry.title
         content_el = soup.select_one('.entry-content')
-        content_html = str(content_el) if content_el is not None else ''
         cover_url = entry.poster_url
         if content_el is not None:
             img_tag = content_el.select_one('img')
             if img_tag is not None:
                 cover_url = img_tag.get('data-lazy-src') or img_tag.get('data-src') or img_tag.get('data-original') or img_tag.get('src') or cover_url
+        content_html = str(content_el) if content_el is not None else ''
+        return self._build_details(entry, title, cover_url, content_html)
+
+    def _build_details(self, entry: RepackEntry, title: str, cover_url: str | None, content_html: str) -> RepackDetails:
         if not cover_url:
-            fallback_entry = RepackEntry(source=self.key, title=title, url=entry.url, poster_url=None)
-            self._resolve_missing_posters([fallback_entry], max_workers=1, timeout=8)
-            cover_url = fallback_entry.poster_url
-        desc_soup, links_soup, updates_soup = _parse_post_body(content_html)
-        description, size_info, metadata = self._parse_description_and_size(desc_soup)
-        if not metadata and (not size_info):
+            fallback = RepackEntry(source=self.key, title=title, url=entry.url, poster_url=None)
+            self._resolve_missing_posters([fallback], timeout=8)
+            cover_url = fallback.poster_url
+
+
+        base = BeautifulSoup(content_html, _PARSER) if content_html else None
+        links = _extract_download_links(base) if base is not None else {}
+        game_updates_html = _extract_game_updates(base) if base is not None else None
+        description, size_info, metadata = self._parse_description_and_size(base)
+        if not metadata and not size_info:
             metadata = dict(metadata)
             metadata['is_announcement'] = True
-        if links_soup is not None:
-            metadata.update(_extract_download_links(links_soup))
-        game_updates_html = _extract_game_updates(updates_soup) if updates_soup is not None else None
+        metadata.update(links)
         if game_updates_html:
             metadata['game_updates_html'] = game_updates_html
         screenshot_urls = metadata.pop('screenshot_urls', [])
-        details = RepackDetails(source=self.key, url=entry.url, title=title, cover_url=cover_url, description=description, size_info=size_info, extra=metadata)
+        details = RepackDetails(source=self.key, url=entry.url, title=title, cover_url=cover_url,
+                                description=description, size_info=size_info, extra=metadata)
         details.screenshot_urls = screenshot_urls
         return details
 
@@ -1227,18 +1144,6 @@ class FitGirlSource(RepackSource):
         return (description, size_info, metadata)
 
     def _extract_featured_image(self, post: dict) -> str | None:
-        embedded = post.get('_embedded', {})
-        media_list = embedded.get('wp:featuredmedia') or []
-        if media_list:
-            media = media_list[0]
-            if 'code' not in media:
-                sizes = media.get('media_details', {}).get('sizes', {})
-                for size_key in ('medium', 'medium_large', 'full'):
-                    if size_key in sizes:
-                        return sizes[size_key].get('source_url')
-                source_url = media.get('source_url')
-                if source_url:
-                    return source_url
         jetpack_url = post.get('jetpack_featured_media_url')
         if jetpack_url:
             return jetpack_url
@@ -1249,24 +1154,9 @@ class FitGirlSource(RepackSource):
         from_body = self._first_image_from_html(content_html)
         if from_body:
             return from_body
-        post_link = post.get('link')
-        if post_link:
-            return self._fetch_og_image_from_page(post_link)
-        return None
 
-    @staticmethod
-    def _fetch_og_image_from_page(page_url: str, timeout: int = 8) -> str | None:
-        try:
-            resp = _get(page_url, timeout=timeout)
-        except Exception as exc:
-            logger.warning('Failed to fetch og:image fallback for %s: %s', page_url, exc)
-            return None
-        if resp.status_code != 200:
-            return None
-        match = _OG_IMAGE_RE.search(resp.text)
-        if not match:
-            return None
-        return _upgrade_to_original(match.group(1))
+
+        return None
 
     @staticmethod
     def _first_image_from_html(html: str) -> str | None:
@@ -1283,15 +1173,15 @@ class FitGirlSource(RepackSource):
     def _fetch_via_html(self, page: int):
         url = _BASE_URL + '/' if page <= 1 else _PAGE_URL_TMPL.format(page=page)
         try:
-            resp = _get(url, timeout=15)
+            resp = _get(url, timeout=10)
         except Exception as exc:
             logger.warning('FitGirl HTML request failed: %s', exc)
-            return ([], False)
+            return (None, False)
         if resp.status_code == 404:
             return ([], False)
         if resp.status_code != 200:
             logger.warning('FitGirl HTML page returned status %s', resp.status_code)
-            return ([], False)
+            return (None, False)
         soup = BeautifulSoup(resp.text, _PARSER)
         articles = soup.select('article')
         entries: list[RepackEntry] = []
@@ -1308,14 +1198,20 @@ class FitGirlSource(RepackSource):
             img_tag = article.select_one('.entry-content img, .entry-summary img, img')
             poster_url = None
             if img_tag is not None:
-                poster_url = img_tag.get('data-src') or img_tag.get('src')
+                poster_url = img_tag.get('data-src') or img_tag.get('data-lazy-src') or img_tag.get('src')
+                if poster_url and poster_url.startswith('data:'):
+                    poster_url = None
             entries.append(RepackEntry(source=self.key, title=title, url=page_url, poster_url=poster_url, slug=_slug_from_url(page_url)))
         has_more = soup.select_one('.nav-previous a, a.next, .pagination .next') is not None
         return (entries, has_more)
 
     @staticmethod
     def _clean_title(raw_title: str) -> str:
-        title = re.sub('&#8211;.*$', '', raw_title)
-        title = re.sub('\\s*[-–]\\s*(RePack|Repack).*$', '', title, flags=re.IGNORECASE)
-        title = _html.unescape(title)
-        return title.strip()
+        title = _html.unescape(raw_title or '')
+        title = _TITLE_ENTITY_TAIL_RE.sub('', title)
+        title = _strip_repeatedly(_TITLE_BRACKET_TAIL_RE, title)
+        title = _TITLE_REPACK_TAIL_RE.sub('', title)
+        title = _TITLE_PLUS_RE.split(title, maxsplit=1)[0]
+        title = _strip_repeatedly(_TITLE_PAREN_JUNK_RE, title)
+        title = _strip_repeatedly(_TITLE_DASH_TAIL_RE, title)
+        return title.strip(' -–—\t,:')

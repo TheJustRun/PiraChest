@@ -263,7 +263,7 @@ def fetch_country_index_channels(source: dict, use_cache: bool = True) -> list[d
         selected_set = set(selected)
         countries = [c for c in countries if c["code"] in selected_set]
     all_channels: list[dict] = []
-    with ThreadPoolExecutor(max_workers=12) as pool:
+    with ThreadPoolExecutor(max_workers=6) as pool:
         for result in pool.map(lambda c: _fetch_country_channels(source["id"], c), countries):
             all_channels.extend(result)
 

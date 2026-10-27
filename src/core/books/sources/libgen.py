@@ -15,6 +15,7 @@ from ...models import BookItem, MediaPage
 logger = logging.getLogger(__name__)
 
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+_LIBGEN_SEARCH_TIMEOUT_S = 25
 
 _EXT_MIME = {
     "epub": "application/epub+zip",
@@ -98,6 +99,26 @@ class LibgenProvider(BookProvider):
         with self._lock:
             return self._book_cache.get(book_id)
 
+    def _search_default_with_deadline(self, query: str, timeout_s: float):
+        box = {}
+
+        def _run():
+            try:
+                from libgen_api_enhanced import LibgenSearch
+                box['result'] = LibgenSearch().search_default(query, add_upload_info=False) or []
+            except BaseException as exc:
+                box['error'] = exc
+
+        worker = threading.Thread(target=_run, daemon=True, name='libgen-search')
+        worker.start()
+        worker.join(timeout_s)
+        if worker.is_alive():
+            logger.warning('LibGen search timed out after %ss for query %r (upstream hang, abandoning thread)', timeout_s, query)
+            return []
+        if 'error' in box:
+            raise box['error']
+        return box.get('result', [])
+
     def search(self, query: str, page: int, is_cancelled: IsCancelled = None) -> MediaPage:
         if not query.strip():
             return MediaPage(entries=[], page=page, has_more=False)
@@ -105,9 +126,7 @@ class LibgenProvider(BookProvider):
         results = []
         _SEM.acquire(True)
         try:
-            from libgen_api_enhanced import LibgenSearch
-
-            results = LibgenSearch().search_default(query, add_upload_info=False) or []
+            results = self._search_default_with_deadline(query, _LIBGEN_SEARCH_TIMEOUT_S)
         except Cancelled:
             raise
         except Exception as exc:
@@ -122,7 +141,7 @@ class LibgenProvider(BookProvider):
             if not getattr(book_obj, "id", None) or not getattr(book_obj, "title", None):
                 continue
             self._remember(book_obj)
-            entries.append(self._book_to_item(book_obj, enrich=False))
+            entries.append(self._book_to_item(book_obj))
 
         return MediaPage(entries=entries, page=page, has_more=False)
 
@@ -145,11 +164,10 @@ class LibgenProvider(BookProvider):
         except Exception as exc:
             logger.warning("LibGen link resolution failed for %s: %s", book_id, exc)
 
-        return self._book_to_item(book_obj, include_download=True, enrich=True)
+        return self._book_to_item(book_obj, include_download=True)
 
-    def _book_to_item(self, book_obj, include_download: bool = False, enrich: bool = False) -> BookItem:
-        from ...artwork import get_cover_url
-        from .openlibrary_meta import lookup as ol_lookup
+    def _book_to_item(self, book_obj, include_download: bool = False) -> BookItem:
+        from ...artwork import resolve_cover_url
 
         bid = str(getattr(book_obj, "id", "") or "")
         md5 = getattr(book_obj, "md5", "") or ""
@@ -157,7 +175,10 @@ class LibgenProvider(BookProvider):
         title = getattr(book_obj, "title", "") or "Unknown"
         author = getattr(book_obj, "author", "") or ""
 
-        cover_url = getattr(book_obj, "cover_url", None) or (get_cover_url(bid, md5) if md5 else None)
+        cover_url = getattr(book_obj, "cover_url", None)
+        if not cover_url and md5:
+            bucket = (int(bid) // 1000) * 1000 if bid.isdigit() else 0
+            cover_url = resolve_cover_url([f"https://libgen.li/covers/{bucket}/{md5.lower()}.jpg"])
 
         formats: dict = {}
         if include_download:
@@ -168,36 +189,17 @@ class LibgenProvider(BookProvider):
                 fmt_key = _EXT_MIME.get(ext, f"application/{ext}" if ext else "application/octet-stream")
                 formats[fmt_key] = link
 
-        description = ""
-        isbn = ""
-        subjects: list = []
-        year = str(getattr(book_obj, "year", "") or "")
-        language = getattr(book_obj, "language", "") or ""
-
-        if enrich:
-            meta = ol_lookup(title, author)
-            if meta:
-                description = meta.get("description", "")
-                isbn = meta.get("isbn", "")
-                subjects = meta.get("subjects", [])
-                if not year:
-                    year = meta.get("year", "")
-                if not language:
-                    language = meta.get("language", "")
-                if not cover_url and isbn:
-                    cover_url = f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg"
-
         return BookItem(
             provider=self.key,
             id=bid,
             title=title,
             author=author,
             artwork_url=cover_url,
-            year=year,
-            language=language,
+            year=str(getattr(book_obj, "year", "") or ""),
+            language=getattr(book_obj, "language", "") or "",
             pages=int(getattr(book_obj, "pages", 0) or 0) if str(getattr(book_obj, "pages", "") or "").isdigit() else 0,
-            description=description,
-            isbn=isbn,
-            subjects=subjects,
+            description="",
+            isbn="",
+            subjects=[],
             formats=formats,
         )

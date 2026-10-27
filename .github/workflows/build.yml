@@ -3,89 +3,194 @@ name: Build PiraChest (Windows x64)
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   version:
-    name: Compute shared version
+    name: Read version
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      is_new: ${{ steps.ver.outputs.is_new }}
     steps:
+      - uses: actions/checkout@v4
       - id: ver
-        run: echo "version=0.4.0" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(tr -d '[:space:]' < VERSION)
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid VERSION: $V" >&2
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+          if gh release view "v$V" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "is_new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_new=true" >> "$GITHUB_OUTPUT"
+          fi
 
   build-windows:
-    name: PyInstaller (Windows x64)
+    name: PyInstaller (Windows x64, onedir)
     needs: version
     runs-on: windows-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python 3.13
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
-
-      - name: Install project dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install --upgrade pyinstaller
-          pip check
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Write version file
         shell: pwsh
-        run: |
-          Set-Content -Path "VERSION" -Value "${{ needs.version.outputs.version }}" -NoNewline
+        run: Set-Content -Path VERSION -Value "${{ needs.version.outputs.version }}" -NoNewline
 
       - name: Build with PyInstaller
         shell: cmd
         run: build.bat
 
-      - name: Rename executable
+      - name: Zip + checksum
         shell: pwsh
         run: |
-          $exePath = "dist/PiraChest.exe"
-          if (-not (Test-Path $exePath)) {
-            Write-Error "Expected build output at $exePath but it does not exist."
-            exit 1
+          if (-not (Test-Path dist/PiraChest/PiraChest.exe)) { Write-Error "Build output missing"; exit 1 }
+          if (Test-Path dist/PiraChest/data) { Remove-Item dist/PiraChest/data -Recurse -Force }
+          $name = "PiraChest-${{ needs.version.outputs.tag }}-Windows-x64.zip"
+          $out = Join-Path $env:GITHUB_WORKSPACE $name
+          Push-Location dist/PiraChest
+          if (Get-Command 7z -ErrorAction SilentlyContinue) {
+            7z a -tzip -mx=9 -mmt=on "$out" * | Out-Null
+          } else {
+            Compress-Archive -Path * -DestinationPath $out -CompressionLevel Optimal
           }
-          $exeName = "PiraChest-v${{ needs.version.outputs.version }}-alpha-Windows-x64.exe"
-          $exePathOut = "${{ github.workspace }}\$exeName"
-          Copy-Item -Path $exePath -Destination $exePathOut -Force
-          echo "EXE_PATH=$exePathOut" >> $env:GITHUB_ENV
+          Pop-Location
+          $hash = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Set-Content "$out.sha256" -Encoding utf8NoBOM
+          $mb = [math]::Round((Get-ChildItem dist/PiraChest -Recurse -File | Measure-Object Length -Sum).Sum / 1MB, 1)
+          "Onedir size: $mb MB" >> $env:GITHUB_STEP_SUMMARY
+          "ZIP_PATH=$out" >> $env:GITHUB_ENV
 
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: windows-exe
-          path: ${{ env.EXE_PATH }}
+          name: windows-zip
+          path: |
+            ${{ env.ZIP_PATH }}
+            ${{ env.ZIP_PATH }}.sha256
 
   release:
-    name: Create Release
+    name: GitHub Release
     needs: [ version, build-windows ]
+    if: needs.version.outputs.is_new == 'true'
     runs-on: ubuntu-latest
-
     steps:
-      - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: windows-exe
+          name: windows-zip
           path: release-files
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
-          tag_name: "v${{ needs.version.outputs.version }}-alpha"
-          name: "PiraChest v${{ needs.version.outputs.version }} Alpha"
-          body: "Automated alpha build from commit ${{ github.sha }}."
-          draft: false
-          prerelease: true
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: "PiraChest ${{ needs.version.outputs.tag }}"
+          body: |
+            PiraChest ${{ needs.version.outputs.version }} (Windows x64, portable).
+
+            Download the ZIP, extract it, and run `PiraChest.exe`.
+            The `.sha256` file contains the checksum used by the built-in updater.
+          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
+          fail_on_unmatched_files: true
           files: release-files/*
+
+  chocolatey:
+    name: Publish to Chocolatey
+    needs: [ version, release ]
+    if: needs.version.outputs.is_new == 'true'
+    runs-on: windows-latest
+    env:
+      CHOCO_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-zip
+          path: release-files
+
+      - name: Package and push (skipped without API key)
+        if: env.CHOCO_KEY != ''
+        shell: pwsh
+        run: |
+          $ver = "${{ needs.version.outputs.version }}"
+          $tag = "${{ needs.version.outputs.tag }}"
+          $repo = "${{ github.repository }}"
+          $owner = "${{ github.repository_owner }}"
+          $zip = "PiraChest-$tag-Windows-x64.zip"
+          $sha = (Get-Content "release-files/$zip.sha256").Split()[0]
+          $url = "https://github.com/$repo/releases/download/$tag/$zip"
+
+          New-Item -ItemType Directory -Force pkg/tools | Out-Null
+
+          @'
+          $ErrorActionPreference = 'Stop'
+          if (-not [Environment]::Is64BitOperatingSystem) { throw 'PiraChest is x64 only.' }
+          $toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+          Install-ChocolateyZipPackage `
+            -PackageName $env:ChocolateyPackageName `
+            -Url '__URL__' `
+            -UnzipLocation $toolsDir `
+            -Checksum '__CHECKSUM__' `
+            -ChecksumType 'sha256'
+          $exe = Join-Path $toolsDir 'PiraChest.exe'
+          if (-not (Test-Path $exe)) { throw 'PiraChest.exe missing after extraction.' }
+          Set-Content -Path (Join-Path $toolsDir '.pirachest-choco') -Value '1' -Encoding ascii
+          Install-BinFile -Name 'pirachest' -Path $exe
+          $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\PiraChest.lnk'
+          Install-ChocolateyShortcut -ShortcutFilePath $shortcut -TargetPath $exe `
+            -WorkingDirectory $toolsDir -Description 'PiraChest'
+          '@.Replace('__URL__', $url).Replace('__CHECKSUM__', $sha) | Set-Content pkg/tools/chocolateyinstall.ps1 -Encoding utf8NoBOM
+
+          @'
+          $ErrorActionPreference = 'Stop'
+          Uninstall-BinFile -Name 'pirachest'
+          $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\PiraChest.lnk'
+          if (Test-Path $shortcut) { Remove-Item $shortcut -Force }
+          '@ | Set-Content pkg/tools/chocolateyuninstall.ps1 -Encoding utf8NoBOM
+
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+            <metadata>
+              <id>pirachest</id>
+              <version>$ver</version>
+              <title>PiraChest</title>
+              <authors>$owner</authors>
+              <projectUrl>https://github.com/$repo</projectUrl>
+              <projectSourceUrl>https://github.com/$repo</projectSourceUrl>
+              <packageSourceUrl>https://github.com/$repo</packageSourceUrl>
+              <bugTrackerUrl>https://github.com/$repo/issues</bugTrackerUrl>
+              <licenseUrl>https://github.com/$repo/blob/main/LICENSE</licenseUrl>
+              <requireLicenseAcceptance>false</requireLicenseAcceptance>
+              <releaseNotes>https://github.com/$repo/releases/tag/$tag</releaseNotes>
+              <tags>pirachest windows desktop</tags>
+              <summary>PiraChest for Windows (x64).</summary>
+              <description>PiraChest is a Windows desktop application for games, movies, TV, anime, manga, books, and ROMs.</description>
+            </metadata>
+            <files>
+              <file src="tools\**" target="tools" />
+            </files>
+          </package>
+          "@ | Set-Content pkg/pirachest.nuspec -Encoding utf8NoBOM
+
+          choco pack pkg/pirachest.nuspec --output-directory pkg
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          choco push "pkg/pirachest.$ver.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCO_KEY
+          exit $LASTEXITCODE
+
+      - name: Skip Chocolatey
+        if: env.CHOCO_KEY == ''
+        shell: pwsh
+        run: Write-Warning 'CHOCOLATEY_API_KEY is not set; skipping Chocolatey publish.'

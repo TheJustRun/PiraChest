@@ -10,20 +10,18 @@ from typing import Callable, Optional
 from urllib.parse import urlsplit
 
 import requests
-from PySide6.QtCore import QObject, QRunnable, QThreadPool
+from PySide6.QtCore import QObject
 
 from src.core.models import BookItem, MediaPage
 from src.core.cache import cache
+from src.core.worker import DL, Priority, cancel as _cancel_task, submit as _submit
 from src.core.books.sources.base import BookProvider, Cancelled, IsCancelled
 from src.core.books.sources.gutenberg import GutenbergProvider
-from src.core.books.sources.internet_archive import InternetArchiveProvider
 from src.core.books.sources.libgen import LibgenProvider
-from src.core.books.sources.wikisource import WikisourceProvider
-from src.core.books.sources.gutenberg import _session as _http_session
 
 logger = logging.getLogger(__name__)
 
-_PROVIDERS: dict[str, BookProvider] = {p.key: p for p in (GutenbergProvider(), InternetArchiveProvider(), LibgenProvider(), WikisourceProvider())}
+_PROVIDERS: dict[str, BookProvider] = {p.key: p for p in (GutenbergProvider(), LibgenProvider())}
 _PROVIDER_ORDER: list[BookProvider] = sorted(_PROVIDERS.values(), key=lambda p: p.priority)
 
 _NS = 'books'
@@ -42,10 +40,6 @@ def get_download_session():
     return _download_session
 
 
-def get_session():
-    return _http_session
-
-
 def safe_filename(name: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*]+', '_', name).strip().strip('.')
     return cleaned[:150] or 'book'
@@ -60,11 +54,6 @@ def format_extension(mime: str) -> str:
 
 def provider_keys() -> list[str]:
     return [p.key for p in _PROVIDER_ORDER]
-
-
-def provider_display_name(key: str) -> str:
-    provider = _PROVIDERS.get(key)
-    return provider.display_name if provider is not None else key.title()
 
 
 def _provider(key: str) -> Optional[BookProvider]:
@@ -89,7 +78,12 @@ _inflight_lock = threading.Lock()
 _inflight: dict[str, _InFlight] = {}
 
 
-def _dedup_fetch(cache_key: str, use_cache: bool, fetch_fn: Callable[[], MediaPage]) -> MediaPage:
+_FOLLOW_TIMEOUT_S = 30.0
+_FOLLOW_SLICE_S = 0.1
+
+
+def _dedup_fetch(cache_key: str, use_cache: bool, fetch_fn: Callable[[], MediaPage],
+                 is_cancelled: IsCancelled = None) -> MediaPage:
     if use_cache:
         cached = cache.load(_NS, cache_key, ttl_seconds=_TTL)
         if cached is not None:
@@ -103,7 +97,11 @@ def _dedup_fetch(cache_key: str, use_cache: bool, fetch_fn: Callable[[], MediaPa
             _inflight[cache_key] = entry
 
     if not is_leader:
-        entry.event.wait(timeout=30)
+        deadline = time.monotonic() + _FOLLOW_TIMEOUT_S
+        while not entry.event.wait(_FOLLOW_SLICE_S):
+            _check_cancelled(is_cancelled)
+            if time.monotonic() >= deadline:
+                break
         if entry.error is not None:
             raise entry.error
         if entry.result is not None:
@@ -133,7 +131,7 @@ def search(provider_key: str, query: str, page: int, use_cache: bool = True, is_
         return MediaPage(entries=[], page=page, has_more=False)
     _check_cancelled(is_cancelled)
     cache_key = f'search:{provider_key}:{query}:{page}'
-    return _dedup_fetch(cache_key, use_cache, lambda: provider.search(query, page, is_cancelled=is_cancelled))
+    return _dedup_fetch(cache_key, use_cache, lambda: provider.search(query, page, is_cancelled=is_cancelled), is_cancelled)
 
 
 def browse(provider_key: str, page: int, use_cache: bool = True, is_cancelled: IsCancelled = None) -> MediaPage:
@@ -142,7 +140,7 @@ def browse(provider_key: str, page: int, use_cache: bool = True, is_cancelled: I
         return MediaPage(entries=[], page=page, has_more=False)
     _check_cancelled(is_cancelled)
     cache_key = f'browse:{provider_key}:{page}'
-    return _dedup_fetch(cache_key, use_cache, lambda: provider.browse(page, is_cancelled=is_cancelled))
+    return _dedup_fetch(cache_key, use_cache, lambda: provider.browse(page, is_cancelled=is_cancelled), is_cancelled)
 
 
 def details(provider_key: str, book_id: str, use_cache: bool = True, is_cancelled: IsCancelled = None) -> Optional[BookItem]:
@@ -206,136 +204,137 @@ def browse_all(page: int, use_cache: bool = True, is_cancelled: IsCancelled = No
     )
 
 
-class BookDownloadJob(QRunnable):
+def _download_book(url: str, dest_path: str, item_id: str, download_manager, is_cancelled: IsCancelled = None) -> None:
+    def cancelled() -> bool:
+        return bool(is_cancelled is not None and is_cancelled())
 
-    def __init__(self, url: str, dest_path: str, item_id: str, download_manager):
-        super().__init__()
-        self._url = url
-        self._dest_path = dest_path
-        self._item_id = item_id
-        self._download_manager = download_manager
-        self._cancelled = False
-
-    def cancel(self) -> None:
-        self._cancelled = True
-
-    def run(self) -> None:
-        tmp_path = self._dest_path + '.part'
-        resp = None
+    tmp_path = dest_path + '.part'
+    resp = None
+    try:
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        parts = urlsplit(url)
+        headers = {}
+        if parts.scheme and parts.netloc:
+            origin = f'{parts.scheme}://{parts.netloc}'
+            headers = {'Referer': origin + '/', 'Origin': origin}
+        total = 0
         try:
-            os.makedirs(os.path.dirname(self._dest_path), exist_ok=True)
-            parts = urlsplit(self._url)
-            headers = {}
-            if parts.scheme and parts.netloc:
-                origin = f'{parts.scheme}://{parts.netloc}'
-                headers = {'Referer': origin + '/', 'Origin': origin}
+            head_resp = get_download_session().head(url, timeout=15, headers=headers, allow_redirects=True)
+            total = int(head_resp.headers.get('Content-Length', 0))
+        except Exception:
             total = 0
+        if cancelled():
+            return
+        resp = get_download_session().get(url, stream=True, timeout=(10, 20), headers=headers, allow_redirects=True)
+        if resp.status_code != 200:
+            download_manager.fail_external(item_id, f'status {resp.status_code}')
+            return
+        content_type = resp.headers.get('Content-Type', '').lower()
+        if 'text/html' in content_type:
+            download_manager.fail_external(item_id, 'download link expired or invalid')
+            return
+        if not total:
+            total = int(resp.headers.get('Content-Length', 0))
+        download_manager.update_external(item_id, total_bytes=total, progress=0.0 if total else None)
+        downloaded = 0
+        last_t = time.monotonic()
+        last_bytes = 0
+        with open(tmp_path, 'wb') as fh:
+            for chunk in resp.iter_content(chunk_size=1024 * 128):
+                if cancelled():
+                    fh.close()
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    return
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                downloaded += len(chunk)
+                now = time.monotonic()
+                elapsed = now - last_t
+                speed_kbps = None
+                if elapsed >= 0.5:
+                    speed_kbps = ((downloaded - last_bytes) / 1024) / elapsed
+                    last_t = now
+                    last_bytes = downloaded
+                if total:
+                    download_manager.update_external(item_id, downloaded_bytes=downloaded, total_bytes=total, speed_down_kbps=speed_kbps)
+                else:
+                    est = 100.0 * (1 - 1 / (1 + downloaded / (5 * 1024 * 1024)))
+                    download_manager.update_external(item_id, downloaded_bytes=downloaded, total_bytes=0, progress=min(95.0, est), speed_down_kbps=speed_kbps)
+        if downloaded == 0:
             try:
-                head_resp = get_download_session().head(self._url, timeout=15, headers=headers, allow_redirects=True)
-                total = int(head_resp.headers.get('Content-Length', 0))
-            except Exception:
-                total = 0
-            resp = get_download_session().get(self._url, stream=True, timeout=(10, 20), headers=headers, allow_redirects=True)
-            if resp.status_code != 200:
-                self._download_manager.fail_external(self._item_id, f'status {resp.status_code}')
-                return
-            content_type = resp.headers.get('Content-Type', '').lower()
-            if 'text/html' in content_type:
-                self._download_manager.fail_external(self._item_id, 'download link expired or invalid')
-                return
-            if not total:
-                total = int(resp.headers.get('Content-Length', 0))
-            self._download_manager.update_external(self._item_id, total_bytes=total, progress=0.0 if total else None)
-            downloaded = 0
-            last_t = time.monotonic()
-            last_bytes = 0
-            with open(tmp_path, 'wb') as fh:
-                for chunk in resp.iter_content(chunk_size=1024 * 128):
-                    if self._cancelled:
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
-                        return
-                    if not chunk:
-                        continue
-                    fh.write(chunk)
-                    downloaded += len(chunk)
-                    now = time.monotonic()
-                    elapsed = now - last_t
-                    speed_kbps = None
-                    if elapsed >= 0.5:
-                        speed_kbps = ((downloaded - last_bytes) / 1024) / elapsed
-                        last_t = now
-                        last_bytes = downloaded
-                    if total:
-                        self._download_manager.update_external(self._item_id, downloaded_bytes=downloaded, total_bytes=total, speed_down_kbps=speed_kbps)
-                    else:
-                        est = 100.0 * (1 - 1 / (1 + downloaded / (5 * 1024 * 1024)))
-                        self._download_manager.update_external(self._item_id, downloaded_bytes=downloaded, total_bytes=0, progress=min(95.0, est), speed_down_kbps=speed_kbps)
-            if downloaded == 0:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-                self._download_manager.fail_external(self._item_id, 'empty response')
-                return
-            os.replace(tmp_path, self._dest_path)
-            self._download_manager.complete_external(self._item_id, self._dest_path)
-        except Exception as exc:
-            try:
-                if os.path.isfile(tmp_path):
-                    os.remove(tmp_path)
+                os.remove(tmp_path)
             except OSError:
                 pass
-            self._download_manager.fail_external(self._item_id, str(exc))
-        finally:
-            if resp is not None:
-                resp.close()
+            download_manager.fail_external(item_id, 'empty response')
+            return
+        os.replace(tmp_path, dest_path)
+        download_manager.complete_external(item_id, dest_path)
+    except Exception as exc:
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        if not cancelled():
+            download_manager.fail_external(item_id, str(exc))
+    finally:
+        if resp is not None:
+            resp.close()
+
+
+def _resolve_and_download(details: BookItem, format_mime: str, dest_path: str, item_id: str,
+                          download_manager, is_cancelled: IsCancelled = None) -> None:
+    file_url = details.formats.get(format_mime)
+    if not file_url:
+        try:
+            refreshed = details_for_entry(details, use_cache=False, is_cancelled=is_cancelled)
+        except Cancelled:
+            return
+        file_url = refreshed.formats.get(format_mime) if refreshed is not None else None
+    if not file_url:
+        download_manager.fail_external(item_id, 'could not resolve download link')
+        return
+    _download_book(file_url, dest_path, item_id, download_manager, is_cancelled)
 
 
 class BookDownloadBridge(QObject):
-
     def __init__(self, download_manager, parent=None):
         super().__init__(parent)
-        from src.core.downloader import DLState
-        self._DLState = DLState
         self._download_manager = download_manager
-        self._pool = QThreadPool(self)
-        self._pool.setMaxThreadCount(2)
-        self._jobs: dict[str, BookDownloadJob] = {}
+        self._tickets: dict[str, object] = {}
         self._download_manager.item_updated.connect(self._on_item_updated)
 
     def download(self, details: BookItem, format_mime: str) -> Optional[str]:
-        file_url = details.formats.get(format_mime)
-        if not file_url:
-            refreshed = details_for_entry(details, use_cache=False)
-            file_url = refreshed.formats.get(format_mime) if refreshed is not None else None
-        if not file_url:
-            item_id = self._download_manager.add_external(game_name=details.title, console=details.author, source='Books', category='books')
-            self._download_manager.fail_external(item_id, 'could not resolve download link')
-            return item_id
         from src.core.config import settings
         dest_dir = getattr(settings, 'download_dir_books', os.path.join(settings.download_dir, 'books'))
         filename = f'{safe_filename(details.title)}.{format_extension(format_mime)}'
         dest_path = os.path.join(dest_dir, filename)
         item_id = self._download_manager.add_external(game_name=details.title, console=details.author, source='Books', category='books')
-        job = BookDownloadJob(file_url, dest_path, item_id, self._download_manager)
-        self._jobs[item_id] = job
-        self._download_manager.register_external_cancel(item_id, job.cancel)
-        self._pool.start(job)
+
+        ticket = _submit(_resolve_and_download, args=(details, format_mime, dest_path, item_id, self._download_manager),
+                         on_error=lambda msg, i=item_id: self._download_manager.fail_external(i, msg),
+                         owner=self, priority=Priority.HIGH, pool=DL)
+        if ticket is not None:
+            self._tickets[item_id] = ticket
+            self._download_manager.register_external_cancel(item_id, lambda t=ticket: _cancel_task(t))
         return item_id
 
     def _on_item_updated(self, item_id: str) -> None:
-        job = self._jobs.get(item_id)
-        if job is None:
+        if item_id not in self._tickets:
             return
         item = self._download_manager.get(item_id)
-        if item is not None and item.state in (self._DLState.completed, self._DLState.error, self._DLState.cancelled):
-            self._jobs.pop(item_id, None)
+        if item is None:
+            self._tickets.pop(item_id, None)
+            return
+        from src.core.downloader import DLState
+        if item.state in (DLState.completed, DLState.error, DLState.cancelled):
+            self._tickets.pop(item_id, None)
 
     def shutdown(self) -> None:
-        for job in list(self._jobs.values()):
-            job.cancel()
-        self._pool.waitForDone(3000)
-
+        for ticket in list(self._tickets.values()):
+            _cancel_task(ticket)
+        self._tickets.clear()

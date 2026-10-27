@@ -1,33 +1,14 @@
 from __future__ import annotations
 
-import json
-import logging
 import re
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List
-
-logger = logging.getLogger(__name__)
+from typing import Optional, Dict
 
 @dataclass
 class ConsoleVariantConfig:
     console: str
     variants: list[str] = field(default_factory=list)
     default_variant: Optional[str] = None
-
-    def to_dict(self) -> dict:
-        return {
-            "console": self.console,
-            "variants": self.variants,
-            "default_variant": self.default_variant,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "ConsoleVariantConfig":
-        return cls(
-            console=data["console"],
-            variants=list(data.get("variants", [])),
-            default_variant=data.get("default_variant"),
-        )
 
 _ALPHA_NUMERIC_BUCKETS = [
     "0-9", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
@@ -1251,22 +1232,6 @@ _GENERIC_VARIANT_KEYWORDS: Dict[str, str] = {
     "play_yan": "Play Yan",
 }
 
-_DESCRIPTOR_ONLY_TOKENS: frozenset = frozenset({
-    "sd", "cards", "no", "mario", "sbi", "subchannels", "net", "jet",
-    "rom", "bin", "cof", "bll", "lnx", "lyx", "pp", "gz", "zip", "7z",
-    "torrent", "md5", "nfo", "cue", "ccd", "img", "iso", "chd", "mds",
-    "toc", "ccd", "ssf", "sub", "cbz", "zip", "rar",
-})
-
-def is_known_descriptor_token(normalized_token: str) -> bool:
-    if not normalized_token:
-        return False
-    if normalized_token in _GENERIC_VARIANT_KEYWORDS:
-        return True
-    if normalized_token in _DESCRIPTOR_ONLY_TOKENS:
-        return True
-    return False
-
 DEFAULT_VARIANT_NAME = "Retail"
 
 def _normalize_token(token: str) -> str:
@@ -1275,26 +1240,7 @@ def _normalize_token(token: str) -> str:
     token = re.sub(r"[^a-z0-9_]", "", token)
     return token
 
-def register_console_variants(config: ConsoleVariantConfig) -> None:
-    CONSOLE_VARIANT_CONFIG[config.console] = config
-
-def load_variant_config_from_json(path: str) -> None:
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Failed to load variant config from %s: %s", path, exc)
-        return
-
-    for entry in data:
-        try:
-            cfg = ConsoleVariantConfig.from_dict(entry)
-            register_console_variants(cfg)
-        except (KeyError, TypeError) as exc:
-            logger.warning("Skipping malformed variant config entry: %s", exc)
-
-def has_variants(console: str) -> bool:
-    return len(get_variants(console)) > 1
+_known_norm_cache: dict[str, dict[str, str]] = {}
 
 def get_variants(console: str) -> list[str]:
     cfg = CONSOLE_VARIANT_CONFIG.get(console)
@@ -1310,8 +1256,10 @@ def get_default_variant(console: str) -> str:
     return variants[0] if variants else DEFAULT_VARIANT_NAME
 
 def guess_variant(console: str, raw_descriptor_parts: list[str]) -> str:
-    known = get_variants(console)
-    known_norm = {_normalize_token(v): v for v in known}
+    known_norm = _known_norm_cache.get(console)
+    if known_norm is None:
+        known_norm = {_normalize_token(v): v for v in get_variants(console)}
+        _known_norm_cache[console] = known_norm
 
     for part in raw_descriptor_parts:
         norm = _normalize_token(part)
@@ -1322,18 +1270,10 @@ def guess_variant(console: str, raw_descriptor_parts: list[str]) -> str:
             return known_norm[norm]
 
         if norm in _GENERIC_VARIANT_KEYWORDS:
-            mapped = _GENERIC_VARIANT_KEYWORDS[norm]
-            if mapped in known_norm.values():
-                return mapped
-            return mapped
+            return _GENERIC_VARIANT_KEYWORDS[norm]
 
         stripped = part.strip().upper()
         if stripped in _ALPHA_NUMERIC_BUCKETS:
             return stripped
 
     return get_default_variant(console)
-
-def get_all_known_consoles_with_variants() -> list[str]:
-    return sorted(
-        c for c, cfg in CONSOLE_VARIANT_CONFIG.items() if len(cfg.variants) > 1
-    )

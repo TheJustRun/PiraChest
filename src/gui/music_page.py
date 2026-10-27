@@ -1,2409 +1,2911 @@
 from __future__ import annotations
-import gc
+
+import atexit
+import base64
+import importlib
 import json
 import logging
-import math
 import os
+import random
 import re
+import shutil
+import sys
+import threading
 import time
+import types
 import uuid
+from collections import OrderedDict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
+from datetime import timedelta
+from functools import lru_cache
 from bisect import bisect_right
-import requests
-from PySide6.QtCore import Qt, QSize, QTimer, QPointF, QRectF, QPropertyAnimation, QEasingCurve, QObject, QRunnable, QThreadPool, Signal
-from PySide6.QtGui import QPixmap, QImage, QImageReader, QFontMetrics, QColor, QPainter, QBrush, QRadialGradient, QIcon, QPolygonF
-from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QScrollArea, QGraphicsBlurEffect, QGraphicsOpacityEffect, QSlider, QListWidget, QListWidgetItem, QAbstractItemView, QStackedWidget, QSizePolicy
-from qfluentwidgets import BodyLabel, CardWidget, CaptionLabel, StrongBodyLabel, SubtitleLabel, SearchLineEdit, PrimaryPushButton, ToolButton, TransparentToolButton, FluentIcon, RoundMenu, Action, IndeterminateProgressBar, InfoBar, InfoBarPosition, MessageBox, Slider, CheckBox, MessageBoxBase, ScrollArea, qconfig, LineEdit, PushButton, TransparentPushButton
-from src.core.worker import submit, cancel, wrap_callback
-from src.core.artwork import full_path, has_full, artwork
-from src.core.music.player import MusicPreviewPlayer
-from src.core.music import music_service
-from src.core.music.settings import settings as music_settings, apply_settings as apply_music_settings, QUALITY_TIERS, SLOW_OR_GATED_SOURCES
+from functools import partial
+from urllib.parse import urlparse
+
+import httpx
+from PySide6.QtCore import (QByteArray, QEasingCurve, QObject, QPoint, QPropertyAnimation, QRect,
+                            QRectF, QRunnable, QSize, Qt, QUrl, QThreadPool, QTimer, QVariantAnimation, Signal)
+from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetrics, QLinearGradient, QPainter,
+                           QPainterPath, QPalette, QPen, QPixmap)
+from PySide6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
+from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QHBoxLayout, QLabel,
+                               QListWidgetItem, QProxyStyle, QScrollArea, QSizePolicy, QSlider,
+                               QStackedWidget, QStyle, QStyledItemDelegate, QToolButton, QVBoxLayout,
+                               QWidget)
+from qfluentwidgets import (Action, CaptionLabel, CardWidget, CheckBox, FluentIcon,
+                            IndeterminateProgressBar, InfoBar, InfoBarPosition, LineEdit, ListWidget,
+                            MessageBox, MessageBoxBase, Pivot, PrimaryPushButton, PushButton,
+                            RoundMenu, ScrollArea, SearchLineEdit, Slider, StrongBodyLabel,
+                            SubtitleLabel, Theme, TransparentToolButton, isDarkTheme, themeColor)
+
+from src.core.artwork import images
+from .grid import PosterGrid
+from src.core.config import paths as app_paths, settings as app_settings
 from src.core.models import MusicItem as Song
-from src.core.config import settings as app_settings, paths as app_paths
-from src.core.theme import palette
-from src.core.translations import tr, register_locale_refresh
+from src.core.net import LazyHttpClient
+from src.core.translations import register_locale_refresh, tr
+from src.core.worker import cancel, submit, wrap_callback
+
+_USER_AGENT_FALLBACK = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+def install_fake_useragent_stub() -> None:
+    if 'fake_useragent' in sys.modules:
+        return
+    try:
+        importlib.import_module('fake_useragent')
+        return
+    except Exception:
+        pass
+
+    module = types.ModuleType('fake_useragent')
+
+    class UserAgent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        random = property(lambda self: _USER_AGENT_FALLBACK)
+
+    module.UserAgent = UserAgent
+    sys.modules['fake_useragent'] = module
+
+
+install_fake_useragent_stub()
+
 logger = logging.getLogger(__name__)
-CARD_WIDTH = 172
-ART_SIZE = 148
-ART_INSET = 10
-GRID_SPACING = 14
-CARD_HEIGHT = 268
-PLAYER_BAR_HEIGHT = 84
+
+_ROW_H, _BAR_H, _CARD_W, _CARD_H, _COVER = 54, 96, 180, 244, 168
+_AUDIO_EXT = ('.mp3', '.flac', '.m4a', '.mp4', '.aac', '.ogg', '.wav')
+_MIME_EXT = {'audio/flac': '.flac', 'audio/x-flac': '.flac', 'audio/mp4': '.m4a', 'audio/aac': '.aac',
+             'audio/ogg': '.ogg', 'audio/wav': '.wav'}
+_PLAYLISTS_DIR = os.path.join(app_paths.config_dir, 'music')
+_PLAYLISTS_FILE = os.path.join(_PLAYLISTS_DIR, 'music_playlists.json')
+_LRCLIB_HEADERS = {'Lrclib-Client': 'PiraChest v1.0 (https://github.com)'}
+_RAW_KEEP = {'bitrate', 'bit_rate', 'br', 'sample_rate', 'samplerate', 'sr', 'sampling_rate', 'channels', 'channel',
+             'nchannels'}
+_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
+       'Chrome/124.0.0.0 Safari/537.36')
+_LRC_RE = re.compile(r'\[(\d+):(\d+(?:\.\d+)?)\]')
+_http = LazyHttpClient(timeout=30, follow_redirects=True, headers={'User-Agent': _UA},
+                       limits=httpx.Limits(max_connections=8, max_keepalive_connections=8))
+
+
+_SVG = {
+    'Play': '<svg xmlns="http://www.w3.org/2000/svg" height="23" width="23" viewBox="0 0 23 23"><g><path transform="rotate(0,11.5,11.5) translate(-1,-0.5) scale(0.04791,0.04791) " fill="#FFFFFF" d="M160,93.5L160,418.5 392.25,256 160,93.5z M128,32L448,256 128,480 128,32z" /></g></svg>',
+    'Pause': '<svg xmlns="http://www.w3.org/2000/svg" height="19" width="19" viewBox="0 0 19 19"><g><path transform="rotate(0,9.5,9.5) translate(-2,-1) scale(0.04241,0.04241) " fill="#FFFFFF" d="M320,64L352,64 352,448 320,448 320,64z M160,64L192,64 192,448 160,448 160,64z" /></g></svg>',
+    'Next': '<svg xmlns="http://www.w3.org/2000/svg" height="20" width="20" viewBox="0 0 20 20"><g><path transform="rotate(0,10,10) translate(-1.5,-1.5) scale(0.04464,0.04464) " fill="#FFFFFF" d="M96,125.75L96,386.25 280.5,256 96,125.75z M416,64L448,64 448,448 416,448 416,64z M64,64L336,256 64,448 64,64z" /></g></svg>',
+    'Previous': '<svg xmlns="http://www.w3.org/2000/svg" height="20" width="20" viewBox="0 0 20 20"><g><path transform="rotate(0,10,10) translate(-1.5,-1.5) scale(0.04464,0.04464) " fill="#FFFFFF" d="M416,125.75L231.5,256 416,386.25 416,125.75z M448,64L448,448 176,256 448,64z M64,64L96,64 96,448 64,448 64,64z" /></g></svg>',
+    'Shuffle': '<svg xmlns="http://www.w3.org/2000/svg" height="26" width="26" viewBox="0 0 26 26"><g><path transform="rotate(0,13,13) translate(0,0) scale(0.05171,0.05171) " fill="#FFFFFF" d="M268.25,278.75L277.375,286.79687 286.75,294.4375 296.375,301.67187 306.25,308.5 316.36718,314.89062 326.71875,320.8125 337.30468,326.26562 348.125,331.25 359.15625,335.73437 370.375,339.6875 381.78125,343.10937 393.375,346 405.13281,348.34375 417.03125,350.125 429.07031,351.34375 441.25,352 404.75,315.25 427.25,292.75 502.75,368 427.25,443.25 404.75,420.75 441.5,384 427.82028,383.3125 414.28121,382 400.88281,380.0625 387.625,377.5 374.55468,374.33593 361.71875,370.59375 349.11718,366.27343 336.75,361.375 324.61718,355.91406 312.71875,349.90625 301.05468,343.35156 289.625,336.25 278.46093,328.64062 267.59375,320.5625 257.02343,312.01562 246.75,303 257.375,290.875 268.25,278.75z M-2.84217E-14,128L14.21484,128.33398 28.23437,129.33593 42.05859,131.00585 55.6875,133.34375 69.12109,136.34960 82.35937,140.02343 95.40234,144.36523 108.25,149.375 120.85937,154.98242 133.1875,161.11718 145.23437,167.77929 157,174.96875 168.48437,182.68554 179.6875,190.92968 190.60937,199.70117 201.25,209 190.625,221.125 179.75,233.25 170.35156,224.96095 160.65625,217.09376 150.66406,209.64843 140.375,202.625 129.82031,196.07032 119.03125,190.03126 108.00781,184.50781 96.75,179.5 85.28125,175.03126 73.625,171.12501 61.78125,167.78125 49.75000,165 37.54687,162.81251 25.1875,161.25 12.67187,160.3125 -2.84217E-14,160 -2.84217E-14,128z M427.25,68.75L502.75,144 427.25,219.25 404.75,196.75 441.25,160 425.58593,160.92970 410.34371,162.71875 395.52340,165.36718 381.125,168.875 367.125,173.1875 353.5,178.25 340.25,184.0625 327.375,190.625 314.85156,197.89843 302.65625,205.84375 290.78906,214.46095 279.25,223.75 268.03125,233.625 257.125,244 246.53123,254.875 236.25,266.25 219.25,285.25 210.49998,294.375 201.25,303.25 190.60937,312.54687 179.6875,321.3125 168.48437,329.54687 157,337.25 145.23437,344.42187 133.1875,351.0625 120.85937,357.17187 108.25,362.75 95.40234,367.73046 82.35937,372.04687 69.12109,375.69921 55.6875,378.6875 42.05859,381.01171 28.23437,382.67187 14.21484,383.66796 -2.84217E-14,384 -2.84217E-14,352 16.16406,351.52343 31.90625,350.09375 47.22656,347.71093 62.12500,344.375 76.61718,340.17187 90.71875,335.1875 104.42968,329.42187 117.75,322.875 130.69531,315.57812 143.28125,307.5625 155.50781,298.82812 167.375,289.375 178.91406,279.28906 190.15625,268.65625 201.10156,257.47656 211.75,245.75 229.375,226 238.53125,216.625 248.25,207.5 258.50781,198.71875 269.03125,190.375 279.82031,182.46876 290.875,175 302.1875,168.01562 313.75,161.5625 325.5625,155.64062 337.625,150.25 349.92187,145.41407 362.4375,141.15625 375.17187,137.47656 388.125,134.375 401.25781,131.86718 414.53125,129.96875 427.94531,128.67968 441.5,128 404.75,91.25 427.25,68.75z" /></g></svg>',
+    'RepeatAll': '<svg xmlns="http://www.w3.org/2000/svg" height="26" width="26" viewBox="0 0 26 26"><g><path transform="rotate(0,13,13) translate(0,0.01904) scale(0.05078,0.05078) " fill="#FFFFFF" d="M446.75,112.5L454.28906,119.42968 461.40625,126.71875 468.10156,134.36718 474.375,142.375 480.20312,150.68751 485.5625,159.25 490.45312,168.0625 494.875,177.125 498.8125,186.41406 502.25,195.90625 505.1875,205.60157 507.625,215.5 509.53906,225.53125 510.90625,235.625 511.72656,245.78125 512,256 511.57031,269.125 510.28125,282 508.13281,294.625 505.125,307 501.33593,319.05468 496.84375,330.71875 491.64843,341.99218 485.75,352.875 479.18746,363.32031 471.99996,373.28125 464.18746,382.75781 455.75,391.75 446.75781,400.1875 437.28125,408 427.32031,415.1875 416.875,421.75 405.99218,427.64843 394.71875,432.84375 383.05468,437.33593 371,441.125 358.625,444.13281 346,446.28125 333.125,447.57031 320,448 158.5,448 199.25,488.75 176.75,511.25 97.5,432 176.75,352.75 199.25,375.25 158.5,416 320,416 330.90625,415.64062 341.625,414.5625 352.15625,412.76562 362.5,410.25 372.57812,407.08593 382.3125,403.34375 391.70312,399.02343 400.75,394.125 409.42968,388.67187 417.71871,382.6875 425.61715,376.17187 433.125,369.125 440.17184,361.61718 446.68746,353.71875 452.67187,345.42968 458.125,336.75 463.02343,327.70312 467.34375,318.3125 471.08593,308.57812 474.25,298.5 476.76562,288.15625 478.56246,277.625 479.64059,266.90625 480,256 479.76559,247.28906 479.06246,238.65625 477.89059,230.10156 476.25,221.625 474.16403,213.27343 471.65621,205.09375 468.72653,197.08593 465.375,189.25 461.60934,181.60157 457.43746,174.15625 452.85934,166.91406 447.875,159.875 436.78125,146.65625 424.25,134.75 446.75,112.5z M335.25,0.75L414.5,80 335.25,159.25 312.75,136.75 353.5,96 192,96 181.09375,96.35937 170.375,97.43750 159.84375,99.23438 149.5,101.75 139.42187,104.91407 129.6875,108.65625 120.29687,112.97657 111.25,117.875 102.57031,123.32813 94.28125,129.3125 86.38281,135.82812 78.875,142.875 71.82812,150.38281 65.3125,158.28125 59.32812,166.57032 53.875,175.25 48.97656,184.29687 44.65625,193.6875 40.91406,203.42187 37.75,213.5 35.23437,223.84376 33.4375,234.37501 32.35937,245.09375 32,256 32.24218,264.60156 32.96875,273.15625 34.17968,281.66406 35.875,290.125 38.01562,298.48437 40.5625,306.6875 43.51562,314.73437 46.875,322.625 50.64062,330.32031 54.81249,337.78125 59.39062,345.00781 64.375,352 75.46875,365.125 88,377 65.25,399.75 57.71875,392.71093 50.625,385.34375 43.96875,377.64843 37.75,369.625 31.96875,361.3125 26.625,352.75 21.71875,343.9375 17.25,334.875 13.25781,325.59375 9.78125,316.125 6.82031,306.46875 4.375,296.625 2.46093,286.63281 1.09375,276.53125 0.27343,266.32031 0,256 0.42968,242.875 1.71875,230 3.86718,217.375 6.875,205 10.66406,192.94532 15.15625,181.28125 20.35156,170.00781 26.25,159.125 32.8125,148.67968 40,138.71875 47.8125,129.24220 56.25,120.25 65.24218,111.81250 74.71875,104.00000 84.67968,96.81250 95.125,90.25 106.00781,84.35157 117.28125,79.15627 128.94531,74.66408 141,70.875 153.375,67.86719 166,65.71875 178.875,64.42968 192,64 353.5,64 312.75,23.25 335.25,0.75z" /></g></svg>',
+    'Volume0': '<svg xmlns="http://www.w3.org/2000/svg" height="26" width="26" viewBox="0 0 26 26"><g><path transform="rotate(0,13,13) translate(0,0) scale(0.05078,0.05078) " fill="#FFFFFF" d="M160,118.75L86.75,192 32,192 32,320 86.75,320 160,393.25 160,118.75z M169.25,64L192,64 192,448 169.5,448 73.25,352 0,352 0,160 73.25,160 169.25,64z" /></g></svg>',
+    'Volume1': '<svg xmlns="http://www.w3.org/2000/svg" height="26" width="26" viewBox="0 0 26 26"><g><path transform="rotate(0,13,13) translate(0,0) scale(0.05078,0.05078) " fill="#FFFFFF" d="M282.5,165.5L291.08593,174.93751 298.59375,185 305.02343,195.6875 310.375,207 314.58593,218.78125 317.59375,230.875 319.39843,243.28125 320,256 319.39843,268.71875 317.59375,281.125 314.58593,293.21875 310.375,305 305.02343,316.3125 298.59375,327 291.08593,337.0625 282.5,346.5 260,324 266.35937,316.99218 271.9375,309.46875 276.73437,301.42968 280.75,292.875 283.92187,283.96093 286.1875,274.84375 287.54687,265.52343 288,256 287.54687,246.47657 286.1875,237.15625 283.92187,228.03906 280.75,219.125 276.73437,210.57031 271.9375,202.53125 266.35937,195.00781 260,188 282.5,165.5z M160,118.75L86.75,192 32,192 32,320 86.75,320 160,393.25 160,118.75z M169.25,64L192,64 192,448 169.5,448 73.25,352 0,352 0,160 73.25,160 169.25,64z" /></g></svg>',
+    'Volume2': '<svg xmlns="http://www.w3.org/2000/svg" height="26" width="26" viewBox="0 0 26 26"><g><path transform="rotate(0,13,13) translate(0,0) scale(0.05078,0.05078) " fill="#FFFFFF" d="M282.5,165.5L291.08593,174.93751 298.59375,185 305.02343,195.6875 310.375,207 314.58593,218.78125 317.59375,230.875 319.39843,243.28125 320,256 319.39843,268.71875 317.59375,281.125 314.58593,293.21875 310.375,305 305.02343,316.3125 298.59375,327 291.08593,337.0625 282.5,346.5 260,324 266.35937,316.99218 271.9375,309.46875 276.73437,301.42968 280.75,292.875 283.92187,283.96093 286.1875,274.84375 287.54687,265.52343 288,256 287.54687,246.47657 286.1875,237.15625 283.92187,228.03906 280.75,219.125 276.73437,210.57031 271.9375,202.53125 266.35937,195.00781 260,188 282.5,165.5z M160,118.75L86.75,192 32,192 32,320 86.75,320 160,393.25 160,118.75z M350.5,97.5L358.14843,105.63671 365.34375,114.04688 372.08593,122.73047 378.375,131.6875 384.21093,140.91796 389.59375,150.42187 394.52343,160.19921 399,170.25 402.98437,180.50390 406.4375,190.89064 409.35937,201.41017 411.75,212.0625 413.60937,222.84765 414.9375,233.76562 415.73437,244.81640 416,256 415.73437,267.18359 414.9375,278.23437 413.60937,289.15234 411.75,299.9375 409.35937,310.58984 406.4375,321.10937 402.98437,331.49609 399,341.75 394.52343,351.80078 389.59375,361.57812 384.21093,371.08203 378.375,380.3125 372.08593,389.26953 365.34375,397.95312 358.14843,406.36328 350.5,414.5 327.75,391.75 334.36328,384.81640 340.57812,377.64062 346.39453,370.22265 351.8125,362.5625 356.83203,354.66015 361.45312,346.51562 365.67578,338.12890 369.5,329.5 372.89843,320.69531 375.84375,311.78125 378.33593,302.75781 380.375,293.625 381.96093,284.38281 383.09375,275.03125 383.77343,265.57031 384,256 383.77343,246.42968 383.09375,236.96875 381.96093,227.61718 380.375,218.375 378.33593,209.24218 375.84375,200.21875 372.89843,191.30468 369.5,182.5 365.67578,173.87109 361.45312,165.48439 356.83203,157.33985 351.8125,149.43751 346.39453,141.77735 340.57812,134.35939 334.36328,127.18360 327.75,120.25 350.5,97.5z M169.25,64L192,64 192,448 169.5,448 73.25,352 0,352 0,160 73.25,160 169.25,64z" /></g></svg>',
+    'Volume3': '<svg xmlns="http://www.w3.org/2000/svg" height="26" width="26" viewBox="0 0 26 26"><g><path transform="rotate(0,13,13) translate(0,0) scale(0.05078,0.05078) " fill="#FFFFFF" d="M282.5,165.5L291.08593,174.93751 298.59375,185 305.02343,195.6875 310.375,207 314.58593,218.78125 317.59375,230.875 319.39843,243.28125 320,256 319.39843,268.71875 317.59375,281.125 314.58593,293.21875 310.375,305 305.02343,316.3125 298.59375,327 291.08593,337.0625 282.5,346.5 260,324 266.35937,316.99218 271.9375,309.46875 276.73437,301.42968 280.75,292.875 283.92187,283.96093 286.1875,274.84375 287.54687,265.52343 288,256 287.54687,246.47657 286.1875,237.15625 283.92187,228.03906 280.75,219.125 276.73437,210.57031 271.9375,202.53125 266.35937,195.00781 260,188 282.5,165.5z M160,118.75L86.75,192 32,192 32,320 86.75,320 160,393.25 160,118.75z M350.5,97.5L358.14843,105.63671 365.34375,114.04688 372.08593,122.73047 378.375,131.6875 384.21093,140.91796 389.59375,150.42187 394.52343,160.19921 399,170.25 402.98437,180.50390 406.4375,190.89064 409.35937,201.41017 411.75,212.0625 413.60937,222.84765 414.9375,233.76562 415.73437,244.81640 416,256 415.73437,267.18359 414.9375,278.23437 413.60937,289.15234 411.75,299.9375 409.35937,310.58984 406.4375,321.10937 402.98437,331.49609 399,341.75 394.52343,351.80078 389.59375,361.57812 384.21093,371.08203 378.375,380.3125 372.08593,389.26953 365.34375,397.95312 358.14843,406.36328 350.5,414.5 327.75,391.75 334.36328,384.81640 340.57812,377.64062 346.39453,370.22265 351.8125,362.5625 356.83203,354.66015 361.45312,346.51562 365.67578,338.12890 369.5,329.5 372.89843,320.69531 375.84375,311.78125 378.33593,302.75781 380.375,293.625 381.96093,284.38281 383.09375,275.03125 383.77343,265.57031 384,256 383.77343,246.42968 383.09375,236.96875 381.96093,227.61718 380.375,218.375 378.33593,209.24218 375.84375,200.21875 372.89843,191.30468 369.5,182.5 365.67578,173.87109 361.45312,165.48439 356.83203,157.33985 351.8125,149.43751 346.39453,141.77735 340.57812,134.35939 334.36328,127.18360 327.75,120.25 350.5,97.5z M169.25,64L192,64 192,448 169.5,448 73.25,352 0,352 0,160 73.25,160 169.25,64z M418.25,29.75L429.1875,41.23439 439.5,53.18752 449.1875,65.60939 458.25,78.5 466.64843,91.78126 474.34375,105.37503 481.33593,119.28127 487.625,133.5 493.21090,148.01564 498.09371,162.81251 502.27343,177.89062 505.75,193.25 508.48437,208.79689 510.4375,224.43751 511.60937,240.17187 512,256 511.60937,271.92968 510.4375,287.71875 508.48437,303.36718 505.75,318.875 502.27343,334.17968 498.09371,349.21875 493.21090,363.99218 487.625,378.5 481.33593,392.71875 474.34375,406.625 466.64843,420.21875 458.25,433.5 449.1875,446.39062 439.5,458.8125 429.1875,470.76562 418.25,482.25 395.5,459.5 405.34375,449.16406 414.625,438.40625 423.34375,427.22656 431.5,415.625 439.0625,403.67187 446,391.4375 452.3125,378.92187 458,366.125 463.04684,353.07031 467.43746,339.78125 471.17187,326.25781 474.25,312.5 476.65625,298.5625 478.375,284.5 479.40625,270.3125 479.75,256 479.40625,241.6875 478.375,227.5 476.65625,213.4375 474.25,199.5 471.17187,185.74218 467.43746,172.21875 463.04684,158.92968 458,145.875 452.3125,133.07812 446,120.5625 439.0625,108.32812 431.5,96.375 423.34375,84.77343 414.625,73.59375 405.34375,62.83593 395.5,52.5 418.25,29.75z" /></g></svg>',
+    'Volumex': '<svg xmlns="http://www.w3.org/2000/svg" height="26" width="26" viewBox="0 0 26 26"><g><path transform="rotate(0,11.5,11.5) translate(0.12193,0) scale(0.05133,0.05133) " fill="#ffffff" d="M283.25,164.75L352,233.25 420.75,164.75 443.25,187.25 374.75,256 443.25,324.75 420.75,347.25 352,278.75 283.25,347.25 260.75,324.75 329.25,256 260.75,187.25 283.25,164.75z M160,118.75L86.75,192 32,192 32,320 86.75,320 160,393.25 160,118.75z M169.25,63.99999L192,63.99999 192,448 169.25,448 73.25,352 2.84217E-14,352 2.84217E-14,160 73.25,160 169.25,63.99999z" /></g></svg>',
+    'ChevronUp': '<svg xmlns="http://www.w3.org/2000/svg" height="16" width="16" viewBox="0 0 16 16"><g><path transform="rotate(0,8,8) translate(0,2.02471) scale(0.16872,0.16872) " fill="#FFFFFF" d="M48,18.32812L94.82812,65.15625 89.15625,70.82812 48,29.67187 6.84374,70.82812 1.17187,65.15625 48,18.32812z" /></g></svg>',
+    'Playlist': '<svg xmlns="http://www.w3.org/2000/svg" height="26" width="26" viewBox="0 0 26 26"><g><path transform="rotate(0,13,13) translate(0,-1) scale(0.05078,0.05078) " fill="#FFFFFF" d="M0,416L512,416 512,448 0,448 0,416z M0,320L512,320 512,352 0,352 0,320z M160,224L512,224 512,256 112,256 160,224z M26.5,147.25L26.5,236.75 89,192 26.5,147.25z M112,128L512,128 512,160 160,160 112,128z M0,96L134.5,192 0,288 0,96z" /></g></svg>',
+    'l_play': '<svg xmlns="http://www.w3.org/2000/svg" height="19" width="19" viewBox="0 0 19 19"><g><path transform="rotate(0,9.5,9.5) translate(-0.63333,0) scale(0.03958,0.03958) " fill="#FFFFFF" d="M160,93.5L160,418.5 392.25,256 160,93.5z M128,32L448,256 128,480 128,32z" /></g></svg>',
+    'l_add': '<svg xmlns="http://www.w3.org/2000/svg" height="19" width="19" viewBox="0 0 19 19"><g><path transform="rotate(0,9.5,9.5) translate(0,0) scale(0.03958,0.03958) " fill="#FFFFFF" d="M224,0L256,0 256,224 480,224 480,256 256,256 256,480 224,480 224,256 0,256 0,224 224,224 224,0z" /></g></svg>',
+    'l_dl': '<svg xmlns="http://www.w3.org/2000/svg" height="20" width="20" viewBox="0 0 20 20"><g><path transform="rotate(0,10,10) translate(1,0) scale(0.03906,0.03906) " fill="#FFFFFF" d="M96,480L384,480 384,512 96,512 96,480z M224,0L256,0 256,362.25 372.75,244.75 395.25,267.25 240,423.75 84.75,267.25 107.25,244.75 224,362.25 224,0z" /></g></svg>',
+    'l_rm': '<svg xmlns="http://www.w3.org/2000/svg" height="20" width="20" viewBox="0 0 20 20"><g><path transform="rotate(0,10,10) translate(0,0) scale(0.04166,0.04166) " fill="#FFFFFF" d="M0,224L480,224 480,256 0,256 0,224z" /></g></svg>',
+}
+
+_SVG.update({
+    'm_play': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M8 5v14l11-7z"/></svg>',
+    'm_pause': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>',
+    'm_next': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>',
+    'm_prev': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>',
+    'm_shuffle': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/></svg>',
+    'm_repeat': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>',
+    'm_volup': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>',
+    'm_voldown': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M18.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM5 9v6h4l5 5V4L9 9H5z"/></svg>',
+    'm_vol0': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M7 9v6h4l5 5V4l-5 5H7z"/></svg>',
+    'm_volx': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>',
+    'm_queue': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z"/></svg>',
+    'm_pladd': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M14 10H2v2h12v-2zm0-4H2v2h12V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM2 16h8v-2H2v2z"/></svg>',
+    'm_lyrics': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-2 12H6v-2h12v2zm0-3H6V9h12v2zm0-3H6V6h12v2z"/></svg>',
+})
+
+
+try:
+    from src.core.cache import cache
+except Exception:
+    cache = None
+
+_MUSIC_CFG_DIR = os.path.join(app_paths.config_dir, 'music')
+_MUSIC_SETTINGS_FILE = os.path.join(_MUSIC_CFG_DIR, 'music_settings.json')
+# Providers verified to return complete, playable tracks (not previews) with a
+# working direct URL.  Ordered alphabetically; the search pool starts all of
+# them at once.  Slow or corrupt providers stay selectable in search filters
+# but are intentionally not enabled by default.
+DEFAULT_SOURCES = [
+    "AudiusMusicClient",
+    "FiveSingMusicClient",
+    "JioSaavnMusicClient",
+    "MituMusicClient",
+    "NeteaseMusicClient",
+    "YinyuekuMusicClient",
+]
+# The previous default list.  Configs that still contain exactly this list are
+# treated as untouched and upgraded to the curated one on load.
+LEGACY_DEFAULT_SOURCES = [
+    "BodianMusicClient",
+    "DeezerMusicClient",
+    "FMAMusicClient",
+    "FangpiMusicClient",
+    "GequhaiMusicClient",
+    "HTQYYMusicClient",
+    "ITingWaMusicClient",
+    "JBSouMusicClient",
+    "JooxMusicClient",
+    "KugouMusicClient",
+    "KuwoMusicClient",
+    "LRTSMusicClient",
+    "LivePOOMusicClient",
+    "MGMP3MusicClient",
+    "MOOVMusicClient",
+    "MiguMusicClient",
+    "NeteaseMusicClient",
+    "QQMusicClient",
+    "QianqianMusicClient",
+    "QobuzMusicClient",
+    "SgogoMusicClient",
+    "SodaMusicClient",
+    "TuneHubMusicClient",
+    "MituMusicClient",
+]
+SEARCH_TIMEOUT_S = 40.0  # Slowest curated source lands around 25-30s; keep headroom.
+QUALITY_TIERS = ['lossless', 'mp3', 'aac', 'other']
+SLOW_OR_GATED_SOURCES = ['AppleMusicClient', 'SoundCloudMusicClient', 'StreetVoiceMusicClient', 'TIDALMusicClient', 'YouTubeMusicClient', 'SpotifyMusicClient', 'MituMusicClient', 'GequbaoMusicClient', 'YinyuedaoMusicClient', 'BuguyyMusicClient']
+
+@dataclass
+class MusicSettings:
+    download_dir: str = field(default_factory=lambda: os.path.join(app_paths.download_root, 'music'))
+    preferred_sources: list[str] = field(default_factory=lambda: list(DEFAULT_SOURCES))
+    quality_filters: list[str] = field(default_factory=lambda: list(QUALITY_TIERS))
+    search_size_per_source: int = 4
+    max_concurrent_searches: int = 8
+    lyrics_font_family: str = ''
+    lyrics_custom_font_path: str = ''
+    lyrics_font_scale: float = 1.0
+    lyrics_align: str = 'center'
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items()}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'MusicSettings':
+        data = dict(data)
+        saved = data.get('preferred_sources')
+        if isinstance(saved, list) and sorted(saved) == sorted(LEGACY_DEFAULT_SOURCES):
+            # Untouched config from before the provider cleanup: move it to the
+            # verified defaults and drop the old (slow) search sizing.
+            data['preferred_sources'] = list(DEFAULT_SOURCES)
+            data['search_size_per_source'] = 4
+            data['max_concurrent_searches'] = 8
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+def load_settings() -> MusicSettings:
+    if os.path.isfile(_MUSIC_SETTINGS_FILE):
+        try:
+            with open(_MUSIC_SETTINGS_FILE, 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+            return MusicSettings.from_dict(data)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning('Failed to load music settings: %s — using defaults', exc)
+    return MusicSettings()
+
+def save_settings(s: MusicSettings) -> None:
+    os.makedirs(_MUSIC_CFG_DIR, exist_ok=True)
+    try:
+        with open(_MUSIC_SETTINGS_FILE, 'w', encoding='utf-8') as fh:
+            json.dump(s.to_dict(), fh, indent=2)
+    except OSError as exc:
+        logger.error('Failed to save music settings: %s', exc)
+settings = load_settings()
+
+def apply_settings(**kwargs) -> None:
+    for key, value in kwargs.items():
+        if hasattr(settings, key):
+            setattr(settings, key, value)
+    save_settings(settings)
+
+music_settings, apply_music_settings = settings, apply_settings
+
+
+class _MusicdlNoiseFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name.startswith('musicdl') and 'quark_parser_config' in record.getMessage():
+            record.levelno = logging.DEBUG
+            record.levelname = 'DEBUG'
+            return logging.getLogger().isEnabledFor(logging.DEBUG)
+        return True
+
+
+logging.getLogger('musicdl').addFilter(_MusicdlNoiseFilter())
+
+
+MUSICDL_WORK_DIR = os.path.join(app_paths.cache_dir, 'musicdl')
+
+_THREADS_PER_SOURCE = 2
+
+_lock = threading.Lock()
+_source_locks: dict[str, threading.Lock] = {}
+_source_clients: dict[str, object] = {}
+_dirs_ready = False
+
+
+def _sources_key(sources: list[str]) -> str:
+    return '|'.join(sorted(sources))
+
+
+@lru_cache(maxsize=1)
+def available_sources() -> list[str]:
+    from musicdl.modules import MusicClientBuilder
+    return sorted(MusicClientBuilder.REGISTERED_MODULES.keys())
+
+
+def _registered(sources: list[str]) -> list[str]:
+    known = set(available_sources())
+    return [s for s in sources if s in known]
+
+
+def _prepare_dirs() -> None:
+    global _dirs_ready
+    with _lock:
+        if _dirs_ready:
+            return
+        shutil.rmtree(MUSICDL_WORK_DIR, ignore_errors=True)
+        os.makedirs(MUSICDL_WORK_DIR, exist_ok=True)
+        atexit.register(shutil.rmtree, MUSICDL_WORK_DIR, True)
+        _dirs_ready = True
+
+
+def _client_cfg(source: str) -> dict:
+    return {source: {'search_size_per_source': settings.search_size_per_source, 'work_dir': MUSICDL_WORK_DIR}}
+
+
+def _get_source_client(source: str):
+    size = settings.search_size_per_source
+    key = f'{source}#{size}'
+    client = _source_clients.get(key)
+    if client is not None:
+        return client
+    _prepare_dirs()
+    with _lock:
+        source_lock = _source_locks.setdefault(key, threading.Lock())
+    with source_lock:
+        client = _source_clients.get(key)
+        if client is None:
+            from musicdl.musicdl import MusicClient
+            client = MusicClient(music_sources=[source], init_music_clients_cfg=_client_cfg(source)).music_clients.get(source)
+            for stale in [k for k in _source_clients if k.startswith(f'{source}#') and k != key]:
+                _source_clients.pop(stale, None)
+            _source_clients[key] = client
+    return client
+
+
+def _filter_by_quality(songs: list[Song]) -> list[Song]:
+    allowed = set(settings.quality_filters)
+    if not allowed or allowed >= set(('lossless', 'mp3', 'aac', 'other')):
+        return songs
+    return [s for s in songs if getattr(s, 'quality_tier', None) in allowed]
+
+
+def _search_source(source: str, query: str, progress, progress_lock):
+    client = _get_source_client(source)
+    if client is None:
+        return []
+
+
+    return client.search(keyword=query, num_threadings=_THREADS_PER_SOURCE, main_process_context=progress, main_progress_lock=progress_lock) or []
+
+
+def search_streaming(query: str, on_source_done, sources: list[str] | None=None, use_cache: bool=True, is_cancelled=None, per_source_timeout: float | None=None) -> list[Song]:
+    sources = _registered(sources or settings.preferred_sources)
+    if not sources:
+        return []
+    key = _sources_key(sources)
+    if use_cache:
+        cached = cache.load('music_search', f'{query}:{key}')
+        if cached:
+            songs = _filter_by_quality([Song.from_dict(d) for d in cached])
+            on_source_done(songs)
+            return songs
+    from rich.progress import Progress
+    progress, progress_lock = Progress(disable=True), threading.Lock()
+    all_songs: list[Song] = []
+    workers = max(1, min(8, len(sources), int(settings.max_concurrent_searches)))
+    ex = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='musicdl-search')
+    try:
+        ordered = sorted(sources, key=lambda source: source in SLOW_OR_GATED_SOURCES)
+        futures = {ex.submit(_search_source, s, query, progress, progress_lock): s for s in ordered}
+        pending = set(futures)
+        timeout = SEARCH_TIMEOUT_S if per_source_timeout is None else per_source_timeout
+        deadline = time.monotonic() + timeout
+        while pending:
+            if is_cancelled is not None and is_cancelled():
+                return _filter_by_quality(all_songs)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning('Search deadline reached after %.1fs; abandoning %d source(s): %s',
+                               timeout, len(pending), ', '.join(sorted(futures[f] for f in pending)))
+                break
+
+            done, pending = wait(pending, timeout=min(0.5, remaining), return_when=FIRST_COMPLETED)
+            for future in done:
+                source = futures[future]
+                try:
+                    song_infos = future.result()
+                except Exception as exc:
+                    logger.warning('Search failed for source %s: %s', source, exc)
+                    continue
+                batch = [Song.from_song_info(source, si) for si in song_infos]
+                if not batch:
+                    continue
+                all_songs.extend(batch)
+                filtered = _filter_by_quality(batch)
+                if filtered:
+                    on_source_done(filtered)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    if all_songs:
+        cache.save('music_search', f'{query}:{key}', [s.to_dict() for s in all_songs])
+    return _filter_by_quality(all_songs)
+
+
+def search(query: str, sources: list[str] | None=None, use_cache: bool=True) -> list[Song]:
+    return search_streaming(query, lambda _songs: None, sources=sources, use_cache=use_cache)
+
+
+FALLBACK_COVER_SOURCES = ('NeteaseMusicClient', 'DeezerMusicClient', 'QQMusicClient', 'KuwoMusicClient')
+_cover_cache: OrderedDict[str, str | None] = OrderedDict()
+
+_cover_slots = threading.Semaphore(2)
+
+
+def fetch_fallback_cover_url(song: Song) -> str | None:
+    if getattr(song, 'cover_url', None):
+        return song.cover_url
+    query = f"{song.song_name or ''} {(song.singers or '').split(',')[0]}".strip()
+    if not query:
+        return None
+    if query in _cover_cache:
+        return _cover_cache[query]
+    with _cover_slots:
+        if query in _cover_cache:
+            return _cover_cache[query]
+        url = None
+        for source in _registered(list(FALLBACK_COVER_SOURCES)):
+            if source == getattr(song, 'source', None):
+                continue
+            try:
+                url = next((r.cover_url for r in search(query, sources=[source]) if r.cover_url), None)
+            except Exception:
+                logger.warning('Fallback cover lookup failed via %s', source)
+            if url:
+                break
+    _cover_cache[query] = url
+    while len(_cover_cache) > 512:
+        _cover_cache.popitem(last=False)
+    return url
+
+
+music_service = types.SimpleNamespace(
+    available_sources=available_sources, search_streaming=search_streaming, search=search,
+    fetch_fallback_cover_url=fetch_fallback_cover_url, _get_source_client=_get_source_client)
+
+
+try:
+    if sys.platform != 'win32':
+        raise ImportError('Windows only')
+    from winrt.windows.foundation import Uri
+    from winrt.windows.media import MediaPlaybackStatus, MediaPlaybackType, SystemMediaTransportControlsButton as Button, SystemMediaTransportControlsTimelineProperties
+    from winrt.windows.media.playback import MediaPlayer
+    from winrt.windows.storage.streams import RandomAccessStreamReference
+except ImportError as exc:
+    MediaPlayer = None
+    if sys.platform == 'win32':
+        logger.warning('Media overlay disabled, missing winrt package: %s', exc)
+
+
+class MediaControls(QObject):
+    _pressed = Signal(object)
+    _seek_requested = Signal(int)
+
+    def __init__(self, player):
+        super().__init__(player)
+        self._p = player
+        self._ref_pos, self._ref_t = 0, time.monotonic()
+
+        self._mp = MediaPlayer()
+        self._mp.command_manager.is_enabled = False
+        self._c = self._mp.system_media_transport_controls
+        self._c.is_enabled = True
+        self._c.is_play_enabled = self._c.is_pause_enabled = True
+        self._c.add_button_pressed(lambda s, a: self._pressed.emit(a.button))
+        self._c.add_playback_position_change_requested(lambda s, a: self._seek_requested.emit(int(a.requested_playback_position.total_seconds() * 1000)))
+        self._actions = {Button.PLAY: player.resume, Button.PAUSE: player.pause, Button.NEXT: player.next, Button.PREVIOUS: player.previous, Button.STOP: player.stop}
+        self._status = {'playing': MediaPlaybackStatus.PLAYING, 'paused': MediaPlaybackStatus.PAUSED, 'stopped': MediaPlaybackStatus.STOPPED}
+        self._pressed.connect(lambda b: self._actions.get(b, lambda: None)())
+        self._seek_requested.connect(player.seek)
+        player.song_changed.connect(self._on_song)
+        player.state_changed.connect(self._on_state)
+        player.queue_changed.connect(self._sync_buttons)
+        player.duration_changed.connect(lambda _: self._sync_timeline())
+        player.position_changed.connect(self._on_position)
+
+    def _on_song(self, song) -> None:
+        u = self._c.display_updater
+        u.type = MediaPlaybackType.MUSIC
+        m = u.music_properties
+        m.title, m.artist, m.album_title = song.song_name or '', song.singers or '', song.album or ''
+        try:
+            u.thumbnail = RandomAccessStreamReference.create_from_uri(Uri(song.cover_url)) if song.cover_url else None
+        except Exception:
+            logger.debug('Media overlay cover failed for %r', song.cover_url)
+        u.update()
+        self._sync_buttons()
+
+    def _on_state(self, state: str) -> None:
+        self._c.playback_status = self._status.get(state, MediaPlaybackStatus.STOPPED)
+        self._sync_buttons()
+        self._sync_timeline()
+
+    def _sync_buttons(self) -> None:
+        self._c.is_next_enabled = self._p.has_next
+        self._c.is_previous_enabled = self._p.has_previous
+
+    def _sync_timeline(self) -> None:
+        dur = self._p.duration
+        if dur <= 0:
+            return
+        self._ref_pos, self._ref_t = self._p.position, time.monotonic()
+        t = SystemMediaTransportControlsTimelineProperties()
+        t.start_time = t.min_seek_time = timedelta(0)
+        t.end_time = t.max_seek_time = timedelta(milliseconds=dur)
+        t.position = timedelta(milliseconds=self._ref_pos)
+        self._c.update_timeline_properties(t)
+
+    def _on_position(self, pos: int) -> None:
+        expected = self._ref_pos + (time.monotonic() - self._ref_t) * 1000 * self._p.is_playing
+        if abs(pos - expected) > 1500:
+            self._sync_timeline()
+
+
+def _attach_media_controls(player):
+    if MediaPlayer is None:
+        return None
+    try:
+        return MediaControls(player)
+    except Exception:
+        logger.warning('Media overlay init failed', exc_info=True)
+        return None
+
+
+_PLAYBACK_STATE_LABELS = {QMediaPlayer.PlaybackState.PlayingState: 'playing', QMediaPlayer.PlaybackState.PausedState: 'paused', QMediaPlayer.PlaybackState.StoppedState: 'stopped'}
+
+class MusicPreviewPlayer(QObject):
+    state_changed = Signal(str)
+    position_changed = Signal(int)
+    duration_changed = Signal(int)
+    song_changed = Signal(object)
+    queue_changed = Signal()
+    error = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._player = QMediaPlayer(self)
+        self._audio_output = QAudioOutput(self)
+        self._player.setAudioOutput(self._audio_output)
+        self._player.playbackStateChanged.connect(self._on_state_changed)
+        self._player.positionChanged.connect(self.position_changed.emit)
+        self._player.durationChanged.connect(self.duration_changed.emit)
+        self._player.errorOccurred.connect(self._on_error)
+        self._player.mediaStatusChanged.connect(self._on_media_status_changed)
+        self._current_song: Song | None = None
+        self._queue: list[Song] = []
+        self._urls: dict[str, str] = {}
+        self._order: list[int] = []
+        self._index = -1
+        self._repeat = False
+        self._shuffle = False
+        self._media_controls = _attach_media_controls(self)
+
+    def set_queue(self, songs: list[Song], urls: dict[str, str]) -> None:
+        current = self._current_song
+        self._queue = list(songs)
+        self._urls.update(urls)
+        self._rebuild_order(current)
+        self.queue_changed.emit()
+
+    def _rebuild_order(self, keep_song: Song | None=None) -> None:
+        n = len(self._queue)
+        self._order = list(range(n))
+        if self._shuffle:
+            random.shuffle(self._order)
+        if keep_song is not None and keep_song in self._queue:
+            song_idx = self._queue.index(keep_song)
+            self._index = self._order.index(song_idx)
+        else:
+            self._index = -1
+
+    def set_repeat(self, enabled: bool) -> None:
+        self._repeat = enabled
+
+    @property
+    def repeat(self) -> bool:
+        return self._repeat
+
+    def set_shuffle(self, enabled: bool) -> None:
+        self._shuffle = enabled
+        self._rebuild_order(self._current_song)
+
+    @property
+    def shuffle(self) -> bool:
+        return self._shuffle
+
+    def play_song(self, song: Song, url: str, queue: list[Song] | None=None, urls: dict[str, str] | None=None) -> None:
+        if queue is not None:
+            self.set_queue(queue, urls or {song.key: url})
+        elif song not in self._queue:
+            self._queue.append(song)
+            self._rebuild_order(self._current_song)
+        if song in self._queue:
+            song_idx = self._queue.index(song)
+            self._index = self._order.index(song_idx)
+        self._urls[song.key] = url
+        self._play_current()
+
+    def _play_current(self) -> None:
+        if not 0 <= self._index < len(self._order):
+            return
+        song = self._queue[self._order[self._index]]
+        url = self._urls.get(song.key)
+        if not url:
+            self.error.emit('No preview available for this track')
+            return
+        self._current_song = song
+        self._player.setSource(QUrl(url))
+        self._player.play()
+        self.song_changed.emit(song)
+
+    def next(self) -> None:
+        if not self._order:
+            return
+        nxt = self._index + 1
+        if nxt >= len(self._order):
+            if not self._repeat:
+                return
+            nxt = 0
+        self._index = nxt
+        self._play_current()
+
+    def previous(self) -> None:
+        if not self._order:
+            return
+        prv = self._index - 1
+        if prv < 0:
+            if not self._repeat:
+                prv = 0
+            else:
+                prv = len(self._order) - 1
+        self._index = prv
+        self._play_current()
+
+    @property
+    def has_next(self) -> bool:
+        return self._index + 1 < len(self._order) or self._repeat
+
+    @property
+    def has_previous(self) -> bool:
+        return self._index > 0 or self._repeat
+
+    def pause(self) -> None:
+        self._player.pause()
+
+    def resume(self) -> None:
+        self._player.play()
+
+    def toggle_play_pause(self) -> None:
+        if self.is_playing:
+            self.pause()
+        else:
+            self.resume()
+
+    def stop(self) -> None:
+        self._player.stop()
+        self._current_song = None
+
+    def seek(self, position_ms: int) -> None:
+        self._player.setPosition(position_ms)
+
+    def set_volume(self, volume: float) -> None:
+        self._audio_output.setMuted(False)
+        self._audio_output.setVolume(max(0.0, min(1.0, volume)))
+
+    def set_muted(self, muted: bool) -> None:
+        self._audio_output.setMuted(muted)
+
+    @property
+    def is_muted(self) -> bool:
+        return self._audio_output.isMuted()
+
+    @property
+    def volume(self) -> float:
+        return self._audio_output.volume()
+
+    @property
+    def position(self) -> int:
+        return self._player.position()
+
+    @property
+    def duration(self) -> int:
+        return self._player.duration()
+
+    @property
+    def current_song(self) -> Song | None:
+        return self._current_song
+
+    @property
+    def is_playing(self) -> bool:
+        return self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+
+    def _on_state_changed(self, state) -> None:
+        self.state_changed.emit(_PLAYBACK_STATE_LABELS.get(state, 'stopped'))
+
+        try:
+            from src.gui.settings_page import get_sound_manager
+            get_sound_manager().set_media_playing('music', state == QMediaPlayer.PlaybackState.PlayingState, owner=self)
+        except Exception:
+            logger.debug('Ambiance ducking update failed', exc_info=True)
+
+    def _on_media_status_changed(self, status) -> None:
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            if self.has_next:
+                self.next()
+            else:
+                self.stop()
+
+    def _on_error(self, error, error_string: str) -> None:
+        logger.warning('Music preview player error: %s', error_string)
+        self.error.emit(error_string)
+
+
+def close_http_client() -> None:
+    try:
+        _http.close()
+    except Exception:
+        pass
+
+
+def _t(key: str, default: str) -> str:
+    try:
+        v = tr(key)
+    except Exception:
+        return default
+    return default if not v or v == key else v
+
 
 def _format_ms(ms: int) -> str:
-    if ms <= 0:
-        return '0:00'
-    total_seconds = ms // 1000
-    minutes = total_seconds // 60
-    seconds = total_seconds % 60
-    return f'{minutes}:{seconds:02d}'
+    s = max(0, ms) // 1000
+    return f'{s // 60}:{s % 60:02d}'
 
-def _format_source(source: str) -> str:
-    if not source:
-        return ''
-    name = source
-    for suffix in ('MusicClient', 'Client'):
-        if name.endswith(suffix):
-            name = name[:-len(suffix)]
-            break
-    return name or source
-_LRC_TIME_RE = re.compile('\\[(\\d+):(\\d+(?:\\.\\d+)?)\\]')
+
+def _format_source(src: str) -> str:
+    for suf in ('MusicClient', 'Client'):
+        if src and src.endswith(suf):
+            return src[:-len(suf)] or src
+    return src or ''
+
+
+def _first_artist(song) -> str:
+    return (song.singers or '').split(',')[0].strip()
+
+
+def _playable(song) -> bool:
+    return isinstance(song.download_url, str) and bool(song.download_url)
+
 
 def _parse_lrc(text: str | None) -> list[tuple[int, str]]:
-    if not text:
-        return []
-    lines: list[tuple[int, str]] = []
-    for raw_line in text.splitlines():
-        matches = list(_LRC_TIME_RE.finditer(raw_line))
-        if not matches:
-            continue
-        content = _LRC_TIME_RE.sub('', raw_line).strip()
-        for m in matches:
-            ms = int((int(m.group(1)) * 60 + float(m.group(2))) * 1000)
-            lines.append((ms, content))
-    lines.sort(key=lambda item: item[0])
-    return lines
-_LRCLIB_HEADERS = {'Lrclib-Client': 'PiraChest v1.0 (https://github.com)'}
+    out = []
+    for line in (text or '').splitlines():
+        ms = list(_LRC_RE.finditer(line))
+        if ms:
+            body = _LRC_RE.sub('', line).strip()
+            out += [(int((int(m.group(1)) * 60 + float(m.group(2))) * 1000), body) for m in ms]
+    out.sort(key=lambda x: x[0])
+    return out
+
 
 def _fetch_lrc_text(song) -> str:
     try:
-        artist = (song.singers or '').split(',')[0].strip()
+        artist = _first_artist(song)
         params = {'track_name': song.song_name or '', 'artist_name': artist}
         if song.album:
             params['album_name'] = song.album
         if song.duration_s:
             params['duration'] = song.duration_s
-        resp = requests.get('https://lrclib.net/api/get', params=params, timeout=8, headers=_LRCLIB_HEADERS)
-        data = None
-        if resp.status_code == 200:
-            data = resp.json()
+        r = _http.get('https://lrclib.net/api/get', params=params, timeout=8, headers=_LRCLIB_HEADERS)
+        if r.status_code == 200:
+            data = r.json()
         else:
-            resp = requests.get('https://lrclib.net/api/search', params={'track_name': params['track_name'], 'artist_name': artist}, timeout=8, headers=_LRCLIB_HEADERS)
-            resp.raise_for_status()
-            results = resp.json()
-            data = results[0] if results else None
+            r = _http.get('https://lrclib.net/api/search', timeout=8, headers=_LRCLIB_HEADERS,
+                          params={'track_name': params['track_name'], 'artist_name': artist})
+            r.raise_for_status()
+            res = r.json()
+            data = res[0] if res else None
         if data:
             return data.get('syncedLyrics') or data.get('plainLyrics') or ''
     except Exception as exc:
         logger.debug('Lyrics fetch failed for %r: %s', song.song_name, exc)
     return ''
 
-class _LrcFetchSignals(QObject):
+
+class _LrcSignals(QObject):
     finished = Signal(str, str)
 
-class _LrcFetchTask(QRunnable):
 
+class _LrcTask(QRunnable):
     def __init__(self, song):
         super().__init__()
-        self.song = song
-        self.signals = _LrcFetchSignals()
+        self.song, self.signals = song, _LrcSignals()
 
     def run(self) -> None:
         self.signals.finished.emit(self.song.key, _fetch_lrc_text(self.song))
 
-def _sanitize_filename(name: str) -> str:
-    name = re.sub('[\\\\/:*?"<>|]', '_', name or '').strip().strip('.')
-    return name or 'Unknown'
 
-def _unique_path(directory: str, base_name: str, ext: str) -> str:
-    candidate = os.path.join(directory, f'{base_name}{ext}')
-    if not os.path.exists(candidate):
-        return candidate
-    n = 1
-    while True:
-        candidate = os.path.join(directory, f'{base_name} ({n}){ext}')
-        if not os.path.exists(candidate):
-            return candidate
+def _unique_path(directory: str, base: str, ext: str) -> str:
+    path, n = os.path.join(directory, base + ext), 1
+    while os.path.exists(path):
+        path = os.path.join(directory, f'{base} ({n}){ext}')
         n += 1
+    return path
 
-def _fetch_cover_bytes(song) -> tuple[bytes | None, str]:
-    cover_url = getattr(song, 'cover_url', None)
-    if not cover_url:
-        return (None, '')
+
+def _fetch_cover(song) -> tuple[bytes | None, str]:
+    if not getattr(song, 'cover_url', None):
+        return None, ''
     try:
-        if has_full('music', cover_url):
-            cover_path = full_path('music', cover_url)
-            with open(cover_path, 'rb') as fh:
-                data = fh.read()
-        else:
-            resp = requests.get(cover_url, timeout=10)
-            resp.raise_for_status()
-            data = resp.content
-        if data[:8] == b'\x89PNG\r\n\x1a\n':
-            return (data, 'image/png')
-        return (data, 'image/jpeg')
+        r = _http.get(song.cover_url, timeout=10)
+        r.raise_for_status()
+        return r.content, 'image/png' if r.content[:8] == b'\x89PNG\r\n\x1a\n' else 'image/jpeg'
     except Exception:
-        logger.debug('Cover art fetch failed for %r', getattr(song, 'song_name', ''))
-        return (None, '')
+        return None, ''
 
-def _embed_metadata(path: str, song, lrc_text: str) -> None:
+
+def _embed_metadata(path: str, song, lrc: str) -> None:
     ext = os.path.splitext(path)[1].lower()
-    title = song.song_name or ''
-    artist = song.singers or ''
-    album = song.album or ''
-    cover_bytes, cover_mime = _fetch_cover_bytes(song)
+    title, artist, album = song.song_name or '', song.singers or '', song.album or ''
+    cover, mime = _fetch_cover(song)
     try:
         if ext == '.mp3':
-            from mutagen.id3 import ID3, ID3NoHeaderError, TIT2, TPE1, TALB, USLT, APIC
+            from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TALB, TIT2, TPE1, USLT
             try:
                 tags = ID3(path)
             except ID3NoHeaderError:
                 tags = ID3()
-            if title:
-                tags.setall('TIT2', [TIT2(encoding=3, text=title)])
-            if artist:
-                tags.setall('TPE1', [TPE1(encoding=3, text=artist)])
-            if album:
-                tags.setall('TALB', [TALB(encoding=3, text=album)])
-            if lrc_text:
+            for cls, v in ((TIT2, title), (TPE1, artist), (TALB, album)):
+                if v:
+                    tags.setall(cls.__name__, [cls(encoding=3, text=v)])
+            if lrc:
                 tags.delall('USLT')
-                tags.add(USLT(encoding=3, lang='eng', desc='', text=lrc_text))
-            if cover_bytes:
+                tags.add(USLT(encoding=3, lang='eng', desc='', text=lrc))
+            if cover:
                 tags.delall('APIC')
-                tags.add(APIC(encoding=3, mime=cover_mime, type=3, desc='Cover', data=cover_bytes))
+                tags.add(APIC(encoding=3, mime=mime, type=3, desc='Cover', data=cover))
             tags.save(path)
-        elif ext == '.flac':
+        elif ext in ('.flac', '.ogg'):
             from mutagen.flac import FLAC, Picture
-            audio = FLAC(path)
-            if title:
-                audio['title'] = title
-            if artist:
-                audio['artist'] = artist
-            if album:
-                audio['album'] = album
-            if lrc_text:
-                audio['LYRICS'] = lrc_text
-            if cover_bytes:
+            from mutagen.oggvorbis import OggVorbis
+            audio = FLAC(path) if ext == '.flac' else OggVorbis(path)
+            for k, v in (('title', title), ('artist', artist), ('album', album), ('LYRICS', lrc)):
+                if v:
+                    audio[k] = v
+            if cover:
                 pic = Picture()
-                pic.data = cover_bytes
-                pic.type = 3
-                pic.mime = cover_mime
-                pic.desc = 'Cover'
-                audio.clear_pictures()
-                audio.add_picture(pic)
+                pic.data, pic.type, pic.mime, pic.desc = cover, 3, mime, 'Cover'
+                if ext == '.flac':
+                    audio.clear_pictures()
+                    audio.add_picture(pic)
+                else:
+                    audio['metadata_block_picture'] = [base64.b64encode(pic.write()).decode('ascii')]
             audio.save()
         elif ext in ('.m4a', '.mp4', '.aac'):
             from mutagen.mp4 import MP4, MP4Cover
             audio = MP4(path)
-            if title:
-                audio['©nam'] = [title]
-            if artist:
-                audio['©ART'] = [artist]
-            if album:
-                audio['©alb'] = [album]
-            if lrc_text:
-                audio['©lyr'] = [lrc_text]
-            if cover_bytes:
-                fmt = MP4Cover.FORMAT_PNG if cover_mime == 'image/png' else MP4Cover.FORMAT_JPEG
-                audio['covr'] = [MP4Cover(cover_bytes, imageformat=fmt)]
-            audio.save()
-        elif ext == '.ogg':
-            import base64
-            from mutagen.oggvorbis import OggVorbis
-            from mutagen.flac import Picture
-            audio = OggVorbis(path)
-            if title:
-                audio['title'] = title
-            if artist:
-                audio['artist'] = artist
-            if album:
-                audio['album'] = album
-            if lrc_text:
-                audio['LYRICS'] = lrc_text
-            if cover_bytes:
-                pic = Picture()
-                pic.data = cover_bytes
-                pic.type = 3
-                pic.mime = cover_mime
-                audio['metadata_block_picture'] = [base64.b64encode(pic.write()).decode('ascii')]
+            for k, v in (('©nam', title), ('©ART', artist), ('©alb', album), ('©lyr', lrc)):
+                if v:
+                    audio[k] = [v]
+            if cover:
+                fmt = MP4Cover.FORMAT_PNG if mime == 'image/png' else MP4Cover.FORMAT_JPEG
+                audio['covr'] = [MP4Cover(cover, imageformat=fmt)]
             audio.save()
     except Exception:
         logger.exception('Failed to embed metadata into %s', path)
 
-class _SongDownloadSignals(QObject):
+
+def _match_key(song) -> tuple[str, str]:
+    norm = lambda s: re.sub(r'\s+', ' ', s.strip().lower())
+    return norm(song.song_name or ''), norm(_first_artist(song))
+
+
+class _DlSignals(QObject):
     progress = Signal(int, int)
     finished = Signal(bool, str, str)
 
-def _download_match_key(song) -> tuple[str, str]:
-    title = re.sub('\\s+', ' ', (song.song_name or '').strip().lower())
-    artist = re.sub('\\s+', ' ', (song.singers or '').split(',')[0].strip().lower())
-    return (title, artist)
 
-class _SongDownloadTask(QRunnable):
+_AUTH_ERRORS = (401, 403, 404, 410)
 
-    def __init__(self, songs: list, dest_dir: str):
+
+def _site_referer(url: str) -> str:
+    parts = (urlparse(url).hostname or '').split('.')
+    return f'https://www.{".".join(parts[-2:])}/' if len(parts) >= 2 else ''
+
+
+def _client_headers(song) -> dict:
+    headers = getattr(song, 'download_headers', None)
+    if isinstance(headers, dict) and headers:
+        return dict(headers)
+    try:
+        client = music_service._get_source_client(song.source)
+        return dict(getattr(client, 'default_download_headers', None) or {})
+    except Exception:
+        return {}
+
+
+def _client_cookies(song) -> dict:
+    cookies = getattr(song, 'download_cookies', None)
+    return dict(cookies) if isinstance(cookies, dict) else {}
+
+
+def _refresh_url(song) -> str | None:
+    try:
+        res = music_service.search(f"{song.song_name or ''} {_first_artist(song)}".strip(),
+                                   sources=[song.source], use_cache=False)
+        key = _match_key(song)
+        for r in res:
+            if _match_key(r) == key and _playable(r):
+                song.download_url = r.download_url
+                if getattr(r, 'download_headers', None):
+                    song.download_headers = dict(r.download_headers)
+                if getattr(r, 'download_cookies', None):
+                    song.download_cookies = dict(r.download_cookies)
+                return r.download_url
+    except Exception as exc:
+        logger.debug('URL refresh failed for %r: %s', song.song_name, exc)
+    return None
+
+
+class _DownloadTask(QRunnable):
+    def __init__(self, songs: list, dest: str):
         super().__init__()
-        self.songs = songs
-        self.dest_dir = dest_dir
-        self.signals = _SongDownloadSignals()
-        self._cancelled = False
+        self.songs, self.dest, self.signals, self._cancelled = songs, dest, _DlSignals(), False
 
     def cancel(self) -> None:
         self._cancelled = True
 
-    def run(self) -> None:
-        candidates = [s for s in self.songs if isinstance(s.download_url, str) and s.download_url]
-        if not candidates:
-            self.signals.finished.emit(False, '', 'No download URL available for this track.')
-            return
-        last_error = ''
-        for song in candidates:
-            if self._cancelled:
-                self.signals.finished.emit(False, '', 'Cancelled')
-                return
-            url = song.download_url
-            tmp_path = None
-            try:
-                os.makedirs(self.dest_dir, exist_ok=True)
-                resp = requests.get(url, stream=True, timeout=30)
-                resp.raise_for_status()
-                content_type = resp.headers.get('Content-Type', '')
+    def _save(self, song, url: str, headers: dict, cookies: dict | None = None) -> str:
+        tmp = None
+        try:
+            with _http.stream('GET', url, headers=headers, cookies=cookies or None, timeout=30) as r:
+                r.raise_for_status()
                 ext = os.path.splitext(url.split('?')[0])[1].lower()
-                if ext not in ('.mp3', '.flac', '.m4a', '.mp4', '.aac', '.ogg', '.wav'):
-                    ext = {'audio/flac': '.flac', 'audio/x-flac': '.flac', 'audio/mp4': '.m4a', 'audio/aac': '.aac', 'audio/ogg': '.ogg', 'audio/wav': '.wav'}.get(content_type.split(';')[0].strip().lower(), '.mp3')
-                artist = (song.singers or '').split(',')[0].strip()
-                base_name = _sanitize_filename(f'{artist} - {song.song_name}' if artist else song.song_name or tr('download.unknown'))
-                final_path = _unique_path(self.dest_dir, base_name, ext)
-                tmp_path = final_path + '.part'
-                total = int(resp.headers.get('Content-Length', 0) or 0)
-                downloaded = 0
-                with open(tmp_path, 'wb') as fh:
-                    for chunk in resp.iter_content(chunk_size=262144):
+                if ext not in _AUDIO_EXT:
+                    ext = _MIME_EXT.get(r.headers.get('Content-Type', '').split(';')[0].strip().lower(), '')
+                if ext not in _AUDIO_EXT:
+                    ext = f'.{(getattr(song, "ext", "") or "").lower().lstrip(".")}'
+                if ext not in _AUDIO_EXT:
+                    ext = '.mp3'
+                artist = _first_artist(song)
+                name = f'{artist} - {song.song_name}' if artist else song.song_name or 'Unknown'
+                name = re.sub(r'[\\/:*?"<>|]', '_', name).strip().strip('.') or 'Unknown'
+                os.makedirs(self.dest, exist_ok=True)
+                final = _unique_path(self.dest, name, ext)
+                tmp = final + '.part'
+                total, done = int(r.headers.get('Content-Length', 0) or 0), 0
+                with open(tmp, 'wb') as fh:
+                    for chunk in r.iter_bytes(262144):
                         if self._cancelled:
                             raise RuntimeError('cancelled')
-                        if not chunk:
-                            continue
                         fh.write(chunk)
-                        downloaded += len(chunk)
-                        self.signals.progress.emit(downloaded, total)
-                os.replace(tmp_path, final_path)
-            except Exception as exc:
-                if tmp_path and os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
-                if self._cancelled:
-                    self.signals.finished.emit(False, '', 'Cancelled')
-                    return
-                last_error = str(exc)[:300]
-                logger.warning('Download failed for %r via %s (%s) — trying next source', song.song_name, song.source, last_error)
-                continue
-            if not self._cancelled and not getattr(song, 'cover_url', None):
+                        done += len(chunk)
+                        self.signals.progress.emit(done, total)
+            os.replace(tmp, final)
+            return final
+        except BaseException:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+            raise
+
+    def _fetch(self, song) -> str:
+        url, refreshed, err = song.download_url, False, None
+        while True:
+            for headers, cookies in ((lambda: {}, lambda: {}),
+                                     (lambda u=url: {'Referer': _site_referer(u)}, lambda: {}),
+                                     (lambda: _client_headers(song), lambda: _client_cookies(song))):
                 try:
-                    fallback_url = music_service.fetch_fallback_cover_url(song)
-                    if fallback_url:
-                        song.cover_url = fallback_url
-                except Exception:
-                    logger.debug('Fallback cover fetch failed for %r', song.song_name)
-            lrc_text = _fetch_lrc_text(song)
-            if not self._cancelled:
-                _embed_metadata(final_path, song, lrc_text)
-            self.signals.finished.emit(True, final_path, '')
+                    return self._save(song, url, headers(), cookies())
+                except httpx.HTTPStatusError as exc:
+                    err = exc
+                    if exc.response.status_code not in _AUTH_ERRORS:
+                        raise
+            fresh = None if refreshed else _refresh_url(song)
+            refreshed = True
+            if not fresh or fresh == url:
+                raise err
+            url = fresh
+
+    def run(self) -> None:
+        cands = [s for s in self.songs if _playable(s)]
+        if not cands:
+            self.signals.finished.emit(False, '', 'No download URL available for this track.')
             return
-        self.signals.finished.emit(False, '', last_error or 'All sources failed.')
-
-def _color_distance(a: QColor, b: QColor) -> float:
-    dr = a.red() - b.red()
-    dg = a.green() - b.green()
-    db = a.blue() - b.blue()
-    return math.sqrt(dr * dr * 0.3 + dg * dg * 0.59 + db * db * 0.11)
-
-def _tune_for_background(c: QColor) -> QColor:
-    h, s, v, _ = c.getHsv()
-    h = h if h >= 0 else 0
-    s = min(255, max(90, int(s * 1.25)))
-    v = max(55, min(v, 160))
-    out = QColor()
-    out.setHsv(h, s, v, 255)
-    return out
-
-def _dominant_colors(path: str, count: int=5, min_distance: float=40.0) -> list[QColor]:
-    fallback = [QColor('#5b1a4a'), QColor('#1c2a4a'), QColor('#150a17'), QColor('#3a1230'), QColor('#241436')]
-    image = QImage(path)
-    if image.isNull():
-        return fallback
-    small = image.scaled(48, 48, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
-    small = small.convertToFormat(QImage.Format.Format_RGB32)
-    step = 24
-    buckets: dict[tuple[int, int, int], list[int]] = {}
-    for y in range(small.height()):
-        for x in range(small.width()):
-            c = small.pixelColor(x, y)
-            key = (c.red() // step, c.green() // step, c.blue() // step)
-            acc = buckets.setdefault(key, [0, 0, 0, 0])
-            acc[0] += c.red()
-            acc[1] += c.green()
-            acc[2] += c.blue()
-            acc[3] += 1
-    ranked = sorted(buckets.values(), key=lambda acc: acc[3], reverse=True)
-    picked: list[QColor] = []
-    for acc in ranked:
-        avg = QColor(acc[0] // acc[3], acc[1] // acc[3], acc[2] // acc[3])
-        if all((_color_distance(avg, p) >= min_distance for p in picked)):
-            picked.append(avg)
-        if len(picked) >= count:
-            break
-    if not picked:
-        acc0 = ranked[0]
-        picked = [QColor(acc0[0] // acc0[3], acc0[1] // acc0[3], acc0[2] // acc0[3])]
-    idx = 1
-    while len(picked) < count:
-        base = picked[0]
-        h, s, v, _ = base.getHsv()
-        h = (h + 45 * idx) % 360 if h >= 0 else 45 * idx % 360
-        alt = QColor()
-        alt.setHsv(h, s, v, 255)
-        picked.append(alt)
-        idx += 1
-    return [_tune_for_background(c) for c in picked[:count]]
-
-class _AnimatedGradientBackground(QWidget):
-    _RENDER_SCALE = 0.16
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._colors = [QColor('#5b1a4a'), QColor('#1c2a4a'), QColor('#150a17'), QColor('#3a1230'), QColor('#241436')]
-        self._base_positions: tuple[tuple[float, float], ...] = ()
-        self._speeds: list[float] = []
-        self._radii_scale: list[float] = []
-        self._phase = 0.0
-        self._buffer: QImage | None = None
-        self._buffer_phase: float | None = None
-        self._timer = QTimer(self)
-        self._timer.setInterval(42)
-        self._timer.timeout.connect(self._advance)
-        self._rebuild_layout()
-
-    def _rebuild_layout(self) -> None:
-        n = max(1, len(self._colors))
-        positions = []
-        speeds = []
-        radii = []
-        golden_angle = 137.508
-        for i in range(n):
-            t = (i + 0.5) / n
-            angle_deg = i * golden_angle
-            r = 0.22 + 0.2 * t
-            cx = 0.5 + r * math.cos(math.radians(angle_deg))
-            cy = 0.48 + r * math.sin(math.radians(angle_deg)) * 0.9
-            positions.append((min(0.92, max(0.08, cx)), min(0.92, max(0.08, cy))))
-            speeds.append(0.55 + 0.21 * i)
-            radii.append(0.62 + 0.1 * (i % 3))
-        self._base_positions = tuple(positions)
-        self._speeds = speeds
-        self._radii_scale = radii
-
-    def set_colors(self, colors: list[QColor]) -> None:
-        colors = list(colors[:5])
-        while len(colors) < 5:
-            colors.append(colors[-1] if colors else QColor('#20101c'))
-        self._colors = colors
-        self._rebuild_layout()
-        self._buffer_phase = None
-        self.update()
-
-    def start_motion(self) -> None:
-        if not self._timer.isActive():
-            self._timer.start()
-
-    def stop_motion(self) -> None:
-        self._timer.stop()
-
-    def _advance(self) -> None:
-        self._phase += 0.014
-        self.update()
-
-    def _render_buffer(self, bw: int, bh: int) -> QImage:
-        image = QImage(bw, bh, QImage.Format.Format_RGB32)
-        image.fill(QColor('#0b0710'))
-        painter = QPainter(image)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        blob_radius = max(bw, bh) * 0.66
-        for i, (bx, by) in enumerate(self._base_positions):
-            speed = self._speeds[i]
-            angle = self._phase * speed + i * 2.1
-            ox = math.sin(angle) * 0.16
-            oy = math.cos(angle * 1.15 + i) * 0.16
-            cx = (bx + ox) * bw
-            cy = (by + oy) * bh
-            color = self._colors[i % len(self._colors)]
-            radius = blob_radius * self._radii_scale[i % len(self._radii_scale)]
-            gradient = QRadialGradient(QPointF(cx, cy), radius)
-            near = QColor(color)
-            near.setAlpha(235)
-            mid = QColor(color)
-            mid.setAlpha(90)
-            far = QColor(color)
-            far.setAlpha(0)
-            gradient.setColorAt(0.0, near)
-            gradient.setColorAt(0.55, mid)
-            gradient.setColorAt(1.0, far)
-            painter.setBrush(QBrush(gradient))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(QPointF(cx, cy), radius, radius)
-        painter.end()
-        return image
-
-    def paintEvent(self, event) -> None:
-        w = max(1, self.width())
-        h = max(1, self.height())
-        bw = max(24, int(w * self._RENDER_SCALE))
-        bh = max(24, int(h * self._RENDER_SCALE))
-        if self._buffer is None or self._buffer.width() != bw or self._buffer.height() != bh or (self._buffer_phase != self._phase):
-            self._buffer = self._render_buffer(bw, bh)
-            self._buffer_phase = self._phase
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        painter.drawImage(self.rect(), self._buffer)
-
-class _LyricLabel(QLabel):
-    clicked = Signal()
-
-    def __init__(self, text: str, parent=None):
-        super().__init__(text, parent)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
-        super().mousePressEvent(event)
-
-def _overlay_icon(icon: FluentIcon) -> QIcon:
-    return icon.icon(color=QColor('#FFFFFF'))
-
-class LyricsOverlay(QWidget):
-
-    def __init__(self, player: MusicPreviewPlayer, artwork_downloader, player_bar: QWidget, parent=None):
-        super().__init__(parent)
-        self._player = player
-        self._artwork_downloader = artwork_downloader
-        self._player_bar = player_bar
-        self._lines: list[tuple[int, str]] = []
-        self._line_times: list[int] = []
-        self._labels: list[QLabel] = []
-        self._active_index = -1
-        self._current_key: str | None = None
-        self._lrc_cache: dict[str, str] = {}
-        self._align_mode = 'center'
-        self._font_scale = 1.0
-        self.setVisible(False)
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        self._bg = _AnimatedGradientBackground(self)
-        outer.addWidget(self._bg)
-        content = QVBoxLayout(self._bg)
-        content.setContentsMargins(28, 18, 28, 12)
-        content.setSpacing(8)
-        top_row = QHBoxLayout()
-        self._btn_back = TransparentToolButton(_overlay_icon(FluentIcon.RETURN), self._bg)
-        self._btn_back.setFixedSize(34, 34)
-        self._btn_back.setIconSize(QSize(15, 15))
-        self._btn_back.clicked.connect(self.hide_overlay)
-        top_row.addWidget(self._btn_back)
-        top_row.addStretch(1)
-        self._btn_align = TransparentToolButton(_overlay_icon(FluentIcon.ALIGNMENT), self._bg)
-        self._btn_align.setFixedSize(30, 30)
-        self._btn_align.setIconSize(QSize(13, 13))
-        self._btn_align.setToolTip(tr('music.text_alignment'))
-        self._btn_align.clicked.connect(self._on_align_clicked)
-        top_row.addWidget(self._btn_align)
-        self._btn_font_size = TransparentToolButton(_overlay_icon(FluentIcon.FONT_SIZE), self._bg)
-        self._btn_font_size.setFixedSize(30, 30)
-        self._btn_font_size.setIconSize(QSize(13, 13))
-        self._btn_font_size.setToolTip(tr('music.font_size'))
-        self._btn_font_size.clicked.connect(self._on_font_size_clicked)
-        top_row.addWidget(self._btn_font_size)
-        content.addLayout(top_row)
-        self._size_popup = QWidget(self._bg)
-        self._size_popup.setFixedSize(132, 34)
-        self._size_popup.setStyleSheet('background: rgba(20, 14, 24, 190); border: 1px solid rgba(255, 255, 255, 40); border-radius: 17px;')
-        size_popup_layout = QHBoxLayout(self._size_popup)
-        size_popup_layout.setContentsMargins(12, 0, 12, 0)
-        self._size_slider = Slider(Qt.Orientation.Horizontal, self._size_popup)
-        self._size_slider.setRange(70, 150)
-        self._size_slider.setValue(100)
-        self._size_slider.setFixedWidth(108)
-        self._size_slider.valueChanged.connect(self._on_font_scale_changed)
-        size_popup_layout.addWidget(self._size_slider)
-        self._size_popup.setVisible(False)
-        self._scroll = QScrollArea(self._bg)
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        self._scroll.setStyleSheet('QScrollArea { background: transparent; border: none; }QScrollBar:vertical { background: transparent; width: 12px; margin: 6px 3px; }QScrollBar::handle:vertical { background: rgba(255, 255, 255, 55); border: 1px solid rgba(255, 255, 255, 40); border-radius: 6px; min-height: 32px; }QScrollBar::handle:vertical:hover { background: rgba(255, 255, 255, 90); }QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }')
-        self._lyrics_content = QWidget()
-        self._lyrics_content.setStyleSheet('background: transparent;')
-        self._lyrics_layout = QVBoxLayout(self._lyrics_content)
-        self._lyrics_layout.setContentsMargins(48, 32, 48, PLAYER_BAR_HEIGHT + 140)
-        self._lyrics_layout.setSpacing(26)
-        self._scroll.setWidget(self._lyrics_content)
-        content.addWidget(self._scroll, 1)
-        self._status_lbl = QLabel('', self._bg)
-        self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._status_lbl.setStyleSheet('color: rgba(255, 255, 255, 150); font-size: 13px; background: transparent;')
-        content.addWidget(self._status_lbl)
-        self._anim = QPropertyAnimation(self._scroll.verticalScrollBar(), b'value', self)
-        self._anim.setDuration(420)
-        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._player.position_changed.connect(self._on_position_changed)
-        self._player.song_changed.connect(self._on_song_changed)
-        self._player.state_changed.connect(self._on_state_changed)
-        self._artwork_downloader.thumb_ready.connect(self._on_artwork_ready)
-        register_locale_refresh(self, self._apply_locale)
-
-    def _apply_locale(self, *_args) -> None:
-        self._btn_align.setToolTip(tr('music.text_alignment'))
-        self._btn_font_size.setToolTip(tr('music.font_size'))
-
-    def _on_align_clicked(self) -> None:
-        order = ('center', 'left', 'right')
-        self._align_mode = order[(order.index(self._align_mode) + 1) % len(order)]
-        flag = {'center': Qt.AlignmentFlag.AlignCenter, 'left': Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, 'right': Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter}[self._align_mode]
-        for lbl in self._labels:
-            lbl.setAlignment(flag)
-
-    def _on_font_size_clicked(self) -> None:
-        if self._size_popup.isVisible():
-            self._size_popup.setVisible(False)
-            return
-        pos = self._btn_font_size.mapTo(self._bg, self._btn_font_size.rect().bottomRight())
-        self._size_popup.move(pos.x() - self._size_popup.width(), pos.y() + 6)
-        self._size_popup.raise_()
-        self._size_popup.setVisible(True)
-
-    def _on_font_scale_changed(self, value: int) -> None:
-        self._font_scale = value / 100.0
-        for i, lbl in enumerate(self._labels):
-            self._style_line(lbl, abs(i - self._active_index) if self._active_index >= 0 else 99)
-
-    def _on_state_changed(self, state: str) -> None:
-        if not self.isVisible():
-            return
-        if state == 'playing':
-            self._bg.start_motion()
-        else:
-            self._bg.stop_motion()
-
-    def show_overlay(self) -> None:
-        if self._player.current_song is None:
-            return
-        self.sync_geometry(force_visible=True)
-        self._on_song_changed(self._player.current_song)
-        self.raise_()
-        self._player_bar.raise_()
-        self._player_bar.set_translucent(True)
-        self.setVisible(True)
-        if self._player.is_playing:
-            self._bg.start_motion()
-        QTimer.singleShot(0, self._recenter_active)
-
-    def _recenter_active(self) -> None:
-        if 0 <= self._active_index < len(self._labels):
-            self._scroll_to(self._active_index)
-
-    def hide_overlay(self) -> None:
-        self.setVisible(False)
-        self._bg.stop_motion()
-        self._player_bar.set_translucent(False)
-
-    def sync_geometry(self, force_visible: bool=False) -> None:
-        parent = self.parentWidget()
-        if parent is None or not (self.isVisible() or force_visible):
-            return
-        self.setGeometry(0, 0, parent.width(), parent.height())
-
-    def _clear_lines(self) -> None:
-        for lbl in self._labels:
-            self._lyrics_layout.removeWidget(lbl)
-            lbl.deleteLater()
-        self._labels = []
-        self._active_index = -1
-        self._line_times = []
-
-    def _on_song_changed(self, song) -> None:
-        self._current_key = song.key if song else None
-        self._bg.set_colors([QColor('#5b1a4a'), QColor('#1c2a4a'), QColor('#150a17'), QColor('#3a1230'), QColor('#241436')])
-        self._clear_lines()
-        self._status_lbl.setText('')
-        if song and song.cover_url and has_full('music', song.cover_url):
-            self._bg.set_colors(_dominant_colors(full_path('music', song.cover_url)))
-        elif song and song.cover_url:
-            self._artwork_downloader.request('music', song.cover_url)
-        if song is None:
-            return
-        cached = self._lrc_cache.get(song.key)
-        if cached is not None:
-            self._apply_lrc(song.key, cached)
-            return
-        self._status_lbl.setText(tr('music.searching_lyrics'))
-        task = _LrcFetchTask(song)
-        task.signals.finished.connect(self._on_lrc_fetched)
-        QThreadPool.globalInstance().start(task)
-
-    def _on_lrc_fetched(self, song_key: str, lrc_text: str) -> None:
-        if not _parse_lrc(lrc_text):
-            current = self._player.current_song
-            if current is not None and current.key == song_key:
-                fallback = getattr(current, 'lyric', None)
-                if fallback and _parse_lrc(fallback):
-                    lrc_text = fallback
-        self._lrc_cache[song_key] = lrc_text
-        if song_key != self._current_key:
-            return
-        self._apply_lrc(song_key, lrc_text)
-
-    def _apply_lrc(self, song_key: str, lrc_text: str) -> None:
-        self._clear_lines()
-        self._lines = _parse_lrc(lrc_text)
-        self._line_times = [t for t, _ in self._lines]
-        if not self._lines:
-            self._status_lbl.setText(tr('music.no_lyrics_found'))
-            return
-        self._status_lbl.setText('')
-        align_flag = {'center': Qt.AlignmentFlag.AlignCenter, 'left': Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, 'right': Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter}[self._align_mode]
-        for time_ms, text in self._lines:
-            lbl = _LyricLabel(text or '♪', self._lyrics_content)
-            lbl.setWordWrap(True)
-            lbl.setAlignment(align_flag)
-            self._style_line(lbl, 99)
-            lbl.clicked.connect(lambda ms=time_ms: self._player.seek(ms))
-            self._lyrics_layout.addWidget(lbl)
-            self._labels.append(lbl)
-        current = self._player.current_song
-        if current is not None and current.key == song_key:
-            QTimer.singleShot(0, lambda key=song_key: self._resync_position(key))
-
-    def _resync_position(self, song_key: str) -> None:
-        current = self._player.current_song
-        if current is None or current.key != song_key:
-            return
-        self._on_position_changed(self._player.position)
-
-    def _ensure_blur(self, label: QLabel) -> QGraphicsBlurEffect:
-        effect = label.graphicsEffect()
-        if isinstance(effect, QGraphicsBlurEffect):
-            return effect
-        effect = QGraphicsBlurEffect(label)
-        label.setGraphicsEffect(effect)
-        return effect
-
-    def _style_line(self, label: QLabel, distance: int) -> None:
-        scale = self._font_scale
-        if distance == 0:
-            label.setGraphicsEffect(None)
-            label.setStyleSheet(f'color: white; font-size: {int(42 * scale)}px; font-weight: 800; background: transparent;')
-        elif distance == 1:
-            self._ensure_blur(label).setBlurRadius(1.4)
-            label.setStyleSheet(f'color: rgba(255, 255, 255, 168); font-size: {int(25 * scale)}px; font-weight: 600; background: transparent;')
-        elif distance == 2:
-            self._ensure_blur(label).setBlurRadius(2.6)
-            label.setStyleSheet(f'color: rgba(255, 255, 255, 120); font-size: {int(23 * scale)}px; font-weight: 500; background: transparent;')
-        else:
-            self._ensure_blur(label).setBlurRadius(3.6)
-            label.setStyleSheet(f'color: rgba(255, 255, 255, 95); font-size: {int(22 * scale)}px; font-weight: 500; background: transparent;')
-
-    def _on_position_changed(self, position_ms: int) -> None:
-        if not self.isVisible() or not self._lines:
-            return
-        idx = bisect_right(self._line_times, position_ms) - 1
-        if idx == self._active_index:
-            return
-        prev_active = self._active_index
-        self._active_index = idx
-        touched = set()
-        for i in (prev_active, idx):
-            if 0 <= i < len(self._labels):
-                for d in range(-3, 4):
-                    j = i + d
-                    if 0 <= j < len(self._labels):
-                        touched.add(j)
-        for j in touched:
-            if j in (prev_active, idx):
+        err = ''
+        for song in cands:
+            if self._cancelled:
+                break
+            try:
+                final = self._fetch(song)
+            except Exception as exc:
+                if self._cancelled:
+                    break
+                err = f'HTTP {exc.response.status_code}' if isinstance(exc, httpx.HTTPStatusError) else str(exc)[:300]
+                logger.warning('Download failed for %r via %s (%s)', song.song_name, song.source, err)
                 continue
-            self._style_line(self._labels[j], abs(j - idx) if idx >= 0 else 99)
-        if 0 <= prev_active < len(self._labels):
-            self._animate_line(self._labels[prev_active], 1)
-        if 0 <= idx < len(self._labels):
-            self._animate_line(self._labels[idx], 0)
-            self._scroll_to(idx)
-
-    def _animate_line(self, label: QLabel, distance: int) -> None:
-        self._style_line(label, distance)
-        effect = QGraphicsOpacityEffect(label)
-        start_opacity = 0.32 if distance == 0 else 1.0
-        end_opacity = 1.0 if distance == 0 else 0.55
-        effect.setOpacity(start_opacity)
-        label.setGraphicsEffect(effect)
-        anim = QPropertyAnimation(effect, b'opacity', label)
-        anim.setDuration(240)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.setStartValue(start_opacity)
-        anim.setEndValue(end_opacity)
-
-        def _cleanup():
-            if label.graphicsEffect() is effect:
-                self._style_line(label, distance)
-        anim.finished.connect(_cleanup)
-        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
-
-    def _scroll_to(self, idx: int) -> None:
-        label = self._labels[idx]
-        bar = self._scroll.verticalScrollBar()
-        target = label.pos().y() + label.height() // 2 - self._scroll.viewport().height() // 2
-        target = max(bar.minimum(), min(bar.maximum(), target))
-        self._anim.stop()
-        self._anim.setStartValue(bar.value())
-        self._anim.setEndValue(target)
-        self._anim.start()
-
-    def _on_artwork_ready(self, kind: str, url: str, path: str) -> None:
-        if kind != 'music':
+            if not getattr(song, 'cover_url', None):
+                try:
+                    song.cover_url = music_service.fetch_fallback_cover_url(song) or song.cover_url
+                except Exception:
+                    pass
+            _embed_metadata(final, song, _fetch_lrc_text(song))
+            self.signals.finished.emit(True, final, '')
             return
-        song = self._player.current_song
-        if song is None or song.cover_url != url:
-            return
-        self._bg.set_colors(_dominant_colors(path))
-_PLAYLISTS_DIR = os.path.join(app_paths.config_dir, 'music')
-_PLAYLISTS_FILE = os.path.join(_PLAYLISTS_DIR, 'music_playlists.json')
+        self.signals.finished.emit(False, '', 'Cancelled' if self._cancelled else err or 'All sources failed.')
+
 
 class Playlist:
     __slots__ = ('id', 'name', 'songs')
 
-    def __init__(self, id: str, name: str, songs: list | None=None):
-        self.id = id
-        self.name = name
-        self.songs: list = songs if songs is not None else []
+    def __init__(self, id: str, name: str, songs: list | None = None):
+        self.id, self.name, self.songs = id, name, songs if songs is not None else []
 
-    def to_dict(self) -> dict:
-        return {'id': self.id, 'name': self.name, 'songs': [s.to_dict() for s in self.songs]}
-
-    @classmethod
-    def from_dict(cls, data: dict) -> 'Playlist':
-        songs = [Song.from_dict(d) for d in data.get('songs', [])]
-        return cls(id=data.get('id') or uuid.uuid4().hex, name=data.get('name') or tr('music.untitled'), songs=songs)
 
 class PlaylistStore(QObject):
     playlists_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._playlists: dict[str, Playlist] = {}
-        self._order: list[str] = []
-        self._load()
-
-    def _load(self) -> None:
-        if not os.path.isfile(_PLAYLISTS_FILE):
-            return
+        self._pl: dict[str, Playlist] = {}
         try:
             with open(_PLAYLISTS_FILE, 'r', encoding='utf-8') as fh:
-                data = json.load(fh)
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning('Failed to load music playlists: %s', exc)
-            return
-        for entry in data.get('playlists', []):
+                entries = json.load(fh).get('playlists', [])
+        except (OSError, json.JSONDecodeError):
+            entries = []
+        for e in entries:
             try:
-                pl = Playlist.from_dict(entry)
+                pid = e.get('id') or uuid.uuid4().hex
+                self._pl[pid] = Playlist(pid, e.get('name') or _t('music.untitled', 'Untitled'),
+                                         [Song.from_dict(d) for d in e.get('songs', [])])
             except Exception:
                 logger.exception('Failed to parse a saved playlist entry')
-                continue
-            self._playlists[pl.id] = pl
-            self._order.append(pl.id)
 
-    def _save(self) -> None:
-        os.makedirs(_PLAYLISTS_DIR, exist_ok=True)
+    def _commit(self) -> None:
         try:
-            payload = {'playlists': [self._playlists[pid].to_dict() for pid in self._order if pid in self._playlists]}
-            tmp_path = _PLAYLISTS_FILE + '.tmp'
-            with open(tmp_path, 'w', encoding='utf-8') as fh:
-                json.dump(payload, fh, indent=2)
-            os.replace(tmp_path, _PLAYLISTS_FILE)
+            os.makedirs(_PLAYLISTS_DIR, exist_ok=True)
+            payload = {'playlists': [{'id': p.id, 'name': p.name, 'songs': [s.to_dict() for s in p.songs]}
+                                     for p in self._pl.values()]}
+            with open(_PLAYLISTS_FILE + '.tmp', 'w', encoding='utf-8') as fh:
+                json.dump(payload, fh)
+            os.replace(_PLAYLISTS_FILE + '.tmp', _PLAYLISTS_FILE)
         except OSError as exc:
             logger.error('Failed to save music playlists: %s', exc)
+        self.playlists_changed.emit()
 
     def all_playlists(self) -> list[Playlist]:
-        return [self._playlists[pid] for pid in self._order if pid in self._playlists]
+        return list(self._pl.values())
 
-    def get(self, playlist_id: str) -> Playlist | None:
-        return self._playlists.get(playlist_id)
+    def get(self, pid) -> Playlist | None:
+        return self._pl.get(pid)
 
     def create(self, name: str) -> Playlist:
-        name = (name or '').strip() or tr('music.untitled_playlist')
-        pl = Playlist(id=uuid.uuid4().hex, name=name)
-        self._playlists[pl.id] = pl
-        self._order.append(pl.id)
-        self._save()
-        self.playlists_changed.emit()
+        pl = Playlist(uuid.uuid4().hex, (name or '').strip() or _t('music.untitled_playlist', 'Untitled playlist'))
+        self._pl[pl.id] = pl
+        self._commit()
         return pl
 
-    def rename(self, playlist_id: str, new_name: str) -> None:
-        pl = self._playlists.get(playlist_id)
-        if pl is None:
-            return
-        new_name = (new_name or '').strip()
-        if not new_name:
-            return
-        pl.name = new_name
-        self._save()
-        self.playlists_changed.emit()
+    def rename(self, pid: str, name: str) -> None:
+        if pid in self._pl and name.strip():
+            self._pl[pid].name = name.strip()
+            self._commit()
 
-    def delete(self, playlist_id: str) -> None:
-        if playlist_id not in self._playlists:
-            return
-        del self._playlists[playlist_id]
-        if playlist_id in self._order:
-            self._order.remove(playlist_id)
-        self._save()
-        self.playlists_changed.emit()
+    def delete(self, pid: str) -> None:
+        if self._pl.pop(pid, None) is not None:
+            self._commit()
 
-    def add_song(self, playlist_id: str, song) -> bool:
-        pl = self._playlists.get(playlist_id)
-        if pl is None:
-            return False
-        if any((s.key == song.key for s in pl.songs)):
+    def add_song(self, pid: str, song) -> bool:
+        pl = self._pl.get(pid)
+        if pl is None or any(s.key == song.key for s in pl.songs):
             return False
         pl.songs.append(song)
-        self._save()
-        self.playlists_changed.emit()
+        self._commit()
         return True
 
-    def remove_song(self, playlist_id: str, song_key: str) -> None:
-        pl = self._playlists.get(playlist_id)
-        if pl is None:
-            return
-        pl.songs = [s for s in pl.songs if s.key != song_key]
-        self._save()
-        self.playlists_changed.emit()
+    def remove_song(self, pid: str, key: str) -> None:
+        pl = self._pl.get(pid)
+        if pl is not None:
+            pl.songs = [s for s in pl.songs if s.key != key]
+            self._commit()
 
-class SaveToPlaylistDialog(MessageBoxBase):
 
-    def __init__(self, store: PlaylistStore, song, parent=None):
+_icon_cache: dict = {}
+
+
+def icon_pm(name: str, color: str = '#FFFFFF', size: int = 20) -> QPixmap:
+    key = (name, color, size)
+    pm = _icon_cache.get(key)
+    if pm is None:
+        pm = QPixmap(size * 2, size * 2)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        QSvgRenderer(QByteArray(_SVG[name].encode())).render(p)
+        p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+        p.fillRect(pm.rect(), QColor(color))
+        p.end()
+        pm.setDevicePixelRatio(2)
+        _icon_cache[key] = pm
+    return pm
+
+
+def _fg() -> QColor:
+    return QColor(255, 255, 255) if isDarkTheme() else QColor(0, 0, 0)
+
+
+def _dim(alpha: float = 0.62) -> QColor:
+    c = _fg()
+    c.setAlphaF(alpha)
+    return c
+
+
+def _tone(c: QColor) -> QColor:
+    h, s, l, _ = c.getHsl()
+    return QColor.fromHsl(max(h, 0), min(s, 210), min(l, 84))
+
+
+def _vivid(colors: list) -> QColor:
+    return max(colors, key=lambda c: c.getHsv()[1] * c.getHsv()[2]) if colors else QColor('#3a2a4a')
+
+
+def _placeholder(size: int) -> QPixmap:
+    pm = QPixmap(size, size)
+    g = QLinearGradient(0, 0, size, size)
+    g.setColorAt(0, QColor('#4a3a63'))
+    g.setColorAt(1, QColor('#2a2038'))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.fillRect(pm.rect(), g)
+    f = QFont()
+    f.setPixelSize(size // 2)
+    p.setFont(f)
+    p.setPen(QColor(255, 255, 255, 110))
+    p.drawText(pm.rect(), Qt.AlignCenter, '♪')
+    p.end()
+    return pm
+
+
+def _font(px: int, weight=QFont.Normal, family: str = '') -> QFont:
+    f = QFont(family) if family else QFont()
+    f.setPixelSize(px)
+    f.setWeight(weight)
+    return f
+
+
+_ph_cache: dict = {}
+
+
+def _ph(size: int) -> QPixmap:
+    return _ph_cache.setdefault(size, _placeholder(size))
+
+
+class ElidedLabel(QLabel):
+    def __init__(self, px=14, weight=QFont.Normal, color=None, parent=None):
         super().__init__(parent)
-        self._store = store
-        self._song = song
-        self._selected_id: str | None = None
-        self.titleLabel = StrongBodyLabel(tr('music.save_to_playlist_title'), self)
-        self.viewLayout.addWidget(self.titleLabel)
-        self._list = QListWidget(self)
-        self._list.setFixedHeight(180)
-        self._list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._populate_list()
-        self._list.itemSelectionChanged.connect(self._on_selection_changed)
-        self._list.itemDoubleClicked.connect(self._on_item_double_clicked)
-        self.viewLayout.addWidget(self._list)
-        new_row = QHBoxLayout()
-        self._new_name_input = LineEdit(self)
-        self._new_name_input.setPlaceholderText(tr('music.new_playlist_placeholder'))
-        self._btn_create = PushButton(tr('music.create'), self)
-        self._btn_create.clicked.connect(self._on_create_clicked)
-        new_row.addWidget(self._new_name_input, 1)
-        new_row.addWidget(self._btn_create, 0)
-        self.viewLayout.addLayout(new_row)
-        self.yesButton.setText(tr('music.save'))
-        self.cancelButton.setText(tr('music.cancel'))
-        self.widget.setMinimumWidth(360)
+        self._text, self._color = '', QColor('white' if color is None else color)
+        self._font = QFont(self.font())
+        self._font.setPixelSize(px)
+        self._font.setWeight(weight)
+        self.setFixedHeight(QFontMetrics(self._font).height() + 2)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
 
-    def _populate_list(self) -> None:
-        self._list.clear()
-        for pl in self._store.all_playlists():
-            item = QListWidgetItem(f'{pl.name} ({len(pl.songs)})')
-            item.setData(Qt.ItemDataRole.UserRole, pl.id)
-            self._list.addItem(item)
-
-    def _on_selection_changed(self) -> None:
-        items = self._list.selectedItems()
-        self._selected_id = items[0].data(Qt.ItemDataRole.UserRole) if items else None
-
-    def _on_item_double_clicked(self, item: QListWidgetItem) -> None:
-        self._selected_id = item.data(Qt.ItemDataRole.UserRole)
-        self.accept()
-
-    def _on_create_clicked(self) -> None:
-        name = self._new_name_input.text().strip()
-        if not name:
-            return
-        pl = self._store.create(name)
-        self._new_name_input.clear()
-        self._populate_list()
-        for i in range(self._list.count()):
-            item = self._list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == pl.id:
-                self._list.setCurrentItem(item)
-                break
-
-    def selected_playlist_id(self) -> str | None:
-        return self._selected_id
-
-class SongCard(CardWidget):
-
-    def __init__(self, song, artwork_downloader, parent=None, play_requested=None, download_requested=None, artwork_settled=None, save_playlist_requested=None):
-        super().__init__(parent)
-        self.song = song
-        self.setFixedSize(CARD_WIDTH, CARD_HEIGHT)
-        self.setBorderRadius(12)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 4)
-        layout.setSpacing(3)
-        art_wrap = QWidget(self)
-        art_wrap.setFixedSize(CARD_WIDTH, ART_SIZE + ART_INSET * 2)
-        art_wrap_layout = QVBoxLayout(art_wrap)
-        art_wrap_layout.setContentsMargins(ART_INSET, ART_INSET, ART_INSET, ART_INSET)
-        self._art_label = QLabel(art_wrap)
-        self._art_label.setFixedSize(ART_SIZE, ART_SIZE)
-        self._art_label.setScaledContents(True)
-        self._apply_art_placeholder()
-        art_wrap_layout.addWidget(self._art_label)
-        layout.addWidget(art_wrap)
-        text_col = QVBoxLayout()
-        text_col.setContentsMargins(12, 0, 12, 0)
-        text_col.setSpacing(1)
-        self._title_lbl = StrongBodyLabel(self)
-        self._title_lbl.setStyleSheet('font-size: 14px;')
-        self._artist_lbl = CaptionLabel(self)
-        self._album_lbl = CaptionLabel(self)
-        self._duration_lbl = CaptionLabel(song.duration or '', self)
-        self._muted_labels = (self._artist_lbl, self._album_lbl, self._duration_lbl)
-        self._refresh_muted_style()
-        self._set_elided(self._title_lbl, song.song_name or tr('download.unknown'))
-        self._set_elided(self._artist_lbl, song.singers or tr('music.unknown_artist'))
-        self._set_elided(self._album_lbl, song.album or '')
-        text_col.addWidget(self._title_lbl)
-        text_col.addWidget(self._artist_lbl)
-        meta_row = QHBoxLayout()
-        meta_row.setSpacing(6)
-        meta_row.addWidget(self._album_lbl, 1)
-        meta_row.addWidget(self._duration_lbl, 0)
-        text_col.addLayout(meta_row)
-        self._quality_lbl = QLabel(song.quality_label, self)
-        self._quality_lbl.setVisible(bool(song.quality_label))
-        self._quality_lbl.setFixedHeight(18)
-        self._apply_quality_pill_style()
-        self._source_lbl = QLabel(_format_source(song.source), self)
-        self._source_lbl.setVisible(bool(song.source))
-        self._source_lbl.setFixedHeight(18)
-        self._apply_source_pill_style()
-        pill_row = QHBoxLayout()
-        pill_row.setContentsMargins(0, 2, 0, 0)
-        pill_row.setSpacing(4)
-        pill_row.addWidget(self._quality_lbl, 0)
-        pill_row.addWidget(self._source_lbl, 0)
-        pill_row.addStretch(1)
-        text_col.addLayout(pill_row)
-        layout.addLayout(text_col)
-        layout.addStretch(1)
-        btn_row = QHBoxLayout()
-        btn_row.setContentsMargins(10, 0, 10, 0)
-        btn_row.setSpacing(4)
-        self._btn_play = ToolButton(FluentIcon.PLAY, self)
-        self._btn_download = ToolButton(FluentIcon.DOWNLOAD, self)
-        self._btn_playlist = ToolButton(FluentIcon.ADD_TO, self)
-        self._btn_playlist.setToolTip(tr('music.save_to_playlist'))
-        self._btn_more = TransparentToolButton(FluentIcon.MORE, self)
-        for b in (self._btn_play, self._btn_download, self._btn_playlist, self._btn_more):
-            b.setFixedSize(27, 27)
-            b.setIconSize(QSize(13, 13))
-        btn_row.addWidget(self._btn_play)
-        btn_row.addWidget(self._btn_download)
-        btn_row.addWidget(self._btn_playlist)
-        btn_row.addStretch(1)
-        btn_row.addWidget(self._btn_more)
-        layout.addLayout(btn_row)
-        self._btn_play.clicked.connect(self._on_play_clicked)
-        self._btn_download.clicked.connect(self._on_download_clicked)
-        self._btn_playlist.clicked.connect(self._on_save_playlist_clicked)
-        self._btn_more.clicked.connect(self._show_menu)
-        self.play_requested = play_requested
-        self.download_requested = download_requested
-        self.artwork_settled = artwork_settled
-        self.save_playlist_requested = save_playlist_requested
-        self._artwork_downloader = artwork_downloader
-        self._artwork_downloader.thumb_ready.connect(self._on_artwork_ready)
-        self._artwork_downloader.failed.connect(self._on_artwork_failed)
-        if song.cover_url:
-            self._artwork_downloader.request('music', song.cover_url)
-        else:
-            submit(music_service.fetch_fallback_cover_url, args=(song,), on_done=self._on_fallback_cover_found)
-        qconfig.themeChanged.connect(self._on_theme_changed)
-
-    def _on_fallback_cover_found(self, cover_url: str | None) -> None:
-        if not cover_url:
-            return
-        try:
-            if self.song.cover_url:
-                return
-            self.song.cover_url = cover_url
-            self._artwork_downloader.request('music', cover_url)
-        except RuntimeError:
-            pass
-
-    def _set_elided(self, label, text: str) -> None:
-        metrics = QFontMetrics(label.font())
-        available = CARD_WIDTH - 28
-        elided = metrics.elidedText(text, Qt.TextElideMode.ElideRight, available)
-        label.setText(elided)
-        if elided != text:
-            label.setToolTip(text)
-
-    def detach(self) -> None:
-        try:
-            self._artwork_downloader.thumb_ready.disconnect(self._on_artwork_ready)
-        except (TypeError, RuntimeError):
-            pass
-        try:
-            self._artwork_downloader.failed.disconnect(self._on_artwork_failed)
-        except (TypeError, RuntimeError):
-            pass
-        try:
-            qconfig.themeChanged.disconnect(self._on_theme_changed)
-        except (TypeError, RuntimeError):
-            pass
-        self._art_label.clear()
-
-    def _apply_art_placeholder(self):
-        c = palette()
-        self._art_label.setStyleSheet(f'background-color: {c['poster_fallback_bg']}; border: 1px solid {c['surface_border']}; border-radius: 8px;')
-
-    def _apply_quality_pill_style(self):
-        c = palette()
-        self._quality_lbl.setStyleSheet(f'background-color: {c['surface_tint_strong']}; color: {c['muted']}; border-radius: 9px; padding: 1px 8px; font-size: 10px; font-weight: 600;')
-
-    def _apply_source_pill_style(self):
-        c = palette()
-        self._source_lbl.setStyleSheet(f'background-color: transparent; color: {c['muted']}; border: 1px solid {c['surface_border']}; border-radius: 9px; padding: 1px 8px; font-size: 10px; font-weight: 600;')
-
-    def _refresh_muted_style(self):
-        for lbl in self._muted_labels:
-            lbl.setStyleSheet(f'color: {palette()['muted']}; font-size: 10.5px;')
-
-    def _on_theme_changed(self, *_):
-        self._refresh_muted_style()
-        self._apply_quality_pill_style()
-        self._apply_source_pill_style()
-        if self._art_label.pixmap() is None or self._art_label.pixmap().isNull():
-            self._apply_art_placeholder()
-
-    def _on_artwork_ready(self, kind: str, url: str, path: str) -> None:
-        if kind != 'music':
-            return
-        if url != self.song.cover_url:
-            return
-        reader = QImageReader(path)
-        reader.setAutoTransform(True)
-        size = reader.size()
-        if size.isValid() and (size.width() > ART_SIZE or size.height() > ART_SIZE):
-            scale = ART_SIZE / max(size.width(), size.height())
-            reader.setScaledSize(QSize(max(1, int(size.width() * scale)), max(1, int(size.height() * scale))))
-        image = reader.read()
-        if image.isNull():
-            self._notify_artwork_settled()
-            return
-        pix = QPixmap.fromImage(image).scaled(ART_SIZE, ART_SIZE, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-        self._art_label.setStyleSheet(f'border: 1px solid {palette()['surface_border']}; border-radius: 8px;')
-        self._art_label.setPixmap(pix)
-        self._notify_artwork_settled()
-
-    def _on_artwork_failed(self, kind: str, url: str, error: str) -> None:
-        if kind != 'music':
-            return
-        if url != self.song.cover_url:
-            return
-        self._notify_artwork_settled()
-
-    def _notify_artwork_settled(self) -> None:
-        if callable(self.artwork_settled):
-            self.artwork_settled(self.song.key)
-
-    def _on_play_clicked(self):
-        if callable(self.play_requested):
-            self.play_requested(self.song)
-
-    def _on_download_clicked(self):
-        if callable(self.download_requested):
-            self.download_requested(self.song)
-
-    def _on_save_playlist_clicked(self):
-        if callable(self.save_playlist_requested):
-            self.save_playlist_requested(self.song)
-
-    def _show_menu(self):
-        menu = RoundMenu(parent=self)
-        play_action = Action(FluentIcon.PLAY, tr('music.play'))
-        play_action.triggered.connect(self._on_play_clicked)
-        download_action = Action(FluentIcon.DOWNLOAD, tr('music.download_action'))
-        download_action.triggered.connect(self._on_download_clicked)
-        playlist_action = Action(FluentIcon.ADD_TO, tr('music.save_to_playlist_title'))
-        playlist_action.triggered.connect(self._on_save_playlist_clicked)
-        menu.addAction(play_action)
-        menu.addAction(download_action)
-        menu.addAction(playlist_action)
-        menu.exec(self._btn_more.mapToGlobal(self._btn_more.rect().bottomLeft()))
-
-def _make_track_icon(forward: bool) -> QIcon:
-    size = 22
-    top, bottom, mid = (4.0, 18.0, 11.0)
-    pix = QPixmap(size, size)
-    pix.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pix)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor('white'))
-    if forward:
-        painter.drawPolygon(QPolygonF([QPointF(10, mid), QPointF(3, top), QPointF(3, bottom)]))
-        painter.drawPolygon(QPolygonF([QPointF(17, mid), QPointF(10, top), QPointF(10, bottom)]))
-        painter.drawRect(QRectF(17.5, top, 2.2, bottom - top))
-    else:
-        painter.drawRect(QRectF(2.5, top, 2.2, bottom - top))
-        painter.drawPolygon(QPolygonF([QPointF(5, mid), QPointF(12, top), QPointF(12, bottom)]))
-        painter.drawPolygon(QPolygonF([QPointF(12, mid), QPointF(19, top), QPointF(19, bottom)]))
-    painter.end()
-    return QIcon(pix)
-
-class _AccentSlider(QSlider):
-
-    def __init__(self, orientation, parent=None):
-        super().__init__(orientation, parent)
-        self._accent = QColor('#8a8a94')
-        self._dragging = False
-        self.setFixedHeight(20)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.valueChanged.connect(lambda _=0: self.update())
-
-    def setAccentColor(self, color: QColor) -> None:
-        self._accent = QColor(color)
+    def setText(self, t: str) -> None:
+        self._text = t or ''
         self.update()
 
-    def _value_from_x(self, x: float) -> int:
-        margin = 7.0
-        usable = max(1.0, self.width() - 2 * margin)
-        frac = min(1.0, max(0.0, (x - margin) / usable))
-        span = self.maximum() - self.minimum()
-        return self.minimum() + round(frac * span)
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setFont(self._font)
+        p.setPen(self._color)
+        p.drawText(self.rect(), Qt.AlignVCenter | Qt.AlignLeft,
+                   QFontMetrics(self._font).elidedText(self._text, Qt.ElideRight, self.width()))
 
-    def mousePressEvent(self, event) -> None:
-        if event.button() != Qt.MouseButton.LeftButton:
-            return
-        self._dragging = True
-        self.setValue(self._value_from_x(event.position().x()))
-        self.sliderPressed.emit()
 
-    def mouseMoveEvent(self, event) -> None:
-        if not self._dragging:
-            return
-        value = self._value_from_x(event.position().x())
-        self.setValue(value)
-        self.sliderMoved.emit(value)
+class ClickWidget(QWidget):
+    clicked = Signal()
 
-    def mouseReleaseEvent(self, event) -> None:
-        if not self._dragging:
-            return
-        self._dragging = False
-        self.sliderReleased.emit()
-
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        margin = 7.0
-        groove_h = 4.0
-        mid_y = self.height() / 2.0
-        groove = QRectF(margin, mid_y - groove_h / 2, max(0.0, self.width() - 2 * margin), groove_h)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 46))
-        painter.drawRoundedRect(groove, groove_h / 2, groove_h / 2)
-        span = self.maximum() - self.minimum()
-        frac = 0.0 if span <= 0 else (self.value() - self.minimum()) / span
-        filled_w = groove.width() * frac
-        if filled_w > 0:
-            filled = QRectF(groove.x(), groove.y(), filled_w, groove_h)
-            painter.setBrush(self._accent)
-            painter.drawRoundedRect(filled, groove_h / 2, groove_h / 2)
-        handle_x = groove.x() + filled_w
-        painter.setBrush(QColor('white'))
-        painter.drawEllipse(QPointF(handle_x, mid_y), 6.0, 6.0)
-_BAR_TEXT = '#F2F2F5'
-_BAR_MUTED = '#9CA3AF'
-_BAR_BG = 'rgba(22, 18, 26, 235)'
-_BAR_BG_TRANSLUCENT = 'rgba(22, 18, 26, 150)'
-_BAR_BORDER = 'rgba(255, 255, 255, 14)'
-_BAR_ART_BG = 'rgba(255, 255, 255, 0.07)'
-
-def _bar_icon(icon: FluentIcon) -> QIcon:
-    return icon.icon(color=QColor(_BAR_TEXT))
-
-def _format_quality_detail(song) -> str:
-    raw = getattr(song, 'raw', None) or {}
-    parts = []
-    bitrate = raw.get('bitrate') or raw.get('bit_rate') or raw.get('br')
-    if bitrate:
-        try:
-            bitrate = int(float(bitrate))
-            if bitrate < 50:
-                bitrate *= 1000
-            parts.append(f'{bitrate // 1000}kb/s' if bitrate >= 1000 else f'{bitrate}kb/s')
-        except (TypeError, ValueError):
-            pass
-    sample_rate = raw.get('sample_rate') or raw.get('samplerate') or raw.get('sr')
-    if sample_rate:
-        try:
-            sample_rate = float(sample_rate)
-            if sample_rate > 1000:
-                sample_rate /= 1000
-            parts.append(f'{sample_rate:g}kHz')
-        except (TypeError, ValueError):
-            pass
-    quality_label = getattr(song, 'quality_label', '') or ''
-    if quality_label:
-        parts.append(quality_label)
-    ext = (getattr(song, 'ext', '') or '').lstrip('.').upper()
-    if ext and ext not in ''.join(parts).upper():
-        parts.append(ext)
-    return ' · '.join(parts)
-
-class MiniPlayerBar(CardWidget):
-    lyrics_requested = Signal()
-
-    def __init__(self, player: MusicPreviewPlayer, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._player = player
-        self._seeking = False
-        self._translucent = False
-        self.setFixedHeight(PLAYER_BAR_HEIGHT)
-        self.setBorderRadius(18)
-        self._apply_bar_background()
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(16, 9, 18, 9)
-        layout.setSpacing(16)
-        self._art_label = QLabel(self)
-        self._art_label.setFixedSize(58, 58)
-        self._art_label.setScaledContents(True)
-        self._apply_art_placeholder()
-        layout.addWidget(self._art_label)
-        info_col = QVBoxLayout()
-        info_col.setSpacing(1)
-        info_col.setContentsMargins(0, 0, 0, 0)
-        self._title_lbl = StrongBodyLabel(tr('music.no_track_playing'), self)
-        self._title_lbl.setStyleSheet(f'color: {_BAR_TEXT}; font-size: 15px; background: transparent;')
-        self._artist_lbl = CaptionLabel('', self)
-        self._artist_lbl.setStyleSheet(f'color: {_BAR_MUTED}; font-size: 12.5px; background: transparent;')
-        self._quality_info_lbl = CaptionLabel('', self)
-        self._quality_info_lbl.setStyleSheet(f'color: {_BAR_MUTED}; font-size: 10.5px; background: transparent;')
-        info_col.addStretch(1)
-        info_col.addWidget(self._title_lbl)
-        info_col.addWidget(self._artist_lbl)
-        info_col.addWidget(self._quality_info_lbl)
-        info_col.addStretch(1)
-        info_wrap = QWidget(self)
-        info_wrap.setMinimumWidth(190)
-        info_wrap.setLayout(info_col)
-        layout.addWidget(info_wrap)
-        center_col = QVBoxLayout()
-        center_col.setSpacing(3)
-        transport_row = QHBoxLayout()
-        transport_row.setSpacing(6)
-        transport_row.addStretch(1)
-        self._btn_shuffle = TransparentToolButton(_bar_icon(FluentIcon.ROTATE), self)
-        self._btn_prev = TransparentToolButton(self)
-        self._btn_prev.setIcon(_make_track_icon(False))
-        self._btn_play = TransparentToolButton(_bar_icon(FluentIcon.PLAY), self)
-        self._btn_next = TransparentToolButton(self)
-        self._btn_next.setIcon(_make_track_icon(True))
-        self._btn_repeat = TransparentToolButton(_bar_icon(FluentIcon.SYNC), self)
-        for b in (self._btn_shuffle, self._btn_prev, self._btn_next, self._btn_repeat):
-            b.setFixedSize(30, 30)
-            b.setIconSize(QSize(14, 14))
-        self._btn_prev.setIconSize(QSize(17, 17))
-        self._btn_next.setIconSize(QSize(17, 17))
-        self._btn_play.setFixedSize(38, 38)
-        self._btn_play.setIconSize(QSize(15, 15))
-        self._btn_shuffle.setCheckable(True)
-        self._btn_repeat.setCheckable(True)
-        transport_row.addWidget(self._btn_shuffle)
-        transport_row.addWidget(self._btn_prev)
-        transport_row.addWidget(self._btn_play)
-        transport_row.addWidget(self._btn_next)
-        transport_row.addWidget(self._btn_repeat)
-        transport_row.addStretch(1)
-        center_col.addLayout(transport_row)
-        seek_row = QHBoxLayout()
-        seek_row.setSpacing(8)
-        self._current_time_lbl = CaptionLabel('0:00', self)
-        self._current_time_lbl.setFixedWidth(36)
-        self._current_time_lbl.setStyleSheet(f'color: {_BAR_MUTED}; background: transparent;')
-        self._current_time_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._seek_slider = _AccentSlider(Qt.Orientation.Horizontal, self)
-        self._seek_slider.setRange(0, 0)
-        self._total_time_lbl = CaptionLabel('0:00', self)
-        self._total_time_lbl.setFixedWidth(36)
-        self._total_time_lbl.setStyleSheet(f'color: {_BAR_MUTED}; background: transparent;')
-        seek_row.addWidget(self._current_time_lbl)
-        seek_row.addWidget(self._seek_slider, 1)
-        seek_row.addWidget(self._total_time_lbl)
-        center_col.addLayout(seek_row)
-        layout.addLayout(center_col, 1)
-        self._btn_lyrics = TransparentToolButton(_bar_icon(FluentIcon.LABEL), self)
-        self._btn_lyrics.setFixedSize(28, 28)
-        self._btn_lyrics.setIconSize(QSize(14, 14))
-        self._btn_lyrics.setToolTip(tr('music.lyrics'))
-        self._btn_lyrics.setEnabled(False)
-        self._btn_lyrics.clicked.connect(self.lyrics_requested.emit)
-        layout.addWidget(self._btn_lyrics)
-        self._btn_mute = TransparentToolButton(_bar_icon(FluentIcon.VOLUME), self)
-        self._btn_mute.setFixedSize(28, 28)
-        self._btn_mute.setIconSize(QSize(14, 14))
-        self._volume_slider = _AccentSlider(Qt.Orientation.Horizontal, self)
-        self._volume_slider.setRange(0, 100)
-        self._volume_slider.setValue(100)
-        self._volume_slider.setFixedWidth(90)
-        layout.addWidget(self._btn_mute)
-        layout.addWidget(self._volume_slider)
-        self._btn_play.clicked.connect(self._player.toggle_play_pause)
-        self._btn_prev.clicked.connect(self._player.previous)
-        self._btn_next.clicked.connect(self._player.next)
-        self._btn_repeat.toggled.connect(self._player.set_repeat)
-        self._btn_shuffle.toggled.connect(self._player.set_shuffle)
-        self._btn_mute.clicked.connect(self._on_mute_clicked)
-        self._volume_slider.valueChanged.connect(self._on_volume_changed)
-        self._seek_slider.sliderPressed.connect(self._on_seek_pressed)
-        self._seek_slider.sliderReleased.connect(self._on_seek_released)
-        self._seek_slider.sliderMoved.connect(self._on_seek_moved)
-        self._player.song_changed.connect(self._on_song_changed)
-        self._player.state_changed.connect(self._on_state_changed)
-        self._player.position_changed.connect(self._on_position_changed)
-        self._player.duration_changed.connect(self._on_duration_changed)
-        self._player.error.connect(self._on_player_error)
-        self._artwork_downloader = None
-        register_locale_refresh(self, self._apply_locale)
+        self.setCursor(Qt.PointingHandCursor)
 
-    def _apply_locale(self, *_args) -> None:
-        self._btn_lyrics.setToolTip(tr('music.lyrics'))
-        if self._player.current_song is None:
-            self._title_lbl.setText(tr('music.no_track_playing'))
-        qconfig.themeChanged.connect(self._on_theme_changed)
-        self._apply_accent(QColor('#8a8a94'))
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
 
-    def _apply_bar_background(self) -> None:
-        bg = _BAR_BG_TRANSLUCENT if self._translucent else _BAR_BG
-        border_radius = 18 if not self._translucent else 18
-        self.setStyleSheet(f'MiniPlayerBar {{ background-color: {bg}; border: 1px solid {_BAR_BORDER}; border-radius: {border_radius}px; }}')
 
-    def set_translucent(self, enabled: bool) -> None:
-        self._translucent = enabled
-        self._apply_bar_background()
+class IconButton(QToolButton):
+    def __init__(self, name: str, size=40, px=20, rotate=0, parent=None):
+        super().__init__(parent)
+        self._name, self._px, self._rot = name, px, rotate
+        self._hover = self._down = False
+        self.tint, self.fill, self.accent = QColor('white'), None, QColor('white')
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
 
-    def set_artwork_downloader(self, downloader) -> None:
-        self._artwork_downloader = downloader
-        downloader.thumb_ready.connect(self._on_artwork_ready)
+    def setIconName(self, name: str) -> None:
+        if name != self._name:
+            self._name = name
+            self.update()
 
-    def _apply_art_placeholder(self):
-        self._art_label.setStyleSheet(f'background-color: {_BAR_ART_BG}; border-radius: 10px;')
+    def set_colors(self, tint, fill=None, accent=None) -> None:
+        self.tint, self.fill = QColor(tint), QColor(fill) if fill else None
+        if accent is not None:
+            self.accent = QColor(accent)
+        self.update()
 
-    def _on_theme_changed(self, *_):
-        if self._art_label.pixmap() is None or self._art_label.pixmap().isNull():
-            self._apply_art_placeholder()
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
 
-    def _on_song_changed(self, song) -> None:
+    def leaveEvent(self, e):
+        self._hover = self._down = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        self._down = True
+        self.update()
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._down = False
+        self.update()
+        super().mouseReleaseEvent(e)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        p.setPen(Qt.NoPen)
+        if self.fill is not None:
+            c = self.fill.lighter(108) if self._hover else QColor(self.fill)
+            p.setBrush(c.darker(108) if self._down else c)
+            p.drawEllipse(r)
+        elif self._hover or self._down:
+            p.setBrush(QColor(255, 255, 255, 46 if self._down else 28))
+            p.drawEllipse(r)
+        checked = self.isCheckable() and self.isChecked()
+        if not self.isEnabled():
+            p.setOpacity(0.35)
+        elif self.isCheckable() and not checked:
+            p.setOpacity(0.55)
+        if self._rot:
+            p.translate(self.width() / 2, self.height() / 2)
+            p.rotate(self._rot)
+            p.translate(-self.width() / 2, -self.height() / 2)
+        color = self.accent if checked else self.tint
+        p.drawPixmap((self.width() - self._px) // 2, (self.height() - self._px) // 2,
+                     icon_pm(self._name, color.name(), self._px))
+
+
+class _HollowStyle(QProxyStyle):
+    def __init__(self):
+        super().__init__()
+        self.h = 4
+        self.size = QSize(16, 16)
+
+    def subControlRect(self, cc, opt, sc, widget):
+        if cc != QStyle.CC_Slider or sc == QStyle.SC_SliderTickmarks:
+            return super().subControlRect(cc, opt, sc, widget)
+        rect = opt.rect
+        if sc == QStyle.SC_SliderGroove:
+            return QRect(0, (rect.height() - self.h) // 2, rect.width(), self.h)
+        if sc == QStyle.SC_SliderHandle:
+            x = QStyle.sliderPositionFromValue(opt.minimum, opt.maximum, opt.sliderPosition, rect.width())
+            x = int(x * (rect.width() - self.size.width()) / max(1, rect.width()))
+            return QRect(x, (rect.height() - self.size.height()) // 2, self.size.width(), self.size.height())
+        return super().subControlRect(cc, opt, sc, widget)
+
+    def drawComplexControl(self, cc, opt, painter, widget):
+        if cc != QStyle.CC_Slider:
+            return super().drawComplexControl(cc, opt, painter, widget)
+        g = self.subControlRect(cc, opt, QStyle.SC_SliderGroove, widget)
+        hd = self.subControlRect(cc, opt, QStyle.SC_SliderHandle, widget)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        cx = hd.center().x()
+        accent = getattr(widget, 'accent', QColor('white'))
+        painter.setBrush(accent)
+        painter.drawRoundedRect(QRectF(g.x(), g.y(), max(0, cx - g.x()), self.h), 2, 2)
+        painter.setBrush(QColor(255, 255, 255, 70))
+        painter.drawRoundedRect(QRectF(cx, g.y(), max(0, g.right() - cx), self.h), 2, 2)
+        painter.setBrush(accent)
+        painter.drawEllipse(QPoint(cx, hd.center().y()), 8 if widget.isSliderDown() else 7, 8 if widget.isSliderDown() else 7)
+
+
+_HOLLOW = _HollowStyle()
+
+
+class HollowSlider(QSlider):
+    seeked = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+        self.accent = QColor('white')
+        self.setStyle(_HOLLOW)
+        self.setFixedHeight(22)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def _val(self, e) -> int:
+        return QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), int(e.position().x()), max(1, self.width()))
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.setSliderDown(True)
+            self.setValue(self._val(e))
+            self.sliderMoved.emit(self.value())
+
+    def mouseMoveEvent(self, e):
+        if self.isSliderDown():
+            self.setValue(self._val(e))
+            self.sliderMoved.emit(self.value())
+
+    def mouseReleaseEvent(self, e):
+        if self.isSliderDown():
+            self.setSliderDown(False)
+            self.seeked.emit(self.value())
+
+
+class Cover(QWidget):
+    loaded = Signal()
+
+    def __init__(self, size: int, radius: int = 6, parent=None):
+        super().__init__(parent)
+        self._r, self._url, self._token, self.pm = radius, None, 0, QPixmap()
+        self.setFixedSize(size, size)
+
+    def set_song(self, song) -> None:
+        self._token += 1
+        self.set_url(None)
         if song is None:
-            self._title_lbl.setText(tr('music.no_track_playing'))
-            self._artist_lbl.setText('')
-            self._quality_info_lbl.setText('')
-            self._apply_art_placeholder()
-            self._apply_accent(QColor('#8a8a94'))
-            self._btn_lyrics.setEnabled(False)
             return
-        self._title_lbl.setText(song.song_name or tr('download.unknown'))
-        self._artist_lbl.setText(song.singers or tr('music.unknown_artist'))
-        self._quality_info_lbl.setText(_format_quality_detail(song))
-        self._apply_art_placeholder()
-        self._apply_accent(QColor('#8a8a94'))
-        self._btn_lyrics.setEnabled(True)
-        if song.cover_url and self._artwork_downloader is not None:
-            self._artwork_downloader.request('music', song.cover_url)
+        if song.cover_url:
+            self.set_url(song.cover_url)
+        else:
+            tok = self._token
+            submit(music_service.fetch_fallback_cover_url, args=(song,),
+                   on_done=lambda url, s=song, t=tok: self._fallback(s, url, t))
 
-    def _apply_accent(self, color: QColor) -> None:
-        self._accent = QColor(color)
-        self._seek_slider.setAccentColor(self._accent)
-        self._volume_slider.setAccentColor(self._accent)
-        normal = self._accent.name()
-        hover = self._accent.lighter(118).name()
-        pressed = self._accent.darker(112).name()
-        self._btn_play.setStyleSheet(f'TransparentToolButton {{ background-color: {normal}; border-radius: 19px; }} TransparentToolButton:hover {{ background-color: {hover}; }} TransparentToolButton:pressed {{ background-color: {pressed}; }}')
+    def _fallback(self, song, url, tok) -> None:
+        if url:
+            song.cover_url = url
+            if tok == self._token:
+                self.set_url(url)
 
-    def _pick_vivid_color(self, colors: list[QColor]) -> QColor:
-        best = colors[0] if colors else QColor('#8a8a94')
-        best_score = -1.0
-        for c in colors:
-            h, s, v, _ = c.getHsv()
-            score = s * v
-            if score > best_score:
-                best_score = score
-                best = c
-        return best
+    def set_url(self, url) -> None:
+        self._url = url
+        if url:
+            images.get(url, (self.width(), self.height()), partial(self._got, url), owner=self)
+        else:
+            self.pm = QPixmap()
+            self.update()
 
-    def _on_artwork_ready(self, kind: str, url: str, path: str) -> None:
-        if kind != 'music':
+    def _got(self, url, pm) -> None:
+        if url == self._url and not pm.isNull():
+            self.pm = pm
+            self.update()
+            self.loaded.emit()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), self._r, self._r)
+        p.setClipPath(path)
+        p.drawPixmap(self.rect(), self.pm if not self.pm.isNull() else _ph(self.width()))
+
+
+def _columns(w: int) -> tuple:
+    pad, dur, meta = 20, 60, (120 if w >= 640 else 0)
+    rest, wide = w - 2 * pad - dur - meta, w >= 760
+    nw, aw = int(rest * (0.42 if wide else 0.6)), int(rest * (0.29 if wide else 0.4))
+    alw = rest - nw - aw if wide else 0
+    ax, alx = pad + nw, pad + nw + aw
+    mx = alx + alw
+    return (pad, nw), (ax, aw), (alx, alw), (mx, meta), (mx + meta, dur)
+
+
+class _Delegate(QStyledItemDelegate):
+    def setHoverRow(self, *_): pass
+    def setPressedRow(self, *_): pass
+    def setSelectedRows(self, *_): pass
+
+
+_ICON = {'play': 'l_play', 'add': 'l_add', 'dl': 'l_dl', 'rm': 'l_rm'}
+
+
+class SongDelegate(_Delegate):
+    def __init__(self, view):
+        super().__init__(view)
+        self.view = view
+        self._title, self._body, self._pill = _font(14, QFont.DemiBold), _font(13), _font(11)
+
+    def sizeHint(self, option, index):
+        return QSize(option.rect.width(), _ROW_H)
+
+    def paint(self, p, opt, idx):
+        song = idx.data(Qt.UserRole)
+        r = opt.rect
+        hover = bool(opt.state & QStyle.State_MouseOver)
+        playing = song.key == self.view.playing_key
+        cols = _columns(r.width())
+        accent = themeColor()
+        p.save()
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        p.setPen(Qt.NoPen)
+        if hover:
+            p.setBrush(QColor(255, 255, 255, 14) if isDarkTheme() else QColor(0, 0, 0, 10))
+            p.drawRoundedRect(QRectF(r).adjusted(4, 2, -4, -2), 6, 6)
+        if playing:
+            p.setBrush(accent)
+            p.drawRoundedRect(QRectF(r.x() + 5, r.y() + 14, 3, r.height() - 28), 1.5, 1.5)
+
+        def cell(i, text, font, color, align=Qt.AlignLeft, shrink=0):
+            x, w = cols[i]
+            rect = QRect(r.x() + x, r.y(), max(0, w - 12 - shrink), r.height())
+            p.setFont(font)
+            p.setPen(color)
+            p.drawText(rect, Qt.AlignVCenter | align, QFontMetrics(font).elidedText(text, Qt.ElideRight, rect.width()))
+
+        btns = self.view.button_rects(r, hover)
+        shrink = cols[0][1] - (min(b.x() for b in btns.values()) - r.x() - cols[0][0]) if btns else 0
+        cell(0, song.song_name or '', self._title, accent if playing else _fg(), shrink=shrink)
+        cell(1, song.singers or '', self._body, _dim())
+        if cols[2][1]:
+            cell(2, song.album or '', self._body, _dim())
+        if cols[3][1]:
+            mx, end = r.x() + cols[3][0], r.x() + cols[3][0] + cols[3][1]
+            fm = QFontMetrics(self._pill)
+            p.setFont(self._pill)
+            if song.quality_label:
+                tw = fm.horizontalAdvance(song.quality_label) + 12
+                box = QRectF(mx, r.center().y() - 9, tw, 18)
+                p.setPen(_dim(0.4))
+                p.setBrush(Qt.NoBrush)
+                p.drawRoundedRect(box, 9, 9)
+                p.setPen(_dim(0.8))
+                p.drawText(box, Qt.AlignCenter, song.quality_label)
+                mx += tw + 6
+            p.setPen(_dim(0.5))
+            p.drawText(QRect(mx, r.y(), max(0, end - mx), r.height()), Qt.AlignVCenter,
+                       fm.elidedText(_format_source(song.source), Qt.ElideRight, max(0, end - mx)))
+        cell(4, song.duration or '', self._body, _dim(), Qt.AlignRight)
+        for name, br in btns.items():
+            col = accent.name() if name == 'play' and playing else _fg().name()
+            p.drawPixmap(br.x() + (br.width() - 16) // 2, br.y() + (br.height() - 16) // 2, icon_pm(_ICON[name], col, 16))
+        p.restore()
+
+
+def _song_menu(view, song, global_pos) -> None:
+    m = RoundMenu(parent=view)
+    m.addAction(Action(FluentIcon.PLAY, _t('music.play', 'Play'), triggered=lambda: view.play.emit(song)))
+    if view.removable:
+        m.addAction(Action(FluentIcon.DELETE, _t('music.remove', 'Remove'), triggered=lambda: view.remove.emit(song)))
+    else:
+        m.addAction(Action(FluentIcon.ADD_TO, tr('music.save_to_playlist'), triggered=lambda: view.add.emit(song)))
+    m.addAction(Action(FluentIcon.DOWNLOAD, _t('music.download', 'Download'), triggered=lambda: view.download.emit(song)))
+    m.exec(global_pos)
+
+
+class _SongView:
+    def _init_view(self, removable: bool) -> None:
+        self.removable, self.playing_key = removable, None
+        self.setUniformItemSizes(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setStyleSheet('QListWidget{background:transparent;border:none;}')
+
+    def songs(self) -> list:
+        return [self.item(i).data(Qt.UserRole) for i in range(self.count())]
+
+    def set_songs(self, songs: list) -> None:
+        self.clear()
+        self.add_songs(songs)
+
+    def add_songs(self, songs: list) -> None:
+        self.setUpdatesEnabled(False)
+        for s in songs:
+            it = QListWidgetItem()
+            it.setData(Qt.UserRole, s)
+            self.addItem(it)
+        self.setUpdatesEnabled(True)
+
+    def set_playing(self, key) -> None:
+        self.playing_key = key
+        self.viewport().update()
+
+    def _hit(self, pos):
+        it = self.itemAt(pos)
+        if it is None:
+            return None, None
+        for n, r in self.button_rects(self.visualItemRect(it), True).items():
+            if r.contains(pos):
+                return it.data(Qt.UserRole), n
+        return it.data(Qt.UserRole), None
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            song, name = self._hit(e.position().toPoint())
+            if name:
+                {'play': self.play, 'add': self.add, 'dl': self.download, 'rm': self.remove}[name].emit(song)
+                return
+        super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        song, _ = self._hit(e.position().toPoint())
+        if song is not None:
+            self.play.emit(song)
+
+    def contextMenuEvent(self, e):
+        it = self.itemAt(e.pos())
+        if it is None:
             return
-        song = self._player.current_song
-        if song is None or song.cover_url != url:
-            return
-        reader = QImageReader(path)
-        reader.setAutoTransform(True)
-        size = reader.size()
-        target = 58
-        if size.isValid() and (size.width() > target or size.height() > target):
-            scale = target / max(size.width(), size.height())
-            reader.setScaledSize(QSize(max(1, int(size.width() * scale)), max(1, int(size.height() * scale))))
-        image = reader.read()
-        if image.isNull():
-            return
-        pix = QPixmap.fromImage(image).scaled(target, target, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-        self._art_label.setStyleSheet('border-radius: 10px;')
-        self._art_label.setPixmap(pix)
-        self._apply_accent(self._pick_vivid_color(_dominant_colors(path)))
+        _song_menu(self, it.data(Qt.UserRole), e.globalPos())
 
-    def _on_state_changed(self, state: str) -> None:
-        self._btn_play.setIcon(_bar_icon(FluentIcon.PAUSE if state == 'playing' else FluentIcon.PLAY))
 
-    def _on_position_changed(self, position_ms: int) -> None:
-        if self._seeking:
-            return
-        self._seek_slider.setValue(position_ms)
-        text = _format_ms(position_ms)
-        if text != self._current_time_lbl.text():
-            self._current_time_lbl.setText(text)
+class SongList(_SongView, ListWidget):
+    play, add, download, remove = Signal(object), Signal(object), Signal(object), Signal(object)
 
-    def _on_duration_changed(self, duration_ms: int) -> None:
-        self._seek_slider.setRange(0, max(0, duration_ms))
-        self._total_time_lbl.setText(_format_ms(duration_ms))
+    def __init__(self, removable=False, parent=None):
+        ListWidget.__init__(self, parent)
+        self.setItemDelegate(SongDelegate(self))
+        self._init_view(removable)
 
-    def _on_seek_pressed(self) -> None:
-        self._seeking = True
+    def button_rects(self, row: QRect, hover: bool) -> dict:
+        if not hover:
+            return {}
+        nx, nw = _columns(row.width())[0]
+        names = ['play', 'rm' if self.removable else 'add', 'dl']
+        x0 = row.x() + nx + nw - 12 - 28 * len(names)
+        return {n: QRect(x0 + 28 * i, row.center().y() - 14, 28, 28) for i, n in enumerate(names)}
 
-    def _on_seek_released(self) -> None:
-        self._seeking = False
-        self._player.seek(self._seek_slider.value())
 
-    def _on_seek_moved(self, value: int) -> None:
-        self._player.seek(value)
-        self._current_time_lbl.setText(_format_ms(value))
+class _CoverGrid(PosterGrid):
+    MIN_W = 190
+    _HOVER_CURSOR = Qt.CursorShape.ArrowCursor
 
-    def _on_volume_changed(self, value: int) -> None:
-        self._player.set_volume(value / 100)
-        self._btn_mute.setIcon(_bar_icon(FluentIcon.MUTE if value == 0 else FluentIcon.VOLUME))
+    def __init__(self, key_attr: str, title_attr: str, parent=None):
+        super().__init__(parent, cell_w=_CARD_W, poster_h=_COVER, cover_attrs=('cover_url',), key_attr=key_attr,
+                         title_attr=title_attr, tooltip_fn=lambda _entry: '', img_size=(240, 240),
+                         cell_h=_COVER + 76, side=0, top=0)
+        self.card_w, self.cover_px = _CARD_W, _COVER
 
-    def _on_mute_clicked(self) -> None:
-        muted = not self._player.is_muted
-        self._player.set_muted(muted)
-        self._btn_mute.setIcon(_bar_icon(FluentIcon.MUTE if muted else FluentIcon.VOLUME))
+    def _grid_metrics(self, avail: int) -> tuple:
+        w = max(self.MIN_W, avail - 2)
+        cols = max(1, w // self.MIN_W)
+        self.card_w = w // cols
+        self.cover_px = self.card_w - 12
+        return cols, 0, 0, self.card_w, self.cover_px + 76, self.cover_px + 76
 
-    def _on_player_error(self, message: str) -> None:
-        InfoBar.error(title=tr('music.playback_error_title'), content=message[:120], orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=4000, parent=self.window())
+    def _target(self, pos: int) -> float:
+        return 0.0
 
-def _quality_labels() -> dict[str, str]:
-    return {'lossless': tr('music.quality_lossless'), 'mp3': 'MP3', 'aac': 'AAC / M4A', 'other': tr('music.quality_other')}
+    def _paint_art(self, p: QPainter, pos: int, cell: QRect, shade: int, hover: bool) -> QRectF:
+        cover = QRectF(cell.x() + 6, cell.y() + 6, self.cover_px, self.cover_px)
+        src = self._src(pos)
+        pixmap = images.peek(src, self._img) if src else None
+        path = QPainterPath()
+        path.addRoundedRect(cover, 8, 8)
+        p.setClipPath(path)
+        p.drawPixmap(cover.toRect(), pixmap if pixmap is not None and not pixmap.isNull() else _ph(240))
+        if hover:
+            p.fillRect(cover, QColor(0, 0, 0, shade))
+        p.setClipping(False)
+        return cover
+
+
+class SongGrid(_CoverGrid):
+    play, add, download, remove = Signal(object), Signal(object), Signal(object), Signal(object)
+    removable = False
+
+    def __init__(self, parent=None):
+        super().__init__('key', 'song_name', parent)
+        self.playing_key = None
+        self._title, self._sub = _font(14, QFont.DemiBold), _font(12)
+        self.context_requested.connect(lambda song, pos: _song_menu(self, song, pos))
+
+    def songs(self) -> list:
+        return list(self._entries)
+
+    def set_songs(self, songs: list) -> None:
+        self.set_entries(songs)
+
+    add_songs = _CoverGrid.append_entries
+    count = _CoverGrid.count_entries
+
+    def set_playing(self, key) -> None:
+        self.playing_key = key
+        self.viewport().update()
+
+    def button_rects(self, row: QRect, hover: bool) -> dict:
+        if not hover:
+            return {}
+        d, gap, cp = 38, 8, self.cover_px
+        x0 = row.x() + 6 + (cp - 3 * d - 2 * gap) // 2
+        y = row.y() + 6 + (cp - d) // 2
+        return {n: QRect(x0 + i * (d + gap), y, d, d) for i, n in enumerate(('play', 'add', 'dl'))}
+
+    def _paint_card(self, p: QPainter, pos: int, cell: QRect) -> None:
+        song = self._entry(pos)
+        hover = pos == self._hover
+        playing = song.key == self.playing_key
+        accent = themeColor()
+        cp = self.cover_px
+        p.save()
+        cover = self._paint_art(p, pos, cell, 100, hover)
+        if playing:
+            p.setPen(QPen(accent, 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(cover.adjusted(1, 1, -1, -1), 8, 8)
+        for name, br in self.button_rects(cell, hover).items():
+            p.setPen(QColor(255, 255, 255, 230))
+            p.setBrush(QColor(0, 0, 0, 90))
+            p.drawEllipse(br)
+            icon, px = ('Play', 20) if name == 'play' else (_ICON[name], 16)
+            p.drawPixmap(br.x() + (br.width() - px) // 2, br.y() + (br.height() - px) // 2, icon_pm(icon, '#FFFFFF', px))
+        y = cell.y() + cp + 14
+        for text, font, color, dy in (
+                (song.song_name or '', self._title, accent if playing else _fg(), 0),
+                (song.singers or '', self._sub, _dim(0.6), 22),
+                (' · '.join(x for x in (song.quality_label, song.duration, _format_source(song.source)) if x),
+                 self._sub, _dim(0.4), 40)):
+            p.setFont(font)
+            p.setPen(color)
+            p.drawText(QRect(cell.x() + 6, y + dy, cp, 22 if dy == 0 else 18), Qt.AlignVCenter,
+                       QFontMetrics(font).elidedText(text, Qt.ElideRight, cp))
+        p.restore()
+
+    def mouseDoubleClickEvent(self, e) -> None:
+        pos = self._hit(e.position().toPoint())
+        if pos is not None:
+            self.play.emit(self._entry(pos))
+
+
+class ListHeader(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(30)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        f = QFont(self.font())
+        f.setPixelSize(12)
+        p.setFont(f)
+        p.setPen(_dim(0.5))
+        heads = [_t('music.col_title', 'Title'), _t('music.col_artist', 'Artist'), _t('music.col_album', 'Album'),
+                 _t('music.col_quality', 'Quality'), _t('music.col_time', 'Time')]
+        for i, ((x, w), t) in enumerate(zip(_columns(self.width()), heads, strict=True)):
+            if w:
+                p.drawText(QRect(x, 0, w - 12, self.height()),
+                           Qt.AlignVCenter | (Qt.AlignRight if i == 4 else Qt.AlignLeft), t)
+        p.setPen(_dim(0.12))
+        p.drawLine(16, self.height() - 1, self.width() - 16, self.height() - 1)
+
+
+class PlaylistGrid(_CoverGrid):
+    open, play, rename, delete = Signal(str), Signal(str), Signal(str), Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__('id', 'name', parent)
+        self.context_requested.connect(self._menu)
+
+    def set_playlists(self, pls: list) -> None:
+        self.set_entries(pls)
+
+    def play_rect(self, r: QRect) -> QRect:
+        return QRect(r.x() + 6 + (self.cover_px - 44) // 2, r.y() + 6 + (self.cover_px - 44) // 2, 44, 44)
+
+    def _src(self, pos: int) -> str:
+        return next((s.cover_url for s in self._entry(pos).songs if s.cover_url), '')
+
+    def _paint_card(self, p: QPainter, pos: int, cell: QRect) -> None:
+        pl = self._entry(pos)
+        hover = pos == self._hover
+        cp = self.cover_px
+        p.save()
+        self._paint_art(p, pos, cell, 90, hover)
+        if hover:
+            c = self.play_rect(cell)
+            p.setPen(QColor(255, 255, 255, 230))
+            p.setBrush(QColor(0, 0, 0, 80))
+            p.drawEllipse(c)
+            p.drawPixmap(c.x() + 11, c.y() + 11, icon_pm('Play', '#FFFFFF', 22))
+        f = _font(14, QFont.DemiBold)
+        p.setFont(f)
+        p.setPen(_fg())
+        p.drawText(QRect(cell.x() + 6, cell.y() + cp + 14, cp, 22), Qt.AlignVCenter,
+                   QFontMetrics(f).elidedText(pl.name, Qt.ElideRight, cp))
+        p.setFont(_font(12))
+        p.setPen(_dim(0.55))
+        p.drawText(QRect(cell.x() + 6, cell.y() + cp + 36, cp, 20), Qt.AlignVCenter,
+                   _t('music.n_songs', '{n} songs').format(n=len(pl.songs)))
+        p.restore()
+
+    def _menu(self, playlist, global_pos) -> None:
+        m = RoundMenu(parent=self)
+        m.addAction(Action(FluentIcon.PLAY, _t('music.play', 'Play'), triggered=lambda: self.play.emit(playlist.id)))
+        m.addAction(Action(FluentIcon.EDIT, _t('music.rename', 'Rename'), triggered=lambda: self.rename.emit(playlist.id)))
+        m.addAction(Action(FluentIcon.DELETE, _t('music.delete', 'Delete'), triggered=lambda: self.delete.emit(playlist.id)))
+        m.exec(global_pos)
+
+
+class NameDialog(MessageBoxBase):
+    def __init__(self, title: str, text: str = '', parent=None):
+        super().__init__(parent)
+        self.viewLayout.addWidget(SubtitleLabel(title, self))
+        self.edit = LineEdit(self)
+        self.edit.setPlaceholderText(tr('music.playlist_name_placeholder'))
+        self.edit.setText(text)
+        self.edit.setClearButtonEnabled(True)
+        self.edit.returnPressed.connect(self.yesButton.click)
+        self.viewLayout.addWidget(self.edit)
+        self.widget.setMinimumWidth(340)
+
+    def text(self) -> str:
+        return self.edit.text().strip()
+
+
+class SaveToPlaylistDialog(MessageBoxBase):
+    def __init__(self, store: PlaylistStore, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.viewLayout.addWidget(SubtitleLabel(tr('music.save_to_playlist'), self))
+        self.list = ListWidget(self)
+        self.list.setFixedHeight(220)
+        self.list.itemDoubleClicked.connect(lambda _: self.yesButton.click())
+        self.viewLayout.addWidget(self.list)
+        row = QHBoxLayout()
+        self.new_edit = LineEdit(self)
+        self.new_edit.setPlaceholderText(tr('music.playlist_name_placeholder'))
+        self.new_edit.returnPressed.connect(self._create)
+        btn = PushButton(FluentIcon.ADD, tr('music.new_playlist'), self)
+        btn.clicked.connect(self._create)
+        row.addWidget(self.new_edit, 1)
+        row.addWidget(btn)
+        self.viewLayout.addLayout(row)
+        self.widget.setMinimumWidth(380)
+        self._fill()
+
+    def _fill(self, select=None) -> None:
+        self.list.clear()
+        for pl in self.store.all_playlists():
+            it = QListWidgetItem(f'{pl.name}  ·  {len(pl.songs)}')
+            it.setData(Qt.UserRole, pl.id)
+            self.list.addItem(it)
+            if pl.id == select:
+                self.list.setCurrentItem(it)
+
+    def _create(self) -> None:
+        name = self.new_edit.text().strip()
+        if name:
+            self._fill(self.store.create(name).id)
+            self.new_edit.clear()
+
+    def selected_playlist_id(self):
+        it = self.list.currentItem()
+        return it.data(Qt.UserRole) if it else None
+
 
 class FilterDialog(MessageBoxBase):
-
-    def __init__(self, all_sources: list[str], selected_sources: list[str], selected_quality: list[str], parent=None):
+    def __init__(self, sources: list, sel_sources: list, sel_quality: list, parent=None):
         super().__init__(parent)
-        self.titleLabel = SubtitleLabel(tr('music.search_filters'), self)
-        self.viewLayout.addWidget(self.titleLabel)
-        quality_header = StrongBodyLabel(tr('music.quality'), self)
-        self.viewLayout.addWidget(quality_header)
-        self._quality_checks: dict[str, CheckBox] = {}
-        quality_col = QVBoxLayout()
-        quality_col.setSpacing(4)
-        for tier in QUALITY_TIERS:
-            cb = CheckBox(_quality_labels().get(tier, tier), self)
-            cb.setChecked(tier in selected_quality)
-            self._quality_checks[tier] = cb
-            quality_col.addWidget(cb)
-        self.viewLayout.addLayout(quality_col)
-        sources_header = StrongBodyLabel(tr('music.sources'), self)
-        self.viewLayout.addWidget(sources_header)
-        scroll = ScrollArea(self)
-        scroll.setFixedHeight(220)
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet('background: transparent; border: none;')
-        sources_container = QWidget(scroll)
-        sources_container.setStyleSheet('background: transparent;')
-        sources_col = QVBoxLayout(sources_container)
-        sources_col.setSpacing(4)
-        self._source_checks: dict[str, CheckBox] = {}
-        sorted_sources = sorted(all_sources, key=lambda s: (s in SLOW_OR_GATED_SOURCES, s))
-        for source in sorted_sources:
-            label = tr('music.source_slow_setup', source=source) if source in SLOW_OR_GATED_SOURCES else source
-            cb = CheckBox(label, sources_container)
-            cb.setChecked(source in selected_sources)
-            self._source_checks[source] = cb
-            sources_col.addWidget(cb)
-        sources_col.addStretch(1)
-        scroll.setWidget(sources_container)
-        self.viewLayout.addWidget(scroll)
+        self.viewLayout.addWidget(SubtitleLabel(tr('music.search_filters'), self))
+        self.viewLayout.addWidget(StrongBodyLabel(tr('music.quality'), self))
+        labels = {'lossless': tr('music.quality_lossless'), 'mp3': 'MP3', 'aac': 'AAC / M4A',
+                  'other': tr('music.quality_other')}
+        self._q = {}
+        for t in QUALITY_TIERS:
+            cb = CheckBox(labels.get(t, t), self)
+            cb.setChecked(t in sel_quality)
+            self._q[t] = cb
+            self.viewLayout.addWidget(cb)
+        self.viewLayout.addWidget(StrongBodyLabel(tr('music.sources'), self))
+        sc = ScrollArea(self)
+        sc.setFixedHeight(220)
+        sc.setWidgetResizable(True)
+        sc.setStyleSheet('background:transparent;border:none;')
+        box = QWidget(sc)
+        box.setStyleSheet('background:transparent;')
+        lay = QVBoxLayout(box)
+        lay.setSpacing(4)
+        self._s = {}
+        for s in sorted(sources, key=lambda s: (s in SLOW_OR_GATED_SOURCES, s)):
+            cb = CheckBox(tr('music.source_slow_setup', source=s) if s in SLOW_OR_GATED_SOURCES else s, box)
+            cb.setChecked(s in sel_sources)
+            self._s[s] = cb
+            lay.addWidget(cb)
+        lay.addStretch(1)
+        sc.setWidget(box)
+        self.viewLayout.addWidget(sc)
         self.yesButton.setText(tr('music.apply'))
         self.cancelButton.setText(tr('music.cancel'))
         self.widget.setMinimumWidth(360)
 
-    def selected_sources(self) -> list[str]:
-        return [source for source, cb in self._source_checks.items() if cb.isChecked()]
+    def selected_sources(self) -> list:
+        return [s for s, c in self._s.items() if c.isChecked()]
 
-    def selected_quality(self) -> list[str]:
-        return [tier for tier, cb in self._quality_checks.items() if cb.isChecked()]
+    def selected_quality(self) -> list:
+        return [t for t, c in self._q.items() if c.isChecked()]
 
-class _PlaylistCoverLabel(QLabel):
 
-    def __init__(self, size: int, artwork_downloader, parent=None):
+def _audio_info(song, meta_kbps: int = 0) -> str:
+    raw = getattr(song, 'raw', None) or {}
+
+    def num(*keys):
+        for k in keys:
+            try:
+                v = float(raw.get(k))
+                if v > 0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+        return 0
+
+    ext = (getattr(song, 'ext', '') or os.path.splitext((song.download_url or '').split('?')[0])[1]).lstrip('.').upper()
+    parts = [ext or getattr(song, 'quality_label', '')]
+    br = num('bitrate', 'bit_rate', 'br')
+    kbps = (br / 1000 if br > 3000 else br) or meta_kbps
+    if kbps:
+        parts.append(f'{kbps:.0f} kb/s')
+    sr = num('sample_rate', 'samplerate', 'sr', 'sampling_rate')
+    if sr:
+        parts.append(f'{sr / 1000 if sr > 1000 else sr:g} kHz')
+    ch = int(num('channels', 'channel', 'nchannels'))
+    if ch:
+        parts.append({1: 'Mono', 2: 'Stereo'}.get(ch, f'{ch} ch'))
+    return ' • '.join(p for p in parts if p)
+
+
+def _accent(c: QColor) -> QColor:
+    h, s, _, _ = c.getHsl()
+    return QColor.fromHsl(max(h, 0), min(s, 150), 175)
+
+
+class PlayBar(QWidget):
+    open_playing = Signal(int)
+    add_requested = Signal()
+
+    def __init__(self, player: MusicPreviewPlayer, parent=None):
         super().__init__(parent)
-        self._size = size
-        self._artwork_downloader = artwork_downloader
-        self._cover_url: str | None = None
-        self.setFixedSize(size, size)
-        self._apply_placeholder()
-        if artwork_downloader is not None:
-            artwork_downloader.thumb_ready.connect(self._on_artwork_ready)
+        self.player, self._song, self._meta_kbps = player, None, 0
+        self._color, self._dark = QColor('#1e2a3a'), QColor('#1e2a3a')
+        self._ani = QVariantAnimation(self, duration=250, valueChanged=self._set_color)
+        self.setFixedHeight(_BAR_H)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 24, 0)
+        lay.setSpacing(0)
 
-    def _apply_placeholder(self) -> None:
-        c = palette()
-        self.setPixmap(FluentIcon.ALBUM.icon(color=QColor(c['muted'])).pixmap(int(self._size * 0.45), int(self._size * 0.45)))
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet(f'background-color: {c['surface_tint_strong']}; border-radius: {min(10, self._size // 4)}px;')
+        left = ClickWidget(self)
+        left.clicked.connect(lambda: self.open_playing.emit(0))
+        ll = QHBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(16)
+        self.cover = Cover(_BAR_H, 0, left)
+        ll.addWidget(self.cover)
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        self.title = ElidedLabel(16, QFont.DemiBold, parent=left)
+        self.artist = ElidedLabel(14, color=QColor(255, 255, 255, 215), parent=left)
+        self.detail = ElidedLabel(13, color=QColor(255, 255, 255, 215), parent=left)
+        col.addStretch(1)
+        for w in (self.title, self.artist, self.detail):
+            col.addWidget(w)
+        col.addStretch(1)
+        ll.addLayout(col, 1)
+        lay.addWidget(left, 3)
 
-    def set_cover(self, cover_url: str | None) -> None:
-        self._cover_url = cover_url
-        self._apply_placeholder()
-        if cover_url and self._artwork_downloader is not None:
-            self._artwork_downloader.request('music', cover_url)
+        mid = QVBoxLayout()
+        mid.setContentsMargins(0, 10, 0, 6)
+        mid.setSpacing(0)
+        row = QHBoxLayout()
+        row.setSpacing(18)
+        row.addStretch(1)
+        self.b_shuffle = IconButton('m_shuffle', 38, 22)
+        self.b_prev = IconButton('m_prev', 40, 24)
+        self.b_play = IconButton('m_play', 54, 30)
+        self.b_next = IconButton('m_next', 40, 24)
+        self.b_repeat = IconButton('m_repeat', 38, 22)
+        for b, on in ((self.b_shuffle, player.shuffle), (self.b_repeat, player.repeat)):
+            b.setCheckable(True)
+            b.setChecked(on)
+        for b in (self.b_shuffle, self.b_prev, self.b_play, self.b_next, self.b_repeat):
+            row.addWidget(b)
+        row.addStretch(1)
+        mid.addLayout(row)
+        prog = QHBoxLayout()
+        prog.setSpacing(12)
+        self.t_cur, self.t_tot = CaptionLabel('0:00', self), CaptionLabel('0:00', self)
+        for t in (self.t_cur, self.t_tot):
+            t.setStyleSheet('color:rgba(255,255,255,215);background:transparent;font-size:13px;')
+            t.setFixedWidth(46)
+        self.t_cur.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.seek = HollowSlider(self)
+        self.seek.setRange(0, 0)
+        prog.addWidget(self.t_cur)
+        prog.addWidget(self.seek, 1)
+        prog.addWidget(self.t_tot)
+        mid.addLayout(prog)
+        lay.addLayout(mid, 5)
 
-    def _on_artwork_ready(self, kind: str, url: str, path: str) -> None:
-        if kind != 'music':
-            return
-        if not self._cover_url or url != self._cover_url:
-            return
-        reader = QImageReader(path)
-        reader.setAutoTransform(True)
-        size = reader.size()
-        if size.isValid() and (size.width() > self._size or size.height() > self._size):
-            scale = self._size / max(size.width(), size.height())
-            reader.setScaledSize(QSize(max(1, int(size.width() * scale)), max(1, int(size.height() * scale))))
-        image = reader.read()
-        if image.isNull():
-            return
-        pix = QPixmap.fromImage(image).scaled(self._size, self._size, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-        self.setStyleSheet(f'border: 1px solid {palette()['surface_border']}; border-radius: {min(10, self._size // 4)}px;')
-        self.setPixmap(pix)
+        right = QHBoxLayout()
+        right.setSpacing(4)
+        right.addStretch(1)
+        self.b_add = IconButton('m_pladd', 42, 24)
+        self.b_queue = IconButton('m_queue', 42, 24)
+        self.b_vol = IconButton('m_volup', 42, 24)
+        self.vol = HollowSlider(self)
+        self.vol.setRange(0, 100)
+        self.vol.setValue(int(player.volume * 100))
+        self.vol.setFixedWidth(110)
+        self.b_lyrics = IconButton('m_lyrics', 42, 24)
+        for w in (self.b_add, self.b_queue, self.b_vol, self.vol):
+            right.addWidget(w)
+        right.addSpacing(10)
+        right.addWidget(self.b_lyrics)
+        lay.addLayout(right, 3)
 
-    def detach(self) -> None:
-        if self._artwork_downloader is None:
-            return
+        self._btns = [self.b_shuffle, self.b_prev, self.b_next, self.b_repeat, self.b_add, self.b_queue,
+                      self.b_vol, self.b_lyrics]
+        self.b_play.clicked.connect(player.toggle_play_pause)
+        self.b_prev.clicked.connect(player.previous)
+        self.b_next.clicked.connect(player.next)
+        self.b_shuffle.toggled.connect(player.set_shuffle)
+        self.b_repeat.toggled.connect(player.set_repeat)
+        self.b_add.clicked.connect(self.add_requested)
+        self.b_queue.clicked.connect(lambda: self.open_playing.emit(1))
+        self.b_lyrics.clicked.connect(lambda: self.open_playing.emit(0))
+        self.b_vol.clicked.connect(self._mute)
+        self.vol.valueChanged.connect(self._volume)
+        self.seek.sliderMoved.connect(lambda v: self.t_cur.setText(_format_ms(v)))
+        self.seek.seeked.connect(player.seek)
+        player.state_changed.connect(lambda s: self.b_play.setIconName('m_pause' if s == 'playing' else 'm_play'))
+        player.position_changed.connect(self._pos)
+        player.duration_changed.connect(self._dur)
+        qp = getattr(player, '_player', None)
+        if qp is not None:
+            qp.metaDataChanged.connect(lambda: self._on_meta(qp))
+        self._apply_accent(self._color)
+        self.set_song(None)
+
+    def _on_meta(self, qp) -> None:
         try:
-            self._artwork_downloader.thumb_ready.disconnect(self._on_artwork_ready)
-        except (TypeError, RuntimeError):
-            pass
+            br = int(qp.metaData().value(QMediaMetaData.Key.AudioBitRate) or 0)
+        except (TypeError, ValueError):
+            br = 0
+        if br and self._song is not None and br // 1000 != self._meta_kbps:
+            self._meta_kbps = br // 1000
+            self.detail.setText(_audio_info(self._song, self._meta_kbps))
 
-class PlaylistSongRow(CardWidget):
-    play_clicked = Signal(object)
-    download_clicked = Signal(object)
-    remove_clicked = Signal(object)
+    def set_song(self, song) -> None:
+        self._song, self._meta_kbps = song, 0
+        has = song is not None
+        self.title.setText((song.song_name or tr('download.unknown')) if has else '')
+        self.artist.setText((song.singers or tr('music.unknown_artist')) if has else '')
+        self.detail.setText(_audio_info(song) if has else '')
+        self.cover.set_song(song)
 
-    def __init__(self, song, index: int, artwork_downloader=None, parent=None):
-        super().__init__(parent)
-        self.song = song
-        self.index = index
-        self.setFixedHeight(56)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 6, 12, 6)
-        layout.setSpacing(12)
-        c = palette()
-        idx_lbl = CaptionLabel(str(index + 1), self)
-        idx_lbl.setFixedWidth(18)
-        idx_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        idx_lbl.setStyleSheet(f'color: {c['muted']}; font-size: 12px;')
-        layout.addWidget(idx_lbl)
-        self._art_label = _PlaylistCoverLabel(40, artwork_downloader, self)
-        self._art_label.set_cover(song.cover_url)
-        layout.addWidget(self._art_label)
-        text_col = QVBoxLayout()
-        text_col.setSpacing(1)
-        title_lbl = StrongBodyLabel(song.song_name or tr('download.unknown'), self)
-        title_lbl.setStyleSheet('font-size: 13.5px;')
-        sub_lbl = CaptionLabel(song.singers or tr('music.unknown_artist'), self)
-        sub_lbl.setStyleSheet(f'color: {c['muted']}; font-size: 11px;')
-        text_col.addWidget(title_lbl)
-        text_col.addWidget(sub_lbl)
-        layout.addLayout(text_col, 1)
-        quality_lbl = CaptionLabel(song.quality_label, self)
-        quality_lbl.setStyleSheet(f'color: {c['muted']}; background-color: {c['surface_tint_strong']}; border-radius: 7px; padding: 1px 6px; font-size: 9.5px; font-weight: 600;')
-        quality_lbl.setVisible(bool(song.quality_label))
-        layout.addWidget(quality_lbl)
-        source_lbl = CaptionLabel(_format_source(song.source), self)
-        source_lbl.setStyleSheet(f'color: {c['muted']}; border: 1px solid {c['surface_border']}; border-radius: 7px; padding: 1px 6px; font-size: 9.5px; font-weight: 600;')
-        source_lbl.setVisible(bool(song.source))
-        layout.addWidget(source_lbl)
-        dur_lbl = CaptionLabel(song.duration or '', self)
-        dur_lbl.setFixedWidth(38)
-        dur_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        dur_lbl.setStyleSheet(f'color: {c['muted']};')
-        layout.addWidget(dur_lbl)
-        btn_play = ToolButton(FluentIcon.PLAY, self)
-        btn_download = ToolButton(FluentIcon.DOWNLOAD, self)
-        btn_remove = TransparentToolButton(FluentIcon.DELETE, self)
-        for b in (btn_play, btn_download, btn_remove):
-            b.setFixedSize(28, 28)
-            b.setIconSize(QSize(13, 13))
-            layout.addWidget(b)
-        btn_play.clicked.connect(lambda: self.play_clicked.emit(self.song))
-        btn_download.clicked.connect(lambda: self.download_clicked.emit(self.song))
-        btn_remove.clicked.connect(lambda: self.remove_clicked.emit(self.song))
+    def _apply_accent(self, c: QColor) -> None:
+        self._dark, acc = _tone(c), _accent(c)
+        self.b_play.set_colors(self._dark, acc)
+        for b in self._btns:
+            b.accent = acc
+            b.update()
+        for sl in (self.seek, self.vol):
+            sl.accent = acc
+            sl.update()
 
-    def detach(self) -> None:
-        self._art_label.detach()
+    def set_color(self, c: QColor) -> None:
+        self._apply_accent(c)
+        self._ani.stop()
+        self._ani.setStartValue(self._color)
+        self._ani.setEndValue(self._dark)
+        self._ani.start()
 
-class PlaylistsPanel(QWidget):
+    def _set_color(self, c) -> None:
+        self._color = QColor(c)
+        self.update()
 
-    def __init__(self, store: PlaylistStore, artwork_downloader=None, parent=None, play_requested=None, download_requested=None, download_all_requested=None, play_song_requested=None):
-        super().__init__(parent)
-        self._store = store
-        self._artwork_downloader = artwork_downloader
-        self._play_requested = play_requested
-        self._download_requested = download_requested
-        self._download_all_requested = download_all_requested
-        self._play_song_requested = play_song_requested
-        self._current_playlist_id: str | None = None
-        self._song_rows: list[PlaylistSongRow] = []
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(10)
-        self._detail_stack = QStackedWidget(self)
-        list_page = QWidget(self._detail_stack)
-        list_layout = QVBoxLayout(list_page)
-        list_layout.setContentsMargins(0, 0, 0, 0)
-        list_layout.setSpacing(10)
-        header_row = QHBoxLayout()
-        header_row.setSpacing(8)
-        header_icon = QLabel(list_page)
-        header_icon.setFixedSize(20, 20)
-        header_icon.setPixmap(FluentIcon.MENU.icon(color=QColor(palette()['muted'])).pixmap(18, 18))
-        header_row.addWidget(header_icon)
-        header_lbl = StrongBodyLabel(tr('music.my_playlists'), list_page)
-        header_lbl.setStyleSheet('font-size: 16px;')
-        self._header_lbl = header_lbl
-        header_row.addWidget(header_lbl)
-        header_row.addStretch(1)
-        btn_new = PrimaryPushButton(FluentIcon.ADD, tr('music.new_playlist'), list_page)
-        self._btn_new = btn_new
-        btn_new.clicked.connect(self._on_new_playlist)
-        header_row.addWidget(btn_new)
-        list_layout.addLayout(header_row)
-        self._playlists_scroll = ScrollArea(list_page)
-        self._playlists_scroll.setWidgetResizable(True)
-        self._playlists_scroll.setStyleSheet('background: transparent; border: none;')
-        self._playlists_container = QWidget()
-        self._playlists_container.setStyleSheet('background: transparent;')
-        self._playlists_container_layout = QVBoxLayout(self._playlists_container)
-        self._playlists_container_layout.setContentsMargins(0, 0, 0, 0)
-        self._playlists_container_layout.setSpacing(8)
-        self._playlists_container_layout.addStretch(1)
-        self._playlists_scroll.setWidget(self._playlists_container)
-        list_layout.addWidget(self._playlists_scroll, 1)
-        self._empty_playlists_lbl = CaptionLabel(tr('music.no_playlists_hint'), list_page)
-        self._empty_playlists_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty_playlists_lbl.setWordWrap(True)
-        self._empty_playlists_lbl.setStyleSheet(f'color: {palette()['muted']}; padding: 24px 12px;')
-        list_layout.addWidget(self._empty_playlists_lbl)
-        self._detail_stack.addWidget(list_page)
-        detail_page = QWidget(self._detail_stack)
-        detail_layout = QVBoxLayout(detail_page)
-        detail_layout.setContentsMargins(0, 0, 0, 0)
-        detail_layout.setSpacing(10)
-        detail_header_row = QHBoxLayout()
-        btn_back = TransparentPushButton(FluentIcon.RETURN, tr('music.back'), detail_page)
-        self._btn_back = btn_back
-        btn_back.clicked.connect(self._on_back_to_list)
-        detail_header_row.addWidget(btn_back)
-        self._detail_title_lbl = StrongBodyLabel('', detail_page)
-        self._detail_title_lbl.setStyleSheet('font-size: 16px;')
-        detail_header_row.addWidget(self._detail_title_lbl)
-        detail_header_row.addStretch(1)
-        btn_play_all = PrimaryPushButton(FluentIcon.PLAY, tr('music.play_all'), detail_page)
-        self._btn_play_all = btn_play_all
-        btn_play_all.clicked.connect(self._on_play_all)
-        detail_header_row.addWidget(btn_play_all)
-        btn_download_all = PushButton(FluentIcon.DOWNLOAD, tr('music.download_all'), detail_page)
-        self._btn_download_all_playlist = btn_download_all
-        btn_download_all.clicked.connect(self._on_download_all)
-        detail_header_row.addWidget(btn_download_all)
-        btn_rename = ToolButton(FluentIcon.EDIT, detail_page)
-        btn_rename.setFixedSize(32, 32)
-        btn_rename.clicked.connect(self._on_rename_playlist)
-        detail_header_row.addWidget(btn_rename)
-        btn_delete = ToolButton(FluentIcon.DELETE, detail_page)
-        btn_delete.setFixedSize(32, 32)
-        btn_delete.clicked.connect(self._on_delete_playlist)
-        detail_header_row.addWidget(btn_delete)
-        detail_layout.addLayout(detail_header_row)
-        self._songs_scroll = ScrollArea(detail_page)
-        self._songs_scroll.setWidgetResizable(True)
-        self._songs_scroll.setStyleSheet('background: transparent; border: none;')
-        self._songs_container = QWidget()
-        self._songs_container.setStyleSheet('background: transparent;')
-        self._songs_container_layout = QVBoxLayout(self._songs_container)
-        self._songs_container_layout.setContentsMargins(0, 0, 0, 0)
-        self._songs_container_layout.setSpacing(6)
-        self._songs_container_layout.addStretch(1)
-        self._songs_scroll.setWidget(self._songs_container)
-        detail_layout.addWidget(self._songs_scroll, 1)
-        self._empty_songs_lbl = CaptionLabel(tr('music.empty_playlist_hint'), detail_page)
-        self._empty_songs_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty_songs_lbl.setWordWrap(True)
-        self._empty_songs_lbl.setStyleSheet(f'color: {palette()['muted']}; padding: 24px 12px;')
-        detail_layout.addWidget(self._empty_songs_lbl)
-        self._detail_stack.addWidget(detail_page)
-        root.addWidget(self._detail_stack, 1)
-        self._store.playlists_changed.connect(self._on_store_changed)
-        register_locale_refresh(self, self._apply_locale)
-        self.refresh()
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), self._color)
+        p.fillRect(0, 0, self.width(), 1, QColor(255, 255, 255, 28))
 
-    def _apply_locale(self, *_args) -> None:
-        self._header_lbl.setText(tr('music.my_playlists'))
-        self._btn_new.setText(tr('music.new_playlist'))
-        self._empty_playlists_lbl.setText(tr('music.no_playlists_hint'))
-        self._btn_back.setText(tr('music.back'))
-        self._btn_play_all.setText(tr('music.play_all'))
-        self._btn_download_all_playlist.setText(tr('music.download_all'))
-        self._empty_songs_lbl.setText(tr('music.empty_playlist_hint'))
+    def _pos(self, ms: int) -> None:
+        if not self.seek.isSliderDown():
+            self.seek.setValue(ms)
+            t = _format_ms(ms)
+            if t != self.t_cur.text():
+                self.t_cur.setText(t)
 
-    def refresh(self) -> None:
-        self._rebuild_playlists_list()
-        if self._current_playlist_id is not None:
-            self._rebuild_song_rows()
+    def _dur(self, ms: int) -> None:
+        self.seek.setRange(0, max(0, ms))
+        self.t_tot.setText(_format_ms(ms))
 
-    def _on_store_changed(self) -> None:
-        self._rebuild_playlists_list()
-        if self._current_playlist_id is not None:
-            pl = self._store.get(self._current_playlist_id)
-            if pl is None:
-                self._on_back_to_list()
-            else:
-                self._rebuild_song_rows()
+    def _volume(self, v: int) -> None:
+        self.player.set_volume(v / 100)
+        self._vol_icon(v, False)
 
-    def _clear_layout(self, layout) -> None:
-        while layout.count() > 1:
-            item = layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                detach = getattr(widget, 'detach', None)
-                if callable(detach):
-                    detach()
-                widget.setParent(None)
-                widget.deleteLater()
+    def _mute(self) -> None:
+        m = not self.player.is_muted
+        self.player.set_muted(m)
+        self._vol_icon(self.vol.value(), m)
 
-    def _rebuild_playlists_list(self) -> None:
-        self._clear_layout(self._playlists_container_layout)
-        playlists = self._store.all_playlists()
-        self._empty_playlists_lbl.setVisible(not playlists)
-        for pl in playlists:
-            row = self._make_playlist_row(pl)
-            self._playlists_container_layout.insertWidget(self._playlists_container_layout.count() - 1, row)
+    def _vol_icon(self, v: int, muted: bool) -> None:
+        self.b_vol.setIconName('m_volx' if muted else 'm_vol0' if v == 0 else 'm_voldown' if v < 50 else 'm_volup')
 
-    def _make_playlist_row(self, pl: Playlist) -> QWidget:
-        row = CardWidget(self._playlists_container)
-        row.setFixedHeight(64)
-        row.setCursor(Qt.CursorShape.PointingHandCursor)
-        layout = QHBoxLayout(row)
-        layout.setContentsMargins(10, 8, 16, 8)
-        layout.setSpacing(12)
-        c = palette()
-        cover = _PlaylistCoverLabel(44, self._artwork_downloader, row)
-        first_cover_url = pl.songs[0].cover_url if pl.songs else None
-        cover.set_cover(first_cover_url)
-        layout.addWidget(cover)
-        text_col = QVBoxLayout()
-        text_col.setSpacing(2)
-        name_lbl = StrongBodyLabel(pl.name, row)
-        name_lbl.setStyleSheet('font-size: 14px;')
-        count_lbl = CaptionLabel(f'{len(pl.songs)} song{('s' if len(pl.songs) != 1 else '')}', row)
-        count_lbl.setStyleSheet(f'color: {c['muted']}; font-size: 11.5px;')
-        text_col.addWidget(name_lbl)
-        text_col.addWidget(count_lbl)
-        layout.addLayout(text_col, 1)
-        chevron = QLabel(row)
-        chevron.setFixedSize(16, 16)
-        chevron.setPixmap(FluentIcon.RIGHT_ARROW.icon(color=QColor(c['muted'])).pixmap(12, 12))
-        layout.addWidget(chevron)
-        row.detach = cover.detach
 
-        def _open(_event=None, playlist_id=pl.id):
-            self._open_playlist(playlist_id)
-        row.mousePressEvent = lambda event, f=_open: f()
-        return row
+_ALIGN = {'center': Qt.AlignCenter, 'left': Qt.AlignLeft | Qt.AlignVCenter, 'right': Qt.AlignRight | Qt.AlignVCenter}
+_LINE_STYLE = ((44, 800, 255), (30, 600, 165), (26, 500, 115), (24, 500, 85))
+_FONT_EXT = ('.ttf', '.otf', '.ttc')
 
-    def _open_playlist(self, playlist_id: str) -> None:
-        self._current_playlist_id = playlist_id
-        self._detail_stack.setCurrentIndex(1)
-        self._rebuild_song_rows()
 
-    def _on_back_to_list(self) -> None:
-        self._current_playlist_id = None
-        self._detail_stack.setCurrentIndex(0)
-        self._rebuild_playlists_list()
+class LyricLine(QLabel):
+    clicked = Signal(int)
+    hovered = Signal(object)
 
-    def _rebuild_song_rows(self) -> None:
-        self._clear_layout(self._songs_container_layout)
-        self._song_rows.clear()
-        pl = self._store.get(self._current_playlist_id) if self._current_playlist_id else None
-        if pl is None:
-            return
-        self._detail_title_lbl.setText(pl.name)
-        self._empty_songs_lbl.setVisible(not pl.songs)
-        for idx, song in enumerate(pl.songs):
-            row = PlaylistSongRow(song, idx, self._artwork_downloader, self._songs_container)
-            row.play_clicked.connect(self._on_row_play)
-            row.download_clicked.connect(self._on_row_download)
-            row.remove_clicked.connect(self._on_row_remove)
-            self._songs_container_layout.insertWidget(self._songs_container_layout.count() - 1, row)
-            self._song_rows.append(row)
+    def __init__(self, text: str, ms: int, parent=None):
+        super().__init__(text, parent)
+        self.ms, self.dist, self.hover = ms, 9, False
+        self.setWordWrap(True)
+        self.setCursor(Qt.PointingHandCursor)
 
-    def _on_row_play(self, song) -> None:
-        pl = self._store.get(self._current_playlist_id) if self._current_playlist_id else None
-        if pl is None:
-            return
-        try:
-            start_index = next((i for i, s in enumerate(pl.songs) if s.key == song.key))
-        except StopIteration:
-            start_index = 0
-        if callable(self._play_requested):
-            self._play_requested(pl.songs, start_index)
+    def enterEvent(self, e):
+        self.hover = True
+        self.hovered.emit(self)
 
-    def _on_row_download(self, song) -> None:
-        if callable(self._download_requested):
-            self._download_requested(song)
+    def leaveEvent(self, e):
+        self.hover = False
+        self.hovered.emit(self)
 
-    def _on_row_remove(self, song) -> None:
-        if self._current_playlist_id is None:
-            return
-        self._store.remove_song(self._current_playlist_id, song.key)
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self.ms)
 
-    def _on_play_all(self) -> None:
-        pl = self._store.get(self._current_playlist_id) if self._current_playlist_id else None
-        if pl is None or not pl.songs:
-            return
-        if callable(self._play_requested):
-            self._play_requested(pl.songs, 0)
 
-    def _on_download_all(self) -> None:
-        pl = self._store.get(self._current_playlist_id) if self._current_playlist_id else None
-        if pl is None or not pl.songs:
-            return
-        if callable(self._download_all_requested):
-            self._download_all_requested(pl.songs)
-        elif callable(self._download_requested):
-            for song in pl.songs:
-                self._download_requested(song)
-
-    def _on_new_playlist(self) -> None:
-        dialog = MessageBoxBase(self.window())
-        dialog.titleLabel = StrongBodyLabel(tr('music.new_playlist'), dialog)
-        dialog.viewLayout.addWidget(dialog.titleLabel)
-        name_input = LineEdit(dialog)
-        name_input.setPlaceholderText(tr('music.playlist_name_placeholder'))
-        dialog.viewLayout.addWidget(name_input)
-        dialog.yesButton.setText(tr('music.create'))
-        dialog.cancelButton.setText(tr('music.cancel'))
-        if dialog.exec():
-            name = name_input.text().strip()
-            if name:
-                self._store.create(name)
-
-    def _on_rename_playlist(self) -> None:
-        pl = self._store.get(self._current_playlist_id) if self._current_playlist_id else None
-        if pl is None:
-            return
-        dialog = MessageBoxBase(self.window())
-        dialog.titleLabel = StrongBodyLabel(tr('music.rename_playlist'), dialog)
-        dialog.viewLayout.addWidget(dialog.titleLabel)
-        name_input = LineEdit(dialog)
-        name_input.setText(pl.name)
-        dialog.viewLayout.addWidget(name_input)
-        dialog.yesButton.setText(tr('music.save'))
-        dialog.cancelButton.setText(tr('music.cancel'))
-        if dialog.exec():
-            new_name = name_input.text().strip()
-            if new_name:
-                self._store.rename(pl.id, new_name)
-                self._detail_title_lbl.setText(new_name)
-
-    def _on_delete_playlist(self) -> None:
-        pl = self._store.get(self._current_playlist_id) if self._current_playlist_id else None
-        if pl is None:
-            return
-        dialog = MessageBoxBase(self.window())
-        dialog.titleLabel = StrongBodyLabel(f'Delete "{pl.name}"?', dialog)
-        dialog.viewLayout.addWidget(dialog.titleLabel)
-        body = CaptionLabel(tr('music.delete_cannot_undo'), dialog)
-        dialog.viewLayout.addWidget(body)
-        dialog.yesButton.setText(tr('music.delete'))
-        dialog.cancelButton.setText(tr('music.cancel'))
-        if dialog.exec():
-            self._store.delete(pl.id)
-            self._on_back_to_list()
-
-class MusicPage(QWidget):
+class LyricView(QScrollArea):
+    seek = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet('background: transparent;')
-        self._player = MusicPreviewPlayer(self)
-        self._artwork_downloader = artwork
-        self._download_manager = None
-        self._download_speed_state: dict[str, tuple[float, int]] = {}
-        self._cards: list[SongCard] = []
-        self._all_songs = []
-        self._song_keys: set[str] = set()
-        self._searching = False
-        self._search_token = None
-        self._search_query = ''
-        self._offset = 0
-        self._page_size = 1
-        self._current_cols = 0
-        self._current_rows = 0
-        self._page_rendered = False
-        self._pending_artwork: set[str] = set()
-        root = QVBoxLayout(self)
-        root.setContentsMargins(24, 12, 24, 16)
-        root.setSpacing(10)
-        search_row = QHBoxLayout()
-        search_row.setSpacing(8)
-        self._search_bar = SearchLineEdit(self)
-        self._search_bar.setPlaceholderText(tr('music.search_placeholder'))
-        self._search_bar.setMinimumWidth(160)
-        self._search_bar.setMaximumWidth(420)
-        self._search_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._search_bar.returnPressed.connect(self._on_search_triggered)
-        self._search_bar.searchSignal.connect(lambda _q: self._on_search_triggered())
-        self._btn_filters = PrimaryPushButton(FluentIcon.FILTER, tr('music.filter'), self)
-        self._btn_filters.setFixedHeight(34)
-        self._btn_filters.setIconSize(QSize(14, 14))
-        self._btn_filters.clicked.connect(self._on_filters_clicked)
-        self._btn_playlists = PrimaryPushButton(FluentIcon.MENU, tr('music.playlists'), self)
-        self._btn_playlists.setFixedHeight(34)
-        self._btn_playlists.setIconSize(QSize(14, 14))
-        self._btn_playlists.setCheckable(True)
-        self._btn_playlists.clicked.connect(self._on_toggle_playlists_view)
-        self._btn_cancel_search = ToolButton(FluentIcon.CLOSE, self)
-        self._btn_cancel_search.setFixedHeight(34)
-        self._btn_cancel_search.setVisible(False)
-        self._btn_cancel_search.clicked.connect(self._on_cancel_search_clicked)
-        search_row.addWidget(self._search_bar)
-        search_row.addWidget(self._btn_cancel_search)
-        search_row.addWidget(self._btn_filters)
-        search_row.addStretch(1)
-        search_row.addWidget(self._btn_playlists)
-        root.addLayout(search_row)
-        self._loading_bar = IndeterminateProgressBar(self, start=False)
-        self._loading_bar.setFixedHeight(3)
-        root.addWidget(self._loading_bar)
-        self._view_stack = QStackedWidget(self)
-        search_view = QWidget(self._view_stack)
-        search_view_layout = QVBoxLayout(search_view)
-        search_view_layout.setContentsMargins(0, 0, 0, 0)
-        search_view_layout.setSpacing(10)
-        self._results_area = QWidget(search_view)
-        self._grid_layout = QGridLayout(self._results_area)
-        self._grid_layout.setContentsMargins(0, 0, 0, 0)
-        self._grid_layout.setSpacing(GRID_SPACING)
-        search_view_layout.addWidget(self._results_area, 1)
-        self._empty_lbl = CaptionLabel(tr('music.search_hint'), search_view)
-        self._empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty_lbl.setStyleSheet(f'color: {palette()['muted']};')
-        search_view_layout.addWidget(self._empty_lbl)
-        qconfig.themeChanged.connect(lambda *_: self._empty_lbl.setStyleSheet(f'color: {palette()['muted']};'))
-        pager_row = QHBoxLayout()
-        pager_row.addStretch(1)
-        self._btn_prev_page = ToolButton(FluentIcon.LEFT_ARROW, search_view)
-        self._btn_prev_page.clicked.connect(self._on_prev_page)
-        self._page_lbl = CaptionLabel('', search_view)
-        self._btn_next_page = ToolButton(FluentIcon.RIGHT_ARROW, search_view)
-        self._btn_next_page.clicked.connect(self._on_next_page)
-        pager_row.addWidget(self._btn_prev_page)
-        pager_row.addWidget(self._page_lbl)
-        pager_row.addWidget(self._btn_next_page)
-        pager_row.addStretch(1)
-        search_view_layout.addLayout(pager_row)
-        self._set_pager_visible(False)
-        self._playlist_store = PlaylistStore(self)
-        self._playlists_panel = PlaylistsPanel(self._playlist_store, self._artwork_downloader, self._view_stack, play_requested=self._on_play_playlist_requested, download_requested=self._on_download_requested, download_all_requested=self._on_download_all_requested, play_song_requested=self._on_play_requested)
-        self._view_stack.addWidget(search_view)
-        self._view_stack.addWidget(self._playlists_panel)
-        root.addWidget(self._view_stack, 1)
-        self._player_bar = MiniPlayerBar(self._player, self)
-        self._player_bar.set_artwork_downloader(self._artwork_downloader)
-        root.addWidget(self._player_bar)
-        self._lyrics_overlay = LyricsOverlay(self._player, self._artwork_downloader, self._player_bar, self)
-        self._player_bar.lyrics_requested.connect(self._lyrics_overlay.show_overlay)
-        self._resize_timer = QTimer(self)
-        self._resize_timer.setSingleShot(True)
-        self._resize_timer.setInterval(80)
-        self._resize_timer.timeout.connect(self._relayout_grid)
-        register_locale_refresh(self, self._apply_locale)
+        self.family = ''
+        self.scale = max(0.7, min(1.5, music_settings.lyrics_font_scale or 1.0))
+        self.align = music_settings.lyrics_align if music_settings.lyrics_align in _ALIGN else 'center'
+        self.setWidgetResizable(True)
+        self.setFrameShape(QScrollArea.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setStyleSheet('QScrollArea,QScrollArea>QWidget>QWidget{background:transparent;}')
+        self._box = QWidget()
+        self._lay = QVBoxLayout(self._box)
+        self._lay.setSpacing(34)
+        self.setWidget(self._box)
+        self._labels: list = []
+        self._times: list = []
+        self._active = -1
+        self._free_until = 0.0
+        self._ani = QPropertyAnimation(self.verticalScrollBar(), b'value', self)
+        self.status = QLabel('', self)
+        self.status.setAlignment(Qt.AlignCenter)
+        self.status.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.status.setStyleSheet('color:rgba(255,255,255,150);font-size:14px;background:transparent;')
 
-    def _apply_locale(self, *_args) -> None:
-        self._search_bar.setPlaceholderText(tr('music.search_placeholder'))
-        self._btn_filters.setText(tr('music.filter'))
-        self._btn_playlists.setText(tr('music.playlists'))
-        if not self._all_songs:
-            self._empty_lbl.setText(tr('music.search_hint'))
-        self._update_pager_label()
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        m = self.height() // 2
+        self._lay.setContentsMargins(40, m, 40, m)
+        self.status.setGeometry(0, 0, self.width(), self.height())
+
+    def wheelEvent(self, e):
+        sb = self.verticalScrollBar()
+        self._free_until = time.monotonic() + 3
+        base = self._ani.endValue() if self._ani.state() == QPropertyAnimation.Running else sb.value()
+        self._animate(max(sb.minimum(), min(sb.maximum(), int(base) - e.angleDelta().y())), 170, QEasingCurve.OutCubic)
+        e.accept()
+
+    def _animate(self, target: int, ms: int, curve) -> None:
+        self._ani.stop()
+        self._ani.setDuration(ms)
+        self._ani.setEasingCurve(curve)
+        self._ani.setStartValue(self.verticalScrollBar().value())
+        self._ani.setEndValue(target)
+        self._ani.start()
+
+    def clear(self, msg: str = '') -> None:
+        for l in self._labels:
+            self._lay.removeWidget(l)
+            l.deleteLater()
+        self._labels, self._times, self._active, self._free_until = [], [], -1, 0.0
+        self.status.setText(msg)
+        self.verticalScrollBar().setValue(0)
+
+    def set_lines(self, lines: list) -> None:
+        self.clear('' if lines else _t('music.no_lyrics_found', 'No lyrics found'))
+        for ms, text in lines:
+            l = LyricLine(text or '♪', ms, self._box)
+            l.setAlignment(_ALIGN[self.align])
+            l.clicked.connect(self._on_click)
+            l.hovered.connect(lambda lab: self._style(lab, lab.dist))
+            self._style(l, 9)
+            self._lay.addWidget(l)
+            self._labels.append(l)
+            self._times.append(ms)
+
+    def _on_click(self, ms: int) -> None:
+        self._free_until = 0.0
+        self.seek.emit(ms)
+        self.set_position(ms)
+
+    def _style(self, l: LyricLine, dist: int) -> None:
+        l.dist = dist
+        size, weight, alpha = _LINE_STYLE[min(dist, 3)]
+        l.setFont(_font(max(8, int(size * self.scale)), QFont.Weight(weight), self.family))
+        pal = l.palette()
+        pal.setColor(QPalette.WindowText, QColor(255, 255, 255, max(alpha, 200) if l.hover else alpha))
+        l.setPalette(pal)
+
+    def restyle(self) -> None:
+        for i, l in enumerate(self._labels):
+            self._style(l, abs(i - self._active) if self._active >= 0 else 9)
+        self._center(self._active, animate=False, force=True)
+
+    def set_align(self, align: str) -> None:
+        self.align = align
+        for l in self._labels:
+            l.setAlignment(_ALIGN[align])
+
+    def set_position(self, ms: int) -> None:
+        if not self._times:
+            return
+        i = bisect_right(self._times, ms) - 1
+        if i == self._active:
+            return
+        prev, self._active = self._active, i
+        touched = {j for k in (prev, i) if k >= 0 for j in range(k - 3, k + 4) if 0 <= j < len(self._labels)}
+        for j in touched:
+            self._style(self._labels[j], abs(j - i) if i >= 0 else 9)
+        self._center(i)
+
+    def _center(self, i: int, animate: bool = True, force: bool = False) -> None:
+        if not 0 <= i < len(self._labels) or (not force and time.monotonic() < self._free_until):
+            return
+        self._box.adjustSize()
+        l = self._labels[i]
+        target = l.y() + l.height() // 2 - self.height() // 2
+        if animate:
+            self._animate(target, 380, QEasingCurve.OutCubic)
+        else:
+            self._ani.stop()
+            self.verticalScrollBar().setValue(target)
+
+
+class FontPopup(CardWidget):
+    chosen = Signal(str, str)
+    reset = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(300, 392)
+        self.setBorderRadius(16)
+        self.setAcceptDrops(True)
+        self._custom: list[tuple[str, str]] = []
+        self._filled = False
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(8)
+        self.search = SearchLineEdit(self)
+        self.search.setPlaceholderText(_t('music.search_fonts_placeholder', 'Search fonts'))
+        self.search.textChanged.connect(self._filter)
+        self.preview = QLabel('AaBbCc 123', self)
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setFixedHeight(38)
+        self.preview.setStyleSheet('color:white;background:rgba(255,255,255,18);border-radius:8px;font-size:15px;')
+        self.list = ListWidget(self)
+        self.list.setFixedHeight(190)
+        self.list.setUniformItemSizes(True)
+        self.list.itemClicked.connect(lambda it: self.chosen.emit(it.data(Qt.UserRole), it.data(Qt.UserRole + 1) or ''))
+        self.list.currentItemChanged.connect(lambda cur, _: cur and self.preview.setFont(QFont(cur.data(Qt.UserRole), 15)))
+        row = QHBoxLayout()
+        btn = PushButton(FluentIcon.FOLDER_ADD, _t('music.load_font_file', 'Load font file'), self)
+        btn.clicked.connect(self._browse)
+        rst = TransparentToolButton(FluentIcon.CANCEL, self)
+        rst.setFixedSize(30, 30)
+        rst.setToolTip(_t('music.reset_font', 'Reset font'))
+        rst.clicked.connect(self.reset)
+        row.addWidget(btn, 1)
+        row.addWidget(rst)
+        hint = CaptionLabel(_t('music.drop_font_hint', 'Drop a .ttf / .otf file here'), self)
+        hint.setWordWrap(True)
+        for w in (self.search, self.preview):
+            lay.addWidget(w)
+        lay.addWidget(self.list, 1)
+        lay.addLayout(row)
+        lay.addWidget(hint)
+
+    def fill(self) -> None:
+        if not self._filled:
+            self._filled = True
+            for fam, path in self._custom:
+                self.list.addItem(self._item(fam, path))
+            for fam in sorted(QFontDatabase.families()):
+                self.list.addItem(self._item(fam))
+
+    @staticmethod
+    def _item(fam: str, path: str = '') -> QListWidgetItem:
+        it = QListWidgetItem(fam)
+        it.setData(Qt.UserRole, fam)
+        it.setData(Qt.UserRole + 1, path)
+        return it
+
+    def select(self, family: str) -> None:
+        self.fill()
+        for i in range(self.list.count()):
+            if self.list.item(i).data(Qt.UserRole) == family:
+                self.list.setCurrentRow(i)
+                self.list.scrollToItem(self.list.item(i))
+                return
+        self.list.setCurrentRow(-1)
+
+    def _filter(self, text: str) -> None:
+        q = text.strip().lower()
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            it.setHidden(bool(q) and q not in it.text().lower())
+
+    def register(self, path: str) -> str | None:
+        fid = QFontDatabase.addApplicationFont(path)
+        fams = QFontDatabase.applicationFontFamilies(fid) if fid != -1 else []
+        if not fams:
+            return None
+        if all(f != fams[0] for f, _ in self._custom):
+            self._custom.insert(0, (fams[0], path))
+            if self._filled:
+                self.list.insertItem(0, self._item(fams[0], path))
+        return fams[0]
+
+    def load(self, path: str) -> bool:
+        fam = self.register(path)
+        if fam:
+            self.chosen.emit(fam, path)
+        return bool(fam)
+
+    def _browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, _t('music.load_font_file', 'Load font file'), '',
+                                              'Fonts (*.ttf *.otf *.ttc)')
+        if path and not self.load(path):
+            InfoBar.warning(_t('music.font_load_failed_title', 'Font failed to load'),
+                            _t('music.font_load_failed_content', 'The file is not a valid font.'),
+                            position=InfoBarPosition.TOP_RIGHT, parent=self.window())
+
+    def dragEnterEvent(self, e):
+        if any(u.toLocalFile().lower().endswith(_FONT_EXT) for u in e.mimeData().urls()):
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        for u in e.mimeData().urls():
+            if u.toLocalFile().lower().endswith(_FONT_EXT):
+                self.load(u.toLocalFile())
+                break
+        e.acceptProposedAction()
+
+
+class PlayingView(QWidget):
+    back = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._base, self._blur = QColor('#2b2233'), QPixmap()
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 14, 24, 8)
+
+        top = QHBoxLayout()
+        top.setSpacing(4)
+        self.b_back = IconButton('ChevronUp', 36, 18, rotate=180)
+        self.b_back.clicked.connect(self.back)
+        self.b_queue = IconButton('m_queue', 36, 20)
+        self.b_queue.setCheckable(True)
+        self.b_queue.toggled.connect(lambda on: self.stack.setCurrentIndex(1 if on else 0))
+        fi = lambda *names: next((getattr(FluentIcon, n) for n in names if hasattr(FluentIcon, n)), FluentIcon.EDIT)
+        self.b_align, self.b_size, self.b_font = (
+            TransparentToolButton(fi(*n).icon(Theme.DARK), self) for n in (('ALIGNMENT',), ('FONT_SIZE',), ('FONT',)))
+        for b, tip in ((self.b_align, 'music.text_alignment'), (self.b_size, 'music.font_size'),
+                       (self.b_font, 'music.font_family')):
+            b.setFixedSize(36, 36)
+            b.setIconSize(QSize(18, 18))
+            b.setToolTip(_t(tip, tip.split('.')[1].replace('_', ' ').title()))
+        top.addWidget(self.b_back)
+        top.addStretch(1)
+        for b in (self.b_align, self.b_size, self.b_font, self.b_queue):
+            top.addWidget(b)
+        root.addLayout(top)
+
+        self.cover = Cover(64, 0, self)
+        self.cover.hide()
+        self.cover.loaded.connect(self._rebuild_bg)
+        self.stack = QStackedWidget()
+        self.lyrics = LyricView()
+        self.queue = SongList()
+        self.queue.setStyleSheet('QListWidget{background:rgba(0,0,0,70);border:none;border-radius:10px;}')
+        self.stack.addWidget(self.lyrics)
+        self.stack.addWidget(self.queue)
+        body = QHBoxLayout()
+        body.addStretch(1)
+        body.addWidget(self.stack, 5)
+        body.addStretch(1)
+        root.addLayout(body, 1)
+
+
+        self._size_pop = QWidget(self)
+        self._size_pop.setFixedSize(132, 34)
+        self._size_pop.setStyleSheet('background:rgba(20,14,24,190);border:1px solid rgba(255,255,255,40);border-radius:17px;')
+        sl = QHBoxLayout(self._size_pop)
+        sl.setContentsMargins(12, 0, 12, 0)
+        self._size_slider = Slider(Qt.Horizontal, self._size_pop)
+        self._size_slider.setRange(70, 150)
+        self._size_slider.setValue(int(self.lyrics.scale * 100))
+        self._size_slider.setFixedWidth(108)
+        self._size_slider.valueChanged.connect(self._on_scale)
+        sl.addWidget(self._size_slider)
+        self._font_pop = FontPopup(self)
+        self._font_pop.chosen.connect(self._on_font)
+        self._font_pop.reset.connect(lambda: self._on_font('', ''))
+        self._size_pop.hide()
+        self._font_pop.hide()
+        self.b_align.clicked.connect(self._cycle_align)
+        self.b_size.clicked.connect(lambda: self._toggle(self._size_pop, self.b_size))
+        self.b_font.clicked.connect(lambda: self._toggle(self._font_pop, self.b_font))
+        self._restore_font()
+
+    def show_tab(self, i: int) -> None:
+        self.b_queue.setChecked(i == 1)
+
+    def _toggle(self, pop: QWidget, anchor: QWidget) -> None:
+        other = self._font_pop if pop is self._size_pop else self._size_pop
+        other.hide()
+        if pop.isVisible():
+            pop.hide()
+            return
+        if pop is self._font_pop:
+            pop.fill()
+            pop.search.clear()
+            pop.select(self.lyrics.family)
+        pt = anchor.mapTo(self, anchor.rect().bottomRight())
+        pop.move(pt.x() - pop.width(), pt.y() + 6)
+        pop.raise_()
+        pop.show()
+
+    def _cycle_align(self) -> None:
+        order = list(_ALIGN)
+        a = order[(order.index(self.lyrics.align) + 1) % 3]
+        self.lyrics.set_align(a)
+        apply_music_settings(lyrics_align=a)
+
+    def _on_scale(self, v: int) -> None:
+        self.lyrics.scale = v / 100
+        self.lyrics.restyle()
+        apply_music_settings(lyrics_font_scale=self.lyrics.scale)
+
+    def _on_font(self, family: str, path: str) -> None:
+        self.lyrics.family = family
+        self.lyrics.restyle()
+        self._font_pop.select(family) if family else self._font_pop.list.setCurrentRow(-1)
+        apply_music_settings(lyrics_font_family=family, lyrics_custom_font_path=path)
+
+    def _restore_font(self) -> None:
+        path, fam = music_settings.lyrics_custom_font_path, music_settings.lyrics_font_family
+        if path and fam and os.path.isfile(path):
+            fam = self._font_pop.register(path) or ''
+        elif fam and fam not in QFontDatabase.families():
+            fam = ''
+        self.lyrics.family = fam
+
+    def hideEvent(self, e):
+        self._size_pop.hide()
+        self._font_pop.hide()
+        super().hideEvent(e)
+
+    def set_song(self, song) -> None:
+        self.cover.set_song(song)
+        if song is None:
+            self._blur = QPixmap()
+            self.update()
+
+    def set_colors(self, colors: list) -> None:
+        self._base = _tone(_vivid(colors)).darker(130)
+        self.update()
+
+    def _rebuild_bg(self) -> None:
+        self._blur = self.cover.pm.scaled(28, 28, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        p.fillRect(self.rect(), self._base)
+        if not self._blur.isNull():
+            p.setOpacity(0.55)
+            p.drawPixmap(self.rect(), self._blur)
+            p.setOpacity(1)
+        g = QLinearGradient(0, 0, 0, self.height())
+        g.setColorAt(0, QColor(0, 0, 0, 60))
+        g.setColorAt(1, QColor(0, 0, 0, 120))
+        p.fillRect(self.rect(), g)
+
+
+class SlideStack(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.base = self.over = None
+        self._p, self.is_open = 0.0, False
+        self._ani = QVariantAnimation(self, valueChanged=self._set)
+
+    def set_base(self, w: QWidget) -> None:
+        self.base = w
+        w.setParent(self)
+        w.setGeometry(self.rect())
+        w.show()
+
+    def set_over(self, w: QWidget) -> None:
+        self.over = w
+        w.setParent(self)
+        w.hide()
+
+    def set_open(self, on: bool, animate: bool = True) -> None:
+        self.is_open = on
+        self._ani.stop()
+        if on:
+            self.over.show()
+            self.over.raise_()
+        end = 1.0 if on else 0.0
+        if not animate or not self.isVisible():
+            self._set(end)
+            return
+        self._ani.setDuration(260 if on else 200)
+        self._ani.setEasingCurve(QEasingCurve.OutQuart)
+        self._ani.setStartValue(self._p)
+        self._ani.setEndValue(end)
+        self._ani.start()
+
+    def _set(self, p) -> None:
+        self._p = float(p)
+        if self.over is None:
+            return
+        self.over.setGeometry(0, int((1 - self._p) * self.height()), self.width(), self.height())
+        if self._p <= 0 and not self.is_open:
+            self.over.hide()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self.base is not None:
+            self.base.setGeometry(self.rect())
+        self._set(self._p)
+
+
+class MusicPage(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._player = MusicPreviewPlayer(self)
+        self._store = PlaylistStore(self)
+        self._dl_manager = None
+        self._dl_speed: dict = {}
+        self._songs: list = []
+        self._keys: set = set()
+        self._queue: list = []
+        self._token = None
+        self._cur_pl = None
+        self._cur_key = None
+        self._lrc: dict = {}
+        self._lrc_pending: set = set()
+        self._lrc_shown = None
+        self._cancel_ev = threading.Event()
+        self._sid = 0
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        self._main = SlideStack(self)
+        root.addWidget(self._main, 1)
+        self.bar = PlayBar(self._player, self)
+        root.addWidget(self.bar)
+
+        lib = QWidget()
+        ll = QVBoxLayout(lib)
+        ll.setContentsMargins(24, 12, 24, 0)
+        ll.setSpacing(8)
+        top = QHBoxLayout()
+        self._pivot = Pivot(lib)
+        self._pivot.addItem('songs', _t('music.songs', 'Songs'), lambda: self._tabs.setCurrentIndex(0))
+        self._pivot.addItem('playlists', tr('music.playlists'), lambda: self._tabs.setCurrentIndex(1))
+        self._pivot.setCurrentItem('songs')
+        self._search = SearchLineEdit(lib)
+        self._search.setPlaceholderText(tr('music.search_placeholder'))
+        self._search.setFixedWidth(340)
+        self._search.returnPressed.connect(self._on_search)
+        self._search.searchSignal.connect(lambda _q: self._on_search())
+        self._b_filter = TransparentToolButton(FluentIcon.FILTER, lib)
+        self._b_filter.setToolTip(tr('music.filter'))
+        self._b_filter.clicked.connect(self._on_filters)
+        self._b_view = TransparentToolButton(getattr(FluentIcon, 'APPLICATION', FluentIcon.MENU), lib)
+        self._b_view.setToolTip(_t('music.grid_view', 'Grid view'))
+        self._b_view.clicked.connect(self._toggle_view)
+        self._b_cancel = TransparentToolButton(FluentIcon.CLOSE, lib)
+        self._b_cancel.hide()
+        self._b_cancel.clicked.connect(self._on_cancel)
+        top.addWidget(self._pivot)
+        top.addStretch(1)
+        for w in (self._b_cancel, self._search, self._b_filter, self._b_view):
+            top.addWidget(w)
+        ll.addLayout(top)
+        self._loading = IndeterminateProgressBar(lib, start=False)
+        self._loading.setFixedHeight(3)
+        ll.addWidget(self._loading)
+        self._tabs = QStackedWidget(lib)
+        ll.addWidget(self._tabs, 1)
+
+        st = QWidget()
+        sl = QVBoxLayout(st)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(0)
+        self._res_stack = QStackedWidget(st)
+        lw = QWidget()
+        lv = QVBoxLayout(lw)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(0)
+        lv.addWidget(ListHeader(lw))
+        self.results = SongList(parent=lw)
+        lv.addWidget(self.results, 1)
+        self.grid_songs = SongGrid()
+        self._res_stack.addWidget(lw)
+        self._res_stack.addWidget(self.grid_songs)
+        self._grid_mode = False
+        sl.addWidget(self._res_stack, 1)
+        self._empty = CaptionLabel(tr('music.search_hint'), st)
+        self._empty.setAlignment(Qt.AlignCenter)
+        sl.addWidget(self._empty)
+        self._tabs.addWidget(st)
+
+        pt = QStackedWidget()
+        self.grid = PlaylistGrid()
+        pt.addWidget(self.grid)
+        detail = QWidget()
+        dl = QVBoxLayout(detail)
+        dl.setContentsMargins(0, 0, 0, 0)
+        head = QHBoxLayout()
+        head.setSpacing(18)
+        b_back = TransparentToolButton(FluentIcon.RETURN, detail)
+        b_back.clicked.connect(self._close_playlist)
+        self._pl_cover = Cover(120, 8, detail)
+        info = QVBoxLayout()
+        self._pl_name = SubtitleLabel('', detail)
+        self._pl_count = CaptionLabel('', detail)
+        brow = QHBoxLayout()
+        b_play = PrimaryPushButton(FluentIcon.PLAY, _t('music.play_all', 'Play all'), detail)
+        b_dlall = PushButton(FluentIcon.DOWNLOAD, _t('music.download_all', 'Download all'), detail)
+        b_ren = TransparentToolButton(FluentIcon.EDIT, detail)
+        b_del = TransparentToolButton(FluentIcon.DELETE, detail)
+        for w in (b_play, b_dlall, b_ren, b_del):
+            brow.addWidget(w)
+        brow.addStretch(1)
+        info.addStretch(1)
+        info.addWidget(self._pl_name)
+        info.addWidget(self._pl_count)
+        info.addSpacing(6)
+        info.addLayout(brow)
+        info.addStretch(1)
+        head.addWidget(b_back, 0, Qt.AlignTop)
+        head.addWidget(self._pl_cover)
+        head.addLayout(info, 1)
+        dl.addLayout(head)
+        dl.addSpacing(8)
+        dl.addWidget(ListHeader(detail))
+        self.pl_songs = SongList(removable=True, parent=detail)
+        dl.addWidget(self.pl_songs, 1)
+        pt.addWidget(detail)
+        self._pl_stack = pt
+        self._tabs.addWidget(pt)
+        self._main.set_base(lib)
+        self.view = PlayingView()
+        self._main.set_over(self.view)
+
+        for name, lst in (('results', self.results), ('results', self.grid_songs), ('pl', self.pl_songs),
+                          ('queue', self.view.queue)):
+            lst.play.connect(partial(self._on_play_song, name))
+            lst.download.connect(self._on_download)
+            lst.add.connect(self._on_add_to_playlist)
+        self.pl_songs.remove.connect(lambda s: self._store.remove_song(self._cur_pl, s.key))
+        self.grid.open.connect(self._open_playlist)
+        self.grid.play.connect(self._play_playlist)
+        self.grid.rename.connect(self._rename_playlist)
+        self.grid.delete.connect(self._delete_playlist)
+        b_play.clicked.connect(lambda: self._play_playlist(self._cur_pl))
+        b_dlall.clicked.connect(lambda: self._download_all(self._pl_songs_now()))
+        b_ren.clicked.connect(lambda: self._rename_playlist(self._cur_pl))
+        b_del.clicked.connect(lambda: self._delete_playlist(self._cur_pl))
+        self._store.playlists_changed.connect(self._refresh_playlists)
+        self.bar.open_playing.connect(self._open_playing)
+        self.bar.add_requested.connect(self._add_current)
+        self.bar.hide()
+        self._player.state_changed.connect(lambda _s: QTimer.singleShot(0, self._check_idle))
+        self.view.back.connect(lambda: self._main.set_open(False))
+        self.view.lyrics.seek.connect(self._player.seek)
+        self._player.song_changed.connect(self._on_song_changed)
+        self._player.position_changed.connect(self._on_position)
+        self._player.error.connect(lambda m: self._toast('error', tr('music.playback_error_title'), m[:120], 4000))
+        register_locale_refresh(self, self._apply_locale)
+        self._refresh_playlists()
+
+    def _add_current(self) -> None:
+        song = self._player.current_song
+        if song is not None:
+            self._on_add_to_playlist(song)
+
+    def _check_idle(self) -> None:
+        if self._player.current_song is None and not self._player.is_playing:
+            self.bar.hide()
+            self._main.set_open(False, animate=False)
+            self._on_song_changed(None)
+
+    def _open_playing(self, tab: int = 0) -> None:
+        self.view.show_tab(tab)
+        self._main.set_open(True)
+        self._want_lyrics()
+
+
+    def _apply_locale(self, *_):
+        self._search.setPlaceholderText(tr('music.search_placeholder'))
+        self._pivot.setItemText('playlists', tr('music.playlists'))
+        if not self._songs:
+            self._empty.setText(tr('music.search_hint'))
+
+    def _toast(self, kind: str, title: str, content: str = '', ms: int = 3000) -> None:
+        getattr(InfoBar, kind)(title=title, content=content, orient=Qt.Horizontal, isClosable=True,
+                               position=InfoBarPosition.TOP_RIGHT, duration=ms, parent=self.window())
 
     def set_download_manager(self, manager) -> None:
-        self._download_manager = manager
+        self._dl_manager = manager
 
     def shutdown(self) -> None:
-        self._resize_timer.stop()
-        if self._search_token is not None:
-            cancel(self._search_token)
-            self._search_token = None
-        try:
-            self._lyrics_overlay.hide_overlay()
-        except RuntimeError:
-            pass
-        self._unload_current_page()
+        self._cancel_ev.set()
+        close_http_client()
+        if self._token is not None:
+            cancel(self._token)
+            self._token = None
         try:
             self._player.stop()
         except RuntimeError:
             pass
-        try:
-            self._artwork_downloader.shutdown()
-        except RuntimeError:
-            pass
-        gc.collect()
+        images.release(self)
 
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._lyrics_overlay.sync_geometry()
-        self._resize_timer.start()
 
-    def _apply_grid_stretch(self, cols: int, rows: int) -> None:
-        if getattr(self, '_stretched_cols', 0) == cols and getattr(self, '_stretched_rows', 0) == rows:
+    def _on_search(self) -> None:
+        q = self._search.text().strip()
+        if not q:
             return
-        prev_cols = getattr(self, '_stretched_cols', 0)
-        prev_rows = getattr(self, '_stretched_rows', 0)
-        for c in range(cols, prev_cols):
-            self._grid_layout.setColumnStretch(c, 0)
-        for c in range(cols):
-            self._grid_layout.setColumnStretch(c, 1)
-        for r in range(rows, prev_rows):
-            self._grid_layout.setRowStretch(r, 0)
-        for r in range(rows):
-            self._grid_layout.setRowStretch(r, 1)
-        self._stretched_cols = cols
-        self._stretched_rows = rows
+        if self._token is not None:
+            cancel(self._token)
+        self._cancel_ev.set()
+        self._cancel_ev = ev = threading.Event()
+        self._sid = sid = self._sid + 1
+        self._songs, self._keys = [], set()
+        self.results.clear()
+        self.grid_songs.clear()
+        self._pivot.setCurrentItem('songs')
+        self._tabs.setCurrentIndex(0)
+        self._loading.start()
+        self._b_cancel.show()
+        self._empty.hide()
+        self._token = submit(music_service.search_streaming, args=(q,),
+                             kwargs={'on_source_done': wrap_callback(partial(self._on_batch, sid)),
+                                     'sources': music_settings.preferred_sources, 'use_cache': True,
+                                     'is_cancelled': ev.is_set},
+                             on_done=partial(self._on_done, sid), on_error=partial(self._on_error, sid))
 
-    def _grid_capacity(self) -> tuple[int, int]:
-        area = self._results_area.size()
-        cols = max(1, (area.width() + GRID_SPACING) // (CARD_WIDTH + GRID_SPACING))
-        rows = max(1, (area.height() + GRID_SPACING) // (CARD_HEIGHT + GRID_SPACING))
-        return (int(cols), int(rows))
-
-    def _relayout_grid(self) -> None:
-        cols, rows = self._grid_capacity()
-        new_page_size = max(1, cols * rows)
-        if cols == self._current_cols and rows == self._current_rows:
+    def _on_batch(self, sid: int, songs) -> None:
+        if sid != self._sid:
             return
-        self._current_cols = cols
-        self._current_rows = rows
-        if new_page_size != self._page_size:
-            self._page_size = new_page_size
-            self._offset = self._offset // self._page_size * self._page_size
-            self._render_current_page()
+        new = [s for s in songs if s.key not in self._keys]
+        self._keys.update(s.key for s in new)
+        for s in new:
+            try:
+                if isinstance(s.raw, dict) and s.raw:
+                    s.raw = {k: v for k, v in s.raw.items() if k in _RAW_KEEP}
+            except Exception:
+                pass
+        self._songs.extend(new)
+        (self.grid_songs if self._grid_mode else self.results).add_songs(new)
+
+    def _toggle_view(self) -> None:
+        self._grid_mode = not self._grid_mode
+        view = self.grid_songs if self._grid_mode else self.results
+        if view.count() != len(self._songs):
+            view.set_songs(self._songs)
+        view.set_playing(self._cur_key)
+        self._res_stack.setCurrentIndex(1 if self._grid_mode else 0)
+        self._b_view.setIcon(FluentIcon.MENU if self._grid_mode else getattr(FluentIcon, 'APPLICATION', FluentIcon.MENU))
+        self._b_view.setToolTip(_t('music.list_view', 'List view') if self._grid_mode else _t('music.grid_view', 'Grid view'))
+
+    def _end_search(self) -> None:
+        self._token = None
+        self._loading.stop()
+        self._b_cancel.hide()
+
+    def _on_done(self, sid: int, _songs) -> None:
+        if sid != self._sid:
+            return
+        self._end_search()
+        if not self._songs:
+            self._empty.setText(tr('music.no_results_try_different'))
+            self._empty.show()
+
+    def _on_error(self, sid: int, error: str) -> None:
+        if sid != self._sid:
+            return
+        self._end_search()
+        self._toast('error', tr('music.search_failed_title'), str(error)[:120], 4000)
+
+    def _on_cancel(self) -> None:
+        self._cancel_ev.set()
+        if self._token is not None:
+            cancel(self._token)
+        self._end_search()
+
+    def _on_filters(self) -> None:
+        dlg = FilterDialog(music_service.available_sources(), music_settings.preferred_sources,
+                           music_settings.quality_filters, self.window())
+        if not dlg.exec():
+            return
+        src, qual = dlg.selected_sources(), dlg.selected_quality()
+        if not src or not qual:
+            self._toast('warning', tr('music.filters_not_applied_title'), tr('music.filters_not_applied_content'))
+            return
+        apply_music_settings(preferred_sources=src, quality_filters=qual)
+        if self._search.text().strip():
+            self._on_search()
+
+
+    def _play(self, song, queue: list) -> None:
+        if not _playable(song):
+            self._toast('warning', tr('music.no_preview_title'), tr('music.no_preview_content'))
+            return
+        q = [s for s in queue if _playable(s)]
+        self._queue = q
+        self.view.queue.set_songs(q)
+        self._player.play_song(song, song.download_url, queue=q, urls={s.key: s.download_url for s in q})
+
+    def _on_play_song(self, src: str, song) -> None:
+        self._play(song, {'results': self._songs, 'pl': self.pl_songs.songs(), 'queue': self._queue}[src])
+
+    def _on_song_changed(self, song) -> None:
+        key = song.key if song else None
+        self._cur_key = key
+        for lst in (self.results, self.grid_songs, self.pl_songs, self.view.queue):
+            lst.set_playing(key)
+        self.bar.set_song(song)
+        self.bar.setVisible(song is not None)
+        self.view.set_song(song)
+        self._lrc_shown = None
+        self.view.lyrics.clear()
+        if song is None:
+            return
+        if song.cover_url:
+            images.dominant(song.cover_url, partial(self._on_colors, key), count=5, owner=self)
+        self._want_lyrics()
+
+    def _want_lyrics(self) -> None:
+        song = self._player.current_song
+        if song is None or not self._main.is_open or self._lrc_shown == song.key:
+            return
+        if song.key in self._lrc:
+            self._apply_lrc(song.key, self._lrc[song.key])
+        elif song.key not in self._lrc_pending:
+            self._lrc_pending.add(song.key)
+            self.view.lyrics.clear(_t('music.searching_lyrics', 'Searching lyrics…'))
+            task = _LrcTask(song)
+            task.signals.finished.connect(self._on_lrc)
+            QThreadPool.globalInstance().start(task)
+
+    def _on_colors(self, key, colors) -> None:
+        if key == self._cur_key and colors:
+            self.bar.set_color(_vivid(colors))
+            self.view.set_colors(colors)
+
+    def _on_lrc(self, key: str, text: str) -> None:
+        self._lrc_pending.discard(key)
+        cur = self._player.current_song
+        if not _parse_lrc(text) and cur is not None and cur.key == key:
+            fb = getattr(cur, 'lyric', None)
+            if fb and _parse_lrc(fb):
+                text = fb
+        self._lrc[key] = text
+        if len(self._lrc) > 50:
+            self._lrc.pop(next(iter(self._lrc)))
+        self._want_lyrics()
+
+    def _apply_lrc(self, key: str, text: str) -> None:
+        self._lrc_shown = key
+        self.view.lyrics.set_lines(_parse_lrc(text))
+        self.view.lyrics.set_position(self._player.position)
+
+    def _on_position(self, ms: int) -> None:
+        if self._main.is_open and self.view.stack.currentIndex() == 0:
+            self.view.lyrics.set_position(ms)
+
+
+    def _refresh_playlists(self) -> None:
+        self.grid.set_playlists(self._store.all_playlists())
+        if self._cur_pl:
+            pl = self._store.get(self._cur_pl)
+            if pl is None:
+                self._close_playlist()
+            else:
+                self._fill_detail(pl)
+
+    def _fill_detail(self, pl) -> None:
+        self._pl_name.setText(pl.name)
+        self._pl_count.setText(_t('music.n_songs', '{n} songs').format(n=len(pl.songs)))
+        self._pl_cover.set_url(next((s.cover_url for s in pl.songs if s.cover_url), None))
+        self.pl_songs.set_songs(pl.songs)
+        self.pl_songs.set_playing(self._cur_key)
+
+    def _pl_songs_now(self) -> list:
+        pl = self._store.get(self._cur_pl) if self._cur_pl else None
+        return pl.songs if pl else []
+
+    def _open_playlist(self, pid: str) -> None:
+        pl = self._store.get(pid)
+        if pl is not None:
+            self._cur_pl = pid
+            self._fill_detail(pl)
+            self._pl_stack.setCurrentIndex(1)
+
+    def _close_playlist(self) -> None:
+        self._cur_pl = None
+        self._pl_stack.setCurrentIndex(0)
+
+    def _play_playlist(self, pid) -> None:
+        pl = self._store.get(pid) if pid else None
+        if pl is None or not pl.songs:
+            return
+        first = next((s for s in pl.songs if _playable(s)), None)
+        if first is None:
+            self._toast('warning', tr('music.no_preview_title'), tr('music.no_preview_in_playlist_content'))
         else:
-            for card in self._cards:
-                self._grid_layout.removeWidget(card)
-            for idx, card in enumerate(self._cards):
-                row, col = divmod(idx, cols)
-                self._grid_layout.addWidget(card, row, col, Qt.AlignmentFlag.AlignCenter)
-            self._apply_grid_stretch(cols, rows)
+            self._play(first, pl.songs)
 
-    def _on_search_triggered(self) -> None:
-        query = self._search_bar.text().strip()
-        if not query:
+    def _rename_playlist(self, pid) -> None:
+        pl = self._store.get(pid) if pid else None
+        if pl is None:
             return
-        if self._search_token is not None:
-            cancel(self._search_token)
-            self._search_token = None
-        self._reset_results()
-        self._search_query = query
-        self._searching = True
-        self._loading_bar.start()
-        self._btn_cancel_search.setVisible(True)
-        self._search_token = submit(music_service.search_streaming, args=(query,), kwargs={'on_source_done': wrap_callback(self._on_search_batch), 'sources': music_settings.preferred_sources, 'use_cache': True}, on_done=self._on_search_done, on_error=self._on_search_error)
+        dlg = NameDialog(_t('music.rename_playlist', 'Rename playlist'), pl.name, self.window())
+        if dlg.exec() and dlg.text():
+            self._store.rename(pid, dlg.text())
 
-    def _on_cancel_search_clicked(self) -> None:
-        if self._search_token is not None:
-            cancel(self._search_token)
-            self._search_token = None
-        self._searching = False
-        self._loading_bar.stop()
-        self._btn_cancel_search.setVisible(False)
-        self._update_pager_label()
+    def _delete_playlist(self, pid) -> None:
+        pl = self._store.get(pid) if pid else None
+        if pl is not None and MessageBox(_t('music.delete_playlist', 'Delete playlist'),
+                                         _t('music.delete_playlist_confirm', 'Delete "{name}"?').format(name=pl.name),
+                                         self.window()).exec():
+            self._store.delete(pid)
 
-    def _on_search_batch(self, songs) -> None:
-        new_songs = [s for s in songs if s.key not in self._song_keys]
-        if not new_songs:
-            return
-        for s in new_songs:
-            self._song_keys.add(s.key)
-        self._all_songs.extend(new_songs)
-        self._empty_lbl.setVisible(False)
-        self._set_pager_visible(True)
-        page_songs = self._current_page_songs()
-        if len(self._cards) < len(page_songs):
-            self._render_current_page()
+    def _on_add_to_playlist(self, song) -> None:
+        if not self._store.all_playlists():
+            dlg = NameDialog(tr('music.new_playlist'), '', self.window())
+            if not (dlg.exec() and dlg.text()):
+                return
+            pid = self._store.create(dlg.text()).id
         else:
-            self._update_pager_label()
-
-    def _on_search_done(self, songs) -> None:
-        self._search_token = None
-        self._searching = False
-        self._loading_bar.stop()
-        self._btn_cancel_search.setVisible(False)
-        if not self._all_songs:
-            self._empty_lbl.setText(tr('music.no_results_try_different'))
-            self._empty_lbl.setVisible(True)
-            self._set_pager_visible(False)
+            dlg = SaveToPlaylistDialog(self._store, self.window())
+            if not dlg.exec():
+                return
+            pid = dlg.selected_playlist_id()
+            if not pid:
+                self._toast('warning', tr('music.no_playlist_selected_title'), tr('music.no_playlist_selected_content'))
+                return
+        name = self._store.get(pid).name
+        if self._store.add_song(pid, song):
+            self._toast('success', tr('music.saved_title'), tr('music.added_to_playlist', name=name), 2500)
         else:
-            self._update_pager_label()
+            self._toast('info', tr('music.already_saved_title'), tr('music.already_in_playlist', name=name), 2500)
 
-    def _on_search_error(self, error: str) -> None:
-        self._search_token = None
-        self._searching = False
-        self._loading_bar.stop()
-        self._btn_cancel_search.setVisible(False)
-        InfoBar.error(title=tr('music.search_failed_title'), content=str(error)[:120], orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=4000, parent=self.window())
 
-    def _reset_results(self) -> None:
-        self._unload_current_page()
-        QApplication.sendPostedEvents(None, 0)
-        QApplication.processEvents()
-        self._all_songs = []
-        self._song_keys.clear()
-        self._pending_artwork.clear()
-        self._offset = 0
-        self._page_rendered = False
-        self._update_pager_label()
-
-    def _unload_current_page(self) -> None:
-        for card in self._cards:
-            self._grid_layout.removeWidget(card)
-            card.detach()
-            card.play_requested = None
-            card.download_requested = None
-            card.artwork_settled = None
-            card.save_playlist_requested = None
-            card.setParent(None)
-            card.deleteLater()
-        self._cards.clear()
-        self._trim_offscreen_song_payloads()
-
-    def _trim_offscreen_song_payloads(self) -> None:
-        keep_keys = set(self._player.queue_keys)
-        page_start = self._offset
-        page_end = self._offset + self._page_size
-        for idx, song in enumerate(self._all_songs):
-            if page_start <= idx < page_end:
-                continue
-            if song.key in keep_keys:
-                continue
-            if song.raw:
-                song.raw = {}
-
-    def _current_page_songs(self):
-        return self._all_songs[self._offset:self._offset + self._page_size]
-
-    def _render_current_page(self) -> None:
-        cols, rows = self._grid_capacity()
-        self._current_cols = cols
-        self._current_rows = rows
-        self._page_size = max(1, cols * rows)
-        self._unload_current_page()
-        page_songs = self._current_page_songs()
-        self._pending_artwork.clear()
-        if not page_songs:
-            self._page_rendered = False
-            self._update_pager_label()
+    def _on_download(self, song) -> None:
+        if not _playable(song):
+            self._toast('warning', tr('music.no_download_title'), tr('music.no_download_content'))
             return
-        self._page_rendered = False
-        self._update_pager_label()
-        for song in page_songs:
-            if song.cover_url:
-                self._pending_artwork.add(song.key)
-            card = SongCard(song, self._artwork_downloader, self._results_area, play_requested=self._on_play_requested, download_requested=self._on_download_requested, artwork_settled=self._on_card_artwork_settled, save_playlist_requested=self._on_save_playlist_requested)
-            self._cards.append(card)
-        for idx, card in enumerate(self._cards):
-            row, col = divmod(idx, cols)
-            self._grid_layout.addWidget(card, row, col, Qt.AlignmentFlag.AlignCenter)
-        self._apply_grid_stretch(cols, rows)
-        if not self._pending_artwork:
-            self._page_rendered = True
-        self._update_pager_label()
-
-    def _on_card_artwork_settled(self, song_key: str) -> None:
-        self._pending_artwork.discard(song_key)
-        if not self._pending_artwork and (not self._page_rendered):
-            self._page_rendered = True
-            self._update_pager_label()
-
-    def _on_play_requested(self, song) -> None:
-        url = song.download_url if isinstance(song.download_url, str) else None
-        if not url:
-            InfoBar.warning(title=tr('music.no_preview_title'), content=tr('music.no_preview_content'), orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=3000, parent=self.window())
-            return
-        page_songs = self._current_page_songs()
-        urls = {s.key: s.download_url if isinstance(s.download_url, str) else '' for s in page_songs}
-        urls = {k: v for k, v in urls.items() if v}
-        self._player.play_song(song, url, queue=page_songs, urls=urls)
-
-    def _on_download_requested(self, song) -> None:
-        url = song.download_url if isinstance(song.download_url, str) else ''
-        if not url:
-            InfoBar.warning(title=tr('music.no_download_title'), content=tr('music.no_download_content'), orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=3000, parent=self.window())
-            return
-        dest_dir = getattr(app_settings, 'download_dir_music', None) or os.path.join(app_settings.download_dir, 'music')
-        dl_item_id = None
-        if self._download_manager is not None:
-            dl_item_id = self._download_manager.add_external(game_name=song.song_name or tr('download.unknown'), console=song.singers or '', source='Music', category='music')
-            self._download_speed_state[dl_item_id] = (time.monotonic(), 0)
-        task = _SongDownloadTask(self._candidates_for(song), dest_dir)
-        task.signals.progress.connect(lambda downloaded, total, iid=dl_item_id: self._on_song_download_progress(iid, downloaded, total))
-        task.signals.finished.connect(lambda ok, path, error, iid=dl_item_id: self._on_song_download_finished(iid, ok, path, error))
-        if dl_item_id is not None and self._download_manager is not None:
-            self._download_manager.register_external_cancel(dl_item_id, task.cancel)
+        dest = getattr(app_settings, 'download_dir_music', None) or os.path.join(app_settings.download_dir, 'music')
+        iid = None
+        if self._dl_manager is not None:
+            iid = self._dl_manager.add_external(game_name=song.song_name or tr('download.unknown'),
+                                                console=song.singers or '', source='Music', category='music')
+            self._dl_speed[iid] = (time.monotonic(), 0)
+        key = _match_key(song)
+        alts = [s for s in self._songs if s is not song and _playable(s) and _match_key(s) == key]
+        task = _DownloadTask([song] + alts, dest)
+        task.signals.progress.connect(lambda d, t, i=iid: self._dl_progress(i, d, t))
+        task.signals.finished.connect(lambda ok, path, err, i=iid: self._dl_done(i, ok, path, err))
+        if iid is not None and self._dl_manager is not None:
+            self._dl_manager.register_external_cancel(iid, task.cancel)
         QThreadPool.globalInstance().start(task)
 
-    def _candidates_for(self, song):
-        key = _download_match_key(song)
-        others = [s for s in self._all_songs if s is not song and _download_match_key(s) == key and isinstance(s.download_url, str) and s.download_url]
-        return [song] + others
+    def _download_all(self, songs: list) -> None:
+        ok = [s for s in songs if _playable(s)]
+        if not ok:
+            self._toast('warning', tr('music.no_downloads_title'), tr('music.no_downloads_content'))
+        for s in ok:
+            self._on_download(s)
 
-    def _on_download_all_requested(self, songs: list) -> None:
-        downloadable = [s for s in songs if isinstance(s.download_url, str) and s.download_url]
-        if not downloadable:
-            InfoBar.warning(title=tr('music.no_downloads_title'), content=tr('music.no_downloads_content'), orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=3000, parent=self.window())
+    def _dl_progress(self, iid, done: int, total: int) -> None:
+        if iid is None or self._dl_manager is None:
             return
-        for song in downloadable:
-            self._on_download_requested(song)
+        kw = {'downloaded_bytes': done, 'total_bytes': total}
+        prev, now = self._dl_speed.get(iid), time.monotonic()
+        if prev and now - prev[0] >= 0.2:
+            kw['speed_down_kbps'] = max(0.0, (done - prev[1]) / (now - prev[0]) / 1024)
+            self._dl_speed[iid] = (now, done)
+        self._dl_manager.update_external(iid, **kw)
 
-    def _on_song_download_progress(self, dl_item_id, downloaded: int, total: int) -> None:
-        if dl_item_id is None or self._download_manager is None:
-            return
-        speed_kbps = 0.0
-        now = time.monotonic()
-        prev = self._download_speed_state.get(dl_item_id)
-        if prev is not None:
-            prev_time, prev_downloaded = prev
-            dt = now - prev_time
-            if dt >= 0.2:
-                speed_kbps = max(0.0, (downloaded - prev_downloaded) / dt / 1024)
-                self._download_speed_state[dl_item_id] = (now, downloaded)
-            else:
-                speed_kbps = None
-        if speed_kbps is None:
-            self._download_manager.update_external(dl_item_id, downloaded_bytes=downloaded, total_bytes=total)
-        else:
-            self._download_manager.update_external(dl_item_id, downloaded_bytes=downloaded, total_bytes=total, speed_down_kbps=speed_kbps)
-
-    def _on_song_download_finished(self, dl_item_id, ok: bool, path: str, error: str) -> None:
-        self._download_speed_state.pop(dl_item_id, None)
-        if dl_item_id is None or self._download_manager is None:
-            if not ok and error and (error != 'Cancelled'):
-                InfoBar.error(title=tr('music.download_error_title'), content=error[:120], orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=4000, parent=self.window())
-            return
+    def _dl_done(self, iid, ok: bool, path: str, err: str) -> None:
+        self._dl_speed.pop(iid, None)
+        managed = iid is not None and self._dl_manager is not None
         if ok:
-            self._download_manager.complete_external(dl_item_id, path)
-        elif error == 'Cancelled':
-            pass
-        else:
-            self._download_manager.fail_external(dl_item_id, error or tr('music.download_failed_generic'))
-            InfoBar.error(title=tr('music.download_error_title'), content=(error or tr('music.status_failed'))[:120], orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=4000, parent=self.window())
-
-    def _update_pager_label(self) -> None:
-        total = max(1, (len(self._all_songs) + self._page_size - 1) // self._page_size)
-        current = self._offset // self._page_size + 1
-        self._page_lbl.setText(tr('music.page_of', current=current, total=total))
-        can_navigate = self._page_rendered
-        self._btn_prev_page.setEnabled(can_navigate and self._offset > 0)
-        has_next = self._offset + self._page_size < len(self._all_songs)
-        self._btn_next_page.setEnabled(can_navigate and (has_next or self._searching))
-
-    def _set_pager_visible(self, visible: bool) -> None:
-        self._btn_prev_page.setVisible(visible)
-        self._page_lbl.setVisible(visible)
-        self._btn_next_page.setVisible(visible)
-
-    def _on_prev_page(self) -> None:
-        if self._offset <= 0:
+            if managed:
+                self._dl_manager.complete_external(iid, path)
             return
-        self._offset = max(0, self._offset - self._page_size)
-        self._page_rendered = False
-        self._render_current_page()
-
-    def _on_next_page(self) -> None:
-        next_offset = self._offset + self._page_size
-        if next_offset >= len(self._all_songs) and (not self._searching):
+        if err == 'Cancelled':
             return
-        self._offset = next_offset
-        self._page_rendered = False
-        if len(self._all_songs) > self._offset:
-            self._render_current_page()
-        else:
-            self._unload_current_page()
-            self._update_pager_label()
-
-    def _on_filters_clicked(self) -> None:
-        all_sources = music_service.available_sources()
-        dialog = FilterDialog(all_sources, music_settings.preferred_sources, music_settings.quality_filters, self.window())
-        if not dialog.exec():
-            return
-        selected_sources = dialog.selected_sources()
-        selected_quality = dialog.selected_quality()
-        if not selected_sources or not selected_quality:
-            InfoBar.warning(title=tr('music.filters_not_applied_title'), content=tr('music.filters_not_applied_content'), orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=3000, parent=self.window())
-            return
-        apply_music_settings(preferred_sources=selected_sources, quality_filters=selected_quality)
-        if self._search_bar.text().strip():
-            self._on_search_triggered()
-
-    def _on_toggle_playlists_view(self) -> None:
-        showing_playlists = self._view_stack.currentIndex() == 1
-        if showing_playlists:
-            self._view_stack.setCurrentIndex(0)
-            self._btn_playlists.setChecked(False)
-        else:
-            self._view_stack.setCurrentIndex(1)
-            self._btn_playlists.setChecked(True)
-            self._playlists_panel.refresh()
-
-    def _on_save_playlist_requested(self, song) -> None:
-        dialog = SaveToPlaylistDialog(self._playlist_store, song, self.window())
-        if not dialog.exec():
-            return
-        playlist_id = dialog.selected_playlist_id()
-        if not playlist_id:
-            InfoBar.warning(title=tr('music.no_playlist_selected_title'), content=tr('music.no_playlist_selected_content'), orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=3000, parent=self.window())
-            return
-        added = self._playlist_store.add_song(playlist_id, song)
-        pl = self._playlist_store.get(playlist_id)
-        pl_name = pl.name if pl is not None else 'playlist'
-        if added:
-            InfoBar.success(title=tr('music.saved_title'), content=tr('music.added_to_playlist', name=pl_name), orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=2500, parent=self.window())
-        else:
-            InfoBar.info(title=tr('music.already_saved_title'), content=tr('music.already_in_playlist', name=pl_name), orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=2500, parent=self.window())
-
-    def _on_play_playlist_requested(self, songs: list, start_index: int) -> None:
-        if not songs:
-            return
-        playable = [s for s in songs if isinstance(s.download_url, str) and s.download_url]
-        if not playable:
-            InfoBar.warning(title=tr('music.no_preview_title'), content=tr('music.no_preview_in_playlist_content'), orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=3000, parent=self.window())
-            return
-        start_song = songs[start_index] if 0 <= start_index < len(songs) else songs[0]
-        if not (isinstance(start_song.download_url, str) and start_song.download_url):
-            start_song = playable[0]
-        urls = {s.key: s.download_url for s in playable}
-        self._player.play_song(start_song, start_song.download_url, queue=playable, urls=urls)
+        if managed:
+            self._dl_manager.fail_external(iid, err or tr('music.download_failed_generic'))
+        self._toast('error', tr('music.download_error_title'), (err or tr('music.status_failed'))[:120], 4000)

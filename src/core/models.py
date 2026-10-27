@@ -1,14 +1,8 @@
 from __future__ import annotations
+import hashlib
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, Optional
 
-class DLState(str, Enum):
-    queued = 'queued'
-    downloading = 'downloading'
-    completed = 'completed'
-    failed = 'failed'
-    cancelled = 'cancelled'
 _LOSSLESS_EXTS = {'flac', 'wav', 'alac', 'ape', 'wv', 'tta', 'dsf', 'dff'}
 
 @dataclass(slots=True)
@@ -29,7 +23,7 @@ class MediaItem:
 
     @classmethod
     def from_dict(cls, data: dict) -> 'MediaItem':
-        return cls(provider=data.get('provider', ''), id=str(data.get('id', '')), title=data.get('title', 'Unknown'), artwork_url=data.get('artwork_url'), artwork_path=data.get('artwork_path'), metadata=dict(data.get('metadata') or {}))
+        return cls(**_media_item_kwargs(data))
 
 def _media_item_kwargs(data: dict) -> dict:
     return dict(provider=data.get('provider', ''), id=str(data.get('id', '')), title=data.get('title', 'Unknown'), artwork_url=data.get('artwork_url'), artwork_path=data.get('artwork_path'), metadata=dict(data.get('metadata') or {}))
@@ -84,15 +78,17 @@ class MusicItem(MediaItem):
     duration: Optional[str] = None
     lyric: Optional[str] = None
     raw: dict = field(default_factory=dict)
+    download_headers: dict = field(default_factory=dict)
+    download_cookies: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d = super(MusicItem, self).to_dict()
-        d.update(artist=self.artist, album=self.album, duration_s=self.duration_s, ext=self.ext, bitrate=self.bitrate, codec=self.codec, file_size_bytes=self.file_size_bytes, download_url=self.download_url if isinstance(self.download_url, str) else None, source=self.source, file_size=self.file_size, duration=self.duration, lyric=self.lyric, raw=self.raw if isinstance(self.raw, dict) else {})
+        d.update(artist=self.artist, album=self.album, duration_s=self.duration_s, ext=self.ext, bitrate=self.bitrate, codec=self.codec, file_size_bytes=self.file_size_bytes, download_url=self.download_url if isinstance(self.download_url, str) else None, source=self.source, file_size=self.file_size, duration=self.duration, lyric=self.lyric, raw=self.raw if isinstance(self.raw, dict) else {}, download_headers=self.download_headers if isinstance(self.download_headers, dict) else {}, download_cookies=self.download_cookies if isinstance(self.download_cookies, dict) else {})
         return d
 
     @classmethod
     def from_dict(cls, data: dict) -> 'MusicItem':
-        return cls(**_media_item_kwargs(data), artist=data.get('artist', ''), album=data.get('album', ''), duration_s=data.get('duration_s'), ext=data.get('ext'), bitrate=data.get('bitrate'), codec=data.get('codec'), file_size_bytes=data.get('file_size_bytes'), download_url=data.get('download_url'), source=data.get('source', ''), file_size=data.get('file_size'), duration=data.get('duration'), lyric=data.get('lyric'), raw=data.get('raw') or {})
+        return cls(**_media_item_kwargs(data), artist=data.get('artist', ''), album=data.get('album', ''), duration_s=data.get('duration_s'), ext=data.get('ext'), bitrate=data.get('bitrate'), codec=data.get('codec'), file_size_bytes=data.get('file_size_bytes'), download_url=data.get('download_url'), source=data.get('source', ''), file_size=data.get('file_size'), duration=data.get('duration'), lyric=data.get('lyric'), raw=data.get('raw') or {}, download_headers=data.get('download_headers') or {}, download_cookies=data.get('download_cookies') or {})
 
     @classmethod
     def from_song_info(cls, source: str, song_info: Any) -> 'MusicItem':
@@ -101,8 +97,10 @@ class MusicItem(MediaItem):
             song_name = getattr(song_info, 'song_name', '') or ''
             singers = getattr(song_info, 'singers', '') or ''
             download_url = getattr(song_info, 'download_url', None)
-            identifier = str(hash((song_name, singers, str(download_url or ''))))
-        return cls(provider=source, id=identifier, title=getattr(song_info, 'song_name', '') or '', artist=getattr(song_info, 'singers', '') or '', source=source, album=getattr(song_info, 'album', None) or '', ext=getattr(song_info, 'ext', None), file_size=getattr(song_info, 'file_size', None), file_size_bytes=getattr(song_info, 'file_size_bytes', None), duration=getattr(song_info, 'duration', None), duration_s=getattr(song_info, 'duration_s', None), bitrate=getattr(song_info, 'bitrate', None), codec=getattr(song_info, 'codec', None), artwork_url=getattr(song_info, 'cover_url', None), lyric=getattr(song_info, 'lyric', None), download_url=getattr(song_info, 'download_url', None), raw=getattr(song_info, 'raw_data', {}) or {})
+
+            seed = f'{song_name}\x00{singers}\x00{download_url or ""}'.encode('utf-8', 'ignore')
+            identifier = hashlib.blake2b(seed, digest_size=8).hexdigest()
+        return cls(provider=source, id=identifier, title=getattr(song_info, 'song_name', '') or '', artist=getattr(song_info, 'singers', '') or '', source=source, album=getattr(song_info, 'album', None) or '', ext=getattr(song_info, 'ext', None), file_size=getattr(song_info, 'file_size', None), file_size_bytes=getattr(song_info, 'file_size_bytes', None), duration=getattr(song_info, 'duration', None), duration_s=getattr(song_info, 'duration_s', None), bitrate=getattr(song_info, 'bitrate', None), codec=getattr(song_info, 'codec', None), artwork_url=getattr(song_info, 'cover_url', None), lyric=getattr(song_info, 'lyric', None), download_url=getattr(song_info, 'download_url', None), raw=getattr(song_info, 'raw_data', {}) or {}, download_headers=getattr(song_info, 'default_download_headers', None) or {}, download_cookies=getattr(song_info, 'default_download_cookies', None) or {})
 
     @property
     def is_lossless(self) -> bool:
@@ -202,28 +200,18 @@ class AnimeItem(MediaItem):
     def from_anilist_media(cls, media: dict) -> 'AnimeItem':
         title = media.get('title') or {}
         display_title = title.get('english') or title.get('romaji') or title.get('native') or 'Unknown'
-        return cls(provider='anilist', id=str(media.get('id', '')), title=display_title, artwork_url=media.get('coverImage'), id_mal=media.get('idMal'), title_english=title.get('english') or '', title_romaji=title.get('romaji') or '', title_native=title.get('native') or '', status=media.get('status') or '', format=media.get('format') or '', season_year=media.get('seasonYear'), episodes=media.get('episodes'), genres=list(media.get('genres') or []) if isinstance(media.get('genres'), list) else [], description=media.get('description') or '', synonyms=list(media.get('synonyms') or []) if isinstance(media.get('synonyms'), list) else [])
+        cover = media.get('coverImage')
+        if isinstance(cover, dict):
+            cover_url = cover.get('large') or cover.get('medium') or cover.get('extraLarge')
+        elif isinstance(cover, str):
+            cover_url = cover
+        else:
+            cover_url = None
+        return cls(provider='anilist', id=str(media.get('id', '')), title=display_title, artwork_url=cover_url, id_mal=media.get('idMal'), title_english=title.get('english') or '', title_romaji=title.get('romaji') or '', title_native=title.get('native') or '', status=media.get('status') or '', format=media.get('format') or '', season_year=media.get('seasonYear'), episodes=media.get('episodes'), genres=list(media.get('genres') or []) if isinstance(media.get('genres'), list) else [], description=media.get('description') or '', synonyms=list(media.get('synonyms') or []) if isinstance(media.get('synonyms'), list) else [])
 
     @property
     def display_title(self) -> str:
         return self.title_english or self.title_romaji or self.title_native or self.title
-
-@dataclass(slots=True)
-class EpisodeItem:
-    number: Any
-    title: str = ''
-    description: str = ''
-    duration_s: Optional[int] = None
-    filler: bool = False
-    air_date: Optional[str] = None
-    image_url: Optional[str] = None
-
-    @classmethod
-    def from_meta(cls, number: Any, meta: dict) -> 'EpisodeItem':
-        return cls(number=number, title=meta.get('title') or f'Episode {number}', description=meta.get('description') or '', duration_s=meta.get('duration'), filler=bool(meta.get('filler')), air_date=meta.get('airDate'), image_url=meta.get('image'))
-
-    def to_dict(self) -> dict:
-        return {'number': self.number, 'title': self.title, 'description': self.description, 'duration_s': self.duration_s, 'filler': self.filler, 'air_date': self.air_date, 'image_url': self.image_url}
 
 @dataclass(slots=True)
 class RepackItem(MediaItem):
@@ -245,15 +233,3 @@ class MediaPage:
     entries: list
     page: int
     has_more: bool
-
-@dataclass(slots=True)
-class DownloadRecord:
-    id: str
-    item: MediaItem
-    state: DLState
-    progress: float = 0.0
-    error: Optional[str] = None
-    output_path: Optional[str] = None
-
-    def to_persist_dict(self) -> dict:
-        return {'id': self.id, 'item': self.item.to_dict(), 'state': self.state.value, 'progress': self.progress, 'error': self.error, 'output_path': self.output_path}

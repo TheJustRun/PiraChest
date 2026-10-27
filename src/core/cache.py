@@ -1,217 +1,171 @@
 from __future__ import annotations
 
 import asyncio
-import gzip
-import hashlib
 import json
 import logging
-import math
 import os
-import re
+import shutil
+import sqlite3
+import sys
 import threading
 import time
-from collections import OrderedDict
-from typing import Optional
+import zlib
 
-from src.core.config import paths
+from src.core.config import dir_size_bytes, empty_dir, paths, settings
 
 logger = logging.getLogger(__name__)
-
 DEFAULT_TTL_SECONDS = 6 * 60 * 60
-_EXT = ".json.gz"
-_MEM_LIMIT = 256
-_GZIP_LEVEL = 1
-_JSON_SEPARATORS = (",", ":")
-_SAFE_RE = re.compile(r"[^A-Za-z0-9_-]+")
-_INF_SENTINEL = "__inf__"
+MAX_AGE_SECONDS = 90 * 24 * 60 * 60
+DB_NAME = 'cache.db'
 
 
-def _entry_json_default(o):
-    if isinstance(o, float) and math.isinf(o):
-        return _INF_SENTINEL
-    raise TypeError(f"Object of type {type(o)} is not JSON serializable")
+_COMPRESS_MIN = 2048
+_ZMARK = b'\x01'
 
 
-def _fix_inf(v):
-    return math.inf if v == _INF_SENTINEL else v
+def _encode(value) -> bytes:
+    raw = json.dumps(value, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+    if len(raw) >= _COMPRESS_MIN:
+        packed = zlib.compress(raw, 1)
+        if len(packed) < len(raw):
+            return _ZMARK + packed
+    return raw
 
 
-def _safe(key: str) -> str:
-    return hashlib.blake2b(key.encode("utf-8"), digest_size=16).hexdigest()
+def _loads(body):
+    try:
+        if body[:1] == _ZMARK:
+            body = zlib.decompress(body[1:])
+        return json.loads(body)
+    except (ValueError, zlib.error):
+        logger.warning('Dropping unreadable cache row')
+        return None
 
 
-def _safe_namespace_parts(namespace: str) -> list[str]:
-    parts = namespace.split(":")
-    return [_SAFE_RE.sub("_", part).strip("_") or "_" for part in parts]
+def _file_size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
 
 
 class CacheManager:
-    def __init__(self):
-        self._root = os.path.join(paths.cache_dir, "shared")
-        os.makedirs(self._root, exist_ok=True)
-        self._mem: "OrderedDict[str, tuple[float, object]]" = OrderedDict()
+    def __init__(self, db_path: str | None = None):
+        self._path = db_path or os.path.join(paths.cache_dir, DB_NAME)
+        folder = os.path.dirname(self._path)
+        os.makedirs(folder, exist_ok=True)
         self._lock = threading.Lock()
-        self._entry_index: dict[str, set[str]] = {}
+        self._closed = False
+        self._con = self._open()
+        legacy = os.path.join(folder, 'shared')
 
-    def _namespace_dir(self, namespace: str) -> str:
-        d = os.path.join(self._root, *_safe_namespace_parts(namespace))
-        os.makedirs(d, exist_ok=True)
-        return d
+        threading.Thread(target=self._housekeeping, args=(legacy,), daemon=True, name='cache-housekeeping').start()
 
-    def _path(self, namespace: str, key: str) -> str:
-        return os.path.join(self._namespace_dir(namespace), f"{_safe(key)}{_EXT}")
-
-    def _mem_get(self, mem_key: str):
-        with self._lock:
-            entry = self._mem.get(mem_key)
-            if entry is None:
-                return None
-            self._mem.move_to_end(mem_key)
-            return entry
-
-    def _mem_set(self, mem_key: str, fetched_at: float, value) -> None:
-        with self._lock:
-            self._mem[mem_key] = (fetched_at, value)
-            self._mem.move_to_end(mem_key)
-            while len(self._mem) > _MEM_LIMIT:
-                self._mem.popitem(last=False)
-
-    def load(self, namespace: str, key: str, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> Optional[object]:
-        mem_key = f"{namespace}:{key}"
-        cached = self._mem_get(mem_key)
-        if cached is not None:
-            fetched_at, value = cached
-            if ttl_seconds is None or (time.time() - fetched_at) <= ttl_seconds:
-                return value
-        path = self._path(namespace, key)
+    def _housekeeping(self, legacy: str) -> None:
         try:
-            with open(path, "rb") as raw:
-                with gzip.GzipFile(fileobj=raw, mode="rb") as fh:
-                    payload = json.loads(fh.read())
-        except OSError:
+            con = sqlite3.connect(self._path, timeout=3, isolation_level=None)
+            try:
+                con.execute('DELETE FROM kv WHERE at < ?', (time.time() - MAX_AGE_SECONDS,))
+            finally:
+                con.close()
+        except sqlite3.Error:
+            logger.debug('Cache purge skipped', exc_info=True)
+        if os.path.isdir(legacy):
+            shutil.rmtree(legacy, True)
+        trim_stream_cache()
+
+    def _open(self) -> sqlite3.Connection:
+        for attempt in (0, 1):
+            con = None
+            try:
+                con = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)
+                con.execute('PRAGMA journal_mode=WAL')
+                con.execute('PRAGMA synchronous=NORMAL')
+                con.execute('PRAGMA temp_store=MEMORY')
+                con.execute('PRAGMA journal_size_limit=4194304')
+                con.execute('PRAGMA busy_timeout=3000')
+                con.execute('CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, '
+                            'at REAL NOT NULL, body BLOB NOT NULL, PRIMARY KEY (ns, key))')
+                return con
+            except sqlite3.DatabaseError:
+                if con is not None:
+                    con.close()
+                if attempt:
+                    raise
+                logger.warning('Cache database unreadable, recreating it', exc_info=True)
+                for suffix in ('', '-wal', '-shm'):
+                    try:
+                        os.remove(self._path + suffix)
+                    except OSError:
+                        pass
+
+    def _exec(self, sql: str, args: tuple = ()) -> list:
+        if self._closed:
+            return []
+        try:
+            with self._lock:
+                return self._con.execute(sql, args).fetchall()
+        except sqlite3.Error:
+            logger.warning('Cache query failed', exc_info=True)
+            return []
+
+    def _get(self, namespace: str, key: str):
+        rows = self._exec('SELECT at, body FROM kv WHERE ns=? AND key=?', (namespace, key))
+        return rows[0] if rows else None
+
+    def _put(self, namespace: str, key: str, value) -> None:
+        try:
+            body = _encode(value)
+        except (TypeError, ValueError):
+            logger.error('Cache value for %s/%s is not JSON serializable', namespace, key)
+            return
+        self._exec('INSERT OR REPLACE INTO kv (ns, key, at, body) VALUES (?, ?, ?, ?)',
+                   (namespace, key, time.time(), body))
+
+    def load(self, namespace: str, key: str, ttl_seconds: int | None = DEFAULT_TTL_SECONDS) -> object | None:
+        row = self._get(namespace, key)
+        if row is None or (ttl_seconds is not None and time.time() - row[0] > ttl_seconds):
             return None
-        except (json.JSONDecodeError, EOFError) as exc:
-            logger.warning("Failed to read cache %s/%s: %s", namespace, key, exc)
-            return None
-        fetched_at = payload.get("fetched_at", 0)
-        if ttl_seconds is not None and (time.time() - fetched_at) > ttl_seconds:
-            return None
-        value = payload.get("value")
-        self._mem_set(mem_key, fetched_at, value)
-        return value
+        return _loads(row[1])
 
     def save(self, namespace: str, key: str, value) -> None:
-        fetched_at = time.time()
-        mem_key = f"{namespace}:{key}"
-        self._mem_set(mem_key, fetched_at, value)
-        path = self._path(namespace, key)
-        payload = json.dumps({"fetched_at": fetched_at, "value": value}, separators=_JSON_SEPARATORS, ensure_ascii=False).encode("utf-8")
-        tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-        try:
-            with open(tmp_path, "wb") as raw:
-                with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=_GZIP_LEVEL) as fh:
-                    fh.write(payload)
-            os.replace(tmp_path, path)
-        except OSError as exc:
-            logger.error("Failed to write cache %s/%s: %s", namespace, key, exc)
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        self._put(namespace, key, value)
 
-    def clear_namespace(self, namespace: str) -> None:
-        d = os.path.join(self._root, *_safe_namespace_parts(namespace))
-        if not os.path.isdir(d):
-            return
-        for name in os.listdir(d):
-            try:
-                os.remove(os.path.join(d, name))
-            except OSError:
-                pass
-        with self._lock:
-            for mem_key in [k for k in self._mem if k.startswith(f"{namespace}:")]:
-                del self._mem[mem_key]
-
-    def clear_all(self) -> None:
-        if not os.path.isdir(self._root):
-            return
-        for root, dirs, files in os.walk(self._root, topdown=False):
-            for name in files:
-                try:
-                    os.remove(os.path.join(root, name))
-                except OSError:
-                    pass
-        with self._lock:
-            self._mem.clear()
-
-    def raw_path(self, namespace: str, key: str) -> str:
-        return self._path(namespace, key)
-
-    def _mem_key(self, namespace: str, key: str) -> str:
-        return f"{namespace}\x00{key}"
-
-    def get_entry(self, namespace: str, key: str) -> Optional[dict]:
-        mem_key = self._mem_key(namespace, key)
-        cached = self._mem_get(mem_key)
-        if cached is not None:
-            return cached[1]
-
-        path = self._path(namespace, key)
-        try:
-            with open(path, "rb") as raw:
-                with gzip.GzipFile(fileobj=raw, mode="rb") as fh:
-                    entry = json.loads(fh.read())
-        except (OSError, json.JSONDecodeError, EOFError):
-            return None
-
-        for k in ("ttl", "refreshAfter", "expiresAt"):
-            if k in entry:
-                entry[k] = _fix_inf(entry[k])
-
-        self._mem_set(mem_key, entry.get("cachedAt", time.time()), entry)
-        with self._lock:
-            self._entry_index.setdefault(namespace, set()).add(key)
-        return entry
+    def get_entry(self, namespace: str, key: str) -> dict | None:
+        row = self._get(namespace, key)
+        return None if row is None else _loads(row[1])
 
     def set_entry(self, namespace: str, key: str, entry: dict) -> None:
-        mem_key = self._mem_key(namespace, key)
-        self._mem_set(mem_key, entry.get("cachedAt", time.time()), entry)
-        with self._lock:
-            self._entry_index.setdefault(namespace, set()).add(key)
-
-        path = self._path(namespace, key)
-        tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-        payload = json.dumps(entry, separators=_JSON_SEPARATORS, ensure_ascii=False, default=_entry_json_default).encode("utf-8")
-        try:
-            with open(tmp_path, "wb") as raw:
-                with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=_GZIP_LEVEL) as fh:
-                    fh.write(payload)
-            os.replace(tmp_path, path)
-        except OSError as exc:
-            logger.error("Failed to write cache entry %s/%s: %s", namespace, key, exc)
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        self._put(namespace, key, entry)
 
     def delete_entry(self, namespace: str, key: str) -> None:
-        mem_key = self._mem_key(namespace, key)
-        with self._lock:
-            self._mem.pop(mem_key, None)
-            self._entry_index.get(namespace, set()).discard(key)
-        try:
-            os.remove(self._path(namespace, key))
-        except OSError:
-            pass
+        self._exec('DELETE FROM kv WHERE ns=? AND key=?', (namespace, key))
 
     def delete_prefix(self, namespace: str, key_prefix: str) -> None:
-        with self._lock:
-            known = set(self._entry_index.get(namespace, set()))
-        for key in known:
-            if key.startswith(key_prefix):
-                self.delete_entry(namespace, key)
+        self._exec('DELETE FROM kv WHERE ns=? AND substr(key, 1, ?)=?', (namespace, len(key_prefix), key_prefix))
 
-    async def get_entry_async(self, namespace: str, key: str) -> Optional[dict]:
+    def clear_namespace(self, namespace: str) -> None:
+        self._exec('DELETE FROM kv WHERE ns=? OR substr(ns, 1, ?)=?',
+                   (namespace, len(namespace) + 1, namespace + ':'))
+
+    def clear_all(self) -> None:
+        self._exec('DELETE FROM kv')
+        self._exec('VACUUM')
+        self._exec('PRAGMA wal_checkpoint(TRUNCATE)')
+
+    def size_bytes(self) -> int:
+        return sum(_file_size(self._path + suffix) for suffix in ('', '-wal', '-shm'))
+
+    def flush_all(self) -> None:
+        self._exec('PRAGMA wal_checkpoint(TRUNCATE)')
+
+    def close(self) -> None:
+        self.flush_all()
+        with self._lock:
+            self._closed = True
+            self._con.close()
+
+    async def get_entry_async(self, namespace: str, key: str) -> dict | None:
         return await asyncio.to_thread(self.get_entry, namespace, key)
 
     async def set_entry_async(self, namespace: str, key: str, entry: dict) -> None:
@@ -225,3 +179,56 @@ class CacheManager:
 
 
 cache = CacheManager()
+
+
+def _sidecar_dirs() -> tuple[str, ...]:
+    return (os.path.join(paths.cache_dir, 'shaders'), paths.torrent_cache, paths.stream_cache)
+
+
+def _stop_stream() -> None:
+    module = sys.modules.get('src.core.tv.torrent_stream')
+    if module is not None:
+        try:
+            module.get_streamer().stop()
+        except Exception:
+            logger.debug('Could not stop the stream before clearing its cache', exc_info=True)
+
+
+def trim_stream_cache(limit_gb: int | None = None) -> None:
+    limit = int(getattr(settings, 'tv_stream_cache_limit_gb', 0) if limit_gb is None else limit_gb) * 1024 ** 3
+    if limit <= 0:
+        return
+    files, total = [], 0
+    for root, _dirs, names in os.walk(paths.stream_cache):
+        for name in names:
+            path = os.path.join(root, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            files.append((st.st_mtime, st.st_size, path))
+            total += st.st_size
+    for _mtime, size, path in sorted(files):
+        if total <= limit:
+            break
+        try:
+            os.remove(path)
+            total -= size
+        except OSError:
+            pass
+
+
+def clear_stream_cache() -> None:
+    _stop_stream()
+    empty_dir(paths.stream_cache)
+
+
+def app_cache_size() -> int:
+    return cache.size_bytes() + sum(dir_size_bytes(d) for d in _sidecar_dirs())
+
+
+def clear_app_cache() -> None:
+    _stop_stream()
+    cache.clear_all()
+    for folder in _sidecar_dirs():
+        empty_dir(folder)

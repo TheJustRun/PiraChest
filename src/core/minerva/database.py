@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import gc
 import logging
 import os
 import sqlite3
+from itertools import islice
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -12,6 +12,55 @@ from ..config import paths as _paths
 
 _DATA_DIR = _paths.data_dir
 _DB_PATH = _paths.db_path
+
+
+_ROMS_SCHEMA = """
+            id              INTEGER PRIMARY KEY,
+            title           TEXT    NOT NULL DEFAULT '',
+            author          TEXT    NOT NULL DEFAULT '',
+            date            TEXT,
+            console         TEXT    NOT NULL DEFAULT '',
+            source          TEXT    NOT NULL DEFAULT '',
+            file_size       TEXT,
+            file_size_bytes INTEGER DEFAULT 0,
+            download_url    TEXT,
+            region          TEXT,
+            lang            TEXT,
+            torrent_file    TEXT,
+            file_id         INTEGER DEFAULT 1,
+            variant         TEXT DEFAULT '',
+            UNIQUE (console, source, title)
+"""
+
+
+_ROMS_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_roms_source ON roms(source)",
+    "CREATE INDEX IF NOT EXISTS idx_roms_title_console ON roms(title, console)",
+    "CREATE INDEX IF NOT EXISTS idx_roms_console_variant ON roms(console, variant)",
+)
+_LEGACY_ROMS_INDEXES = ("idx_roms_title", "idx_roms_console")
+
+_stats_cache: dict[str, dict] = {}
+
+
+def _invalidate_stats_cache(db_path: Optional[str] = None) -> None:
+    _stats_cache.pop(db_path or _DB_PATH, None)
+
+def _create_roms_indexes(conn: sqlite3.Connection) -> None:
+    for stmt in _ROMS_INDEXES:
+        conn.execute(stmt)
+
+def _build_fts(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS roms_fts")
+    try:
+        conn.execute(
+            "CREATE VIRTUAL TABLE roms_fts USING fts5("
+            "title, author, content='roms', content_rowid='id', tokenize='trigram')"
+        )
+    except sqlite3.OperationalError as exc:
+        logger.warning("FTS5 trigram unavailable (%s) — searches fall back to LIKE", exc)
+        return
+    conn.execute("INSERT INTO roms_fts(roms_fts) VALUES('rebuild')")
 
 def _migrate_name_to_title(conn: sqlite3.Connection) -> None:
     existing = {
@@ -27,52 +76,16 @@ def _migrate_name_to_title(conn: sqlite3.Connection) -> None:
 
     logger.info("Recreating roms table with new schema (legacy → title)")
 
+    conn.execute("DROP TABLE IF EXISTS roms_fts")
     conn.execute("DROP TABLE IF EXISTS roms")
-
-    conn.execute("""
-        CREATE TABLE roms (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            title           TEXT    NOT NULL DEFAULT '',
-            author          TEXT    NOT NULL DEFAULT '',
-            date            TEXT,
-            console         TEXT    NOT NULL DEFAULT '',
-            source          TEXT    NOT NULL DEFAULT '',
-            file_size       TEXT,
-            file_size_bytes INTEGER DEFAULT 0,
-            download_url    TEXT,
-            region          TEXT,
-            lang            TEXT,
-            torrent_file    TEXT,
-            file_id         INTEGER DEFAULT 1,
-            variant         TEXT DEFAULT ''
-        )
-    """)
-
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_roms_title ON roms(title)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_roms_console ON roms(console)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_roms_source ON roms(source)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_roms_title_console ON roms(title, console)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_roms_console_variant ON roms(console, variant)")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_roms_dedup ON roms(console, source, title)")
+    conn.execute(f"CREATE TABLE roms ({_ROMS_SCHEMA})")
+    _create_roms_indexes(conn)
 
     conn.commit()
     logger.info("Table recreation complete")
 
 def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-def _dedup_existing_rows(conn: sqlite3.Connection) -> None:
-    if not _table_exists(conn, "roms"):
-        return
-    conn.execute("""
-        DELETE FROM roms
-        WHERE id NOT IN (
-            SELECT MIN(id) FROM roms GROUP BY console, source, title
-        )
-    """)
-
-def get_db_path() -> str:
-    return _DB_PATH
 
 _conn_cache: dict[str, sqlite3.Connection] = {}
 
@@ -93,7 +106,8 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA cache_size=-2000")
+    conn.execute("PRAGMA cache_size=-16384")
+    conn.execute("PRAGMA mmap_size=268435456")
     _conn_cache[db_path] = conn
     return conn
 
@@ -141,9 +155,6 @@ def _migrate_console_names(conn: sqlite3.Connection) -> None:
 
     logger.info("Migrating %d stale console name(s) to canonical form", len(updates))
     for canonical, raw in updates:
-        # Some rows under `raw` may collide with an existing `canonical` row
-        # on the (console, source, title) dedup constraint once renamed —
-        # those are true duplicates, so drop them; migrate the rest normally.
         conn.execute(
             """
             DELETE FROM roms
@@ -168,24 +179,7 @@ def _migrate_console_names(conn: sqlite3.Connection) -> None:
 def init_db(db_path: Optional[str] = None) -> None:
     conn = get_connection(db_path)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS roms (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            title           TEXT    NOT NULL DEFAULT '',
-            author          TEXT    NOT NULL DEFAULT '',
-            date            TEXT,
-            console         TEXT    NOT NULL DEFAULT '',
-            source          TEXT    NOT NULL DEFAULT '',
-            file_size       TEXT,
-            file_size_bytes INTEGER DEFAULT 0,
-            download_url    TEXT,
-            region          TEXT,
-            lang            TEXT,
-            torrent_file    TEXT,
-            file_id         INTEGER DEFAULT 1,
-            variant         TEXT DEFAULT ''
-        )
-    """)
+    conn.execute(f"CREATE TABLE IF NOT EXISTS roms ({_ROMS_SCHEMA})")
 
     _add_column_if_missing(conn, "roms", "author", "TEXT NOT NULL DEFAULT ''")
     _add_column_if_missing(conn, "roms", "date", "TEXT")
@@ -200,21 +194,14 @@ def init_db(db_path: Optional[str] = None) -> None:
     _migrate_name_to_title(conn)
     _migrate_console_names(conn)
 
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_roms_title ON roms(title)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_roms_console ON roms(console)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_roms_source ON roms(source)")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_roms_title_console ON roms(title, console)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_roms_console_variant ON roms(console, variant)"
-    )
-    _dedup_existing_rows(conn)
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_roms_dedup ON roms(console, source, title)"
-    )
+    _create_roms_indexes(conn)
+    if not _table_exists(conn, "roms_fts") and conn.execute("SELECT 1 FROM roms LIMIT 1").fetchone():
+        _build_fts(conn)
+    for name in _LEGACY_ROMS_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {name}")
 
     conn.commit()
+    _invalidate_stats_cache(db_path)
     logger.info("Database initialised at %s", db_path)
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -224,116 +211,67 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     ).fetchone()
     return row[0] > 0
 
-def clear_roms(db_path: Optional[str] = None) -> int:
-    conn = get_connection(db_path)
-    if not _table_exists(conn, "roms"):
-        return 0
-    total = conn.execute("SELECT COUNT(*) FROM roms").fetchone()[0]
-    conn.execute("DELETE FROM roms")
-    conn.commit()
-    logger.info("Cleared roms table (%d rows removed)", total)
-    return total
-
-def upsert_roms(roms: list[dict], db_path: Optional[str] = None) -> int:
-    if not roms:
-        return 0
-
-    for r in roms:
-        r.setdefault("file_id", 1)
-        r.setdefault("variant", "")
-
-    conn = get_connection(db_path)
-    conn.executemany(
-        """
-        INSERT OR IGNORE INTO roms
-            (title, author, date, console, source,
-             file_size, file_size_bytes, download_url, region, lang, torrent_file, file_id, variant)
-        VALUES
-            (:title, :author, :date, :console, :source,
-             :file_size, :file_size_bytes, :download_url, :region, :lang, :torrent_file, :file_id, :variant)
-        """,
-        roms,
-    )
-    total = conn.execute("SELECT COUNT(*) FROM roms").fetchone()[0]
-    conn.commit()
-    logger.info("Inserted ROM records — total rows in DB: %d", total)
-    return total
-
-def upsert_roms_streaming(
+def replace_roms_streaming(
     rom_iter,
     db_path: Optional[str] = None,
     batch_size: int = 2000,
     on_batch=None,
 ) -> int:
-    conn = get_connection(db_path)
-    insert_sql = """
-        INSERT OR IGNORE INTO roms
-            (title, author, date, console, source,
-             file_size, file_size_bytes, download_url, region, lang, torrent_file, file_id, variant)
-        VALUES
-            (:title, :author, :date, :console, :source,
-             :file_size, :file_size_bytes, :download_url, :region, :lang, :torrent_file, :file_id, :variant)
-    """
-
-    batch: list[dict] = []
+    path = db_path or _DB_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30)
     processed = 0
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-65536")
 
-    def _flush():
-        nonlocal processed
-        if not batch:
-            return
-        conn.executemany(insert_sql, batch)
+        conn.execute("DROP TABLE IF EXISTS roms_staging")
+        conn.execute(f"CREATE TABLE roms_staging ({_ROMS_SCHEMA})")
         conn.commit()
-        processed += len(batch)
-        batch.clear()
-        if on_batch is not None:
-            try:
-                on_batch(processed)
-            except Exception:
-                logger.exception("on_batch progress callback raised — continuing sync")
 
-    for rec in rom_iter:
-        rec.setdefault("file_id", 1)
-        rec.setdefault("variant", "")
-        batch.append(rec)
-        if len(batch) >= batch_size:
-            _flush()
+        insert_sql = (
+            "INSERT OR IGNORE INTO roms_staging (title, console, source, torrent_file, file_id, variant)"
+            " VALUES (?, ?, ?, ?, ?, ?)"
+        )
 
-    _flush()
+        rows_iter = iter(rom_iter)
+        while rows := list(islice(rows_iter, batch_size)):
+            conn.executemany(insert_sql, rows)
+            conn.commit()
+            processed += len(rows)
+            if on_batch is not None:
+                try:
+                    on_batch(processed)
+                except Exception:
+                    logger.exception("on_batch progress callback raised — continuing sync")
 
-    total = conn.execute("SELECT COUNT(*) FROM roms").fetchone()[0]
-    conn.execute("PRAGMA optimize")
-    logger.info("Processed %d ROM records (streaming) — total rows in DB: %d", processed, total)
-    gc.collect()
+        if not processed:
+            raise RuntimeError("Index sync produced no records — keeping the existing index")
+
+
+        conn.execute("BEGIN")
+        conn.execute("DROP TABLE IF EXISTS roms")
+        conn.execute("ALTER TABLE roms_staging RENAME TO roms")
+        _create_roms_indexes(conn)
+        _build_fts(conn)
+        conn.commit()
+        conn.execute("PRAGMA optimize")
+        total = conn.execute("SELECT COUNT(*) FROM roms").fetchone()[0]
+    except BaseException:
+        conn.rollback()
+        conn.execute("DROP TABLE IF EXISTS roms_staging")
+        conn.commit()
+        raise
+    finally:
+        conn.close()
+
+    _invalidate_stats_cache(db_path)
+    logger.info("Rebuilt ROM index — %d rows in DB (%d records streamed)", total, processed)
     return total
 
-def parse_file_size(size_str: str | None) -> tuple[str, int]:
-    if not size_str:
-        return ("0 B", 0)
-    size_str = size_str.strip().upper()
-    multipliers: dict[str, int] = {
-        "B": 1,
-        "KB": 1_024,
-        "MB": 1_024**2,
-        "GB": 1_024**3,
-        "TB": 1_024**4,
-    }
-    parts = size_str.split()
-    if len(parts) == 2:
-        try:
-            value = float(parts[0])
-            unit = parts[1].rstrip(".")
-            bytes_val = int(value * multipliers.get(unit, 1))
-            return (size_str, bytes_val)
-        except (ValueError, KeyError):
-            pass
-    try:
-        bytes_val = int(float(size_str))
-        return (size_str, bytes_val)
-    except ValueError:
-        return ("0 B", 0)
-
 def _build_rom_filter(
+    conn: sqlite3.Connection,
     query: str,
     console: Optional[str],
     sources: Optional[list[str]],
@@ -343,10 +281,6 @@ def _build_rom_filter(
     params: list[object] = []
 
     if console:
-        # Defense in depth: the DB is expected to store canonical console
-        # names (see indexer.sync_index / _migrate_console_names), but
-        # normalize here too so a stray legacy value passed in can't
-        # silently zero out results.
         from . import console_mapper as _cm
         clauses.append("console = ?")
         params.append(_cm._normalize_db_console(console))
@@ -358,10 +292,18 @@ def _build_rom_filter(
         clauses.append("variant = ?")
         params.append(variant)
     if query:
+        use_fts = _table_exists(conn, "roms_fts")
+        fts_terms: list[str] = []
         for word in query.split():
-            escaped = _escape_like(word)
-            clauses.append("(title LIKE ? ESCAPE '\\' OR author LIKE ? ESCAPE '\\')")
-            params.extend([f"%{escaped}%", f"%{escaped}%"])
+            if use_fts and len(word) >= 3:
+                fts_terms.append('"' + word.replace('"', '""') + '"')
+            else:
+                escaped = _escape_like(word)
+                clauses.append("(title LIKE ? ESCAPE '\\' OR author LIKE ? ESCAPE '\\')")
+                params.extend([f"%{escaped}%", f"%{escaped}%"])
+        if fts_terms:
+            clauses.append("id IN (SELECT rowid FROM roms_fts WHERE roms_fts MATCH ?)")
+            params.append(" AND ".join(fts_terms))
 
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
     return where, params
@@ -377,8 +319,19 @@ def count_roms(
     if not _table_exists(conn, "roms"):
         return 0
 
-    where, params = _build_rom_filter(query, console, sources, variant)
+
+    unfiltered = not query and not console and not sources and not variant
+    if unfiltered:
+        cached = _stats_cache.get(db_path or _DB_PATH, {})
+        if "total_roms" in cached:
+            return cached["total_roms"]
+
+    where, params = _build_rom_filter(conn, query, console, sources, variant)
     total = conn.execute(f"SELECT COUNT(*) FROM roms {where}", params).fetchone()[0]
+
+    if unfiltered:
+        _stats_cache.setdefault(db_path or _DB_PATH, {})["total_roms"] = total
+
     return total
 
 def search_roms(
@@ -396,12 +349,16 @@ def search_roms(
     if not _table_exists(conn, "roms"):
         return []
 
-    where, params = _build_rom_filter(query, console, sources, variant)
+    where, params = _build_rom_filter(conn, query, console, sources, variant)
 
     valid_fields = {"title", "author", "date", "console", "source", "file_size_bytes", "variant"}
     if sort_field not in valid_fields:
         sort_field = "title"
     sort_dir = "DESC" if sort_dir.upper() == "DESC" else "ASC"
+
+
+    order_by = (f"title {sort_dir}, console {sort_dir}, id {sort_dir}" if sort_field == "title"
+                else f"{sort_field} {sort_dir}, id {sort_dir}")
 
     rows = conn.execute(
         f"""
@@ -410,7 +367,7 @@ def search_roms(
                download_url, region, lang, torrent_file, file_id, variant
         FROM roms
         {where}
-        ORDER BY {sort_field} {sort_dir}
+        ORDER BY {order_by}
         LIMIT ? OFFSET ?
         """,
         params + [limit, offset],
@@ -454,32 +411,6 @@ def get_all_consoles(
 
     return result
 
-def get_all_variants(
-    console: str,
-    db_path: Optional[str] = None,
-    sources: Optional[list[str]] = None,
-) -> list[str]:
-    if not console:
-        return []
-    conn = get_connection(db_path)
-    if not _table_exists(conn, "roms"):
-        return []
-
-    if sources:
-        placeholders = ", ".join("?" for _ in sources)
-        rows = conn.execute(
-            f"SELECT DISTINCT variant FROM roms "
-            f"WHERE console = ? AND variant != '' AND source IN ({placeholders}) "
-            f"ORDER BY variant",
-            [console, *sources],
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT DISTINCT variant FROM roms WHERE console = ? AND variant != '' ORDER BY variant",
-            (console,),
-        ).fetchall()
-    return [r["variant"] for r in rows]
-
 def get_all_sources(db_path: Optional[str] = None) -> list[str]:
     conn = get_connection(db_path)
     if not _table_exists(conn, "roms"):
@@ -488,12 +419,3 @@ def get_all_sources(db_path: Optional[str] = None) -> list[str]:
         "SELECT DISTINCT source FROM roms WHERE source != '' ORDER BY source"
     ).fetchall()
     return [r["source"] for r in rows]
-
-def get_stats(db_path: Optional[str] = None) -> dict:
-    conn = get_connection(db_path)
-    if not _table_exists(conn, "roms"):
-        return {"total_roms": 0, "consoles": 0, "sources": 0}
-    total = conn.execute("SELECT COUNT(*) FROM roms").fetchone()[0]
-    consoles = conn.execute("SELECT COUNT(DISTINCT console) FROM roms WHERE console != ''").fetchone()[0]
-    sources = conn.execute("SELECT COUNT(DISTINCT source) FROM roms WHERE source != ''").fetchone()[0]
-    return {"total_roms": total, "consoles": consoles, "sources": sources}
