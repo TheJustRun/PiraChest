@@ -30,7 +30,7 @@ Get the latest build from [GitHub Releases](https://github.com/TheJustRun/PiraCh
 
 [![Download](https://img.shields.io/badge/Download-Latest%20Release-brightgreen?style=for-the-badge)](https://github.com/TheJustRun/PiraChest/releases)
 
-Chocolatey support is planned. Eventually, installing it should be as simple as:
+Chocolatey support is out, installing it is as simple as:
 
 ```powershell
 choco install pirachest
