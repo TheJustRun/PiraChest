@@ -33,7 +33,7 @@ Get the latest build from [GitHub Releases](https://github.com/TheJustRun/PiraCh
 Chocolatey support is out, installing it is as simple as:
 
 ```powershell
-choco install pirachest
+choco install pirachest --pre
 ```
 
 ## Features
