@@ -272,7 +272,7 @@ If you find PiraChest useful, consider supporting its development.
     <td align="center" width="33%">
       <strong>Ethereum (ETH)</strong><br><br>
       <img src="https://github.com/user-attachments/assets/499a6be1-158a-434e-8727-93f3788ab8cc" width="140" alt="Ethereum donation QR code"><br>
-      <code>0xD8e4d1408aF248B97C2cdCe85afbeD83e61Cc3f8xv</code>
+      <code>0xD8e4d1408aF248B97C2cdCe85afbeD83e61Cc3f8</code>
     </td>
     <td align="center" width="33%">
       <strong>Litecoin (LTC)</strong><br><br>
