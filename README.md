@@ -44,7 +44,7 @@ There's a new Home page that acts as a central starting point for discovering co
 
 ### Sailseek
 
-A fast global search system that lets you search across the content and functionality PiraChest offers from one compact interface — movies, shows, games, music, anime, manga, settings, and more. Result cards show relevant metadata like artwork, name, source, and date where available. There's a customizable keyboard shortcut for opening it too.
+A fast global search system that lets you search across the content and functionality PiraChest offers from one compact interface: movies, shows, games, music, anime, manga, and more. Result cards show relevant metadata like artwork, name, source, and date where available. There's a customizable keyboard shortcut for opening it too.
 
 ### ROMs
 
