@@ -13,6 +13,8 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -209,23 +211,25 @@ def fetch_expected_checksum(checksum_url: str, asset_name: str) -> str | None:
 
 
 def _download(url: str, dest: str, expected_sha256: str | None, on_progress, is_cancelled) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": "PiraChest-Updater"})
+    req = urllib.request.Request(url, headers={"User-Agent": "PiraChest-Updater", "Accept-Encoding": "identity"})
     hasher = hashlib.sha256() if expected_sha256 else None
     downloaded = 0
     last_pct = -1
+    view = memoryview(bytearray(4 << 20))
     try:
         with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb", buffering=8 << 20) as fh:
             total = int(resp.headers.get("Content-Length", 0))
             while True:
                 if is_cancelled is not None and is_cancelled():
                     raise UpdateCancelled()
-                chunk = resp.read(1 << 20)
-                if not chunk:
+                n = resp.readinto(view)
+                if not n:
                     break
+                chunk = view[:n]
                 fh.write(chunk)
                 if hasher:
                     hasher.update(chunk)
-                downloaded += len(chunk)
+                downloaded += n
                 if on_progress and total > 0:
                     pct = downloaded * 100 // total
                     if pct != last_pct:
@@ -251,9 +255,7 @@ def _download_with_retries(url: str, dest: str, expected: str | None, on_progres
         try:
             _download(url, dest, expected, on_progress, is_cancelled)
             return
-        except UpdateCancelled:
-            raise
-        except ChecksumMismatch:
+        except (UpdateCancelled, ChecksumMismatch):
             raise
         except Exception as exc:
             if attempt >= 2:
@@ -262,39 +264,101 @@ def _download_with_retries(url: str, dest: str, expected: str | None, on_progres
             time.sleep(1.0 + attempt)
 
 
-def _safe_extract(archive: zipfile.ZipFile, out_dir: str) -> None:
-    root = os.path.realpath(out_dir)
-    entries = []
-    for info in archive.infolist():
+def _workers() -> int:
+    return max(2, min(8, os.cpu_count() or 4))
+
+
+def _unchanged(path: str, info: zipfile.ZipInfo) -> bool:
+    try:
+        if os.stat(path).st_size != info.file_size:
+            return False
+        crc = 0
+        with open(path, "rb") as fh:
+            while chunk := fh.read(1 << 20):
+                crc = zlib.crc32(chunk, crc)
+        return crc == info.CRC
+    except OSError:
+        return False
+
+
+def _extract_batch(zip_path: str, batch: list, is_cancelled) -> None:
+    with zipfile.ZipFile(zip_path) as zf:
+        for name, target in batch:
+            if is_cancelled is not None and is_cancelled():
+                raise UpdateCancelled()
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with zf.open(name) as src, open(target, "wb", buffering=1 << 20) as dst:
+                shutil.copyfileobj(src, dst, 1 << 20)
+
+
+def _partition(items: list, count: int) -> list[list]:
+    buckets: list[list] = [[] for _ in range(count)]
+    loads = [0] * count
+    for item in sorted(items, key=lambda x: x[2], reverse=True):
+        i = loads.index(min(loads))
+        buckets[i].append((item[0], item[1]))
+        loads[i] += item[2] + 1
+    return [b for b in buckets if b]
+
+
+def _stale_files(install_dir: str, keep: set[str]) -> list[str]:
+    stale = []
+    for current, _dirs, files in os.walk(os.path.join(install_dir, "_internal")):
+        for name in files:
+            rel = os.path.relpath(os.path.join(current, name), install_dir).replace("\\", "/")
+            if rel.lower() not in keep:
+                stale.append(rel.replace("/", "\\"))
+    return stale
+
+
+def _stage_delta(zip_path: str, out_dir: str, exe_name: str, install_dir: str | None, is_cancelled) -> None:
+    with zipfile.ZipFile(zip_path) as zf:
+        infos = zf.infolist()
+    exe_lower = exe_name.lower()
+    names = []
+    for info in infos:
         name = info.filename.replace("\\", "/")
-        if not name or name.startswith("/") or re.match(r"^[a-zA-Z]:", name):
+        if not name or name.startswith("/") or re.match(r"^[a-zA-Z]:", name) or ".." in name.split("/"):
             raise RuntimeError("Update archive contains an unsafe path")
-        target = os.path.realpath(os.path.join(root, name))
-        try:
-            inside = os.path.commonpath([root, target]) == root
-        except ValueError:
-            inside = False
-        if not inside:
-            raise RuntimeError("Update archive escapes the staging directory")
         if (info.external_attr >> 16) & 0o170000 == 0o120000:
             raise RuntimeError("Update archive contains a symbolic link")
-        entries.append((info, target))
-    os.makedirs(root, exist_ok=True)
-    for info, target in entries:
-        if info.is_dir() or info.filename.endswith("/"):
-            os.makedirs(target, exist_ok=True)
+        names.append(name)
+    roots = [n for n in names if not n.endswith("/") and n.rsplit("/", 1)[-1].lower() == exe_lower]
+    if not roots:
+        raise RuntimeError(f"{exe_name} not found in update archive")
+    prefix = min(roots, key=len)[: -len(exe_name)]
+    files = []
+    for info, name in zip(infos, names):
+        if info.is_dir() or name.endswith("/") or not name.startswith(prefix):
             continue
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with archive.open(info) as src, open(target, "wb") as dst:
-            shutil.copyfileobj(src, dst, 1 << 20)
-
-
-def _find_app_root(extracted: str, exe_name: str) -> str:
-    root = os.path.realpath(extracted)
-    for current, _dirs, files in os.walk(root):
-        if exe_name in files:
-            return current
-    raise RuntimeError(f"{exe_name} not found in update archive")
+        rel = name[len(prefix):]
+        if rel.split("/", 1)[0].lower() == "data":
+            continue
+        files.append((info, rel))
+    if install_dir is None:
+        changed = files
+    else:
+        def differs(item) -> bool:
+            if is_cancelled is not None and is_cancelled():
+                raise UpdateCancelled()
+            info, rel = item
+            if rel.lower() == exe_lower:
+                return True
+            return not _unchanged(os.path.join(install_dir, *rel.split("/")), info)
+        with ThreadPoolExecutor(_workers()) as pool:
+            flags = list(pool.map(differs, files))
+        changed = [item for item, flag in zip(files, flags) if flag]
+    os.makedirs(out_dir, exist_ok=True)
+    work = [(info.filename, os.path.join(out_dir, *rel.split("/")), info.file_size) for info, rel in changed]
+    batches = _partition(work, _workers())
+    if batches:
+        with ThreadPoolExecutor(len(batches)) as pool:
+            for future in [pool.submit(_extract_batch, zip_path, b, is_cancelled) for b in batches]:
+                future.result()
+    if install_dir is not None:
+        keep = {rel.lower() for _info, rel in files}
+        with open(os.path.join(os.path.dirname(out_dir), "delete.lst"), "w", encoding="utf-8", newline="\r\n") as fh:
+            fh.write("".join(f"{p}\n" for p in _stale_files(install_dir, keep)))
 
 
 def download_and_verify_update(update_info: dict, on_progress=None, is_cancelled=None) -> str:
@@ -308,17 +372,17 @@ def download_and_verify_update(update_info: dict, on_progress=None, is_cancelled
     zip_path = os.path.join(staging, "update.zip")
     out_dir = os.path.join(staging, "new")
     shutil.rmtree(out_dir, ignore_errors=True)
+    frozen = bool(getattr(sys, "frozen", False))
+    exe_name = os.path.basename(sys.executable) if frozen else "PiraChest.exe"
     try:
         _download_with_retries(update_info["download_url"], zip_path, expected, on_progress, is_cancelled)
-        with zipfile.ZipFile(zip_path) as zf:
-            _safe_extract(zf, out_dir)
+        _stage_delta(zip_path, out_dir, exe_name, _app_dir() if frozen else None, is_cancelled)
     finally:
         try:
             os.remove(zip_path)
         except OSError:
             pass
-    exe_name = os.path.basename(sys.executable) if getattr(sys, "frozen", False) else "PiraChest.exe"
-    return _find_app_root(out_dir, exe_name)
+    return out_dir
 
 
 def _can_write(path: str) -> bool:
@@ -332,9 +396,9 @@ def _can_write(path: str) -> bool:
         return False
 
 
-def _update_script() -> str:
-    return """@echo off
+_UPDATE_SCRIPT = """@echo off
 setlocal
+chcp 65001 >NUL
 set "SRC=%PIRACHEST_UPDATE_SRC%"
 set "DST=%PIRACHEST_UPDATE_DST%"
 set "STAGE=%PIRACHEST_UPDATE_STAGE%"
@@ -342,46 +406,34 @@ set "LOG=%PIRACHEST_UPDATE_LOG%"
 set "EXE=%PIRACHEST_UPDATE_EXE%"
 set "NAME=%PIRACHEST_UPDATE_NAME%"
 set "PID=%PIRACHEST_UPDATE_PID%"
+set "DEL=%PIRACHEST_UPDATE_DEL%"
 set "TASKS=%LOG%.tasks"
 set "FAILED="
-set RC_FLAGS=/R:20 /W:1 /NFL /NDL /NJH /NJS /NP /IS
 del /q "%LOG%" >NUL 2>NUL
-del /q "%TASKS%" >NUL 2>NUL
 set /a WAIT=0
 
 :waitloop
 tasklist /FI "PID eq %PID%" /NH /FO CSV >"%TASKS%" 2>NUL
 find /I "%NAME%" "%TASKS%" >NUL 2>NUL
-if errorlevel 1 goto copystart
+if errorlevel 1 goto apply
 set /a WAIT+=1 >NUL
-if %WAIT% GEQ 120 goto copystart
-ping -n 2 127.0.0.1 >NUL 2>NUL
+if %WAIT% GEQ 480 goto apply
+ping -n 1 -w 250 192.0.2.1 >NUL 2>NUL
 goto waitloop
 
-:copystart
+:apply
 del /q "%TASKS%" >NUL 2>NUL
-robocopy "%SRC%" "%DST%" /E /XD _internal data %RC_FLAGS% >NUL 2>&1
-set RC1=%ERRORLEVEL%
-set RC2=0
-if %RC1% GEQ 8 goto copyfailed
-if not exist "%SRC%\\_internal" goto internaldone
-robocopy "%SRC%\\_internal" "%DST%\\_internal" /MIR %RC_FLAGS% >NUL 2>&1
-set RC2=%ERRORLEVEL%
-goto internaldone
+robocopy "%SRC%" "%DST%" /E /IS /MT:16 /R:10 /W:1 /NFL /NDL /NJH /NJS /NP /XD data >NUL 2>&1
+if errorlevel 8 set FAILED=1
+if defined FAILED goto done
+if exist "%DEL%" for /f "usebackq tokens=* delims=" %%F in ("%DEL%") do del /f /q "%DST%\\%%F" >NUL 2>NUL
 
-:copyfailed
-set FAILED=1
-goto finish
-
-:internaldone
-if %RC2% GEQ 8 set FAILED=1
-:finish
+:done
 if defined FAILED (
-    echo Update copy failed ^(robocopy codes %RC1%/%RC2%^). > "%LOG%"
+    echo Update copy failed. > "%LOG%"
 ) else (
     rmdir /S /Q "%STAGE%" >NUL 2>NUL
 )
-
 pushd "%DST%" 2>NUL
 start "" "%EXE%"
 popd 2>NUL
@@ -403,24 +455,25 @@ def apply_update_and_restart(new_app_dir: str) -> None:
     if not _can_write(install_dir):
         raise RuntimeError("PiraChest cannot write to its install folder. Run it as administrator or reinstall through Chocolatey.")
     staging = _update_staging_dir()
-    log_path = os.path.join(tempfile.gettempdir(), "pirachest_update_error.log")
-    script_path = os.path.join(tempfile.gettempdir(), "pirachest_update.bat")
+    temp = tempfile.gettempdir()
+    script_path = os.path.join(temp, "pirachest_update.bat")
     with open(script_path, "w", encoding="ascii", newline="\r\n") as fh:
-        fh.write(_update_script())
+        fh.write(_UPDATE_SCRIPT)
     env = os.environ.copy()
     env.update({
         "PIRACHEST_UPDATE_SRC": new_app_dir,
         "PIRACHEST_UPDATE_DST": install_dir,
         "PIRACHEST_UPDATE_STAGE": staging,
-        "PIRACHEST_UPDATE_LOG": log_path,
+        "PIRACHEST_UPDATE_LOG": os.path.join(temp, "pirachest_update_error.log"),
         "PIRACHEST_UPDATE_EXE": current_exe,
         "PIRACHEST_UPDATE_NAME": exe_name,
         "PIRACHEST_UPDATE_PID": str(os.getpid()),
+        "PIRACHEST_UPDATE_DEL": os.path.join(staging, "delete.lst"),
         "PYINSTALLER_RESET_ENVIRONMENT": "1",
     })
     subprocess.Popen(
         ["cmd.exe", "/d", "/c", "pirachest_update.bat"],
-        cwd=tempfile.gettempdir(),
+        cwd=temp,
         creationflags=subprocess.CREATE_NO_WINDOW,
         close_fds=True,
         env=env,

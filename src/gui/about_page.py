@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 import os
 import random
+import sys
 from collections import deque
+from pathlib import Path
 
 from PySide6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -38,7 +40,21 @@ from src.core.theme import (
     to_color,
 )
 from src.core.translations import register_locale_refresh, tr
-from .assets import DISCORD_URL, PHOTO_DIR, find_logo_path
+DISCORD_URL = 'https://discord.gg/j7dBxTZMDE'
+_GUI_DIR = Path(__file__).resolve().parent
+_PHOTO_ROOTS = tuple(dict.fromkeys(
+    [_GUI_DIR / 'photos']
+    + ([Path(sys._MEIPASS) / 'src' / 'gui' / 'photos'] if getattr(sys, '_MEIPASS', None) else [])
+))
+PHOTO_DIR = str(next((r for r in _PHOTO_ROOTS if r.is_dir()), _PHOTO_ROOTS[0]))
+
+
+def find_logo_path() -> str | None:
+    return next(
+        (str(p) for n in ('logo.png', 'icon.png', 'logo.ico', 'icon.ico')
+         for r in _PHOTO_ROOTS if (p := r / n).is_file()),
+        None,
+    )
 from .settings_page import make_smooth_scroll_area
 
 logger = logging.getLogger(__name__)

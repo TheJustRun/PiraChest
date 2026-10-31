@@ -85,12 +85,49 @@ jobs:
           } catch {
             [System.Drawing.Icon]::ExtractAssociatedIcon($exe).ToBitmap().Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
           }
+          $art = Join-Path $env:RUNNER_TEMP 'msi-art'
+          New-Item -ItemType Directory -Force $art | Out-Null
+          $dlgBmp = Join-Path $art 'dialog.bmp'
+          $banBmp = Join-Path $art 'banner.bmp'
+          $logo = [System.Drawing.Image]::FromFile($png)
+          $hex = { param($c) [System.Drawing.ColorTranslator]::FromHtml($c) }
+          function New-Bmp($path, $w, $h, $draw) {
+            $bmp = New-Object System.Drawing.Bitmap($w, $h, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.SmoothingMode = 'AntiAlias'
+            $g.InterpolationMode = 'HighQualityBicubic'
+            $g.TextRenderingHint = 'ClearTypeGridFit'
+            $g.Clear([System.Drawing.Color]::White)
+            & $draw $g
+            $g.Dispose()
+            $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Bmp)
+            $bmp.Dispose()
+          }
+          New-Bmp $dlgBmp 493 312 {
+            param($g)
+            $rect = New-Object System.Drawing.Rectangle(0, 0, 164, 312)
+            $grad = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, (& $hex '#0B1220'), (& $hex '#1D5185'), 70.0)
+            $g.FillRectangle($grad, $rect)
+            $g.DrawImage($logo, 34, 64, 96, 96)
+            $center = New-Object System.Drawing.StringFormat
+            $center.Alignment = 'Center'
+            $title = New-Object System.Drawing.Font('Segoe UI Semibold', 17, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
+            $sub = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
+            $g.DrawString('PiraChest', $title, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF(0, 172, 164, 34)), $center)
+            $g.FillRectangle((New-Object System.Drawing.SolidBrush((& $hex '#58B9FF'))), 70, 212, 24, 3)
+            $g.DrawString("Games, movies, anime,`nbooks and more", $sub, (New-Object System.Drawing.SolidBrush((& $hex '#A9C3DD'))), (New-Object System.Drawing.RectangleF(0, 224, 164, 40)), $center)
+          }
+          New-Bmp $banBmp 493 58 {
+            param($g)
+            $g.DrawImage($logo, 493 - 52, 9, 40, 40)
+          }
+          $logo.Dispose()
           $msiName = "PiraChest-${{ needs.version.outputs.tag }}-Windows-x64.msi"
           $msi = Join-Path $env:GITHUB_WORKSPACE "package/$msiName"
           wix extension add -g WixToolset.UI.wixext/5.0.2
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          wix build installer/PiraChest.wxs -arch x64 -ext WixToolset.UI.wixext `
-            -d Version=$ver -d SourceDir="$srcDir" -d IconFile="$iconSrc" `
+          wix build installer/PiraChest.wxs -arch x64 -pdbtype none -ext WixToolset.UI.wixext `
+            -d Version=$ver -d SourceDir="$srcDir" -d IconFile="$iconSrc" -d DialogBmp="$dlgBmp" -d BannerBmp="$banBmp" `
             -d Manufacturer="${{ github.repository_owner }}" -d ProjectUrl="https://github.com/${{ github.repository }}" `
             -o "$msi"
           if ($LASTEXITCODE -ne 0) { exit 1 }
