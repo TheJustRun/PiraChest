@@ -41,7 +41,7 @@ from qfluentwidgets import (
 from src.core import worker as _worker_module
 from functools import partial
 from shiboken6 import isValid as _qt_is_valid
-from src.core.artwork import images
+from src.core.artwork import images, FIT
 
 _LOGO_SIZE = (48, 48)
 from src.core.tv import channels as channels_backend
@@ -57,10 +57,10 @@ from PySide6.QtGui import QActionGroup, QCursor, QIconEngine, QFontMetrics, QGui
 from PySide6.QtWidgets import (QAbstractItemView, QBoxLayout, QFrame, QMenu, QStyle, QStyledItemDelegate,
                                QToolButton, QToolTip)
 from qfluentwidgets import Action, ListView, RoundMenu
-from src.core.models import AnimeItem
+from src.core.models import AnimeItem, assess_source_files, classify_file
 from src.core.net import LazyHttpClient, shared_ssl_context
 from src.core.translations import tr, register_locale_refresh
-from src.core.theme import to_color, palette, apply_pivot_theme, apply_tool_button_theme, apply_label_theme, count_badge_qss, register_theme_refresh, themed_icon, apply_slot_icon_theme
+from src.core.theme import to_color, palette, apply_pivot_theme, apply_tool_button_theme, apply_label_theme, count_badge_qss, register_theme_refresh, themed_icon, apply_slot_icon_theme, ScrollingTextDelegate
 from .home_page import MediaPageBase
 from .grid import PosterGrid, PosterStrip, ViewModeButton, attrs_subtitle, grid_colors as _grid_colors
 
@@ -522,6 +522,7 @@ _SOURCE_NAMES = {"torrentio": "Torrentio", "apibay": "The Pirate Bay",
 class _StreamPickerDialog(MessageBoxBase):
     _COLUMNS = (
         ("tv.stream.col_name", "Name", 0),
+        ("tv.stream.col_type", "Type", 72),
         ("tv.stream.col_quality", "Quality", 94),
         ("tv.stream.col_size", "Size", 94),
         ("tv.stream.col_peers", "Peers", 86),
@@ -530,6 +531,7 @@ class _StreamPickerDialog(MessageBoxBase):
 
     def __init__(self, sources: list, title: str, parent=None, action: str = "play") -> None:
         super().__init__(parent)
+        self._pirachest_no_sfx = True
         self._sources = list(sources)
 
         self.titleLabel = SubtitleLabel(tr("tv.download.pick_title", default="Choose a source to download")
@@ -548,6 +550,15 @@ class _StreamPickerDialog(MessageBoxBase):
         hint.setWordWrap(True)
         apply_label_theme(hint, "muted")
         self.viewLayout.addWidget(hint)
+        safety = assess_source_files(
+            [source.label or source.name for source in self._sources
+             if not getattr(source, "is_direct", False)], context="video")
+        if safety.level != "ok":
+            warning = CaptionLabel(f"{safety.summary}. {tr('tbhb.file_type_review')}", self)
+            warning.setWordWrap(True)
+            warning.setToolTip(safety.details)
+            warning.setStyleSheet(f"color: {palette()['state_verifying']};")
+            self.viewLayout.addWidget(warning)
 
         self._table = TableWidget(self)
         self._table.setBorderVisible(True)
@@ -588,19 +599,27 @@ class _StreamPickerDialog(MessageBoxBase):
 
     def _fill_row(self, row: int, source) -> None:
         label = source.label or source.name or source.info_hash
+        info = classify_file(label)
         name = QTableWidgetItem(label)
         name.setData(Qt.ItemDataRole.UserRole, row)
-        name.setToolTip(source.detail or label)
+        type_item = QTableWidgetItem(info.label)
+        type_item.setToolTip(info.reason)
+        if info.risk != "ok":
+            type_item.setForeground(QColor(palette()["state_error" if info.risk == "dangerous"
+                                                    else "state_verifying"]))
+        source_item = QTableWidgetItem(source.indexer or _SOURCE_NAMES.get(source.source, source.source or "\u2014"))
+        if source.detail:
+            source_item.setToolTip(source.detail)
         cells = (
             (name, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+            (type_item, Qt.AlignmentFlag.AlignCenter),
             (QTableWidgetItem(source.quality or "\u2014"), Qt.AlignmentFlag.AlignCenter),
             (QTableWidgetItem(stream_backend.human_size(source.size) if source.size else "\u2014"),
              Qt.AlignmentFlag.AlignCenter),
             (QTableWidgetItem("Direct" if getattr(source, "is_direct", False)
                               else (str(source.seeders) if source.seeders else "\u2014")),
              Qt.AlignmentFlag.AlignCenter),
-            (QTableWidgetItem(source.indexer or _SOURCE_NAMES.get(source.source, source.source or "\u2014")),
-             Qt.AlignmentFlag.AlignCenter),
+            (source_item, Qt.AlignmentFlag.AlignCenter),
         )
         for column, (item, alignment) in enumerate(cells):
             item.setTextAlignment(alignment)
@@ -613,7 +632,8 @@ class _StreamPickerDialog(MessageBoxBase):
 
 class _TorrentFilesDialog(MessageBoxBase):
     def __init__(self, entries: list, title: str, parent=None,
-                 preset_season: Optional[int] = None, preset_episode: Optional[int] = None) -> None:
+                 preset_season: Optional[int] = None, preset_episode: Optional[int] = None,
+                 safety=None) -> None:
         super().__init__(parent)
         self._items: list = []
 
@@ -624,6 +644,13 @@ class _TorrentFilesDialog(MessageBoxBase):
         for_label.setWordWrap(True)
         self.viewLayout.addWidget(for_label)
 
+        if safety is not None and safety.level != "ok":
+            warning = CaptionLabel(f"{safety.summary}. {tr('tbhb.file_type_review')}", self)
+            warning.setWordWrap(True)
+            warning.setToolTip(safety.details)
+            warning.setStyleSheet(f"color: {palette()['state_error' if safety.level == 'dangerous' else 'state_verifying']};")
+            self.viewLayout.addWidget(warning)
+
         self._all_chk = CheckBox(tr("tv.download.select_all", default="Select all"), self)
         self._all_chk.setChecked(True)
         self._all_chk.stateChanged.connect(self._on_select_all)
@@ -631,13 +658,17 @@ class _TorrentFilesDialog(MessageBoxBase):
 
         self._tree = TreeWidget(self)
         self._tree.setHeaderLabels([tr("tv.download.col_file", default="File"),
+                                    tr("tv.download.col_type", default="Type"),
                                     tr("repacks.size", default="Size")])
         header = self._tree.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self._tree.setColumnWidth(1, 92)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self._tree.setColumnWidth(1, 72)
+        self._tree.setColumnWidth(2, 92)
         self._tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self._name_delegate = ScrollingTextDelegate(self._tree, 0, padding=4)
         self._tree.setBorderVisible(True)
         self._tree.setBorderRadius(8)
         self._tree.setMinimumHeight(300)
@@ -676,12 +707,19 @@ class _TorrentFilesDialog(MessageBoxBase):
         ordered = sorted(entries, key=lambda e: (e.get("season") is None, e.get("season") or 0,
                                                  e.get("episode") or 0, e["name"].lower()))
         for entry in ordered:
-            item = QTreeWidgetItem(self._tree, [self._label(entry), stream_backend.human_size(entry["size"])])
+            info = classify_file(entry["name"])
+            item = QTreeWidgetItem(self._tree, [self._label(entry), info.label,
+                                                stream_backend.human_size(entry["size"])])
             item.setData(0, Qt.ItemDataRole.UserRole, entry["index"])
+            item.setToolTip(1, info.reason)
+            if info.risk != "ok":
+                item.setForeground(1, QColor(palette()["state_error" if info.risk == "dangerous"
+                                                    else "state_verifying"]))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(0, Qt.CheckState.Checked if self._preselected(entry, preset_season, preset_episode)
                                else Qt.CheckState.Unchecked)
-            item.setTextAlignment(1, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+            item.setTextAlignment(1, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
+            item.setTextAlignment(2, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
             self._items.append((entry, item))
         self._tree.blockSignals(False)
         self._sync_select_all()
@@ -1834,6 +1872,49 @@ def _meta_field(label: str, value_widget: QWidget, parent=None) -> QWidget:
     return container
 
 
+
+def _tmdb_img(path, size: str) -> str:
+    return (tmdb.image_url(path, size) or "") if path else ""
+
+
+def _pick_art(items, langs: tuple, min_width: int = 0) -> str:
+    pool = [i for i in items or [] if i.get("file_path") and not str(i["file_path"]).lower().endswith(".svg")
+            and (i.get("width") or 0) >= min_width]
+    if not pool:
+        return ""
+    def rank(i):
+        lang = i.get("iso_639_1")
+        pref = langs.index(lang) if lang in langs else len(langs)
+        return (-pref, i.get("vote_average") or 0, i.get("width") or 0)
+    return max(pool, key=rank)["file_path"]
+
+
+def _pick_trailer(videos) -> str:
+    pool = [v for v in videos or [] if v.get("site") == "YouTube" and v.get("key")]
+    if not pool:
+        return ""
+    def rank(v):
+        return (v.get("type") == "Trailer", bool(v.get("official")), v.get("iso_639_1") == "en", v.get("published_at") or "")
+    return f"https://www.youtube.com/watch?v={max(pool, key=rank)['key']}"
+
+
+def _fade_banner(pix, width: int):
+    from PySide6.QtGui import QImage, QLinearGradient
+    pix = QPixmap(pix)
+    pix.setDevicePixelRatio(1.0)
+    scaled = pix.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation)
+    img = scaled.copy(0, 0, width, min(scaled.height(), 900)).toImage()
+    img = img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    fade = QLinearGradient(0, 0, 0, img.height())
+    for pos, alpha in ((0.0, 215), (0.16, 130), (0.38, 45), (0.6, 0)):
+        fade.setColorAt(pos, QColor(0, 0, 0, alpha))
+    painter = QPainter(img)
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+    painter.fillRect(img.rect(), fade)
+    painter.end()
+    return QPixmap.fromImage(img)
+
+
 class _TmdbItem:
     __slots__ = ('raw', 'id', 'title', 'poster_url', 'subtitle')
 
@@ -1858,6 +1939,7 @@ class _MediaRow(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         _row_title_lbl = StrongBodyLabel(title, self)
+        self._title_lbl = _row_title_lbl
         apply_label_theme(_row_title_lbl, "primary_text")
         layout.addWidget(_row_title_lbl)
         self._strip = PosterStrip(self, colors_fn=_grid_colors)
@@ -1865,6 +1947,9 @@ class _MediaRow(QWidget):
         self._strip.context_requested.connect(self.context_requested.emit)
         layout.addWidget(self._strip)
         self.hide()
+
+    def set_title(self, title: str) -> None:
+        self._title_lbl.setText(title)
 
     def set_items(self, items: list[dict]) -> None:
         self._strip.set_entries([self._wrap(item) for item in items])
@@ -1918,9 +2003,18 @@ class _EpisodeThumb(_LeftClickCard):
 class _MediaDetailsView(QWidget):
     POSTER_WIDTH = 220
     POSTER_HEIGHT = 330
+    banner_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._gen = 0
+        self.banner_active = False
+        self._banner_src = ""
+        self._banner_pix = None
+        self._banner_cache = (0, None)
+        self._logo_src = ""
+        self._trailer_url = ""
+        self._imdb_url = ""
         self._media_id: Optional[int] = None
         self._media_type = "movie"
         self._raw: dict = {}
@@ -1954,6 +2048,9 @@ class _MediaDetailsView(QWidget):
         self._download_pending = False
         self._autoplay_episode = False
         self._auto_pick = False
+        self._picker_forced = False
+        self._source_quick = False
+        self._streams_full = False
         self._season_eps: dict[int, list[int]] = {}
         self._skip_gen = 0
         self._pending_play_episode: Optional[int] = None
@@ -1976,6 +2073,8 @@ class _MediaDetailsView(QWidget):
         scroll.setStyleSheet("background: transparent; border: none;")
         outer.addWidget(scroll, 1)
 
+        self._scroll = scroll
+        scroll.verticalScrollBar().valueChanged.connect(lambda _v: self.banner_changed.emit())
         content = QWidget()
         content.setStyleSheet("background: transparent;")
         scroll.setWidget(content)
@@ -1999,6 +2098,10 @@ class _MediaDetailsView(QWidget):
         self._title_lbl = TitleLabel("", content)
         self._title_lbl.setWordWrap(True)
         info_col.addWidget(self._title_lbl)
+        self._logo_lbl = QLabel(content)
+        self._logo_lbl.setStyleSheet("background: transparent;")
+        self._logo_lbl.hide()
+        info_col.addWidget(self._logo_lbl, 0, Qt.AlignmentFlag.AlignLeft)
 
         meta_grid = QGridLayout()
         meta_grid.setHorizontalSpacing(32)
@@ -2020,10 +2123,20 @@ class _MediaDetailsView(QWidget):
         self._watch_btn.clicked.connect(self._on_watch)
         self._watch_btn.setVisible(bool(getattr(settings, "tv_stream_enabled", True)))
         watch_row.addWidget(self._watch_btn)
+        self._sources_btn = PushButton(FluentIcon.MENU,
+                                       tr("tv.stream.choose_source", default="Choose source"), content)
+        self._sources_btn.clicked.connect(self._on_choose_source)
+        self._sources_btn.setVisible(bool(getattr(settings, "tv_stream_enabled", True)))
+        watch_row.addWidget(self._sources_btn)
         self._wl_btn = _WatchLaterButton(content)
         self._wl_btn.clicked.connect(self._on_toggle_watch_later)
         self._wl_btn.hide()
         watch_row.addWidget(self._wl_btn)
+        self._tmdb_btn = PushButton(FluentIcon.LINK, "TMDB", content)
+        self._tmdb_btn.clicked.connect(lambda: QDesktopServices.openUrl(
+            QUrl(f"https://www.themoviedb.org/{self._media_type}/{self._media_id}")))
+        self._tmdb_btn.hide()
+        watch_row.addWidget(self._tmdb_btn)
         self._download_btn = PushButton(themed_icon('tv.download', FluentIcon.DOWNLOAD),
                                         tr("tv.download.btn", default="Download"), content)
         self._download_btn.clicked.connect(lambda: self._on_download())
@@ -2044,6 +2157,19 @@ class _MediaDetailsView(QWidget):
         self._tags_layout.addStretch(1)
         info_col.addWidget(self._tags_container)
 
+        links_row = QHBoxLayout()
+        links_row.setSpacing(8)
+        self._trailer_btn = PushButton(FluentIcon.VIDEO, tr("tv.movies.trailer", default="Trailer"), content)
+        self._trailer_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self._trailer_url)))
+        self._trailer_btn.hide()
+        links_row.addWidget(self._trailer_btn)
+        self._imdb_btn = PushButton(FluentIcon.LINK, "IMDb", content)
+        self._imdb_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self._imdb_url)))
+        self._imdb_btn.hide()
+        links_row.addWidget(self._imdb_btn)
+        links_row.addStretch(1)
+        info_col.addLayout(links_row)
+
         overview_header = StrongBodyLabel(tr("tv.movies.overview", default="Overview"), content)
         apply_label_theme(overview_header, "primary_text")
         info_col.addWidget(overview_header)
@@ -2057,6 +2183,11 @@ class _MediaDetailsView(QWidget):
         self._cast_lbl = BodyLabel("", content)
         self._cast_lbl.setWordWrap(True)
         info_col.addWidget(self._cast_lbl)
+        self._crew_lbl = BodyLabel("", content)
+        self._crew_lbl.setWordWrap(True)
+        apply_label_theme(self._crew_lbl, "muted")
+        self._crew_lbl.hide()
+        info_col.addWidget(self._crew_lbl)
 
         info_col.addStretch(1)
         top_row.addLayout(info_col, 1)
@@ -2100,7 +2231,141 @@ class _MediaDetailsView(QWidget):
         content_layout.addWidget(self._episodes_section)
         self._episodes_section.hide()
 
+        self._collection_row = _MediaRow("", "movie", self._open_related, content)
+        content_layout.addWidget(self._collection_row)
+        self._recs_row = _MediaRow(tr("tv.movies.more_like_this", default="More like this"), "movie", self._open_related, content)
+        content_layout.addWidget(self._recs_row)
+
         content_layout.addStretch(1)
+
+    def banner_for(self, width: int):
+        if not self.banner_active or self._banner_pix is None or width <= 0:
+            return None
+        if self._banner_cache[0] != width:
+            self._banner_cache = (width, _fade_banner(self._banner_pix, width))
+        return self._banner_cache[1]
+
+    def banner_offset(self) -> int:
+        return self._scroll.verticalScrollBar().value()
+
+    def _set_banner(self, src: str) -> None:
+        if src == self._banner_src:
+            return
+        self._banner_src = src
+        self._banner_pix = None
+        self._banner_cache = (0, None)
+        self.banner_changed.emit()
+        if not src:
+            return
+
+        def _apply(pix, _src=src):
+            if _src == self._banner_src and not pix.isNull():
+                self._banner_pix = pix
+                self.banner_changed.emit()
+
+        images.get(src, (1920, 1080), _apply, mode=FIT, owner=self)
+
+    def _set_logo(self, src: str) -> None:
+        if src == self._logo_src:
+            return
+        self._logo_src = src
+        self._logo_lbl.hide()
+        self._title_lbl.show()
+        if not src:
+            return
+
+        def _apply(pix, _src=src):
+            if _src != self._logo_src or pix.isNull():
+                return
+            pix = QPixmap(pix)
+            pix.setDevicePixelRatio(1.0)
+            pix = pix.scaled(420, 110, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            self._logo_lbl.setFixedSize(pix.size())
+            self._logo_lbl.setPixmap(pix)
+            self._logo_lbl.setToolTip(self._title_lbl.text())
+            self._logo_lbl.show()
+            self._title_lbl.hide()
+
+        images.get(src, (420, 140), _apply, mode=FIT, owner=self)
+
+    def _guard(self, gen: int, fn):
+        def wrapped(*args, **kwargs):
+            if gen == self._gen and _qt_is_valid(self):
+                self._safe(fn)(*args, **kwargs)
+        return wrapped
+
+    def _reset_extras(self) -> None:
+        self._set_banner("")
+        self._set_logo("")
+        self._trailer_url = self._imdb_url = ""
+        self._trailer_btn.hide()
+        self._imdb_btn.hide()
+        self._crew_lbl.hide()
+        self._collection_row.set_items([])
+        self._recs_row.set_items([])
+
+    def _paint_preview(self, raw: dict) -> None:
+        if not raw:
+            return
+        rating = raw.get("vote_average") or 0
+        if rating:
+            self._rating_lbl.setText(f"\u2605 {rating:.1f}")
+        self._date_lbl.setText(raw.get("release_date") or raw.get("first_air_date") or "\u2014")
+        self._overview_lbl.setText(raw.get("overview") or "")
+        self._set_banner(_tmdb_img(raw.get("backdrop_path"), "w1280"))
+        poster = tmdb.image_url(raw.get("poster_path"), "w342")
+        if poster:
+            self._pending_poster_url = poster
+            images.get(poster, (self.POSTER_WIDTH, self.POSTER_HEIGHT), partial(self._on_thumb_ready, poster), owner=self)
+
+    def _open_related(self, raw: dict, media_type: str) -> None:
+        tab = self.parent()
+        while tab is not None and not hasattr(tab, "_open_details"):
+            tab = tab.parent()
+        if tab is not None and raw.get("id") is not None:
+            tab._open_details(raw, media_type)
+
+    def _on_movie_full(self, data: dict) -> None:
+        if not isinstance(data, dict):
+            return
+        ext = data.get("external_ids") or {}
+        if not data.get("imdb_id") and ext.get("imdb_id"):
+            data["imdb_id"] = ext["imdb_id"]
+        self._on_details(data)
+        self._on_credits(data.get("credits") or {})
+        imgs = data.get("images") or {}
+        self._set_banner(_tmdb_img(data.get("backdrop_path") or _pick_art(imgs.get("backdrops"), (None, "en"), 1000), "w1280"))
+        self._set_logo(_tmdb_img(_pick_art(imgs.get("logos"), ("en", None)), "w500"))
+        self._trailer_url = _pick_trailer((data.get("videos") or {}).get("results"))
+        self._trailer_btn.setVisible(bool(self._trailer_url))
+        imdb = str(data.get("imdb_id") or "")
+        self._imdb_url = f"https://www.imdb.com/title/{imdb}/" if imdb.startswith("tt") else ""
+        self._imdb_btn.setVisible(bool(self._imdb_url))
+        crew = (data.get("credits") or {}).get("crew") or []
+        directors = list(dict.fromkeys(c["name"] for c in crew if c.get("job") == "Director" and c.get("name")))[:2]
+        writers = list(dict.fromkeys(c["name"] for c in crew if c.get("job") in ("Screenplay", "Writer", "Story") and c.get("name")))[:2]
+        parts = []
+        if directors:
+            parts.append(tr("tv.movies.directed_by", default="Directed by {names}", names=", ".join(directors)))
+        if writers:
+            parts.append(tr("tv.movies.written_by", default="Written by {names}", names=", ".join(writers)))
+        self._crew_lbl.setText("  \u00b7  ".join(parts))
+        self._crew_lbl.setVisible(bool(parts))
+        recs = [r for r in (data.get("recommendations") or {}).get("results") or [] if r.get("poster_path")]
+        self._recs_row.set_items(_MediaTab._filter_released(recs)[:14])
+        coll = data.get("belongs_to_collection") or {}
+        if coll.get("id"):
+            gen, name, own = self._gen, coll.get("name") or "", self._media_id
+            self._task_ids.append(tmdb.collection_async(
+                coll["id"], on_done=self._guard(gen, lambda d: self._on_collection(name, own, d)),
+                on_error=lambda _m: None))
+
+    def _on_collection(self, name: str, own_id, data: dict) -> None:
+        parts = [p for p in (data or {}).get("parts") or [] if p.get("poster_path") and p.get("id") != own_id]
+        parts = _MediaTab._filter_released(parts)
+        parts.sort(key=lambda p: p.get("release_date") or "")
+        self._collection_row.set_title(data.get("name") or name or tr("tv.movies.collection", default="Collection"))
+        self._collection_row.set_items(parts)
 
     def _on_back(self) -> None:
         parent_tab = self.parent()
@@ -2110,6 +2375,9 @@ class _MediaDetailsView(QWidget):
             parent_tab._show_grid()
 
     def show_media(self, media_id: int, media_type: str, title: str, raw: Optional[dict] = None) -> None:
+        self._gen += 1
+        gen = self._gen
+        self.banner_active = True
         for task_id in self._task_ids:
             _worker_module.cancel(task_id)
         self._task_ids = []
@@ -2124,7 +2392,9 @@ class _MediaDetailsView(QWidget):
             self._source_task_id = None
         self._stop_playback()
         self._imdb_id, self._stream_sources, self._stream_episode = None, [], None
-        self._season_eps, self._auto_pick = {}, False
+        self._season_eps, self._auto_pick, self._picker_forced = {}, False, False
+        self._source_quick = False
+        self._streams_full = False
         self._media_id, self._media_type = media_id, media_type
         self._current_season = self._current_episode = 1
         self._pending_play_episode = None
@@ -2133,6 +2403,7 @@ class _MediaDetailsView(QWidget):
         self._download_preset = (None, None)
         self._autoplay_episode = False
         self._watch_btn.setVisible(bool(getattr(settings, "tv_stream_enabled", True)))
+        self._sources_btn.setVisible(bool(getattr(settings, "tv_stream_enabled", True)))
         self._download_btn.setVisible(self._download_manager is not None)
         self._raw = raw if isinstance(raw, dict) else {}
         self._update_watch_label()
@@ -2151,6 +2422,13 @@ class _MediaDetailsView(QWidget):
         self._clear_tags()
         self._episodes_section.setVisible(media_type == "tv")
         self._clear_episodes()
+        self._reset_extras()
+
+        if media_type == "movie":
+            self._paint_preview(self._raw)
+            self._task_ids.append(tmdb.movie_full_async(
+                media_id, on_done=self._guard(gen, self._on_movie_full), on_error=self._guard(gen, self._on_error)))
+            return
 
         self._task_ids.append(tmdb.details_async(media_type, media_id, on_done=self._safe(self._on_details), on_error=self._safe(self._on_error)))
         self._task_ids.append(tmdb.credits_async(media_type, media_id, on_done=self._safe(self._on_credits)))
@@ -2196,6 +2474,7 @@ class _MediaDetailsView(QWidget):
         }
 
     def _update_watch_later_btn(self) -> None:
+        self._tmdb_btn.setVisible(self._media_id is not None)
         if self._media_id is None:
             self._wl_btn.hide()
             return
@@ -2261,6 +2540,9 @@ class _MediaDetailsView(QWidget):
             if idx >= 0:
                 self._season_combo.setCurrentIndex(idx)
             self._season_combo.blockSignals(False)
+
+        if self._media_type == "tv":
+            self._set_banner(_tmdb_img(data.get("backdrop_path"), "w1280"))
 
         poster = tmdb.image_url(data.get("poster_path"), "w342")
         if poster:
@@ -2472,20 +2754,16 @@ class _MediaDetailsView(QWidget):
                                            default="No playable sources were found for this title."),
                                 duration=5000, parent=self)
                 return
-            sources = [source for source in sources if not getattr(source, "is_direct", False)]
-            if not sources:
-                InfoBar.warning(title=tr("tv.stream.none_title", default="No streams found"),
-                                content=tr("tv.download.torrent_only",
-                                           default="No torrent sources are available for downloading."),
-                                duration=5000, parent=self)
-                return
             title = self._title_lbl.text()
             if episode:
                 title = tr("tv.stream.pick_for", default="{title} (S{season}E{episode})",
                            title=title, season=season, episode=episode)
             dialog = _StreamPickerDialog(sources, title, self.window(), action="download")
             if dialog.exec() == QDialog.DialogCode.Accepted and (source := dialog.chosen()) is not None:
-                self._fetch_download_files(source)
+                if getattr(source, "is_direct", False):
+                    self._download_direct_source(source)
+                else:
+                    self._fetch_download_files(source)
 
         def _failed(message: str) -> None:
             self._download_task_id = None
@@ -2496,8 +2774,137 @@ class _MediaDetailsView(QWidget):
         self._download_task_id = _worker_module.submit_coro(
             _find_media_sources,
             args=(self._imdb_id, self._media_type, season, episode, self._title_lbl.text(),
-                  self._media_year()),
+                  self._media_year(), self._media_id),
             on_done=_done, on_error=_failed)
+
+    def _ensure_ffmpeg_ready(self, source) -> bool:
+        """Prompt for ffmpeg when a DASH download needs it.
+
+        Returns True when the download can start immediately. When ffmpeg is
+        missing and the user agrees to install it, the install runs in the
+        background and starts the download through ``_start_direct_download``
+        once it finishes.
+        """
+        if ".mpd" not in (getattr(source, "url", "") or "").lower() or _resolve_ffmpeg():
+            return True
+
+        from src.core.yt import provider
+        parent = self.window()
+        box = MessageBoxBase(parent)
+        box.titleLabel = SubtitleLabel(
+            tr("tv.download.ffmpeg_title", default="ffmpeg is required"), box)
+        box.viewLayout.addWidget(box.titleLabel)
+        content = CaptionLabel(tr(
+            "tv.download.ffmpeg_body",
+            default="This DASH stream needs ffmpeg to download. Download it now? "
+                    "The download is about 70 MB."), box)
+        content.setWordWrap(True)
+        box.viewLayout.addWidget(content)
+        box.yesButton.setText(tr("tv.download.ffmpeg_install", default="Download ffmpeg"))
+        box.cancelButton.setText(tr("common.cancel", default="Cancel"))
+        if not box.exec():
+            return False
+
+        from PySide6.QtWidgets import QProgressDialog
+        dialog = QProgressDialog(
+            tr("tv.download.ffmpeg_progress", default="Downloading ffmpeg..."),
+            tr("common.cancel", default="Cancel"), 0, 100, parent)
+        dialog.setWindowTitle(tr("tv.download.ffmpeg_title", default="ffmpeg is required"))
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setValue(0)
+        state = {"finished": False, "cancelled": False}
+
+        def _close() -> None:
+            state["finished"] = True
+            dialog.close()
+
+        def _progress(done: int, total: int) -> None:
+            if total:
+                dialog.setValue(max(0, min(100, int(done * 100 / total))))
+
+        def _done(_result) -> None:
+            _close()
+            if state["cancelled"]:
+                return
+            InfoBar.success(
+                title=tr("tv.download.ffmpeg_ready", default="ffmpeg installed"),
+                content=tr("tv.download.ffmpeg_ready_body",
+                           default="The DASH download is starting."),
+                duration=2500, parent=parent)
+            self._start_direct_download(source)
+
+        def _failed(message: str) -> None:
+            _close()
+            if state["cancelled"]:
+                return
+            InfoBar.error(
+                title=tr("tv.download.ffmpeg_failed", default="Could not install ffmpeg"),
+                content=str(message), duration=6000, parent=parent)
+
+        progress = _worker_module.wrap_callback(dialog, _progress)
+        ticket = _worker_module.submit(
+            provider.install_ffmpeg, args=(progress,),
+            on_done=_done, on_error=_failed)
+
+        def _cancelled() -> None:
+            if state["finished"]:
+                return
+            state["cancelled"] = True
+            _worker_module.cancel(ticket)
+
+        dialog.canceled.connect(_cancelled, Qt.ConnectionType.DirectConnection)
+        dialog.open()
+        return False
+
+    def _download_direct_source(self, source) -> None:
+        manager = self._download_manager
+        if manager is None or not getattr(source, "url", ""):
+            return
+        if not self._ensure_ffmpeg_ready(source):
+            return
+        self._start_direct_download(source)
+
+    def _start_direct_download(self, source) -> None:
+        manager = self._download_manager
+        if manager is None or not getattr(source, "url", ""):
+            return
+        title = self._title_lbl.text() or "Video"
+        season, episode = self._stream_episode or (None, None)
+        suffix = f" - S{int(season):02d}E{int(episode):02d}" if season and episode else ""
+        base = f"{_sanitize_filename(title)}{suffix}"
+        dest_dir = os.path.join(settings.download_dir, _sanitize_filename(title))
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+        except OSError as exc:
+            InfoBar.error(title=tr("tv.download.failed_title", default="Download failed"),
+                          content=str(exc), duration=5000, parent=self)
+            return
+        extension = ".ts" if ".m3u8" in source.url.lower() else ".mp4"
+        dest_path = os.path.join(dest_dir, base + extension)
+        item_id = manager.add_external(
+            game_name=base, console=title,
+            source=getattr(source, "indexer", "") or "Vyla", category="tv",
+        )
+
+        def _done(path: str) -> None:
+            manager.complete_external(item_id, path)
+
+        def _failed(message: str) -> None:
+            manager.fail_external(item_id, message)
+
+        task_id = _worker_module.submit(
+            _do_download_direct_source,
+            args=(manager, item_id, source, dest_path),
+            on_done=_done, on_error=_failed,
+        )
+        manager.register_external_cancel(item_id, lambda tid=task_id: _worker_module.cancel(tid))
+        InfoBar.success(
+            title=tr("tv.download.queued_title", default="Download queued"),
+            content=tr("tv.download.queued_direct", default="The direct stream was added to Downloads."),
+            duration=2500, parent=self.window())
 
     def _fetch_download_files(self, source) -> None:
         manager = self._download_manager
@@ -2530,8 +2937,11 @@ class _MediaDetailsView(QWidget):
                             duration=5000, parent=self)
             return
         preset_season, preset_episode = self._download_preset
+        safety = assess_source_files([path for path, _size in files or ()], context="video",
+                                     title=self._title_lbl.text())
         dialog = _TorrentFilesDialog(entries, self._title_lbl.text(), self.window(),
-                                     preset_season=preset_season, preset_episode=preset_episode)
+                                     preset_season=preset_season, preset_episode=preset_episode,
+                                     safety=safety)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         indices = dialog.selected_indices()
@@ -2580,28 +2990,52 @@ class _MediaDetailsView(QWidget):
             return
         self._open_stream_picker()
 
-    def _on_alt_stream(self, _stream: dict) -> None:
-        self._open_stream_picker()
+    def _on_choose_source(self) -> None:
+        if self._media_id is None or not getattr(settings, "tv_stream_enabled", True):
+            return
+        self._open_stream_picker(force_picker=True)
 
-    def _open_stream_picker(self, refresh: bool = False) -> None:
+    def _on_alt_stream(self, _stream: dict) -> None:
+        self._open_stream_picker(force_picker=True)
+
+    def _open_stream_picker(self, refresh: bool = False, force_picker: bool = False) -> None:
         if self._source_task_id is not None:
+            if force_picker:
+                self._picker_forced = True
+                if self._source_quick:
+                    # The in-flight quick search may cancel torrent providers
+                    # as soon as it finds a direct source. An explicit picker
+                    # request deserves the complete list instead.
+                    _worker_module.cancel(self._source_task_id)
+                    self._source_task_id = None
+                    self._source_quick = False
+                    self._open_stream_picker(force_picker=True)
             return
         if not self._imdb_id and not self._title_lbl.text():
+            self._picker_forced = False
             InfoBar.warning(title=tr("tv.stream.no_imdb_title", default="Cannot search streams"),
                             content=tr("tv.stream.no_imdb_body", default="This title has no name to look up."),
                             duration=4000, parent=self)
             return
         target = self._episode_target()
-        if self._stream_sources and target == self._stream_episode and not refresh:
-            self._pick_from_sources()
+        if (self._stream_sources and target == self._stream_episode and not refresh
+                and (self._streams_full or not force_picker)):
+            forced, self._picker_forced = force_picker or self._picker_forced, False
+            self._pick_from_sources(forced)
             return
+        self._picker_forced = force_picker
         self._stream_episode = target
+        quick = not force_picker
+        self._source_quick = quick
         self._set_streaming(True, tr("tv.stream.searching", default="Searching sources..."))
 
         def _done(sources: list) -> None:
             self._source_task_id = None
+            self._source_quick = False
             self._set_streaming(False)
             self._stream_sources = list(sources or [])
+            self._streams_full = not quick
+            forced, self._picker_forced = self._picker_forced, False
             if not self._stream_sources:
                 self._auto_pick = False
                 InfoBar.warning(title=tr("tv.stream.none_title", default="No streams found"),
@@ -2609,11 +3043,13 @@ class _MediaDetailsView(QWidget):
                                            default="No playable sources were found for this title."),
                                 duration=5000, parent=self)
                 return
-            self._pick_from_sources()
+            self._pick_from_sources(forced)
 
         def _failed(message: str) -> None:
             self._source_task_id = None
+            self._source_quick = False
             self._auto_pick = False
+            self._picker_forced = False
             self._set_streaming(False)
             InfoBar.error(title=tr("tv.stream.search_failed", default="Source search failed"),
                           content=str(message), duration=6000, parent=self)
@@ -2622,15 +3058,17 @@ class _MediaDetailsView(QWidget):
             _find_media_sources,
             args=(self._imdb_id, self._media_type,
                   target[0] if target else None, target[1] if target else None,
-                  self._title_lbl.text(), self._media_year()),
+                  self._title_lbl.text(), self._media_year(), self._media_id, quick),
             on_done=_done, on_error=_failed)
 
-    def _pick_from_sources(self) -> None:
+    def _pick_from_sources(self, force_picker: bool = False) -> None:
         auto, self._auto_pick = self._auto_pick, False
         if not self._stream_sources:
             return
-        if auto or getattr(settings, "tv_auto_pick", False):
-            best = stream_backend.pick_source(self._stream_sources) or self._stream_sources[0]
+        direct = [s for s in self._stream_sources if getattr(s, "is_direct", False)]
+        if not force_picker and (auto or direct or getattr(settings, "tv_auto_pick", False)):
+            pool = direct or self._stream_sources
+            best = stream_backend.pick_source(pool) or pool[0]
             self._stream_sources = [best] + [x for x in self._stream_sources if x is not best]
             self._play_source(best)
             return
@@ -2677,6 +3115,8 @@ class _MediaDetailsView(QWidget):
             self._active_source = source
             self._debrid_playback = False
             self._start_player(source.url, source=source)
+            if getattr(source, "source", "") == "vyla" and not getattr(source, "subtitles", None):
+                self._prefetch_vyla_subtitles(source)
             return
 
         if self._use_debrid_stream(source):
@@ -2858,6 +3298,25 @@ class _MediaDetailsView(QWidget):
         else:
             qs.remove(self._resume_key())
 
+    def _prefetch_vyla_subtitles(self, source: Any) -> None:
+        from src.core.tv import external as external_backend
+        season, episode = self._stream_episode or (None, None)
+
+        def _done(subtitles: list) -> None:
+            if not subtitles:
+                return
+            try:
+                if self._active_source is source:
+                    self._player_widget._on_manifest_subs_ready(subtitles)
+            except Exception:
+                pass
+
+        _worker_module.submit(
+            external_backend.vyla_subtitles,
+            args=(self._imdb_id or "", self._media_id, season, episode),
+            on_done=_done, on_error=lambda _message: None,
+        )
+
     def _start_player(self, url: str, source: Any = None) -> None:
         if not url:
             return
@@ -3006,6 +3465,7 @@ class _MediaTab(MediaPageBase):
         self._loaded = False
         self._search_task_id: Optional[str] = None
         self._download_manager: Any = None
+        self._force = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -3048,6 +3508,12 @@ class _MediaTab(MediaPageBase):
         watch_later_store().changed.connect(self._sync_watchlater_badge)
         QTimer.singleShot(0, self._sync_watchlater_badge)
         search_row.addWidget(self._watchlater_btn)
+        self._refresh_btn = TransparentToolButton(FluentIcon.SYNC, self._browse_page)
+        apply_tool_button_theme(self._refresh_btn)
+        self._refresh_btn.setFixedSize(32, 32)
+        self._refresh_btn.setToolTip(tr("tv.refresh", default="Refresh"))
+        self._refresh_btn.clicked.connect(self.refresh)
+        search_row.addWidget(self._refresh_btn)
         browse_layout.addLayout(search_row)
 
         self._status_lbl = BodyLabel("", self._browse_page)
@@ -3108,10 +3574,24 @@ class _MediaTab(MediaPageBase):
             for key, _title_key in self._categories:
                 self._load_category(key)
 
+    def refresh(self) -> None:
+        self._loaded = True
+        self._force = True
+        try:
+            if self._query:
+                self._on_search_commit()
+            else:
+                for key, _title_key in self._categories:
+                    self._load_category(key)
+        finally:
+            self._force = False
+
     def _load_category(self, key: str) -> None:
         def _on_done(items: list) -> None:
             try:
                 self._category_rows[key].set_items(items)
+                if self._media_type == "movie":
+                    tmdb.prefetch_movies([i.get("id") for i in items])
             except Exception:
                 logger.exception("Failed to render %s row '%s'", self._media_type, key)
 
@@ -3125,15 +3605,15 @@ class _MediaTab(MediaPageBase):
             on_done(self._filter_released(data.get("results") or []))
 
         if key == "trending":
-            tmdb.trending_async(self._media_type, "week", 1, on_done=_done, on_error=on_error)
+            tmdb.trending_async(self._media_type, "week", 1, use_cache=not self._force, on_done=_done, on_error=on_error)
         elif key == "popular":
-            tmdb.popular_async(self._media_type, 1, on_done=_done, on_error=on_error)
+            tmdb.popular_async(self._media_type, 1, use_cache=not self._force, on_done=_done, on_error=on_error)
         elif key == "top_rated":
-            tmdb.top_rated_async(self._media_type, 1, on_done=_done, on_error=on_error)
+            tmdb.top_rated_async(self._media_type, 1, use_cache=not self._force, on_done=_done, on_error=on_error)
         elif key == "now_playing" and self._media_type == "movie":
-            tmdb.now_playing_async(1, on_done=_done, on_error=on_error)
+            tmdb.now_playing_async(1, use_cache=not self._force, on_done=_done, on_error=on_error)
         elif key == "on_the_air" and self._media_type == "tv":
-            tmdb.on_the_air_async(1, on_done=_done, on_error=on_error)
+            tmdb.on_the_air_async(1, use_cache=not self._force, on_done=_done, on_error=on_error)
 
     @staticmethod
     def _filter_released(results: list[dict]) -> list[dict]:
@@ -3172,7 +3652,7 @@ class _MediaTab(MediaPageBase):
         self._search_task_id = self._start_search(self._query, _on_done, _on_error)
 
     def _start_search(self, query: str, on_done, on_error):
-        return tmdb.search_async(self._media_type, query, 1, on_error=on_error,
+        return tmdb.search_async(self._media_type, query, 1, use_cache=not self._force, on_error=on_error,
                                  on_done=lambda data: on_done(self._filter_released(data.get("results") or [])))
 
     def _render_search(self, results: list[dict]) -> None:
@@ -3189,6 +3669,8 @@ class _MediaTab(MediaPageBase):
             logger.exception("Failed to open media details")
 
     def _show_grid(self) -> None:
+        self._details.banner_active = False
+        self._details.banner_changed.emit()
         self._details.shutdown()
         self._switch_stack_animated(self._browse_page)
 
@@ -3307,9 +3789,11 @@ def close_ad_hoc_client() -> None:
 
 async def _find_media_sources(imdb_id: str, media_type: str, season: Optional[int] = None,
                               episode: Optional[int] = None, title: str = "",
-                              year: str = "") -> list:
+                              year: str = "", tmdb_id: Optional[int] = None,
+                              quick: bool = False) -> list:
     return await stream_backend.find_streams(imdb_id, media_type, season, episode,
-                                              title=title, year=year)
+                                              title=title, year=year, tmdb_id=tmdb_id,
+                                              quick=quick)
 
 def _icon(name: str, fallback=FluentIcon.PLAY):
     return getattr(FluentIcon, name, fallback)
@@ -3373,12 +3857,17 @@ def _anime_card_raw(item) -> dict:
 
 async def _browse_anime(category: str) -> list[AnimeItem]:
     results = await anime_backend.browse_category(_ANIME_CAT_MAP.get(category, category))
+    results = await anime_backend.collapse_to_franchises(results)
     return [AnimeItem.from_anilist_media(r) for r in results]
 
 
 async def _search_anime(query: str) -> list[AnimeItem]:
     results = await anime_backend.search_cached(query)
+    results = await anime_backend.collapse_to_franchises(results)
     return [AnimeItem.from_anilist_media(r) for r in results]
+
+async def _load_anime_seasons(anilist_id: Any) -> list[dict]:
+    return await anime_backend.get_seasons(anilist_id)
 
 async def _load_anime_media(anilist_id: Any) -> dict:
     return await anime_backend.get_media(anilist_id)
@@ -3404,7 +3893,7 @@ async def _load_anime_provider_episodes(anilist_id: Any, provider: str) -> dict:
     hit = _PROV_CACHE.get(key)
     if hit and hit[0] > time.monotonic():
         return hit[1]
-    resp = await anime_backend.get_filtered_episodes_response(anilist_id, {provider}, False)
+    resp = await anime_backend.get_group_provider_episodes(anilist_id, provider)
     if isinstance(resp, dict) and "notAired" in resp:
         return resp
     data = (resp or {}).get(provider) or {}
@@ -6107,7 +6596,17 @@ def _sanitize_filename(name: str) -> str:
     return _SANITIZE_FILENAME_RE.sub("_", str(name)).strip() or "unknown"
 
 def _resolve_ffmpeg() -> Optional[str]:
-    return shutil.which("ffmpeg")
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    from src.core.config import paths as _paths
+    for candidate in (
+        os.path.join(_paths.yt_dir, "ffmpeg.exe" if os.name == "nt" else "ffmpeg"),
+        os.path.join(_paths.app_data_dir, "yt", "ffmpeg.exe" if os.name == "nt" else "ffmpeg"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 def _download_hls_pure(url: str, referer: Optional[str], headers: dict, dest_path: str, item_id, download_manager, is_cancelled=None) -> None:
     import time
@@ -6206,6 +6705,99 @@ def _download_hls_pure(url: str, referer: Optional[str], headers: dict, dest_pat
                     progress=progress,
                     speed_down_kbps=speed_kbps,
                 )
+    return dest_path
+
+
+def _download_ffmpeg_stream(url: str, referer: Optional[str], headers: dict, dest_path: str,
+                            item_id, download_manager, is_cancelled=None) -> None:
+    import subprocess
+    import time
+
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError(
+            "This stream needs ffmpeg to download. Install ffmpeg from the YouTube page "
+            "or add it to PATH.")
+    cmd = [ffmpeg, "-y", "-loglevel", "error", "-progress", "pipe:1"]
+    header_lines = [f"{key}: {value}" for key, value in (headers or {}).items()]
+    if referer and not any(line.lower().startswith("referer:") for line in header_lines):
+        header_lines.append(f"Referer: {referer}")
+    if header_lines:
+        cmd += ["-headers", "\r\n".join(header_lines) + "\r\n"]
+    cmd += ["-i", url, "-c", "copy", dest_path]
+    kwargs = {}
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        kwargs["startupinfo"] = startupinfo
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, **kwargs)
+    last_bytes = 0
+    last_time = time.time()
+    try:
+        for line in proc.stdout or []:
+            if is_cancelled and is_cancelled():
+                proc.terminate()
+                raise RuntimeError("Cancelled")
+            line = line.strip()
+            if not line.startswith("total_size="):
+                continue
+            try:
+                size = int(line.split("=", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            now = time.time()
+            elapsed = now - last_time
+            speed = ((size - last_bytes) / 1024) / elapsed if elapsed > 0 else 0.0
+            last_bytes = size
+            last_time = now
+            download_manager.update_external(
+                item_id, downloaded_bytes=size, speed_down_kbps=speed,
+            )
+        proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+    if proc.returncode != 0:
+        raise RuntimeError("ffmpeg failed to download the stream")
+
+
+def _do_download_direct_source(download_manager, item_id, source, dest_path: str, is_cancelled=None) -> str:
+    url = source.url
+    headers = {"User-Agent": _UA}
+    headers.update(getattr(source, "headers", None) or {})
+    referer = getattr(source, "referer", "") or ""
+    if referer:
+        headers["Referer"] = referer
+    lower = url.lower()
+    if ".m3u8" in lower:
+        _download_hls_pure(url, referer, getattr(source, "headers", None) or {}, dest_path,
+                           item_id, download_manager, is_cancelled)
+        return dest_path
+    if ".mpd" in lower:
+        _download_ffmpeg_stream(url, referer, headers, dest_path, item_id,
+                                download_manager, is_cancelled)
+        return dest_path
+    with _ad_hoc_client.stream("GET", url, headers=headers, timeout=60) as response:
+        response.raise_for_status()
+        total = int(response.headers.get("Content-Length") or 0)
+        downloaded = 0
+        with open(dest_path, "wb") as fh:
+            for chunk in response.iter_bytes(1024 * 256):
+                if is_cancelled and is_cancelled():
+                    raise RuntimeError("Cancelled")
+                fh.write(chunk)
+                downloaded += len(chunk)
+                download_manager.update_external(
+                    item_id,
+                    downloaded_bytes=downloaded,
+                    total_bytes=max(total, downloaded),
+                    progress=(downloaded / total * 100) if total else 0,
+                    speed_down_kbps=0,
+                )
+    return dest_path
+
 
 def _stream_quality_value(s: dict) -> Optional[int]:
     for key in ("quality", "label", "resolution"):
@@ -6287,7 +6879,8 @@ def _do_download_anime_episode(download_manager, item_id, anilist_id, provider, 
     import time
     import urllib.request
 
-    path = f"/watch/{provider}/{anilist_id}/{audio}/{provider}-{episode.get('number')}"
+    path = (f"/watch/{provider}/{episode.get('anilistId') or anilist_id}/{audio}/"
+            f"{provider}-{episode.get('sourceNumber', episode.get('number'))}")
     data = asyncio.run(anime_backend.handle(path))
     streams = data.get("streams") or []
 
@@ -6314,10 +6907,11 @@ def _do_download_anime_episode(download_manager, item_id, anilist_id, provider, 
         if ffmpeg_exe:
             dest_path = os.path.join(dest_dir, f"{base_name}.mp4")
             cmd = [ffmpeg_exe, "-y", "-loglevel", "error", "-progress", "pipe:1"]
-            if referer:
-                cmd += ["-headers", f"Referer: {referer}\r\n"]
-            for hk, hv in headers.items():
-                cmd += ["-headers", f"{hk}: {hv}\r\n"]
+            header_lines = [f"{hk}: {hv}" for hk, hv in headers.items()]
+            if referer and not any(line.lower().startswith("referer:") for line in header_lines):
+                header_lines.append(f"Referer: {referer}")
+            if header_lines:
+                cmd += ["-headers", "\r\n".join(header_lines) + "\r\n"]
             cmd += ["-i", url, "-c", "copy", dest_path]
             popen_kwargs = {}
             if os.name == "nt":
@@ -6596,6 +7190,8 @@ class AnimeDetailView(QWidget):
     back_requested = Signal()
     download_requested = Signal(object, str, str, object, str, str)
     provider_requested = Signal(str)
+    season_requested = Signal(object)
+    banner_changed = Signal()
 
     def _set_genre_pills(self, genres: list) -> None:
         for p in self._genre_pills:
@@ -6611,6 +7207,7 @@ class AnimeDetailView(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._media: Optional[dict] = None
+        self._seasons: list = []
         self._episodes_by_provider: dict = {}
         self._lazy_names: list[str] = []
         self._current_provider: Optional[str] = None
@@ -6621,6 +7218,10 @@ class AnimeDetailView(QWidget):
         self._download_pending = False
 
         self._cover_url: Optional[str] = None
+        self.banner_active = False
+        self._banner_src = ""
+        self._banner_pix = None
+        self._banner_cache = (0, None)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -6641,6 +7242,8 @@ class AnimeDetailView(QWidget):
         scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         scroll.viewport().setStyleSheet("background: transparent;")
         outer.addWidget(scroll, 1)
+        self._scroll = scroll
+        scroll.verticalScrollBar().valueChanged.connect(lambda _v: self.banner_changed.emit())
 
         content = QWidget()
         content.setStyleSheet("background: transparent;")
@@ -6691,6 +7294,12 @@ class AnimeDetailView(QWidget):
         self._episodes_title = StrongBodyLabel(tr("anime.episodes", default="Episodes"))
         controls_row.addWidget(self._episodes_title)
         controls_row.addStretch(1)
+
+        self._season_combo = ComboBox()
+        self._season_combo.setMinimumWidth(120)
+        self._season_combo.currentIndexChanged.connect(self._on_season_changed)
+        self._season_combo.hide()
+        controls_row.addWidget(self._season_combo)
 
         self._provider_combo = ComboBox()
         self._provider_combo.setMinimumWidth(140)
@@ -6780,12 +7389,15 @@ class AnimeDetailView(QWidget):
         self._poster.setFixedSize(200, 300)
 
     def show_loading(self, entry: AnimeItem) -> None:
+        self.banner_active = True
+        self._set_banner("")
         self._now_episode = None
         self._pending_play_number = None
         self._download_pending = False
         self._player_widget.stop()
         self._player_widget.hide()
         self._set_movie(_is_movie(getattr(entry, 'format', None)))
+        self._season_combo.hide()
 
         self._media = None
         self._episodes_by_provider = {}
@@ -6829,7 +7441,57 @@ class AnimeDetailView(QWidget):
         self._movie = on
         self._ep_scroll.setVisible(not on)
 
+    def _on_anime_banner(self, anilist_id, url: str) -> None:
+        if _qt_is_valid(self) and url and self.banner_active and (self._media or {}).get("id") == anilist_id:
+            self._set_banner(url)
+
+    def set_seasons(self, seasons: list, current_id: Any) -> None:
+        self._seasons = list(seasons or [])
+        try:
+            current = int(current_id)
+        except (TypeError, ValueError):
+            current = None
+        idx = next((i for i, s in enumerate(self._seasons)
+                    if current in (s.get("ids") or [s.get("id")])), 0)
+        self._season_combo.blockSignals(True)
+        self._season_combo.clear()
+        for n, season in enumerate(self._seasons, 1):
+            label = tr("anime.season_n", default="Season {n}").format(n=n)
+            if season.get("seasonYear"):
+                label += f" \u00b7 {season['seasonYear']}"
+            self._season_combo.addItem(label, userData=season["id"])
+        if self._seasons:
+            self._season_combo.setCurrentIndex(idx)
+        self._season_combo.blockSignals(False)
+        self._season_combo.setVisible(len(self._seasons) > 1)
+
+    def _on_season_changed(self, idx: int) -> None:
+        if not 0 <= idx < len(self._seasons):
+            return
+        season = self._seasons[idx]
+        if (self._media or {}).get("id") in (season.get("ids") or []):
+            return
+        self.season_requested.emit(season["id"])
+
+    def begin_season_switch(self) -> None:
+        self._close_player()
+        self._now_episode = None
+        self._pending_play_number = None
+        self._media = None
+        self._episodes_by_provider = {}
+        self._current_provider = None
+        self._provider_combo.blockSignals(True)
+        self._provider_combo.clear()
+        self._provider_combo.blockSignals(False)
+        self._clear_episode_cards()
+
     def show_detail(self, media: dict, episodes_by_provider: dict) -> None:
+        self.banner_active = True
+        banner = str(media.get("bannerImage") or "")
+        self._set_banner(banner)
+        if not banner and media.get("id"):
+            aid = media["id"]
+            tmdb.anime_banner_async(aid, on_done=lambda url, a=aid: self._on_anime_banner(a, url))
         self._now_episode = None
         if _is_movie(media.get('format')):
             self._set_movie(True)
@@ -7185,7 +7847,8 @@ class AnimeDetailView(QWidget):
 
         self._stream_task_id = _worker_module.submit_coro(
             _load_stream,
-            args=(self._current_provider, self._media["id"], self._current_audio, episode.get("number")),
+            args=(self._current_provider, episode.get("anilistId") or self._media["id"], self._current_audio,
+                  episode.get("sourceNumber", episode.get("number"))),
             on_done=_on_done,
             on_error=_on_error,
         )
@@ -7327,6 +7990,10 @@ class AnimeDetailView(QWidget):
             parent=self.window(), duration=3000, isClosable=True,
         )
 
+for _name in ("banner_for", "banner_offset", "_set_banner"):
+    setattr(AnimeDetailView, _name, getattr(_MediaDetailsView, _name))
+
+
 class AnimePage(_MediaTab):
     anime_selected = Signal(object)
     _wrap = staticmethod(_AnimeCard)
@@ -7348,6 +8015,7 @@ class AnimePage(_MediaTab):
         view.back_requested.connect(self._show_grid)
         view.download_requested.connect(self._on_download_requested)
         view.provider_requested.connect(self._on_provider_requested)
+        view.season_requested.connect(self._on_season_requested)
         return view
 
     def _start_category(self, key: str, on_done, on_error) -> None:
@@ -7360,6 +8028,8 @@ class AnimePage(_MediaTab):
         self._on_anime_clicked(item)
 
     def _show_grid(self) -> None:
+        self._detail_view.banner_active = False
+        self._detail_view.banner_changed.emit()
         self._switch_stack_animated(self._browse_page)
 
     def set_download_manager(self, manager) -> None:
@@ -7471,7 +8141,18 @@ class AnimePage(_MediaTab):
         self._switch_stack_animated(self._detail_view)
         self.anime_selected.emit(result)
 
-        def _on_media_loaded(media: dict) -> None:
+        self._load_media_into_view(anilist_id)
+
+        def _seasons_ok(seasons: list) -> None:
+            if self._lazy_id == anilist_id or self._detail_view._media is None:
+                self._detail_view.set_seasons(seasons or [], anilist_id)
+
+        _worker_module.submit_coro(
+            _load_anime_seasons, args=(anilist_id,), on_done=_seasons_ok, on_error=lambda _m: None,
+        )
+
+    def _load_media_into_view(self, anilist_id: Any) -> None:
+        def _ok(media: dict) -> None:
             self._detail_task_id = None
             self._detail_view.show_detail(media, {})
             deferred, self._deferred_eps = getattr(self, "_deferred_eps", None), None
@@ -7480,7 +8161,7 @@ class AnimePage(_MediaTab):
             elif self._episodes_task_id is not None:
                 self._detail_view.set_episodes_loading()
 
-        def _on_media_err(msg: str) -> None:
+        def _err(msg: str) -> None:
             self._detail_task_id = None
             InfoBar.error(
                 title=tr("anime.error", default="Error"),
@@ -7491,8 +8172,15 @@ class AnimePage(_MediaTab):
         self._deferred_eps = None
         self._start_episode_load(anilist_id)
         self._detail_task_id = _worker_module.submit_coro(
-            _load_anime_media, args=(anilist_id,), on_done=_on_media_loaded, on_error=_on_media_err,
+            _load_anime_media, args=(anilist_id,), on_done=_ok, on_error=_err,
         )
+
+    def _on_season_requested(self, season_id: Any) -> None:
+        if self._detail_task_id is not None:
+            _worker_module.cancel(self._detail_task_id)
+            self._detail_task_id = None
+        self._detail_view.begin_season_switch()
+        self._load_media_into_view(season_id)
 
     def _cancel_lazy_tasks(self) -> None:
         for tid in self._lazy_tasks.values():
@@ -7757,6 +8445,15 @@ class TV_page(QWidget):
         return _TVTabPlaceholder(themed_icon(f'tv.tab_{key}', self._tab_icons[key]),
                                  self._tab_text_keys[key], self)
 
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        details = getattr(self._stack.currentWidget(), '_details', None)
+        if details is None or not getattr(details, 'banner_active', False):
+            return
+        pix = details.banner_for(self.width())
+        if pix is not None:
+            QPainter(self).drawPixmap(0, -details.banner_offset(), pix)
+
     def _ensure_tab(self, key: str) -> QWidget | None:
         tab = self._tabs.get(key)
         if tab is not None:
@@ -7773,6 +8470,9 @@ class TV_page(QWidget):
         else:
             self._stack.addWidget(tab)
         self._tabs[key] = tab
+        details = getattr(tab, '_details', None)
+        if details is not None and hasattr(details, 'banner_changed'):
+            details.banner_changed.connect(self.update)
         if self._download_manager is not None and hasattr(tab, 'set_download_manager'):
             tab.set_download_manager(self._download_manager)
         return tab

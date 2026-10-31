@@ -3,6 +3,10 @@ import os
 from PyInstaller.utils.hooks import collect_data_files
 
 datas = [
+    # src/core includes the Node bridge scripts and the vendored Vyla SDK.
+    # Node.js itself is provisioned on demand into the user data folder
+    # (runtime/node), and npm dependencies are installed next to
+    # integrations/vyla so the SDK resolves them from an ancestor folder.
     ('src/gui', 'src/gui'),
     ('src/core', 'src/core'),
     ('VERSION', '.'),
@@ -20,6 +24,7 @@ hiddenimports = [
     'qframelesswindow',
     'socks',
     'sockshandler',
+    'src.core.tv.external',
 ]
 
 excludes = [

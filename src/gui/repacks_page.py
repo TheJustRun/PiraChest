@@ -8,13 +8,13 @@ from contextlib import suppress
 from functools import wraps
 from PySide6.QtCore import Qt, QSize, QSizeF, QRect, QThread, QObject, Signal, Property, QPropertyAnimation, QEasingCurve, QTimer, QVariantAnimation, QAbstractAnimation, QEvent
 from shiboken6 import isValid as _qt_is_valid
-from PySide6.QtGui import QColor, QIcon
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLayout, QLayoutItem, QScrollArea, QDialog, QTreeWidgetItem, QHeaderView, QGridLayout, QLabel, QSizePolicy, QFileDialog, QGraphicsOpacityEffect
+from PySide6.QtGui import QBrush, QColor, QIcon, QImage, QFontMetrics, QMovie, QTextDocument
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLayout, QLayoutItem, QScrollArea, QDialog, QTreeWidgetItem, QHeaderView, QGridLayout, QLabel, QSizePolicy, QFileDialog, QGraphicsOpacityEffect, QTextBrowser, QListWidget, QListWidgetItem
 from qfluentwidgets import CardWidget, FluentIcon, Pivot, TitleLabel, SubtitleLabel, BodyLabel, StrongBodyLabel, CaptionLabel, TransparentToolButton, PushButton, PrimaryPushButton, ImageLabel, PillPushButton, FlowLayout as QFlowLayout, themeColor, SearchLineEdit, LineEdit, CheckBox, TreeWidget, MessageBoxBase, SmoothScrollArea, HyperlinkButton, qconfig, isDarkTheme
 from .home_page import AccentColorMixin, DetailsViewMixin, MediaPageBase
-from PySide6.QtGui import QAction, QDesktopServices, QPen, QRegion
+from PySide6.QtGui import QAction, QDesktopServices, QPainter, QPainterPath, QPen, QPixmap, QRegion
 from PySide6.QtWidgets import QApplication, QGraphicsScene, QGraphicsView, QMenu, QPushButton as _QPB, QStackedWidget, QStyle, QSystemTrayIcon, QWidgetItem
-from PySide6.QtCore import QCoreApplication, QUrl
+from PySide6.QtCore import QCoreApplication, QRectF, QUrl
 from qfluentwidgets import InfoBar, InfoBarPosition, RoundMenu
 _bookmark_icon_cache: dict[str, QIcon] = {}
 
@@ -51,12 +51,69 @@ def _bookmark_icon(filled: bool=False) -> QIcon:
     p.end()
     icon = _bookmark_icon_cache[key] = QIcon(pm)
     return icon
-from src.core.repacks.base import RepackEntry, RepackDetails, magnet_display_name
+from src.core.models import assess_source_files, classify_file
+from src.core.repacks.base import RepackEntry, RepackDetails, display_title, magnet_display_name
 from src.core.worker import fetch_page_async, fetch_details_async, fetch_upcoming_repacks_async, fetch_search_async, fetch_popular_repacks_async, cancel as cancel_task, Priority
 from src.core.downloader import DownloadManager, DLState
-from src.core.theme import palette, register_theme_refresh, apply_pivot_theme, apply_tool_button_theme, branded_icon, count_badge_qss, themed_icon, apply_slot_icon_theme
+from src.core.theme import palette, to_color, register_theme_refresh, apply_pivot_theme, apply_tool_button_theme, branded_icon, count_badge_qss, themed_icon, apply_slot_icon_theme, ScrollingTextDelegate
 from .grid import PosterGrid, ViewModeButton, attrs_subtitle, play_sfx
 _source_subtitle = attrs_subtitle('source', labels={'fitgirl': 'FitGirl Repacks', 'gog': 'GOG Revived'})
+
+
+def _entry_title(entry) -> str:
+    raw = str(getattr(entry, 'title', '') or '')
+    clean = str(getattr(entry, 'display_title', '') or '')
+    if clean and clean != raw:
+        return clean
+    try:
+        return display_title(raw) or raw
+    except Exception:
+        return raw
+
+
+def _decorate_repack_entry(entry):
+    try:
+        from src.core.repacks.base import parse_title
+
+        parsed = parse_title(getattr(entry, 'title', '') or '')
+        if parsed.clean:
+            entry.clean_title = parsed.clean
+        entry.meta_text = parsed.display_meta
+    except Exception:
+        pass
+    try:
+        from src.core.config import settings as _settings
+
+        if not getattr(_settings, 'steam_enrichment_enabled', False):
+            entry.poster_fallback = None
+        elif not getattr(entry, 'poster_path', None) and not getattr(entry, 'poster_url', None):
+            from src.core.repacks import enrichment as service
+
+            entry.poster_fallback = service.cached_card_art(entry) or None
+    except Exception:
+        pass
+    return entry
+
+
+def _entry_search_text(entry) -> str:
+    try:
+        from src.core.repacks import enrichment as service
+
+        return service.search_text_for(entry)
+    except Exception:
+        return str(getattr(entry, 'title', '') or '')
+
+
+def _entry_meta_text(entry) -> str:
+    return str(getattr(entry, 'meta_text', '') or '')
+
+
+def _titles_enabled() -> bool:
+    try:
+        from src.core.config import settings as _s
+        return bool(getattr(_s, 'repack_show_titles', False))
+    except Exception:
+        return False
 from src.core.translations import tr, register_locale_refresh
 from src.core.repacks.installer import get_install_coordinator, parse_size_bytes, inspect_inno_setup, build_inno_selection
 try:
@@ -194,7 +251,12 @@ class _BookmarkStore(QObject):
         return True
 
     def to_entry(self, d: dict) -> RepackEntry:
-        return RepackEntry(source=d.get('source', ''), title=d.get('title', ''), url=d.get('url', ''), poster_url=d.get('poster_url'), poster_path=d.get('poster_path'), slug=d.get('slug'))
+        entry = RepackEntry(
+            source=d.get('source', ''), title=d.get('title', ''), url=d.get('url', ''),
+            poster_url=d.get('poster_url'), poster_path=d.get('poster_path'), slug=d.get('slug'),
+            clean_title=d.get('clean_title'), meta_text=d.get('meta_text'),
+            poster_fallback=d.get('poster_fallback'))
+        return _decorate_repack_entry(entry)
 _bookmark_store = None
 
 def bookmark_store() -> _BookmarkStore:
@@ -308,7 +370,7 @@ class FlowLayout(QLayout):
             _flush_row(is_last=True)
         total_h = y - base_spacing - effective_rect.y() if line_height else 0
         return total_h + top + bottom
-from src.core.artwork import images, FIT
+from src.core.artwork import images, image_file, FIT
 
 def _stop_previous_movie(image_label) -> None:
     try:
@@ -425,7 +487,7 @@ class PosterCard(_AnimatedPosterMixin, QWidget):
 
     def bind(self, entry) -> None:
         self._entry = entry
-        self.setToolTip(entry.title)
+        self.setToolTip(_entry_title(entry))
         if self._fallback_icon is not None:
             self._fallback_icon.deleteLater()
             self._fallback_icon = None
@@ -499,7 +561,7 @@ class PosterCard(_AnimatedPosterMixin, QWidget):
         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_lbl.setStyleSheet('background: transparent;')
         wrapper_layout.addWidget(icon_lbl)
-        title_lbl = QLabel(self._entry.title, wrapper)
+        title_lbl = QLabel(_entry_title(self._entry), wrapper)
         title_lbl.setWordWrap(True)
         title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_lbl.setStyleSheet(f'background: transparent; font-size: 11px; color: {palette()['primary_text']};')
@@ -977,38 +1039,188 @@ def _round_widget_corners(widget: QWidget, radius: int) -> None:
         _apply_mask()
     widget.resizeEvent = _resize_event
 
-class ScreenshotEnlargeDialog(MessageBoxBase):
+class _LightboxCloseButton(_QPB):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(40, 40)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        alpha = 100 if self.isDown() else 72 if self.underMouse() else 38
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, alpha))
+        p.drawEllipse(self.rect().adjusted(1, 1, -1, -1))
+        pen = QPen(QColor(255, 255, 255, 235), 2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        cx, cy, d = self.width() // 2, self.height() // 2, 7
+        p.drawLine(cx - d, cy - d, cx + d, cy + d)
+        p.drawLine(cx - d, cy + d, cx + d, cy - d)
+        p.end()
+
+
+class ScreenshotEnlargeDialog(QWidget):
+    finished = Signal(int)
+    _MARGIN = 56
+    _DIM = 200
+
     def __init__(self, image_path: str, parent=None):
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.yesButton.setText(tr('repacks.close'))
-        self.hideCancelButton()
-        self._img = ImageLabel(self)
-        self._img.setBorderRadius(8, 8, 8, 8)
-        self._img.setFixedSize(640, 360)
-        self.viewLayout.addWidget(self._img)
-        images.get(image_path, (1100, 720), self._on_ready, mode=FIT, owner=self)
+        self._path = image_path
+        self._pix = None
+        self._t = 0.0
+        self._closing = False
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._close_btn = _LightboxCloseButton(self)
+        self._close_btn.clicked.connect(self.close_lightbox)
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(160)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.valueChanged.connect(self._on_anim)
+        self._anim.finished.connect(self._on_anim_finished)
+        self._reload = QTimer(self)
+        self._reload.setSingleShot(True)
+        self._reload.setInterval(120)
+        self._reload.timeout.connect(self._request)
+        if parent is not None:
+            parent.installEventFilter(self)
+        self._fit_to_parent()
+
+    def _fit_to_parent(self) -> None:
+        parent = self.parentWidget()
+        if parent is not None:
+            self.setGeometry(parent.rect())
+
+    def _available(self) -> QRectF:
+        full = QRectF(self.rect()).adjusted(self._MARGIN, self._MARGIN, -self._MARGIN, -self._MARGIN)
+        w = min(full.width(), max(320.0, min(self.width() * 0.6, 1000.0)))
+        h = min(full.height(), max(180.0, min(self.height() * 0.65, 640.0)))
+        c = QRectF(self.rect()).center()
+        return QRectF(c.x() - w / 2, c.y() - h / 2, w, h)
+
+    def _target_rect(self) -> QRectF:
+        avail = self._available()
+        if self._pix is not None and not self._pix.isNull():
+            dpr = self._pix.devicePixelRatio() or 1.0
+            w, h = self._pix.width() / dpr, self._pix.height() / dpr
+        else:
+            w, h = 640.0, 360.0
+        scale = min(1.0, avail.width() / max(1.0, w), avail.height() / max(1.0, h))
+        w, h = w * scale, h * scale
+        c = avail.center()
+        return QRectF(c.x() - w / 2, c.y() - h / 2, w, h)
+
+    def _request(self) -> None:
+        avail = self._available()
+        images.get(self._path, (max(120, int(avail.width())), max(120, int(avail.height()))),
+                   self._on_ready, mode=FIT, owner=self)
 
     def _on_ready(self, pix) -> None:
-        if pix.isNull() or not _qt_is_valid(self):
+        if not _qt_is_valid(self) or pix is None or pix.isNull():
             return
-        dpr = pix.devicePixelRatio() or 1.0
-        w, h = (round(pix.width() / dpr), round(pix.height() / dpr))
-        self._img.setImage(pix)
-        self._img.setFixedSize(w, h)
-        self._img.setScaledSize(QSize(w, h))
-        self.widget.adjustSize()
-        self.adjustSize()
+        self._pix = pix
+        self.update()
+
+    def _on_anim(self, value) -> None:
+        self._t = float(value)
+        self.update()
+
+    def _on_anim_finished(self) -> None:
+        if self._closing:
+            self.hide()
+            self.finished.emit(0)
+            self.deleteLater()
+
+    def close_lightbox(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        self._anim.stop()
+        self._anim.setDirection(QAbstractAnimation.Direction.Backward)
+        self._anim.start()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._fit_to_parent()
+        self.raise_()
+        self.setFocus(Qt.FocusReason.PopupFocusReason)
+        self._anim.setDirection(QAbstractAnimation.Direction.Forward)
+        self._anim.start()
+        self._request()
+
+    def hideEvent(self, event) -> None:
+        try:
+            images.release(self)
+        except Exception:
+            pass
+        super().hideEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._close_btn.move(self.width() - self._close_btn.width() - 20, 20)
+        self._close_btn.raise_()
+        self._reload.start()
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.parentWidget() and event.type() == QEvent.Type.Resize:
+            self._fit_to_parent()
+        return False
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        p.fillRect(self.rect(), QColor(0, 0, 0, int(self._DIM * self._t)))
+        rect = self._target_rect()
+        path = QPainterPath()
+        path.addRoundedRect(rect, 10, 10)
+        p.setOpacity(self._t)
+        if self._pix is not None and not self._pix.isNull():
+            p.save()
+            p.setClipPath(path)
+            p.drawPixmap(rect, self._pix, QRectF(self._pix.rect()))
+            p.restore()
+        else:
+            p.fillPath(path, to_color(palette()['card_bg']))
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        p.end()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and not self._target_rect().contains(event.position()):
+            self.close_lightbox()
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        event.accept()
+
+    def wheelEvent(self, event) -> None:
+        event.accept()
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Escape:
-            self.reject()
-            event.accept()
-            return
-        super().keyPressEvent(event)
+            self.close_lightbox()
+        event.accept()
 
     def closeEvent(self, event) -> None:
-        self.reject()
+        if not self._closing:
+            event.ignore()
+            self.close_lightbox()
+            return
         super().closeEvent(event)
 
 class _VideoThumb(QWidget):
@@ -1313,6 +1525,14 @@ class ScreenshotGallery(QWidget):
             if isinstance(thumb, _VideoThumb):
                 thumb.deactivate()
 
+    def play_external(self, url: str, title: str = '') -> None:
+        if not url:
+            return
+        dialog = VideoEnlargeDialog(url, self._video_downloader, self.window())
+        if title:
+            dialog.setWindowTitle(title)
+        dialog.exec()
+
     def update_visible_videos(self) -> None:
         scroll = self._find_scroll_area()
         if scroll is None:
@@ -1357,11 +1577,8 @@ class ScreenshotGallery(QWidget):
     def _on_thumb_clicked(self, path: str) -> None:
         self._pause_all_videos()
         dialog = ScreenshotEnlargeDialog(path, self.window())
-        dialog.setModal(True)
         dialog.finished.connect(lambda *_: self._resume_all_videos())
         dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
 
     def _on_video_clicked(self, video_url: str) -> None:
         self._pause_all_videos()
@@ -1726,6 +1943,26 @@ def render_game_updates_html(raw_html: str) -> str:
     body = container.decode_contents() if container is not None else soup.decode_contents()
     return f'<div style="line-height:{_DESC_LINE_HEIGHT_PCT}%; word-wrap:break-word; overflow-wrap:break-word; word-break:break-all;">{body}</div>'
 
+_DESC_SIZE_NOISE_RE = re.compile(
+    r'^(?:\[\s*)?(?:from\s+)?\d+(?:[.,]\d+)?(?:\s*(?:~|～|–|—|-|to)\s*\d+(?:[.,]\d+)?)?'
+    r'\s*(?:GB|MB|TB)(?:\s*(?:GB|MB|TB))?(?:\s*\[?\s*Selective\s+Download\s*\]?)?\s*\]?\.?$',
+    re.IGNORECASE,
+)
+_DESC_META_NOISE_RE = re.compile(
+    r'^(?:genres?/tags?|companies?|languages?|original\s+size|repack\s+size|final\s+size)\s*:'
+    r'|^\[?\s*Selective\s+Download\s*\]?$',
+    re.IGNORECASE,
+)
+
+
+def _desc_noise_line(line: str) -> bool:
+    candidate = (line or '').replace('\x00', ' ').strip()
+    candidate = re.sub('^[•*-]\\s*', '', candidate).strip()
+    if not candidate:
+        return True
+    return bool(_DESC_SIZE_NOISE_RE.match(candidate) or _DESC_META_NOISE_RE.match(candidate))
+
+
 def render_description_html(text: str) -> str:
     if not text:
         return ''
@@ -1733,6 +1970,7 @@ def render_description_html(text: str) -> str:
     html_parts: list[str] = []
 
     def _flush_prose(prose_lines: list[str]) -> None:
+        prose_lines = [line for line in prose_lines if not _desc_noise_line(line)]
         if not prose_lines:
             return
         joined = '\n'.join(prose_lines).strip()
@@ -1750,6 +1988,8 @@ def render_description_html(text: str) -> str:
             return
         items = []
         for ln in bullet_lines:
+            if _desc_noise_line(ln):
+                continue
             item_text = re.sub('^[•*-]\\s*', '', ln.strip())
             if not item_text:
                 continue
@@ -1861,6 +2101,75 @@ def _extract_trailing_backwards_compat(intro_text: str) -> tuple[str, str]:
     note = ' '.join(note_lines).strip()
     return (cleaned, note)
 
+_BULLETS = ('•', '- ', '* ')
+
+
+def _peel_list_groups(text: str) -> tuple[str, list[tuple[str, str]]]:
+    if not text or not any(ln.lstrip().startswith(_BULLETS) for ln in text.split('\n')):
+        return (text, [])
+    lines = text.split('\n')
+    keep: list[str] = []
+    groups: list[tuple[str, str]] = []
+    i = 0
+    n = len(lines)
+
+    def _next_nonblank(k: int) -> int:
+        while k < n and not lines[k].strip():
+            k += 1
+        return k
+
+    while i < n:
+        head = lines[i].strip()
+        if head and not head.startswith(_BULLETS) and len(head) <= 100 and not head.endswith(('.', '!', '?')):
+            j = _next_nonblank(i + 1)
+            if j < n and lines[j].strip().startswith(_BULLETS):
+                body: list[str] = []
+                while j < n:
+                    cur = lines[j].strip()
+                    if cur.startswith(_BULLETS):
+                        body.append(cur)
+                        j += 1
+                        continue
+                    k = _next_nonblank(j)
+                    if not cur and k < n and lines[k].strip().startswith(_BULLETS):
+                        j = k
+                        continue
+                    break
+                groups.append((head.rstrip(':').strip(), '\n'.join(body)))
+                i = j
+                continue
+        keep.append(lines[i])
+        i += 1
+    return (re.sub('\\n{3,}', '\n\n', '\n'.join(keep)).strip(), groups)
+
+
+def _merge_sections(sections: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    def _norm(value: str) -> str:
+        return ' '.join(re.sub('^[•*-]\\s*', '', value.strip()).casefold().split())
+
+    merged: dict[str, tuple[str, list[str]]] = {}
+    seen: set[str] = set()
+    for heading, body in sections:
+        key = _norm(heading)
+        _h, lines = merged.setdefault(key, (heading, []))
+        for line in (body or '').split('\n'):
+            norm = _norm(line)
+            if not norm:
+                if lines and lines[-1]:
+                    lines.append('')
+                continue
+            if norm in seen and line.strip().startswith(_BULLETS):
+                continue
+            seen.add(norm)
+            lines.append(line)
+    out = []
+    for heading, lines in merged.values():
+        body = '\n'.join(lines).strip()
+        if body:
+            out.append((heading, body))
+    return out
+
+
 def _split_description_sections(description: str) -> list[tuple[str, str]]:
     if not description:
         return []
@@ -1963,6 +2272,19 @@ class _SourceOptionCard(CardWidget):
             self.clicked_source.emit(self._key)
         super().mousePressEvent(event)
 
+def _norm_source(text) -> str:
+    return re.sub(r'[^a-z0-9]', '', str(text or '').lower())
+
+def _preferred_source_key(download_sources: dict) -> str | None:
+    from src.core.config import settings as _s
+    preferred = _norm_source(getattr(_s, 'repack_preferred_source', 'ask'))
+    if not preferred or preferred == 'ask':
+        return None
+    for key, data in download_sources.items():
+        if data.get('magnet_url') and preferred in _norm_source(f"{key}{data.get('name', '')}"):
+            return key
+    return None
+
 class SourceSelectDialog(MessageBoxBase):
     def __init__(self, download_sources: dict, parent=None):
         super().__init__(parent)
@@ -2006,7 +2328,8 @@ def send_to_external_torrent_client(source: str, parent=None) -> bool:
 class SelectiveDownloadDialog(MessageBoxBase):
     _ORDERED_CATEGORIES = ('Required', 'Bonus Content')
 
-    def __init__(self, entries: list[SelectiveDownloadEntry], parent=None, subtitle: str | None=None):
+    def __init__(self, entries: list[SelectiveDownloadEntry], parent=None, subtitle: str | None=None,
+                 context: str = 'other'):
         super().__init__(parent)
         self._entries = entries
         self._checkboxes: dict[str, QTreeWidgetItem] = {}
@@ -2017,22 +2340,32 @@ class SelectiveDownloadDialog(MessageBoxBase):
             name_lbl.setWordWrap(True)
             name_lbl.setStyleSheet(f'color: {_muted_text_color()};')
             self.viewLayout.addWidget(name_lbl)
+        safety = assess_source_files([entry.patterns[0] if entry.patterns else entry.label for entry in entries],
+                                     context=context)
         info = CaptionLabel(tr('repacks.required_files_hint'), self)
         info.setWordWrap(True)
         info.setStyleSheet(f'color: {_muted_text_color()};')
+        if safety.level != 'ok':
+            info.setText(f"{info.text()}\n{safety.summary}. {tr('repacks.file_type_review')}")
+            info.setToolTip(safety.details)
         self.viewLayout.addWidget(info)
         self._tree = TreeWidget(self)
-        self._tree.setHeaderLabels([tr('repacks.include'), tr('repacks.size')])
+        self._tree.setHeaderLabels([tr('repacks.include'), tr('repacks.file_type'), tr('repacks.size')])
         self._tree.header().setStretchLastSection(False)
         self._tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self._tree.setColumnWidth(1, 92)
+        self._tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self._tree.setColumnWidth(1, 72)
+        self._tree.setColumnWidth(2, 92)
         self._tree.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._name_delegate = ScrollingTextDelegate(self._tree, 0, padding=4)
         self._tree.setRootIsDecorated(True)
         self._tree.setBorderVisible(True)
         self._tree.setBorderRadius(8)
         self._tree.setMinimumHeight(320)
         self.viewLayout.addWidget(self._tree)
+        highlighted = {name.lower() for name in safety.highlighted}
+        pal = palette()
         by_category: dict[str, list[SelectiveDownloadEntry]] = {}
         for e in entries:
             by_category.setdefault(e.category, []).append(e)
@@ -2040,15 +2373,20 @@ class SelectiveDownloadDialog(MessageBoxBase):
         for cat in self._ORDERED_CATEGORIES:
             if cat not in by_category:
                 continue
-            cat_item = QTreeWidgetItem([_category_labels.get(cat, cat), ''])
+            cat_item = QTreeWidgetItem([_category_labels.get(cat, cat), '', ''])
             cat_item.setFlags(cat_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
             self._tree.addTopLevelItem(cat_item)
             font = self._tree.font()
             font.setBold(True)
             cat_item.setFont(0, font)
             for entry in by_category[cat]:
-                child = QTreeWidgetItem([entry.label, entry.size_hint])
-                child.setToolTip(0, entry.label)
+                path = entry.patterns[0] if entry.patterns else entry.label
+                file_info = classify_file(path)
+                child = QTreeWidgetItem([entry.label, file_info.label, entry.size_hint])
+                child.setToolTip(1, file_info.reason)
+                if os.path.basename(path.replace('\\', '/')).lower() in highlighted:
+                    color = pal['state_error'] if file_info.risk == 'dangerous' else pal['state_verifying']
+                    child.setForeground(1, QBrush(QColor(color)))
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 child.setCheckState(0, Qt.CheckState.Checked)
                 cat_item.addChild(child)
@@ -2242,12 +2580,14 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
             return
         download_sources = self._details.extra.get('download_sources') or {}
         if download_sources:
-            dialog = SourceSelectDialog(download_sources, parent=self.window())
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                return
-            key = dialog.chosen_source_key()
+            key = _preferred_source_key(download_sources)
             if key is None:
-                return
+                dialog = SourceSelectDialog(download_sources, parent=self.window())
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                key = dialog.chosen_source_key()
+                if key is None:
+                    return
             chosen = download_sources.get(key) or {}
             magnet_url = chosen.get('magnet_url')
             if not magnet_url:
@@ -2384,7 +2724,7 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
         paths = [p for p, _size in torrent_files]
         sizes = [s for _p, s in torrent_files]
         entries = build_selective_entries_from_torrent(paths, sizes)
-        dialog = SelectiveDownloadDialog(entries, parent=self.window())
+        dialog = SelectiveDownloadDialog(entries, parent=self.window(), context='repack')
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         selected_labels = dialog.selected_labels()
@@ -2569,14 +2909,413 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
         except RuntimeError:
             pass
 
+class ElidedLabel(QLabel):
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__("", parent)
+        self._full = ""
+        self.setWordWrap(False)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:
+        self._full = str(text or "")
+        self.setToolTip(self._full)
+        self._refresh_elide()
+
+    def fullText(self) -> str:
+        return self._full
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh_elide()
+
+    def _refresh_elide(self) -> None:
+        if not self._full:
+            super().setText("")
+            return
+        width = max(0, self.width() - 2)
+        if width <= 0:
+            super().setText(self._full)
+            return
+        text = QFontMetrics(self.font()).elidedText(self._full, Qt.TextElideMode.ElideRight, width)
+        super().setText(text)
+
+
+class SteamInfoWidget(QWidget):
+    refresh_requested = Signal()
+    change_match_requested = Signal()
+    clear_match_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setVisible(False)
+        self._row = QHBoxLayout(self)
+        self._row.setContentsMargins(0, 0, 0, 0)
+        self._row.setSpacing(6)
+        self._match_btn = PushButton(tr("steam.match_manually", "Match manually"), self)
+        self._match_btn.setFixedHeight(26)
+        self._match_btn.clicked.connect(self.change_match_requested.emit)
+        self._more_btn = TransparentToolButton(FluentIcon.MORE, self)
+        self._more_btn.setFixedSize(28, 28)
+        self._more_btn.clicked.connect(self._show_menu)
+
+    def _show_menu(self) -> None:
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        menu.addAction(tr("steam.refresh", "Refresh Steam data"), self.refresh_requested.emit)
+        menu.addAction(tr("steam.change_match", "Change match"), self.change_match_requested.emit)
+        menu.addSeparator()
+        menu.addAction(tr("steam.clear_match", "Remove match"), self.clear_match_requested.emit)
+        menu.exec(self._more_btn.mapToGlobal(self._more_btn.rect().bottomLeft()))
+
+    def _reset(self) -> None:
+        while self._row.count():
+            item = self._row.takeAt(0)
+            widget = item.widget()
+            if widget is not None and widget not in (self._match_btn, self._more_btn):
+                widget.deleteLater()
+        self._match_btn.setVisible(False)
+        self._more_btn.setVisible(False)
+
+    def set_loading(self) -> None:
+        self._reset()
+        self.setVisible(False)
+
+    def show_no_match(self, *, enabled: bool = True) -> None:
+        self._reset()
+        self._row.addWidget(self._match_btn)
+        self._row.addStretch(1)
+        self._match_btn.setVisible(enabled)
+        self.setVisible(enabled)
+
+    def set_enrichment(self, enrichment) -> None:
+        self._reset()
+        self._row.addWidget(self._more_btn)
+        self._row.addStretch(1)
+        self._more_btn.setVisible(True)
+        self.setVisible(True)
+
+    def clear(self) -> None:
+        self._reset()
+        self.setVisible(False)
+
+
+class SteamMatchDialog(MessageBoxBase):
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self._selected_appid: int | None = None
+        self._search_seq = 0
+        self.titleLabel = SubtitleLabel(tr("steam.choose_match", "Choose Steam match"), self)
+        self.viewLayout.addWidget(self.titleLabel)
+        self._hint = CaptionLabel(tr("steam.choose_match_hint", "Search by name or enter a Steam AppID."), self)
+        self._hint.setWordWrap(True)
+        self.viewLayout.addWidget(self._hint)
+        self._query = LineEdit(self)
+        self._query.setText(title)
+        self._query.setClearButtonEnabled(True)
+        self._query.returnPressed.connect(self._search)
+        self.viewLayout.addWidget(self._query)
+        search_btn = PushButton(tr("steam.search", "Search"), self)
+        search_btn.clicked.connect(self._search)
+        self.viewLayout.addWidget(search_btn)
+        self._results = QListWidget(self)
+        self._results.setMinimumHeight(220)
+        self._results.itemDoubleClicked.connect(lambda _item: self._accept_selected())
+        self.viewLayout.addWidget(self._results)
+        self._appid_edit = LineEdit(self)
+        self._appid_edit.setPlaceholderText(tr("steam.manual_appid", "Steam AppID (optional)"))
+        self.viewLayout.addWidget(self._appid_edit)
+        self._status = CaptionLabel("", self)
+        self._status.setWordWrap(True)
+        self.viewLayout.addWidget(self._status)
+        self.yesButton.setText(tr("steam.use_match", "Use match"))
+        self.cancelButton.setText(tr("common.cancel", "Cancel"))
+        self._apply_theme()
+        register_theme_refresh(self, self._apply_theme)
+        self._search()
+
+    def _apply_theme(self, *_args) -> None:
+        color = palette()["muted"]
+        self._hint.setStyleSheet(f"color: {color};")
+        self._status.setStyleSheet(f"color: {color};")
+
+    def _search(self) -> None:
+        query = self._query.text().strip()
+        if len(query) < 2:
+            self._status.setText(tr("steam.search_too_short", "Enter at least two characters."))
+            return
+        self._search_seq += 1
+        seq = self._search_seq
+        self._status.setText(tr("steam.searching", "Searching Steam…"))
+        from src.core.repacks import enrichment as service
+        from src.core.worker import submit
+
+        submit(
+            service.search_candidates,
+            args=(query,),
+            on_done=lambda items, s=seq: self._on_results(items, s),
+            on_error=lambda error, s=seq: self._on_error(error, s),
+            owner=self,
+            key=f"steam:dialog:{query.casefold()}",
+        )
+
+    def _on_results(self, items, seq: int) -> None:
+        if not _qt_is_valid(self) or seq != self._search_seq:
+            return
+        self._results.clear()
+        for item in items or ():
+            name = str(item.get("name") or "")
+            appid = item.get("appid")
+            if not name or not appid:
+                continue
+            row = QListWidgetItem(f"{name}  ·  {appid}")
+            row.setData(Qt.ItemDataRole.UserRole, int(appid))
+            self._results.addItem(row)
+        if self._results.count():
+            self._results.setCurrentRow(0)
+            self._status.setText(tr("steam.results_count", "{count} result(s)", count=self._results.count()))
+        else:
+            self._status.setText(tr("steam.no_results", "No Steam results. You can enter an AppID above."))
+
+    def _on_error(self, error, seq: int) -> None:
+        if not _qt_is_valid(self) or seq != self._search_seq:
+            return
+        logger.debug("Steam match search failed", exc_info=error if isinstance(error, BaseException) else None)
+        self._status.setText(tr("steam.search_failed", "Steam search failed. You can enter an AppID above."))
+
+    def _accept_selected(self) -> None:
+        if self.validate():
+            self.accept()
+
+    def validate(self) -> bool:
+        from src.core.repacks import enrichment as service
+
+        manual = str(self._appid_edit.text() or "").strip()
+        if manual:
+            appid = service.resolve_appid(manual)
+            if appid is None:
+                self._status.setText(tr("steam.invalid_appid", "Enter a numeric Steam AppID."))
+                return False
+            self._selected_appid = appid
+            return True
+        item = self._results.currentItem()
+        if item is None:
+            self._status.setText(tr("steam.select_result", "Select a result or enter an AppID."))
+            return False
+        try:
+            appid = int(item.data(Qt.ItemDataRole.UserRole))
+        except (TypeError, ValueError):
+            return False
+        if appid <= 0:
+            return False
+        self._selected_appid = appid
+        return True
+
+    def selected_appid(self) -> int | None:
+        return self._selected_appid
+
+
+class _FrameAnimation(QObject):
+    """Small looped frame player for formats QMovie cannot open (animated AVIF)."""
+
+    frame = Signal(QImage)
+
+    def __init__(self, frames: list[tuple[QImage, int]], parent=None):
+        super().__init__(parent)
+        self._frames = list(frames)
+        self._index = 0
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._advance)
+
+    def start(self) -> None:
+        if not self._frames:
+            return
+        self._index = 0
+        self._advance()
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def _advance(self) -> None:
+        if not self._frames:
+            return
+        image, delay = self._frames[self._index]
+        self._index = (self._index + 1) % len(self._frames)
+        self.frame.emit(image)
+        self._timer.start(max(20, int(delay or 40)))
+
+
+def _animation_payload(src: str):
+    path = image_file(src)
+    if not path:
+        return path, []
+    if re.search(r'\.avif(?:$|[?#])', src, re.IGNORECASE):
+        from src.core.artwork import avif_animation
+
+        return path, avif_animation(path)
+    return path, []
+
+
+class _SteamDesc(QTextBrowser):
+    _ANIMATED_RE = re.compile(r'\.(?:gif|webp|avif)(?:$|[?#])', re.IGNORECASE)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._html = ''
+        self._imgs = {}
+        self._movies = {}
+        self._frame_anims: dict[str, _FrameAnimation] = {}
+        self._animated_srcs: set[str] = set()
+        self.setOpenExternalLinks(True)
+        self.setFrameShape(QTextBrowser.Shape.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._refresh = QTimer(self)
+        self._refresh.setSingleShot(True)
+        self._refresh.setInterval(60)
+        self._refresh.timeout.connect(lambda: self.setHtml(self._html))
+        self.document().documentLayout().documentSizeChanged.connect(
+            lambda size: self.setFixedHeight(int(size.height()) + 6))
+
+    def loadResource(self, kind, url):
+        return self._imgs.get(url.toString()) or self._imgs.get(bytes(url.toEncoded()).decode())
+
+    def set_content(self, html: str) -> None:
+        import html as _html_lib
+
+        self._stop_animations()
+        self._html = html
+        self._imgs = {}
+        self.setHtml(html)
+        for raw in dict.fromkeys(re.findall(r'<img[^>]+src="([^"]+)"', html)):
+            src = _html_lib.unescape(raw)
+            if self._ANIMATED_RE.search(src):
+                self._animated_srcs.add(src)
+                self._load_animation(src, html)
+            else:
+                images.get(src, (760, 1600), lambda pix, s=src, h=html: self._on_image(s, h, pix), mode=FIT, owner=self)
+
+    def _load_animation(self, src: str, html: str) -> None:
+        from src.core.worker import submit
+
+        submit(lambda: _animation_payload(src),
+               on_done=lambda payload, s=src, h=html: self._on_animation_file(s, h, payload),
+               on_error=lambda _error, s=src, h=html: self._on_image_failed(s, h),
+               owner=self, key=('steam-anim', src), priority=Priority.VISIBLE)
+
+    def _on_animation_file(self, src: str, html: str, payload) -> None:
+        if html != self._html or src not in self._animated_srcs:
+            return
+        path, frames = payload if isinstance(payload, tuple) else (payload, [])
+        if frames and len(frames) > 1:
+            anim = _FrameAnimation(frames, self)
+            anim.frame.connect(lambda image, s=src: self._set_frame(s, QPixmap.fromImage(image)))
+            self._frame_anims[src] = anim
+            if self.isVisible():
+                anim.start()
+            else:
+                anim.frame.emit(frames[0][0])
+            return
+        if frames:
+            image = frames[0][0]
+            if image.width() > 760 or image.height() > 1600:
+                image = image.scaled(760, 1600, Qt.AspectRatioMode.KeepAspectRatio,
+                                     Qt.TransformationMode.SmoothTransformation)
+            pix = QPixmap.fromImage(image)
+            if not pix.isNull():
+                self._set_frame(src, pix)
+            return
+        movie = QMovie(self)
+        movie.setFileName(str(path or ''))
+        movie.setCacheMode(QMovie.CacheMode.CacheNone)
+        if not movie.isValid() or movie.frameCount() <= 1:
+            movie.deleteLater()
+            self._on_image_failed(src, html)
+            return
+        # QMovie.frameChanged(int) passes the frame number; swallow it so the
+        # captured source stays the first positional argument.
+        movie.frameChanged.connect(lambda _frame, s=src, m=movie: self._on_movie_frame(s, m))
+        self._movies[src] = movie
+        movie.jumpToFrame(0)
+        pix = movie.currentPixmap()
+        if not pix.isNull() and (pix.width() > 760 or pix.height() > 1600):
+            movie.setScaledSize(pix.size().scaled(760, 1600, Qt.AspectRatioMode.KeepAspectRatio))
+            movie.jumpToFrame(0)
+            pix = movie.currentPixmap()
+        if not pix.isNull():
+            self._set_frame(src, pix)
+        if self.isVisible():
+            movie.start()
+
+    def _on_movie_frame(self, src: str, movie) -> None:
+        if self._movies.get(src) is not movie:
+            return
+        pix = movie.currentPixmap()
+        if not pix.isNull():
+            self._set_frame(src, pix)
+
+    def _set_frame(self, src: str, pix) -> None:
+        self._imgs[src] = pix
+        try:
+            self.document().addResource(QTextDocument.ResourceType.ImageResource, QUrl(src), pix)
+        except RuntimeError:
+            return
+        self.viewport().update()
+
+    def _on_image_failed(self, src: str, html: str) -> None:
+        if html == self._html:
+            self._animated_srcs.discard(src)
+            images.get(src, (760, 1600), lambda pix, s=src, h=html: self._on_image(s, h, pix),
+                       mode=FIT, owner=self)
+
+    def _on_image(self, src: str, html: str, pix) -> None:
+        if html != self._html or pix.isNull():
+            return
+        self._imgs[src] = pix
+        self._refresh.start()
+
+    def _stop_animations(self) -> None:
+        for movie in self._movies.values():
+            with suppress(RuntimeError, TypeError):
+                movie.stop()
+                movie.frameChanged.disconnect()
+            movie.deleteLater()
+        self._movies.clear()
+        for anim in self._frame_anims.values():
+            anim.stop()
+            anim.deleteLater()
+        self._frame_anims.clear()
+        self._animated_srcs.clear()
+
+    def hideEvent(self, event) -> None:
+        for movie in self._movies.values():
+            with suppress(RuntimeError):
+                movie.stop()
+        for anim in self._frame_anims.values():
+            anim.stop()
+        super().hideEvent(event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        for movie in self._movies.values():
+            with suppress(RuntimeError):
+                movie.start()
+        for anim in self._frame_anims.values():
+            anim.start()
+
+
 class RepackDetailsView(DetailsViewMixin, QWidget):
     back_requested = Signal()
+    banner_changed = Signal()
     COVER_WIDTH = 280
     COVER_HEIGHT = 392
 
     @property
     def _META_LABELS(self):
-        return (('repack_size', tr('repacks.repack_size')), ('original_size', tr('repacks.original_size')), ('company', tr('repacks.company')), ('languages', tr('repacks.languages')), ('rating', tr('repacks.rating')))
+        return (('repack_size', tr('repacks.repack_size')), ('original_size', tr('repacks.original_size')), ('company', tr('repacks.company')), ('languages', tr('repacks.languages')), ('rating', tr('repacks.rating')), ('released', tr('steam.released_label', 'Released')), ('metacritic', tr('steam.metacritic_label', 'Metacritic')))
 
     def __init__(self, manager: DownloadManager, source_key: str | None=None, parent=None):
         super().__init__(parent)
@@ -2591,7 +3330,7 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         outer = QVBoxLayout(self)
 
 
-        outer.setContentsMargins(24, 12, 24, 20)
+        outer.setContentsMargins(24, 0, 24, 20)
         outer.setSpacing(10)
         back_btn = PushButton(themed_icon('repacks.detail_back', FluentIcon.RETURN), tr('repacks.back_to_grid'))
         back_btn.setFixedHeight(32)
@@ -2610,17 +3349,18 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         btn_row.addWidget(self._bookmark_btn, 0, Qt.AlignmentFlag.AlignLeft)
         btn_row.addStretch(1)
         back_btn.clicked.connect(self.back_requested.emit)
-        outer.addLayout(btn_row)
         self._scroll = SmoothScrollArea(self)
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self._scroll.setStyleSheet('background: transparent; border: none;')
         outer.addWidget(self._scroll, 1)
+        self._scroll.verticalScrollBar().valueChanged.connect(lambda _v: self.banner_changed.emit())
         content = QWidget()
         self._scroll.setWidget(content)
         self._content_layout = QVBoxLayout(content)
         self._content_layout.setContentsMargins(4, 12, 24, 40)
         self._content_layout.setSpacing(24)
+        self._content_layout.addLayout(btn_row)
         self.SECTIONS_WIDTH = 300
         top_row = QHBoxLayout()
         top_row.setSpacing(40)
@@ -2677,6 +3417,28 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         self._title_lbl.setWordWrap(True)
         self._title_lbl.setStyleSheet(f'font-weight: 700; color: {palette()['primary_text']};')
         info_col.addWidget(self._title_lbl)
+        self._logo_lbl = QLabel(info_col_container)
+        self._logo_lbl.setStyleSheet('background: transparent;')
+        self._logo_lbl.setVisible(False)
+        info_col.addWidget(self._logo_lbl, 0, Qt.AlignmentFlag.AlignLeft)
+        self._logo_src = None
+        self._steam_desc_html = ''
+        self._steam_host = QWidget(info_col_container)
+        self._steam_layout = QVBoxLayout(self._steam_host)
+        self._steam_layout.setContentsMargins(0, 0, 0, 0)
+        self._steam_layout.setSpacing(6)
+        self._steam_host.setVisible(False)
+        info_col.addWidget(self._steam_host)
+        self._meta_lbl = None
+        self._steam_widget = None
+        self._parsed_title = None
+        self._current_entry = None
+        self._steam_enrichment = None
+        self._steam_gen = 0
+        self._meta_extra = {}
+        self._banner_src = None
+        self._banner_pix = None
+        self._banner_cache = (0, None)
         self._meta_grid = QGridLayout()
         self._meta_grid.setHorizontalSpacing(40)
         self._meta_grid.setVerticalSpacing(10)
@@ -2706,6 +3468,9 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         self._desc_default_qss = self._desc_default_qss_template.format(pct=_DESC_LINE_HEIGHT_PCT, color=_body_text_color())
         self._desc_lbl.setStyleSheet(self._desc_default_qss)
         info_col.addWidget(self._desc_lbl)
+        self._steam_desc = _SteamDesc(info_col_container)
+        self._steam_desc.setVisible(False)
+        info_col.addWidget(self._steam_desc)
         self._raw_intro_text = ''
         self._is_announcement = False
         qconfig.themeChanged.connect(self._on_theme_changed)
@@ -2722,11 +3487,15 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         self._sections_col.addWidget(sections_header)
         self._site_link_btn = HyperlinkButton('', tr('repacks.view_on_website'), sections_container, themed_icon('repacks.site_link', FluentIcon.LINK))
         self._site_link_btn.setIconSize(QSize(14, 14))
-        self._apply_site_link_style()
         qconfig.themeColorChanged.connect(self._deferred_apply_site_link_style)
         qconfig.themeChanged.connect(self._deferred_apply_site_link_style)
         self._site_link_btn.setVisible(False)
         self._sections_col.addWidget(self._site_link_btn)
+        self._steam_btn = HyperlinkButton('', tr('steam.view_on_steam', 'View on Steam'), sections_container, themed_icon('repacks.site_link', FluentIcon.LINK))
+        self._steam_btn.setIconSize(QSize(14, 14))
+        self._steam_btn.setVisible(False)
+        self._sections_col.addWidget(self._steam_btn)
+        self._apply_site_link_style()
         self._sections_insert_index = self._sections_col.count()
         self._sections_header.setVisible(False)
         top_row.addWidget(sections_container, 0, Qt.AlignmentFlag.AlignTop)
@@ -2764,14 +3533,17 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         self._desc_header.setText(tr('repacks.description'))
         self._sections_header.setText(tr('repacks.details'))
         self._site_link_btn.setText(tr('repacks.view_on_website'))
+        self._steam_btn.setText(tr('steam.view_on_steam', 'View on Steam'))
 
     def _apply_site_link_style(self) -> None:
         color = themeColor()
         base_alpha = 55 if isDarkTheme() else 40
         hover_alpha = 85 if isDarkTheme() else 65
         text_color = palette()['primary_text']
-        self._site_link_btn.setStyleSheet(f'HyperlinkButton {{ background-color: rgba({color.red()}, {color.green()}, {color.blue()}, {base_alpha}); border-radius: 6px; padding: 6px 10px 6px 30px; font-weight: 600; color: {text_color}; }} HyperlinkButton:hover {{ background-color: rgba({color.red()}, {color.green()}, {color.blue()}, {hover_alpha}); color: {text_color}; }}')
-        self._site_link_btn.setIcon(themed_icon('repacks.site_link', FluentIcon.LINK, color=text_color))
+        qss = f'HyperlinkButton {{ background-color: rgba({color.red()}, {color.green()}, {color.blue()}, {base_alpha}); border-radius: 6px; padding: 6px 10px 6px 30px; font-weight: 600; color: {text_color}; }} HyperlinkButton:hover {{ background-color: rgba({color.red()}, {color.green()}, {color.blue()}, {hover_alpha}); color: {text_color}; }}'
+        for btn in (self._site_link_btn, self._steam_btn):
+            btn.setStyleSheet(qss)
+            btn.setIcon(themed_icon('repacks.site_link', FluentIcon.LINK, color=text_color))
 
     def _apply_desc_style(self) -> None:
         title_color = palette()['primary_text']
@@ -2789,6 +3561,9 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         self._tags_header.setStyleSheet(f'font-weight: 400; color: {_muted_text_color()};')
         self._desc_header.setStyleSheet(f'font-size: 16px; font-weight: 600; color: {palette()['primary_text']};')
         self._sections_header.setStyleSheet(f'font-size: 16px; font-weight: 600; color: {palette()['primary_text']};')
+        if self._meta_lbl is not None:
+            self._meta_lbl.setStyleSheet(
+                f'color: {_muted_text_color()}; font-size: 12px; background: transparent;')
         self._apply_site_link_style()
         QTimer.singleShot(0, self._refresh_desc_theme)
 
@@ -2799,8 +3574,8 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
 
     def _refresh_desc_theme(self) -> None:
         self._apply_desc_style()
-        if self._raw_intro_text:
-            self._desc_lbl.setText(render_description_html(self._raw_intro_text))
+        if self._raw_intro_text or self._steam_desc_html:
+            self._apply_desc_text()
 
     def set_cover_action_widget(self, widget) -> None:
         while self._cover_action_layout.count():
@@ -2810,15 +3585,366 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         if widget is not None:
             self._cover_action_layout.addWidget(widget)
 
+
+    def _ensure_steam_ui(self) -> None:
+        if self._steam_widget is not None:
+            return
+        self._meta_lbl = ElidedLabel('', self._steam_host)
+        self._meta_lbl.setStyleSheet(
+            f'color: {_muted_text_color()}; font-size: 12px; background: transparent;')
+        self._steam_layout.addWidget(self._meta_lbl)
+        self._steam_widget = SteamInfoWidget(self._steam_host)
+        self._steam_layout.addWidget(self._steam_widget)
+        self._steam_widget.refresh_requested.connect(self._on_steam_refresh)
+        self._steam_widget.change_match_requested.connect(self._on_steam_change_match)
+        self._steam_widget.clear_match_requested.connect(self._on_steam_clear_match)
+
+    def _update_steam_host(self) -> None:
+        meta = bool(self._meta_lbl is not None and self._meta_lbl.fullText())
+        steam = self._steam_widget is not None and not self._steam_widget.isHidden()
+        self._steam_host.setVisible(meta or steam)
+
+    def _apply_clean_title(self, raw_title: str) -> None:
+        self._ensure_steam_ui()
+        try:
+            from src.core.repacks.base import parse_title
+            parsed = parse_title(raw_title or '')
+        except Exception:
+            logger.debug('Title parsing unavailable', exc_info=True)
+            parsed = None
+        self._parsed_title = parsed
+        self._title_lbl.setText((parsed.clean if parsed else '') or raw_title or '')
+        meta = parsed.display_meta if parsed else ''
+        self._meta_lbl.setText(meta)
+        self._meta_lbl.setVisible(bool(meta))
+        self._update_steam_host()
+
+    def _begin_steam(self, entry) -> None:
+        self._steam_gen += 1
+        gen = self._steam_gen
+        self._steam_enrichment = None
+        self._ensure_steam_ui()
+        self._steam_widget.clear()
+        try:
+            from src.core.repacks import enrichment as service
+
+            enabled = service.enrichment_enabled()
+        except Exception:
+            enabled = False
+        is_announcement = bool((getattr(entry, 'extra', None) or {}).get('is_announcement'))
+        if not enabled or is_announcement or not entry:
+            self._update_steam_host()
+            return
+        try:
+            cached = service.peek_enrichment(entry)
+        except Exception:
+            cached = None
+        if cached is not None:
+            self._on_steam_ready(cached, gen)
+            try:
+                if not service.needs_refresh(entry):
+                    return
+
+                def _apply(result, g=gen):
+                    if result is not None:
+                        self._on_steam_ready(result, g)
+
+                service.request_enrichment(
+                    entry, owner=self,
+                    on_done=_apply,
+                    on_error=lambda error, g=gen: None)
+            except Exception:
+                pass
+            return
+        self._steam_widget.set_loading()
+        self._update_steam_host()
+        try:
+            service.request_enrichment(
+                entry, owner=self,
+                on_done=lambda result, g=gen: self._on_steam_ready(result, g),
+                on_error=lambda error, g=gen: self._on_steam_error(error, g))
+        except Exception:
+            logger.debug('Could not queue Steam enrichment', exc_info=True)
+            self._steam_widget.show_no_match(enabled=True)
+            self._update_steam_host()
+
+    def _on_steam_ready(self, enrichment, gen: int) -> None:
+        if not _qt_is_valid(self) or gen != self._steam_gen:
+            return
+        self._steam_enrichment = enrichment
+        if enrichment is None:
+            self._steam_widget.show_no_match(enabled=True)
+        else:
+            self._steam_widget.set_enrichment(enrichment)
+            self._apply_steam_artwork(enrichment)
+        self._sync_steam_extras()
+        self._update_steam_host()
+        if enrichment is not None:
+            self._request_steam_art(enrichment, gen)
+
+    def _request_steam_art(self, enrichment, gen: int) -> None:
+        try:
+            appid = int(enrichment.appid)
+        except (TypeError, ValueError):
+            return
+        if appid <= 0:
+            return
+        try:
+            from src.core.repacks import enrichment as service
+
+            def _apply(art, g=gen, a=appid):
+                if not _qt_is_valid(self) or g != self._steam_gen or not isinstance(art, dict):
+                    return
+                current = self._steam_enrichment
+                if current is None or int(getattr(current, 'appid', 0) or 0) != a:
+                    return
+                merged = dict(getattr(current, 'artwork', None) or {})
+                fresh = {k: v for k, v in art.items() if v and merged.get(k) != v}
+                if not fresh:
+                    return
+                merged.update(fresh)
+                current.artwork = merged
+                entry = self._current_entry
+                if entry is not None and not (getattr(entry, 'poster_path', None)
+                                              or getattr(entry, 'poster_url', None)):
+                    entry.poster_fallback = merged.get('poster') or None
+                if fresh.keys() & {'poster', 'hero', 'banner', 'capsule'}:
+                    self._apply_steam_artwork(current)
+                if fresh.keys() & {'hero', 'banner', 'background', 'logo'}:
+                    self._sync_steam_extras()
+
+            service.request_artwork(appid, owner=self, on_done=_apply)
+        except Exception:
+            logger.debug('Could not queue Steam artwork', exc_info=True)
+
+    def _sync_steam_extras(self) -> None:
+        from src.core.config import settings as _s
+
+        enrichment = self._steam_enrichment
+        live = enrichment is not None and not self._is_announcement
+        self._steam_btn.setVisible(live)
+        art = (getattr(enrichment, 'artwork', None) or {}) if live else {}
+        banner = art.get('hero') or art.get('banner') or art.get('background') or ''
+        self._set_banner(banner if getattr(_s, 'steam_banner', False) else '')
+        logo = ''
+        if live:
+            self._steam_btn.setUrl(f'https://store.steampowered.com/app/{int(enrichment.appid)}/')
+            logo = art.get('logo') or f'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{int(enrichment.appid)}/logo.png'
+        self._set_logo(logo if getattr(_s, 'steam_logo', False) else '')
+        self._steam_desc_html = ''
+        if live and getattr(_s, 'steam_description', False):
+            html = enrichment.about_html
+            has_content = len(re.sub(r'<[^>]+>', '', html).strip()) > 20 or '<img' in html
+            self._steam_desc_html = html if has_content else enrichment.summary_text
+        if self._current_details is not None:
+            self._apply_desc_text()
+            self._fill_meta()
+
+    def _apply_desc_text(self) -> None:
+        steam = bool(self._steam_desc_html)
+        self._steam_desc.setVisible(steam)
+        self._desc_lbl.setVisible(not steam)
+        if steam:
+            self._steam_desc.setStyleSheet(f'background: transparent; border: none; font-size: 16px; color: {_body_text_color()};')
+            if self._steam_desc._html != self._steam_desc_html:
+                self._steam_desc.set_content(self._steam_desc_html)
+        else:
+            self._desc_lbl.setText(render_description_html(self._raw_intro_text) or tr('repacks.no_description'))
+
+    def _set_logo(self, src: str) -> None:
+        if src == self._logo_src:
+            return
+        self._logo_src = src
+        self._logo_lbl.setVisible(False)
+        self._title_lbl.setVisible(True)
+        if not src:
+            return
+
+        def _apply(pix, _src=src):
+            if _src == self._logo_src and not pix.isNull():
+                from PySide6.QtGui import QBitmap
+
+                pix = QPixmap(pix)
+                pix.setDevicePixelRatio(1.0)
+                box = QRegion(QBitmap.fromImage(pix.toImage().createAlphaMask())).boundingRect()
+                if not box.isEmpty():
+                    pix = pix.copy(box)
+                pix = pix.scaled(460, 120, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                self._logo_lbl.setFixedSize(pix.size())
+                self._logo_lbl.setPixmap(pix)
+                self._logo_lbl.setToolTip(self._title_lbl.text())
+                self._logo_lbl.setVisible(True)
+                self._title_lbl.setVisible(False)
+
+        images.get(src, (460, 170), _apply, mode=FIT, owner=self)
+
+    def _set_banner(self, src: str) -> None:
+        if src == self._banner_src:
+            return
+        self._banner_src = src
+        self._banner_pix = None
+        self._banner_cache = (0, None)
+        self.banner_changed.emit()
+        if not src:
+            return
+
+        def _apply(pix, _src=src):
+            if _src == self._banner_src and not pix.isNull():
+                self._banner_pix = pix
+                self.banner_changed.emit()
+
+        images.get(src, (1920, 1080), _apply, mode=FIT, owner=self)
+
+    def banner_for(self, width: int):
+        pix = self._banner_pix
+        if pix is None or width <= 0:
+            return None
+        if self._banner_cache[0] != width:
+            from PySide6.QtGui import QImage, QLinearGradient, QPainter
+
+            pix = QPixmap(pix)
+            pix.setDevicePixelRatio(1.0)
+            scaled = pix.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation)
+            img = scaled.copy(0, 0, width, min(scaled.height(), 900)).toImage()
+            img = img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+            fade = QLinearGradient(0, 0, 0, img.height())
+            for pos, alpha in ((0.0, 215), (0.16, 130), (0.38, 45), (0.6, 0)):
+                fade.setColorAt(pos, QColor(0, 0, 0, alpha))
+            painter = QPainter(img)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+            painter.fillRect(img.rect(), fade)
+            painter.end()
+            self._banner_cache = (width, QPixmap.fromImage(img))
+        return self._banner_cache[1]
+
+    def set_top_inset(self, px: int) -> None:
+        self._content_layout.setContentsMargins(4, 12 + px, 24, 40)
+
+    def banner_offset(self) -> int:
+        return self._scroll.verticalScrollBar().value()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.banner_changed.emit()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self.banner_changed.emit()
+
+    def _on_steam_error(self, _error, gen: int) -> None:
+        if not _qt_is_valid(self) or gen != self._steam_gen:
+            return
+        self._steam_widget.show_no_match(enabled=True)
+        self._update_steam_host()
+
+    def _apply_steam_artwork(self, enrichment) -> None:
+        entry = self._current_entry
+        details = self._current_details
+        fitgirl_art = bool(
+            (entry is not None and (getattr(entry, 'poster_path', None) or getattr(entry, 'poster_url', None)))
+            or (details is not None and (getattr(details, 'cover_path', None) or getattr(details, 'cover_url', None)))
+        )
+        if not fitgirl_art:
+            art = getattr(enrichment, 'artwork', None) or {}
+            src = art.get('poster') or art.get('hero') or art.get('banner') or art.get('capsule')
+            if src:
+                self._show_cover(str(src), self._title_lbl.text())
+        if details is None:
+            return
+        base = list(details.screenshot_urls or ())
+        trailer = next((m['url'] for m in enrichment.movies if re.search(r'\.(mp4|webm)(\?|$)', m['url'], re.I)), '')
+        extra = [f'video::{trailer}'] if trailer and f'video::{trailer}' not in base else []
+        has_shots = any(not u.startswith('video::') for u in base)
+        urls = extra + base + ([] if has_shots else list(enrichment.screenshots or ()))
+        if urls and urls != base:
+            self._gallery.set_urls(urls)
+            self._gallery.setVisible(True)
+
+    def _queue_manual_steam(self, appid: int) -> None:
+        entry = self._current_entry
+        if entry is None:
+            return
+        self._steam_gen += 1
+        gen = self._steam_gen
+        self._steam_widget.set_loading()
+        self._update_steam_host()
+        from src.core.worker import submit
+
+        def _task():
+            from src.core.repacks import enrichment as service
+
+            return service.set_manual_match(entry, appid)
+
+        submit(_task, on_done=lambda result, g=gen: self._on_steam_ready(result, g),
+               on_error=lambda error, g=gen: self._on_steam_error(error, g),
+               owner=self, key=f'steam:manual:{appid}:{entry.url}')
+
+    def _on_steam_refresh(self) -> None:
+        entry = self._current_entry
+        if entry is None:
+            return
+        self._steam_gen += 1
+        gen = self._steam_gen
+        self._steam_widget.set_loading()
+        self._update_steam_host()
+        try:
+            from src.core.repacks import enrichment as service
+
+            service.refresh_enrichment(
+                entry, owner=self,
+                on_done=lambda result, g=gen: self._on_steam_ready(result, g),
+                on_error=lambda error, g=gen: self._on_steam_error(error, g))
+        except Exception:
+            self._on_steam_error(None, gen)
+
+    def _on_steam_change_match(self) -> None:
+        entry = self._current_entry
+        if entry is None:
+            return
+        title = (self._parsed_title.clean if self._parsed_title is not None else '') or entry.title
+        dialog = SteamMatchDialog(title, self.window())
+        try:
+            if dialog.exec():
+                appid = dialog.selected_appid()
+                if appid:
+                    self._queue_manual_steam(int(appid))
+        finally:
+            dialog.deleteLater()
+
+    def _on_steam_clear_match(self) -> None:
+        entry = self._current_entry
+        if entry is None:
+            return
+        self._steam_gen += 1
+        self._steam_enrichment = None
+        try:
+            from src.core.repacks import enrichment as service
+
+            service.clear_match(entry)
+        except Exception:
+            logger.debug('Could not clear Steam match', exc_info=True)
+        self._steam_widget.show_no_match(enabled=True)
+        self._sync_steam_extras()
+        self._update_steam_host()
+
     def show_loading(self, entry: RepackEntry) -> None:
         self._current_details = None
+        self._current_entry = entry
         self._bookmark_btn.setVisible(False)
-        self._title_lbl.setText(entry.title)
+        self._steam_btn.setVisible(False)
+        self._set_banner('')
+        self._set_logo('')
+        self._steam_desc_html = ''
         self._is_announcement = False
+        self._apply_clean_title(entry.title)
+        self._begin_steam(entry)
         self._raw_intro_text = ''
         self._apply_desc_style()
         self._desc_lbl.setText(tr('repacks.loading_details'))
+        self._steam_desc.setVisible(False)
+        self._desc_lbl.setVisible(True)
         self._clear_sections()
+        self._meta_extra = {}
         self._clear_meta()
         self._clear_tags()
         self._gallery.clear()
@@ -2826,12 +3952,17 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         self._site_link_btn.setVisible(False)
         self._download_action.set_accent_color(None)
         self._download_action.setVisible(True)
-        self._show_cover(entry.poster_path or entry.poster_url, entry.title)
+        cover_src = entry.poster_path or entry.poster_url or None
+        if not cover_src and self._steam_enrichment is not None:
+            art = getattr(self._steam_enrichment, 'artwork', None) or {}
+            cover_src = art.get('poster') or art.get('hero') or art.get('banner') or art.get('capsule')
+        cover_src = cover_src or getattr(entry, 'steam_poster', '') or None
+        self._show_cover(cover_src, entry.title)
 
     def show_details(self, details: RepackDetails) -> None:
         self._current_details = details
         self._download_action.set_details(details)
-        self._title_lbl.setText(details.title)
+        self._apply_clean_title(details.title)
         self._update_bookmark_button()
         if details.url:
             self._site_link_btn.setUrl(details.url)
@@ -2855,6 +3986,8 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
                     break
             else:
                 extra_sections.append(('Backwards Compatibility', trailing_compat_note))
+        intro_text, moved_groups = _peel_list_groups(intro_text)
+        extra_sections.extend(moved_groups)
         self._raw_intro_text = intro_text
         self._desc_lbl.setText(render_description_html(intro_text) or tr('repacks.no_description'))
         extra = dict(details.extra or {})
@@ -2863,28 +3996,19 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
             extra_sections.append((tr('repacks.system_requirements'), system_requirements_text))
         is_announcement = bool(extra.pop('is_announcement', False))
         self._is_announcement = is_announcement
+        if is_announcement and self._steam_widget is not None:
+            self._steam_gen += 1
+            self._steam_enrichment = None
+            self._steam_widget.clear()
+            self._update_steam_host()
+        self._sync_steam_extras()
         self._download_action.setVisible(not is_announcement)
         self._site_link_btn.setVisible(bool(details.url) and (not is_announcement))
         self._apply_desc_style()
         if details.size_info:
             extra.setdefault('repack_size', details.size_info)
-        row = 0
-        col = 0
-        for key, label in self._META_LABELS:
-            value = extra.get(key)
-            if not value:
-                continue
-            field = MetaField(label, value)
-            span = 2 if len(value) > 28 else 1
-            if span == 2 and col == 1:
-                row += 1
-                col = 0
-            self._meta_grid.addWidget(field, row, col, 1, span)
-            self._meta_widgets.append(field)
-            col += span
-            if col >= 2:
-                col = 0
-                row += 1
+        self._meta_extra = extra
+        self._fill_meta()
         genres_raw = extra.get('genres', '')
         seen_tags: set[str] = set()
         genre_tags: list[str] = []
@@ -2909,15 +4033,43 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
             self._add_section(tr('repacks.game_updates'), html=render_game_updates_html(game_updates_html))
         repack_features_text = extra.pop('repack_features', '')
         if repack_features_text:
-            repack_sub_sections = _split_description_sections(repack_features_text)
-            for heading, body in repack_sub_sections:
-                self._add_section(heading or tr('repacks.repack_features'), text=body)
-        for heading, body in extra_sections:
+            extra_sections = [(h or tr('repacks.repack_features'), b)
+                              for h, b in _split_description_sections(repack_features_text)] + extra_sections
+        for heading, body in _merge_sections(extra_sections):
             self._add_section(heading, text=body)
 
         keep = bool(details.cover_url) and details.cover_url == self._cover_src
         self._show_cover(self._cover_src if keep else details.cover_path or details.cover_url, details.title)
         self._gallery.set_urls(details.screenshot_urls)
+        if self._steam_enrichment is not None:
+            self._apply_steam_artwork(self._steam_enrichment)
+
+    def _fill_meta(self) -> None:
+        self._clear_meta()
+        extra = dict(self._meta_extra)
+        enrichment = self._steam_enrichment
+        if enrichment is not None and not self._is_announcement:
+            if enrichment.release_date:
+                extra['released'] = enrichment.release_date
+            if enrichment.metacritic:
+                extra['metacritic'] = str(enrichment.metacritic)
+        row = 0
+        col = 0
+        for key, label in self._META_LABELS:
+            value = extra.get(key)
+            if not value:
+                continue
+            field = MetaField(label, value)
+            span = 2 if len(value) > 28 else 1
+            if span == 2 and col == 1:
+                row += 1
+                col = 0
+            self._meta_grid.addWidget(field, row, col, 1, span)
+            self._meta_widgets.append(field)
+            col += span
+            if col >= 2:
+                col = 0
+                row += 1
 
     def _add_section(self, heading: str, text: str | None=None, html: str | None=None) -> None:
         section = CollapsibleSection(heading, expanded=self._expanded_state.get(heading, False))
@@ -3086,7 +4238,10 @@ class SourceTab(MediaPageBase):
         carousel = PopularCarousel()
         self._grid = PosterGrid(
             self, header=carousel, subtitle_fn=_source_subtitle, colors_fn=_grid_colors,
+            title_attr='display_title', cover_attrs=('poster_path', 'poster_url', 'poster_fallback', 'steam_poster'),
+            show_caption=_titles_enabled(), meta_fn=_entry_meta_text, search_fn=_entry_search_text,
             fallback_icon_fn=lambda: themed_icon('repacks.card_fallback', FluentIcon.GAME, size=48, color=_body_text_color()))
+        self._caption_on = _titles_enabled()
         self._grid.context_requested.connect(self._show_grid_menu)
         self._grid.poster_clicked.connect(self._show_details)
         self._grid.download_requested.connect(self.open_details_and_download)
@@ -3131,6 +4286,22 @@ class SourceTab(MediaPageBase):
         self._stack.setCurrentWidget(grid_page)
         self._load_latest_repacks()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        on = _titles_enabled()
+        if on == self._caption_on:
+            return
+        self._caption_on = on
+        grid = self._grid
+        setter = getattr(grid, 'set_show_caption', None)
+        if setter is not None:
+            setter(on)
+        else:
+            for attr in ('show_caption', '_show_caption'):
+                if hasattr(grid, attr):
+                    setattr(grid, attr, on)
+        grid.refresh()
+
     def _load_latest_repacks(self) -> None:
         if self._latest_task is not None:
             return
@@ -3140,7 +4311,12 @@ class SourceTab(MediaPageBase):
         self._latest_task = None
         if self._search_query:
             return
-        self._grid.set_latest_entries(entries or [])
+        self._grid.set_latest_entries(self._decorate_entries(entries or []))
+
+    def _decorate_entries(self, entries):
+        for entry in entries or ():
+            _decorate_repack_entry(entry)
+        return entries
 
     def open_details_and_download(self, entry: RepackEntry) -> None:
         self._pending_auto_download_url = getattr(entry, 'url', None)
@@ -3245,7 +4421,7 @@ class SourceTab(MediaPageBase):
         if query != self._search_query:
             return
         self._grid.set_latest_section_visible(False)
-        self._grid.set_entries(result.entries)
+        self._grid.set_entries(self._decorate_entries(result.entries))
         self._stack.setCurrentWidget(self._grid_row)
         self._set_status('' if result.entries else tr('repacks.no_games_matching', query=query))
 
@@ -3320,7 +4496,7 @@ class SourceTab(MediaPageBase):
         self._current_page = result.page
         self._has_more = result.has_more
         before = self._grid.count_entries()
-        self._grid.append_entries(result.entries)
+        self._grid.append_entries(self._decorate_entries(result.entries))
         added = self._grid.count_entries() - before
         logger.info('Repack page %d: +%d entries, has_more=%s', result.page, added, result.has_more)
         if added == 0 and result.entries:
@@ -3857,6 +5033,7 @@ class _ReleasedPoster(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.setToolTip(hit.get('title', ''))
 
+
     def enterEvent(self, event):
         self._hover = True
         self.update()
@@ -4103,7 +5280,15 @@ class RepacksPage(QWidget):
         outer.setSpacing(12)
         self._pivot = Pivot()
         self._pivot.setContentsMargins(24, 12, 24, 0)
-        outer.addWidget(self._pivot)
+        self._header = QWidget(self)
+        header_layout = QVBoxLayout(self._header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(12)
+        header_layout.addWidget(self._pivot)
+        self._top_state = None
+        self._floating = False
+        self._header_h = 0
+        self._header.installEventFilter(self)
         self._search_bar = SearchLineEdit()
         self._search_bar.setPlaceholderText(tr('repacks.search_placeholder'))
         self._search_bar.setMinimumWidth(160)
@@ -4161,7 +5346,8 @@ class RepacksPage(QWidget):
         search_row.addWidget(self._refresh_btn, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addWidget(self._view_btn, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addStretch(1)
-        outer.addLayout(search_row)
+        header_layout.addLayout(search_row)
+        outer.addWidget(self._header)
         self._stack = QStackedWidget()
         outer.addWidget(self._stack, 1)
         self._tabs: dict[str, SourceTab] = {}
@@ -4185,6 +5371,50 @@ class RepacksPage(QWidget):
         register_locale_refresh(self, self._apply_locale)
         release_notifier().attach_page(self)
         start_release_watching()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._sync_top()
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._header and event.type() in (QEvent.Type.LayoutRequest, QEvent.Type.Show, QEvent.Type.Hide):
+            QTimer.singleShot(0, self._sync_top)
+        return super().eventFilter(obj, event)
+
+    def _sync_top(self) -> None:
+        tab = self._stack.currentWidget()
+        details = getattr(tab, '_details', None)
+        inner = getattr(tab, '_stack', None)
+        active = (details is not None and inner is not None and inner.currentWidget() is details
+                  and details.isVisible() and self._header_h > 0)
+        outer = self.layout()
+        if not active:
+            if self._floating:
+                self._floating = False
+                outer.insertWidget(0, self._header)
+                self._header.show()
+            elif self._header.height() > 0:
+                self._header_h = self._header.height()
+        else:
+            if not self._floating:
+                self._floating = True
+                outer.removeWidget(self._header)
+            self._header.setGeometry(0, -details.banner_offset(), self.width(), self._header_h)
+            self._header.raise_()
+        if self._header_h and self._top_state != self._header_h:
+            self._top_state = self._header_h
+            for t in self._tabs.values():
+                t._details.set_top_inset(self._header_h + 12)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        details = getattr(self._stack.currentWidget(), '_details', None)
+        if details is None or not details.isVisible():
+            return
+        pix = details.banner_for(self.width())
+        if pix is not None:
+            QPainter(self).drawPixmap(0, -details.banner_offset(), pix)
 
     def _open_released(self, hit: dict) -> None:
         entry = _released_entry(hit)
@@ -4454,6 +5684,7 @@ class RepacksPage(QWidget):
 
     def _add_source_tab(self, key: str, display_name: str) -> None:
         tab = SourceTab(key, display_name, self._manager, self)
+        tab._details.banner_changed.connect(self._sync_top)
         self._tabs[key] = tab
         self._view_btn.bind(tab._grid)
         self._tab_display_names[key] = display_name
@@ -4480,6 +5711,7 @@ class RepacksPage(QWidget):
         self._pivot.currentItemChanged.connect(self._on_tab_changed)
         self._tab_handler_connected = True
         self._pivot.setVisible(len(enabled) > 1)
+        self._sync_top()
         self._pivot.setCurrentItem(current)
         self._stack.setCurrentWidget(self._tabs[current])
         self._current_tab_key = current
@@ -4570,7 +5802,7 @@ class GameInstallOptionsDialog(MessageBoxBase):
             self._inspected = {'available': False}
         self.titleLabel = SubtitleLabel(tr('library.install_options_title'), self)
         self.viewLayout.addWidget(self.titleLabel)
-        name = CaptionLabel(details.title or '', self)
+        name = CaptionLabel(_entry_title(details), self)
         name.setStyleSheet(f'color: {_muted()};')
         self.viewLayout.addWidget(name)
         hint = BodyLabel(tr('library.install_options_hint'), self)

@@ -1,0 +1,36 @@
+{
+  "name": "@vyla-entertainment/sdk",
+  "version": "1.20.0",
+  "scripts": {
+    "test": "node test/index.js"
+  },
+  "author": "vyla-entertainment",
+  "contributors": [
+    {
+      "name": "GavinGoGaming",
+      "email": "gavin@klash.dev"
+    },
+    {
+      "name": "alwaysmesmerizingyou",
+      "email": "alwaysmesmerizingyou@gmail.com"
+    }
+  ],
+  "license": "CC-BY-NC-4.0",
+  "type": "module",
+  "description": "Vyla's multi-provider stream scraper SDK",
+  "main": "src/sdk.js",
+  "types": "src/sdk.d.ts",
+  "directories": {
+    "test": "test"
+  },
+  "keywords": [],
+  "devDependencies": {
+    "dotenv": "^17.4.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "node-tls-client": "^2.1.0"
+  }
+}

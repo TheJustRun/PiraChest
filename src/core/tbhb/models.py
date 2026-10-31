@@ -23,6 +23,48 @@ def to_int(value, default: int = 0) -> int:
             return default
 
 
+def to_float(value, default: float = 0.0) -> float:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    return f if f == f else default
+
+
+_TRUE = {"1", "true", "yes", "y", "on", "enabled", "active"}
+_FALSE = {"0", "false", "no", "n", "off", "disabled", "inactive"}
+
+
+def to_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    s = str(value).strip().lower()
+    if s in _TRUE:
+        return True
+    if s in _FALSE:
+        return False
+    return default
+
+
+def _pick(d, *keys, default=None):
+    if isinstance(d, dict):
+        for k in keys:
+            v = d.get(k)
+            if v is not None and v != "":
+                return v
+    return default
+
+
+def _effective_category(raw, source) -> int:
+    if str(source or "").strip().lower().startswith("nyaa"):
+        return 200
+    return to_int(raw)
+
+
 def category_bucket(category: int) -> int:
     return (category // 100) * 100 if category else 0
 
@@ -40,6 +82,17 @@ def format_size(num_bytes) -> str:
             return f"{int(size)} B" if unit == "B" else f"{size:.2f} {unit}"
         size /= 1024
     return f"{size:.2f} TiB"
+
+
+_SIZE_RE = re.compile(r"\s*([\d.]+)\s*([KMGTP]?)(?:i?B)?\s*$", re.IGNORECASE)
+
+
+def parse_size_label(text) -> int:
+    m = _SIZE_RE.match(str(text or "").replace(",", ""))
+    if not m:
+        return 0
+    exp = ("KMGTP".find(m.group(2).upper()) + 1) if m.group(2) else 0
+    return int(to_float(m.group(1)) * 1024 ** exp)
 
 
 def format_age(timestamp, now: float | None = None) -> str:
@@ -146,10 +199,12 @@ class TBHBEntry:
     username: str = ""
     size: int = 0
     added: int = 0
+    category_label: str = ""
+    page_url: str = ""
 
     @property
     def category_name(self) -> str:
-        return category_bucket_name(self.category)
+        return self.category_label or category_bucket_name(self.category)
 
     @property
     def format_guess(self) -> str:
@@ -176,7 +231,7 @@ class TBHBEntry:
         return cls(
             id=str(d.get("id", "")),
             title=title,
-            category=to_int(d.get("category")),
+            category=_effective_category(d.get("category"), d.get("source")),
             size_label=d.get("sizeLabel") or format_size(size),
             seeders=to_int(d.get("seeders")),
             leechers=to_int(d.get("leechers")),
@@ -187,6 +242,8 @@ class TBHBEntry:
             username=d.get("username") or "",
             size=size,
             added=to_int(d.get("added")),
+            category_label=d.get("categoryLabel") or "",
+            page_url=d.get("pageUrl") or "",
         )
 
 
@@ -205,10 +262,13 @@ class TBHBDetails:
     added: int = 0
     source: str = ""
     status: str = ""
+    category_label: str = ""
+    page_url: str = ""
+    description: str = ""
 
     @property
     def category_name(self) -> str:
-        return category_bucket_name(self.category)
+        return self.category_label or category_bucket_name(self.category)
 
     @property
     def file_format(self) -> str:
@@ -229,6 +289,7 @@ class TBHBDetails:
             title=e.title, category=e.category, size_label=e.size_label, seeders=e.seeders,
             leechers=e.leechers, info_hash=e.info_hash, username=e.username, size=e.size,
             added=e.added, source=e.source, status=e.status, extra={"magnet_url": e.magnet},
+            category_label=e.category_label, page_url=e.page_url,
         )
 
     @classmethod
@@ -239,7 +300,7 @@ class TBHBDetails:
         size = to_int(t.get("size"))
         return cls(
             title=title,
-            category=to_int(t.get("category")),
+            category=_effective_category(t.get("category"), t.get("source")),
             size_label=t.get("sizeLabel") or format_size(size),
             seeders=to_int(t.get("seeders")),
             leechers=to_int(t.get("leechers")),
@@ -255,13 +316,142 @@ class TBHBDetails:
             added=to_int(t.get("added")),
             source=t.get("source") or "",
             status=t.get("status") or "",
+            category_label=t.get("categoryLabel") or "",
+            page_url=t.get("pageUrl") or "",
+            description=t.get("description") or "",
         )
 
     def fill_missing_from(self, e: TBHBEntry) -> None:
         if not self.extra.get("magnet_url"):
             self.extra["magnet_url"] = e.magnet
-        for attr in ("username", "category", "size_label", "info_hash", "size", "added", "source", "status"):
+        for attr in ("username", "category", "size_label", "info_hash", "size", "added", "source", "status",
+                     "category_label", "page_url"):
             if not getattr(self, attr):
                 setattr(self, attr, getattr(e, attr))
         if not (self.seeders or self.leechers):
             self.seeders, self.leechers = e.seeders, e.leechers
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def clean_description(text, limit: int = 1500) -> str:
+    t = _TAG_RE.sub("", str(text or "")).replace("\r", "")
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t if len(t) <= limit else t[:limit].rstrip() + "…"
+
+
+def _pick_any(dicts, *keys):
+    for d in dicts:
+        v = _pick(d, *keys)
+        if v is not None:
+            return v
+    return None
+
+
+@dataclass
+class UploaderReputation:
+    username: str = ""
+    xp: float = 0.0
+    level: int = 0
+    rank: str = ""
+    avg_rating: float = 0.0
+    rating_count: int = 0
+    uploads: int = 0
+    distribution: dict = field(default_factory=dict)
+
+    @property
+    def has_data(self) -> bool:
+        return bool(self.xp or self.level or self.rank or self.avg_rating or self.rating_count or self.uploads)
+
+    @property
+    def summary(self) -> str:
+        parts = []
+        if self.avg_rating > 0:
+            parts.append(f"★ {self.avg_rating:.1f}" + (f" ({self.rating_count})" if self.rating_count else ""))
+        if self.rank:
+            parts.append(self.rank)
+        if self.level:
+            parts.append(f"Lv {self.level}")
+        if self.xp:
+            parts.append(f"{self.xp:g} XP")
+        if self.uploads:
+            parts.append(f"{self.uploads} uploads")
+        return " · ".join(parts)
+
+    @property
+    def detail(self) -> str:
+        if not self.distribution:
+            return ""
+        return " · ".join(f"{n}★ {to_int(self.distribution.get(str(n)))}" for n in (5, 4, 3, 2, 1))
+
+    @classmethod
+    def from_api(cls, d, username: str = "") -> "UploaderReputation":
+        if not isinstance(d, dict):
+            return cls(username=username)
+        r = d.get("reputation") if isinstance(d.get("reputation"), dict) else d
+        sub = [x for x in (r.get("uploader"), r.get("ratings"), r.get("rating")) if isinstance(x, dict)]
+        src = [r, *sub]
+        rank = _pick_any(src, "rank", "tier", "title")
+        level = to_int(_pick_any(src, "level", "trust_level", "trustLevel"))
+        if not level and isinstance(rank, (int, float)) and not isinstance(rank, bool):
+            level = int(rank)
+        return cls(
+            username=str(_pick_any(src, "username", "name") or username),
+            xp=to_float(_pick_any(src, "xp", "score", "points")),
+            level=level,
+            rank=rank if isinstance(rank, str) else "",
+            avg_rating=to_float(_pick_any(src, "averageRating", "average", "avg", "avgRating")),
+            rating_count=to_int(_pick_any(src, "ratingCount", "count", "totalRatings")),
+            uploads=to_int(_pick_any(src, "uploads", "uploadCount", "upload_count", "totalUploads")),
+        )
+
+    def apply_ratings(self, d) -> None:
+        if not isinstance(d, dict):
+            return
+        count = to_int(d.get("ratingCount"))
+        if count:
+            self.rating_count = count
+            self.avg_rating = to_float(d.get("averageRating"))
+        if isinstance(d.get("distribution"), dict):
+            self.distribution = d["distribution"]
+
+    @classmethod
+    def from_profile(cls, data, username: str = "") -> "UploaderReputation":
+        data = data if isinstance(data, dict) else {}
+        rep = cls.from_api(data.get("reputation"), username)
+        rep.apply_ratings(data.get("ratings"))
+        return rep
+
+
+def normalize_nyaa_item(d: dict) -> dict | None:
+    name = _pick(d, "name", "title")
+    if not name:
+        return None
+    info_hash = str(_pick(d, "info_hash", "infoHash", default="")).lower()
+    raw_size = _pick(d, "size")
+    size = int(raw_size) if isinstance(raw_size, (int, float)) and not isinstance(raw_size, bool) \
+        else parse_size_label(_pick(d, "sizeLabel", default=raw_size))
+    return {
+        "id": str(_pick(d, "id", default="") or info_hash),
+        "name": str(name),
+        "info_hash": info_hash,
+        "magnet": _pick(d, "magnet", default="") or build_magnet(info_hash, str(name)),
+        "seeders": to_int(d.get("seeders")),
+        "leechers": to_int(d.get("leechers")),
+        "size": size,
+        "sizeLabel": _pick(d, "sizeLabel", default="") or format_size(size),
+        "category": 200,
+        "added": to_int(d.get("added")),
+        "username": "",
+        "status": "trusted" if to_bool(d.get("trusted")) else "",
+        "source": "Nyaa",
+        "pageUrl": str(_pick(d, "pageUrl", default="")),
+    }
+
+
+def parse_nyaa_results(data) -> list[dict]:
+    raw = data.get("results") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        return []
+    return [n for n in (normalize_nyaa_item(i) for i in raw if isinstance(i, dict)) if n]

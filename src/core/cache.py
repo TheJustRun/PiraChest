@@ -148,6 +148,11 @@ class CacheManager:
         self._exec('DELETE FROM kv WHERE ns=? OR substr(ns, 1, ?)=?',
                    (namespace, len(namespace) + 1, namespace + ':'))
 
+    def count_namespace(self, namespace: str) -> int:
+        rows = self._exec('SELECT COUNT(*) FROM kv WHERE ns=? OR substr(ns, 1, ?)=?',
+                          (namespace, len(namespace) + 1, namespace + ':'))
+        return int(rows[0][0]) if rows and rows[0] else 0
+
     def clear_all(self) -> None:
         self._exec('DELETE FROM kv')
         self._exec('VACUUM')

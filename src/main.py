@@ -16,7 +16,8 @@ os.environ.setdefault('QT_MEDIA_BACKEND', 'ffmpeg')
 
 logger = logging.getLogger(__name__)
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_ROOT = (getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+                 if _FROZEN else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
@@ -91,8 +92,7 @@ def main() -> int:
     app = create_application(sys.argv)
     app.setApplicationName('PiraChest')
 
-    from src.core.config import (SingleInstance, ensure_associations_repaired, extract_cli_targets,
-                                 register_associations, should_auto_register_associations)
+    from src.core.config import (SingleInstance, ensure_associations_repaired, extract_cli_targets)
     initial_targets = extract_cli_targets(sys.argv[1:])
 
     window = None
@@ -124,13 +124,10 @@ def main() -> int:
 
     QTimer.singleShot(3000, _deferred_temp_cleanup)
 
-    if settings.associations_enabled or should_auto_register_associations():
+    if settings.associations_enabled:
         def _deferred_assoc():
             try:
-                if settings.associations_enabled:
-                    ensure_associations_repaired()
-                elif should_auto_register_associations():
-                    register_associations()
+                ensure_associations_repaired()
             except Exception:
                 logger.warning('Association repair failed', exc_info=True)
         QTimer.singleShot(2000, _deferred_assoc)

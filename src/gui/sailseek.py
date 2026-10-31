@@ -232,6 +232,16 @@ def _category_label(key: str) -> str:
     }.get(key, key.title())
 
 
+def _clean_game_title(raw: str) -> str:
+    text = raw or ''
+    try:
+        from src.core.repacks.base import display_title
+
+        return display_title(text) or text
+    except Exception:
+        return text
+
+
 def _contrast_fg(bg: QColor) -> QColor:
     lum = (0.299 * bg.red() + 0.587 * bg.green() + 0.114 * bg.blue()) / 255.0
     return QColor('#ffffff') if lum < 0.62 else QColor('#101010')
@@ -2467,6 +2477,10 @@ class SailSeekController(QObject):
         results = []
         for item in items:
             title = item.game_name or tr('sailseek.untitled', 'Untitled')
+            category = str(getattr(item, 'category', '') or '')
+            source = str(getattr(item, 'source', '') or '')
+            if category == 'repacks' or source.casefold() in ('fitgirl', 'gog'):
+                title = _clean_game_title(title)
             try:
                 state = item.state if isinstance(item.state, DLState) else DLState(item.state)
             except Exception:
@@ -2541,20 +2555,42 @@ class SailSeekController(QObject):
 
     def _map_repack_all(self, entries, query: str) -> list[SailSeekResult]:
         results = []
+        try:
+            from .repacks_page import _decorate_repack_entry
+        except Exception:
+            _decorate_repack_entry = None
         for entry in entries or []:
-            title = str(getattr(entry, 'title', '') or '')
-            if not title:
+            if _decorate_repack_entry is not None:
+                try:
+                    _decorate_repack_entry(entry)
+                except Exception:
+                    pass
+            raw_title = str(getattr(entry, 'title', '') or '')
+            if not raw_title:
                 continue
+            title = _clean_game_title(str(getattr(entry, 'display_title', '') or raw_title))
             source = str(getattr(entry, 'source', '') or '')
             source_label = {'fitgirl': 'FitGirl', 'gog': 'GOG'}.get(source, source.title())
-            score = _match_score(query, title, source_label)
+            meta = str(getattr(entry, 'title_meta', '') or '')
+            search_blob = raw_title
+            try:
+                from src.core.repacks import enrichment as service
+
+                search_blob = service.search_text_for(entry) or raw_title
+            except Exception:
+                pass
+            score = _match_score(query, title, f'{meta} {search_blob} {source_label}')
             if score is None:
                 continue
             url = str(getattr(entry, 'url', '') or '')
-            image = str(getattr(entry, 'poster_url', '') or getattr(entry, 'poster_path', '') or '')
+            image = str(getattr(entry, 'poster_url', '') or getattr(entry, 'poster_path', '')
+                        or getattr(entry, 'steam_poster', '') or '')
+            subtitle = f'{source_label} · {tr("sailseek.type_pc_game", "PC game")}'
+            if meta:
+                subtitle = f'{subtitle} · {meta}'
             results.append(SailSeekResult(
                 uid=f'repack:{source}:{url or title}', category='games', title=title,
-                subtitle=f'{source_label} · {tr("sailseek.type_pc_game", "PC game")}',
+                subtitle=subtitle,
                 image=image, score=score, action=lambda e=entry: self._open_repack(e),
                 secondary=[(tr('sailseek.action_open_source', 'Open source page'),
                             lambda u=url: self._open_url(u))],

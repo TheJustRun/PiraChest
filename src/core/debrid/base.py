@@ -6,8 +6,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
-import requests
-
 logger = logging.getLogger(__name__)
 
 _USER_AGENT = "PiraChest/3.0 Debrid"
@@ -91,6 +89,8 @@ def wanted_indices(file_ids: Optional[Iterable[int]]) -> list[int]:
 def fetch_torrent_bytes(source: str, timeout: float = _DEFAULT_TIMEOUT) -> tuple[bytes, str]:
     source = (source or "").strip()
     if source.startswith(("http://", "https://")):
+        import requests
+
         response = requests.get(source, timeout=timeout, headers={"User-Agent": _USER_AGENT})
         response.raise_for_status()
         data = response.content
@@ -118,6 +118,9 @@ class DebridProvider:
             raise DebridAuthError(f"No {self.label or self.key} token has been saved")
         self._token = token.strip()
         self._timeout = max(5.0, float(timeout))
+        import requests
+
+        self._requests = requests
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": _USER_AGENT, "Accept": "application/json"})
         self._apply_proxy()
@@ -163,7 +166,7 @@ class DebridProvider:
                 method.upper(), url, params=params, data=data, json=json, files=files,
                 headers=merged, timeout=self._timeout,
             )
-        except requests.RequestException as exc:
+        except self._requests.RequestException as exc:
             raise DebridError(f"{self.label} request failed: {exc}", provider=self.key) from exc
         status = response.status_code
         if status == 429:
@@ -186,7 +189,7 @@ class DebridProvider:
         return payload
 
     @staticmethod
-    def _error_message(response: requests.Response) -> str:
+    def _error_message(response: Any) -> str:
         try:
             payload = response.json()
         except ValueError:

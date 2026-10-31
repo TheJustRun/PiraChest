@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import collections
 import ctypes
+import gc
 import importlib
 import logging
+import math
 import os
+import re
+import struct
 import subprocess
 import sys
 import threading
 import time
+import weakref
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import (
     Property,
@@ -19,6 +26,7 @@ from PySide6.QtCore import (
     QEasingCurve,
     QElapsedTimer,
     QEvent,
+    qInstallMessageHandler,
     QObject,
     QPoint,
     QPointF,
@@ -30,11 +38,13 @@ from PySide6.QtCore import (
     Qt,
     QThreadPool,
     QTimer,
+    QtMsgType,
     QUrl,
     Signal,
 )
 from PySide6.QtGui import (
     QAction,
+    QBrush,
     QColor,
     QCursor,
     QDesktopServices,
@@ -42,8 +52,11 @@ from PySide6.QtGui import (
     QFontDatabase,
     QFontMetrics,
     QIcon,
+    QImage,
     QImageReader,
     QKeySequence,
+    QLinearGradient,
+    QMatrix4x4,
     QMouseEvent,
     QMovie,
     QPainter,
@@ -51,8 +64,22 @@ from PySide6.QtGui import (
     QPalette,
     QPen,
     QPixmap,
+    QPixmapCache,
     QShortcut,
     QSurfaceFormat,
+)
+from PySide6.QtOpenGL import (
+    QOpenGLBuffer,
+    QOpenGLFramebufferObject,
+    QOpenGLShader,
+    QOpenGLShaderProgram,
+    QOpenGLTexture,
+    QOpenGLVersionFunctionsFactory,
+    QOpenGLVersionProfile,
+    QOpenGLVertexArrayObject,
+)
+from PySide6.QtOpenGLWidgets import (
+    QOpenGLWidget,
 )
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -69,17 +96,16 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QGraphicsPixmapItem,
     QGraphicsScene,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QScrollArea,
     QScrollBar,
     QSizePolicy,
     QSlider,
-    QStackedWidget,
     QSystemTrayIcon,
     QTableView,
     QTextEdit,
@@ -98,28 +124,27 @@ from qfluentwidgets import (
     InfoBadgePosition,
     InfoBar,
     InfoBarPosition,
-    LineEdit,
     MessageBoxBase,
     NavigationItemPosition,
     Pivot,
     PrimaryPushButton,
     PushButton,
     qconfig,
-    ScrollArea,
-    Slider,
-    SplashScreen,
     setFont,
     setTheme,
+    Slider,
+    SplashScreen,
     StrongBodyLabel,
     SubtitleLabel,
-    SwitchButton,
     Theme,
     themeColor,
     ToolTip,
     ToolTipPosition,
     TransparentToolButton,
 )
-from shiboken6 import isValid as _qt_is_valid
+from shiboken6 import (
+    isValid as _qt_is_valid,
+)
 
 from src.core.config import (
     apply_settings,
@@ -127,6 +152,7 @@ from src.core.config import (
     associations_need_repair,
     check_dir_writable,
     download_dir_changes,
+    DOWNLOAD_DIR_SUBFOLDERS,
     extract_cli_targets,
     format_size,
     free_space_bytes,
@@ -141,7 +167,6 @@ from src.core.config import (
     ThemeMode,
 )
 from src.core.theme import (
-    filled_icon,
     activate_theme,
     active_preset_id,
     all_preset_ids,
@@ -150,8 +175,9 @@ from src.core.theme import (
     apply_tool_button_theme,
     ChromeChip,
     ensure_contrast,
-    manager as theme_manager,
+    filled_icon,
     global_app_qss,
+    manager as theme_manager,
     open_theme_maker,
     palette,
     preset_label,
@@ -167,16 +193,22 @@ from src.core.theme import (
     theme_shader_image_path,
     theme_shader_path,
     themed_icon,
-    trimmed_icon,
     themed_nav_icon,
     to_color,
+    trimmed_icon,
     WindowChrome,
 )
-from src.core.translations import current_language, register_locale_refresh, set_language, tr
+from src.core.translations import (
+    current_language,
+    register_locale_refresh,
+    set_language,
+    tr,
+    tr_for,
+)
 
-from .about_page import AboutPage, DISCORD_URL, find_app_icon_path, find_discord_icon_path
-from .home_page import HomePage
-from .sailseek import SailSeekController
+from .home_page import (
+    HomePage,
+)
 from .settings_page import (
     apply_qfluentwidgets_font_families,
     apply_theme_font_families,
@@ -196,11 +228,44 @@ from .settings_page import (
 
 set_popout_sfx_hook(play_popout_sfx)
 logger = logging.getLogger(__name__)
+DISCORD_URL = 'https://discord.gg/j7dBxTZMDE'
 
 _LOG_FORMAT = '%(asctime)s [%(levelname)s] %(name)s — %(message)s'
 _LOG_FILE_HANDLER: logging.FileHandler | None = None
 _PREV_EXCEPTHOOK = None
 _QT_MESSAGE_HANDLER_INSTALLED = False
+_LOG_MAX_BYTES = 2 * 1024 * 1024
+_LOG_BACKUPS = 3
+
+_REDACT_MAGNET_RE = re.compile(r'magnet:\?[^\s"\'<>]+', re.IGNORECASE)
+_REDACT_URL_QUERY_RE = re.compile(r'(\b(?:https?|ftp)://[^\s"\'<>?]+)\?[^\s"\'<>]*', re.IGNORECASE)
+_REDACT_URL_AUTH_RE = re.compile(r'(\b(?:https?|ftp)://)[^/\s"\'<>@]+@', re.IGNORECASE)
+_REDACT_SECRET_RE = re.compile(
+    r'(?i)\b(token|api[_-]?key|apikey|password|passwd|secret|auth|authorization|passkey)[=:]\s*[^\s&,;"\'<>]+')
+_REDACT_BEARER_RE = re.compile(r'(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}')
+_REDACT_WIN_USER_RE = re.compile(r'(?i)(\b[A-Z]:\\Users\\)[^\\\s"\']+')
+_REDACT_UNIX_USER_RE = re.compile(r'(?i)(/home/)[^/\s"\']+')
+
+
+def _redact_text(text: str) -> str:
+    if not text:
+        return text
+    try:
+        text = _REDACT_MAGNET_RE.sub('magnet:[redacted]', text)
+        text = _REDACT_URL_QUERY_RE.sub(r'\1?<redacted>', text)
+        text = _REDACT_URL_AUTH_RE.sub(r'\1<redacted>@', text)
+        text = _REDACT_SECRET_RE.sub(lambda match: f'{match.group(1)}=<redacted>', text)
+        text = _REDACT_BEARER_RE.sub(r'\1 <redacted>', text)
+        text = _REDACT_WIN_USER_RE.sub(r'\1<user>', text)
+        text = _REDACT_UNIX_USER_RE.sub(r'\1<user>', text)
+    except Exception:
+        pass
+    return text
+
+
+class _RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return _redact_text(super().format(record))
 
 
 def log_file_path() -> str:
@@ -228,8 +293,9 @@ def set_file_logging_enabled(enabled: bool) -> None:
             return
         path = log_file_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        handler = logging.FileHandler(path, encoding='utf-8')
-        handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+        handler = RotatingFileHandler(
+            path, maxBytes=_LOG_MAX_BYTES, backupCount=_LOG_BACKUPS, encoding='utf-8')
+        handler.setFormatter(_RedactingFormatter(_LOG_FORMAT))
         root_logger.addHandler(handler)
         if root_logger.level > logging.INFO or root_logger.level == logging.NOTSET:
             root_logger.setLevel(logging.INFO)
@@ -247,12 +313,14 @@ def configure_logging(enable_file: bool = True) -> None:
         logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
     elif root_logger.level > logging.INFO or root_logger.level == logging.NOTSET:
         root_logger.setLevel(logging.INFO)
+    formatter = _RedactingFormatter(_LOG_FORMAT)
+    for handler in root_logger.handlers:
+        handler.setFormatter(formatter)
     if enable_file:
         set_file_logging_enabled(True)
 
 
 def _qt_message_handler(mode, context, message) -> None:
-    from PySide6.QtCore import QtMsgType
     levels = {
         QtMsgType.QtDebugMsg: logging.DEBUG,
         QtMsgType.QtInfoMsg: logging.INFO,
@@ -267,7 +335,6 @@ def install_qt_message_handler() -> None:
     global _QT_MESSAGE_HANDLER_INSTALLED
     if _QT_MESSAGE_HANDLER_INSTALLED:
         return
-    from PySide6.QtCore import qInstallMessageHandler
     qInstallMessageHandler(_qt_message_handler)
     _QT_MESSAGE_HANDLER_INSTALLED = True
 
@@ -280,24 +347,6 @@ def shutdown_logging() -> None:
         _LOG_FILE_HANDLER = None
     logging.shutdown()
 
-
-import math
-import re
-import struct
-import weakref
-
-from PySide6.QtGui import QImage, QMatrix4x4
-from PySide6.QtOpenGL import (
-    QOpenGLBuffer,
-    QOpenGLFramebufferObject,
-    QOpenGLShader,
-    QOpenGLShaderProgram,
-    QOpenGLTexture,
-    QOpenGLVersionFunctionsFactory,
-    QOpenGLVersionProfile,
-    QOpenGLVertexArrayObject,
-)
-from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 _GL_COLOR_BUFFER_BIT = 0x4000
 _GL_TRIANGLE_STRIP = 0x0005
@@ -617,7 +666,6 @@ class _GLBackground(QOpenGLWidget):
         self._vao = None
         self._vbo = None
 
-
     def _init_gl(self) -> bool:
         if self._gl is not None:
             return True
@@ -766,7 +814,6 @@ class ShaderBackgroundWidget(_GLBackground):
         self._anim.timeout.connect(self._tick)
         self._restart_anim()
 
-
     @property
     def uses_mouse(self) -> bool:
         return self._uses_mouse
@@ -897,7 +944,6 @@ class ShaderBackgroundWidget(_GLBackground):
         self._window_pos = QPoint(pos)
         self._window_velocity = QPointF(max(-2500.0, min(2500.0, vx)), max(-2500.0, min(2500.0, vy)))
 
-
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._restart_anim()
@@ -972,7 +1018,6 @@ class ShaderBackgroundWidget(_GLBackground):
         accel = (target - self._tilt_angle) * 18.0 - self._tilt_velocity * 6.0
         self._tilt_velocity += accel * self._delta
         self._tilt_angle += self._tilt_velocity * self._delta
-
 
     def initializeGL(self) -> None:
         if not self._init_gl():
@@ -1113,7 +1158,6 @@ class MediaBackgroundWidget(_GLBackground):
         self._blit_program = None
         self._solid_program = None
 
-
     def start(self, kind: str, path: str, blur: int, darken: int) -> None:
         self._failed = False
         self._stop_media()
@@ -1148,7 +1192,6 @@ class MediaBackgroundWidget(_GLBackground):
         self._kind = ''
         self._frame_image = None
         self.update()
-
 
     def _ensure_player(self) -> None:
         if self._player is not None:
@@ -1213,7 +1256,6 @@ class MediaBackgroundWidget(_GLBackground):
         logger.warning('GPU media background disabled, using CPU path: %s', summary)
         _report_bg_mode('CPU (GPU failed)', summary)
         QTimer.singleShot(0, self, lambda: self.failed.emit(message))
-
 
     def initializeGL(self) -> None:
         if not self._init_gl():
@@ -1443,8 +1485,8 @@ def _process_background_pixmap(pixmap: QPixmap, blur_radius: int, darken_percent
     return _darken_pixmap(pixmap, darken_percent)
 
 
-_GUI_DIR = os.path.dirname(os.path.abspath(__file__))
-_FONT_DIR = os.path.join(_GUI_DIR, 'lang', 'fonts')
+_GUI_DIR = Path(__file__).resolve().parent
+_FONT_DIR = _GUI_DIR / 'lang' / 'fonts'
 _FIGTREE_FILENAMES = ('Inter.ttf',)
 
 
@@ -2163,7 +2205,7 @@ class VPNDisclaimerDialog(MessageBoxBase):
     def __init__(self, parent=None):
         super().__init__(parent)
         t = tr_or
-        self.widget.setMinimumWidth(440)
+        self.widget.setMinimumWidth(480)
         head = QHBoxLayout()
         head.setSpacing(10)
         icon = IconWidget(FluentIcon.INFO, self.widget)
@@ -2179,6 +2221,9 @@ class VPNDisclaimerDialog(MessageBoxBase):
             label = BodyLabel(t(key, text), self.widget)
             label.setWordWrap(True)
             self.viewLayout.addWidget(label)
+        etiquette = StrongBodyLabel(t('disclaimer.etiquette', "Have a pirate's etiquette and know what you're doing. This app is for the lazy, not the stupid."), self.widget)
+        etiquette.setWordWrap(True)
+        self.viewLayout.addWidget(etiquette)
         self._chk_never_show = CheckBox(t('disclaimer.never_show', "Don't show this again"), self.widget)
         self.viewLayout.addWidget(self._chk_never_show)
         self.yesButton.setText(t('disclaimer.confirm', 'I understand'))
@@ -2189,284 +2234,84 @@ class VPNDisclaimerDialog(MessageBoxBase):
 
 
 LANGUAGES = (
-    ('en', 'English', 'Hello, choose your language'),
-    ('ar', 'العربية', 'مرحبًا، اختر لغتك'),
-    ('es', 'Español', 'Hola, elige tu idioma'),
-    ('ru', 'Русский', 'Привет, выберите язык'),
-    ('de', 'Deutsch', 'Hallo, wähle deine Sprache'),
+    ('en', 'English'),
+    ('ar', 'العربية'),
+    ('es', 'Español'),
+    ('ru', 'Русский'),
+    ('de', 'Deutsch'),
 )
 
 FEATURES = (
-    ('minerva_enabled', 'nav.minerva', FluentIcon.APPLICATION, 'Minerva ROM Index', 'ROM browsing and sync on the Home section'),
-    ('pc_games_enabled', 'nav.pc_games', FluentIcon.GAME, 'Repacks (PC Games)', 'A PC Games section in the sidebar'),
-    ('youtube_enabled', 'nav.youtube', FluentIcon.PLAY, 'YouTube Downloader', 'A YouTube Downloader section in the sidebar'),
-    ('tv_enabled', 'nav.tv', FluentIcon.TILES, 'TV', 'Movies, series, sports and channels'),
-    ('tbhb_enabled', 'nav.tbhb', FluentIcon.SEARCH, 'The Black Hole Bay', 'Torrent search section in the sidebar'),
-    ('sailseek_enabled', 'nav.sailseek', FluentIcon.SEARCH, 'SailSeek', 'Instant search and YouTube links from one shortcut'),
-    ('music_enabled', 'nav.music', FluentIcon.MUSIC, 'Music', 'Placeholder, coming in a future update'),
-    ('books_enabled', 'nav.books', FluentIcon.BOOK_SHELF, 'Books', 'Placeholder, coming in a future update'),
+    ('minerva_enabled', 'nav.minerva', 'Minerva', 'onboarding.feature_minerva_desc',
+     'Browse and sync the Minerva ROM index.'),
+    ('pc_games_enabled', 'nav.pc_games', 'PC Games', 'onboarding.feature_pc_games_desc',
+     'Download repacks and PC games.'),
+    ('youtube_enabled', 'nav.youtube', 'YouTube', 'onboarding.feature_youtube_desc',
+     'Download videos and audio from YouTube.'),
+    ('tv_enabled', 'nav.tv', 'TV', 'onboarding.feature_tv_desc',
+     'Browse movies, series and live channels.'),
+    ('tbhb_enabled', 'nav.tbhb', 'TBHB', 'onboarding.feature_tbhb_desc',
+     'Search torrents from The Black Hole Bay.'),
+    ('music_enabled', 'nav.music', 'Music', 'onboarding.feature_music_desc',
+     'Browse and manage your music library.'),
+    ('books_enabled', 'nav.books', 'Books', 'onboarding.feature_books_desc',
+     'Browse and manage your books.'),
+    ('sailseek_enabled', 'nav.sailseek', 'SailSeek', 'onboarding.feature_sailseek_desc',
+     'Search instantly and open YouTube links with one shortcut.'),
 )
 
 _PLAIN_THEMES = ('dark', 'light')
 _SWATCH_KEYS = ('page_bg', 'primary_text', 'accent')
+_VIDEO_EXT = frozenset(('.mp4', '.webm', '.mkv', '.mov', '.avi', '.m4v'))
+_PREVIEW_PX = QSize(320, 180)
+_THUMBS: dict[str, QPixmap] = {}
+_THUMB_BADGE = {'gif': 'GIF', 'video': 'VIDEO', 'shader': 'SHADER', 'photo': 'PHOTO'}
 
 
 def _mix(a: QColor, b: QColor, t: float) -> QColor:
-    return QColor(*(round(x + (y - x) * t) for x, y in ((a.red(), b.red()), (a.green(), b.green()), (a.blue(), b.blue()), (a.alpha(), b.alpha()))))
+    t = max(0.0, min(1.0, float(t)))
+    return QColor(
+        round(a.red() + (b.red() - a.red()) * t),
+        round(a.green() + (b.green() - a.green()) * t),
+        round(a.blue() + (b.blue() - a.blue()) * t),
+        round(a.alpha() + (b.alpha() - a.alpha()) * t),
+    )
 
 
-def _fade_in(widget: QWidget, ms: int = 240) -> None:
-    effect = QGraphicsOpacityEffect(widget)
-    widget.setGraphicsEffect(effect)
-    anim = QPropertyAnimation(effect, b'opacity', widget)
-    anim.setDuration(ms)
-    anim.setStartValue(0.0)
-    anim.setEndValue(1.0)
-    anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-    anim.finished.connect(lambda: widget.setGraphicsEffect(None))
-    anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+def _css(color) -> str:
+    c = to_color(color)
+    if c.alpha() < 255:
+        return f'rgba({c.red()}, {c.green()}, {c.blue()}, {c.alpha() / 255:.3f})'
+    return c.name()
 
 
-def _animated_property(owner: QWidget, name: bytes, ms: int, curve=QEasingCurve.Type.OutCubic) -> QPropertyAnimation:
-    anim = QPropertyAnimation(owner, name, owner)
-    anim.setDuration(ms)
-    anim.setEasingCurve(curve)
-    return anim
+def _font_px(base: QFont, px: int, weight: QFont.Weight | None = None) -> QFont:
+    font = QFont(base)
+    font.setPixelSize(max(9, int(px)))
+    if weight is not None:
+        font.setWeight(weight)
+    return font
 
 
-def _glide(anim: QPropertyAnimation, end: float) -> None:
-    anim.stop()
-    anim.setStartValue(anim.targetObject().property(anim.propertyName().data().decode()))
-    anim.setEndValue(end)
-    anim.start()
+def _height_for_width(widget: QWidget, width: int) -> int:
+    width = max(1, int(width))
+    value = widget.heightForWidth(width)
+    if value and value > 0:
+        return int(value)
+    layout = widget.layout()
+    if layout is not None and layout.hasHeightForWidth():
+        value = layout.totalHeightForWidth(width)
+        if value and value > 0:
+            return int(value)
+    return max(widget.sizeHint().height(), widget.minimumSizeHint().height())
 
 
-class _ProgressBar(QWidget):
-
-    def __init__(self, steps: int, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(4)
-        self._steps = steps
-        self._value = 1 / steps
-        self._anim = _animated_property(self, b'value', 360, QEasingCurve.Type.InOutCubic)
-
-    def _get_value(self) -> float:
-        return self._value
-
-    def _set_value(self, value: float) -> None:
-        self._value = value
-        self.update()
-
-    value = Property(float, _get_value, _set_value)
-
-    def go_to(self, step: int) -> None:
-        _glide(self._anim, (step + 1) / self._steps)
-
-    def paintEvent(self, _event) -> None:
-        c = palette()
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(c['card_border']))
-        p.drawRoundedRect(self.rect(), 2, 2)
-        p.setBrush(QColor(c['accent']))
-        p.drawRoundedRect(QRectF(0, 0, self.width() * self._value, self.height()), 2, 2)
-
-
-class _Greeting(QWidget):
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        font = QFont(self.font())
-        font.setPixelSize(22)
-        font.setWeight(QFont.Weight.DemiBold)
-        self.setFont(font)
-        self.setFixedHeight(QFontMetrics(font).lineSpacing() * 2 + 8)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._text = self._target = LANGUAGES[0][2]
-        self._opacity = 1.0
-        self._index = 0
-        self._locked = False
-        self._fading_out = False
-        self._fade = _animated_property(self, b'textOpacity', 190, QEasingCurve.Type.Linear)
-        self._fade.finished.connect(self._on_fade_done)
-        self._timer = QTimer(self)
-        self._timer.setInterval(2400)
-        self._timer.timeout.connect(self._cycle)
-        register_theme_refresh(self, self.update)
-
-    def _get_opacity(self) -> float:
-        return self._opacity
-
-    def _set_opacity(self, value: float) -> None:
-        self._opacity = value
-        self.update()
-
-    textOpacity = Property(float, _get_opacity, _set_opacity)
-
-    def lock_to(self, code: str) -> None:
-        self._locked = True
-        self._timer.stop()
-        self._show(next(greeting for lang, _name, greeting in LANGUAGES if lang == code))
-
-    def _cycle(self) -> None:
-        self._index = (self._index + 1) % len(LANGUAGES)
-        self._show(LANGUAGES[self._index][2])
-
-    def _show(self, text: str) -> None:
-        self._target = text
-        if self._fade.state() != QPropertyAnimation.State.Running:
-            self._run_fade(out=True)
-
-    def _run_fade(self, out: bool) -> None:
-        self._fading_out = out
-        self._fade.setStartValue(self._opacity)
-        self._fade.setEndValue(0.0 if out else 1.0)
-        self._fade.start()
-
-    def _on_fade_done(self) -> None:
-        if self._fading_out:
-            self._text = self._target
-            self._run_fade(out=False)
-        elif self._text != self._target:
-            self._run_fade(out=True)
-
-    def paintEvent(self, _event) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        p.setOpacity(self._opacity)
-        p.setPen(QColor(palette()['primary_text']))
-        p.setFont(self.font())
-        p.drawText(self.rect(), int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap), self._text)
-
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
-        if not self._locked:
-            self._timer.start()
-
-    def hideEvent(self, event) -> None:
-        super().hideEvent(event)
-        self._timer.stop()
-
-
-class _SelectableCard(QFrame):
-
-    clicked = Signal()
-
-    def __init__(self, parent=None, radius: int = 10):
-        super().__init__(parent)
-        self._radius = radius
-        self._selection = 0.0
-        self._hover = 0.0
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self._selection_anim = _animated_property(self, b'selection', 180)
-        self._hover_anim = _animated_property(self, b'hover', 140)
-
-    def _get_selection(self) -> float:
-        return self._selection
-
-    def _set_selection(self, value: float) -> None:
-        self._selection = value
-        self.update()
-
-    def _get_hover(self) -> float:
-        return self._hover
-
-    def _set_hover(self, value: float) -> None:
-        self._hover = value
-        self.update()
-
-    selection = Property(float, _get_selection, _set_selection)
-    hover = Property(float, _get_hover, _set_hover)
-
-    def set_selected(self, selected: bool, animate: bool = True) -> None:
-        if animate and self.isVisible():
-            _glide(self._selection_anim, 1.0 if selected else 0.0)
-        else:
-            self._set_selection(1.0 if selected else 0.0)
-
-    def enterEvent(self, event) -> None:
-        _glide(self._hover_anim, 1.0)
-        super().enterEvent(event)
-
-    def leaveEvent(self, event) -> None:
-        _glide(self._hover_anim, 0.0)
-        super().leaveEvent(event)
-
-    def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
-            self.clicked.emit()
-        super().mouseReleaseEvent(event)
-
-    def keyPressEvent(self, event) -> None:
-        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self.clicked.emit()
-        else:
-            super().keyPressEvent(event)
-
-    def paintEvent(self, _event) -> None:
-        c = palette()
-        accent = QColor(c['accent'])
-        tint = QColor(accent)
-        tint.setAlphaF(0.12 * self._selection + 0.05 * self._hover * (1 - self._selection))
-        rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(c['card_bg']))
-        p.drawRoundedRect(rect, self._radius, self._radius)
-        p.setBrush(tint)
-        p.drawRoundedRect(rect, self._radius, self._radius)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(_mix(QColor(c['card_border']), accent, max(self._selection, self._hover * 0.5)), 1 + self._selection))
-        p.drawRoundedRect(rect, self._radius, self._radius)
-        if self.hasFocus():
-            p.setPen(QPen(accent, 1, Qt.PenStyle.DashLine))
-            p.drawRoundedRect(rect.adjusted(3, 3, -3, -3), self._radius - 2, self._radius - 2)
-
-    def draw_check(self, p: QPainter, center: QPointF) -> None:
-        if self._selection <= 0.01:
-            return
-        p.save()
-        p.setOpacity(self._selection)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(palette()['accent']))
-        p.drawEllipse(center, 9, 9)
-        tick = QPainterPath(QPointF(center.x() - 4, center.y()))
-        tick.lineTo(center.x() - 1, center.y() + 3)
-        tick.lineTo(center.x() + 4, center.y() - 3)
-        p.setPen(QPen(QColor('white'), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(tick)
-        p.restore()
-
-    def paint_overlay(self) -> QPainter:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        return p
-
-
-class _LanguageCard(_SelectableCard):
-    def __init__(self, native_name: str, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(52)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(40, 0, 40, 0)
-        label = StrongBodyLabel(native_name, self)
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        row.addWidget(label, 1, Qt.AlignmentFlag.AlignCenter)
-
-    def paintEvent(self, event) -> None:
-        super().paintEvent(event)
-        self.draw_check(self.paint_overlay(), QPointF(self.width() - 24, self.height() / 2))
-
-
-_VIDEO_EXT = frozenset(('.mp4', '.webm', '.mkv', '.mov', '.avi', '.m4v'))
-_PREVIEW_PX = QSize(288, 152)
-_THUMBS: dict[str, QPixmap] = {}
-_THUMB_BADGE = {'gif': 'GIF', 'video': 'VIDEO', 'shader': 'SHADER', 'photo': 'PHOTO'}
+def _text_height(fm: QFontMetrics, text: str, width: int) -> int:
+    if not text:
+        return 0
+    flags = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap)
+    rect = fm.boundingRect(QRect(0, 0, max(1, int(width)), 100000), flags, text)
+    return max(fm.height(), rect.height() + 1)
 
 
 class _ThumbJob(QRunnable):
@@ -2516,42 +2361,680 @@ class _ThumbLoader(QObject):
             self.ready.emit(path)
 
 
-class _ThemeCard(_SelectableCard):
+@dataclass(frozen=True)
+class _Metrics:
+    compact: bool
+    base_px: int
+    title_px: int
+    subtitle_px: int
+    caption_px: int
+    button_px: int
+    side: int
+    top: int
+    bottom: int
+    gap: int
+    section_gap: int
+    radius: int
+    progress_h: int
+    header_bottom: int
+    title_gap: int
+    footer_top: int
+    footer_bottom: int
+    button_h: int
+    input_h: int
+    icon_px: int
+    card_pad: int
+    lang_h: int
+    theme_min_col: int
+    feature_min_col: int
+    grid_gap: int
+    theme_gap: int
+    theme_pad: int
+    page_top: int
+    page_bottom: int
 
-    def __init__(self, label: str, swatch: tuple, media: str = '', kind: str = '', parent=None):
-        super().__init__(parent, radius=12)
+
+def _make_metrics(font: QFont, compact: bool) -> _Metrics:
+    fm = QFontMetrics(font)
+    base = max(12, round(fm.height() * 0.82))
+    return _Metrics(
+        compact=compact,
+        base_px=base,
+        title_px=round(base * (1.5 if compact else 1.82)),
+        subtitle_px=base + 1,
+        caption_px=max(10, base - 2),
+        button_px=base + 1,
+        side=20 if compact else 28,
+        top=16 if compact else 22,
+        bottom=10 if compact else 14,
+        gap=8 if compact else 10,
+        section_gap=12 if compact else 16,
+        radius=14 if compact else 18,
+        progress_h=4,
+        header_bottom=10 if compact else 14,
+        title_gap=3,
+        footer_top=10 if compact else 12,
+        footer_bottom=14 if compact else 18,
+        button_h=max(32, round(base * 2.55)),
+        input_h=max(34, round(base * 2.7)),
+        icon_px=max(28, round(base * 2.15)),
+        card_pad=max(10, round(base * 0.9)),
+        lang_h=max(44, round(base * 3.5)),
+        theme_min_col=max(108, round(base * 8.2)),
+        feature_min_col=max(232, round(base * 17.5)),
+        grid_gap=8 if compact else 10,
+        theme_gap=8 if compact else 10,
+        theme_pad=6 if compact else 7,
+        page_top=2,
+        page_bottom=8,
+    )
+
+
+_LABEL_CAPTION = ('caption_px', None, ('muted',), '#9a9a9a')
+_LABEL_STYLES = {
+    'title': ('title_px', QFont.Weight.DemiBold, ('dialog_title_text', 'primary_text'), '#eaeaea'),
+    'subtitle': ('subtitle_px', None, ('muted',), '#9a9a9a'),
+    'step': _LABEL_CAPTION,
+    'error': ('caption_px', None, ('state_error',), '#e5484d'),
+    'accent': ('caption_px', None, ('accent_text', 'accent'), '#0078d4'),
+    'body': ('base_px', None, ('primary_text',), '#eaeaea'),
+}
+
+
+class _Label(QLabel):
+
+    def __init__(self, text: str, role: str, metrics: _Metrics, parent=None):
+        super().__init__(text, parent)
+        self._role = role
+        self._metrics = metrics
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setWordWrap(role != 'step')
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._apply()
+
+    def set_role(self, role: str) -> None:
+        self._role = role
+        self._apply()
+
+    def refresh_theme(self) -> None:
+        self._apply()
+
+    def _apply(self) -> None:
+        size_attr, weight, color_keys, fallback = _LABEL_STYLES.get(self._role, _LABEL_CAPTION)
+        pal = palette()
+        color = next((pal[k] for k in color_keys if k in pal), fallback)
+        self.setFont(_font_px(self.font(), getattr(self._metrics, size_attr), weight))
+        self.setStyleSheet(f'color: {_css(color)}; background: transparent; border: none; padding: 0;')
+
+    def heightForWidth(self, width: int) -> int:
+        if not self.wordWrap():
+            return self.sizeHint().height()
+        return super().heightForWidth(max(1, int(width)))
+
+
+class _Button(QAbstractButton):
+
+    def __init__(self, text: str, kind: str, metrics: _Metrics, parent=None):
+        super().__init__(parent)
+        self._kind = kind
+        self._metrics = metrics
+        self._hover = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setFont(_font_px(self.font(), metrics.button_px, QFont.Weight.DemiBold))
+        self.setText(text)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+    def set_text(self, text: str) -> None:
+        self.setText(text)
+        self._resize_to_hint()
+
+    def sizeHint(self) -> QSize:
+        fm = self.fontMetrics()
+        pad = max(16, round(fm.height() * 1.15))
+        return QSize(fm.horizontalAdvance(self.text()) + pad * 2, self._metrics.button_h)
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def _resize_to_hint(self) -> None:
+        hint = self.sizeHint()
+        self.setFixedSize(hint)
+
+    def enterEvent(self, event) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.click()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        pal = palette()
+        accent = to_color(pal.get('accent', '#0078d4'))
+        on_accent = to_color(pal.get('on_accent', '#ffffff'))
+        primary = to_color(pal.get('primary_text', '#eaeaea'))
+        border = to_color(pal.get('card_border', '#444444'))
+        surface = to_color(pal.get('card_bg', '#1b1b1b'))
+        radius = max(7, self.height() / 2.2)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if not self.isEnabled():
+            p.setOpacity(0.45)
+        hovered = self._hover or self.isDown()
+        if self._kind == 'primary':
+            fill = accent.lighter(108) if hovered else accent
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fill)
+            p.drawRoundedRect(rect, radius, radius)
+            text_color = on_accent
+        elif self._kind == 'ghost':
+            if hovered:
+                tint = accent
+                tint.setAlphaF(0.08)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(tint)
+                p.drawRoundedRect(rect, radius, radius)
+            text_color = to_color(pal.get('accent_text', pal.get('accent', '#0078d4')))
+        else:
+            fill = _mix(surface, to_color(pal.get('card_hover', '#242424')), 0.8 if hovered else 0.0)
+            p.setPen(QPen(border, 1))
+            p.setBrush(fill)
+            p.drawRoundedRect(rect, radius, radius)
+            text_color = primary
+        if self.hasFocus():
+            ring = QColor(accent)
+            ring.setAlpha(170)
+            p.setPen(QPen(ring, 1.4, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(rect.adjusted(2.5, 2.5, -2.5, -2.5), radius - 2, radius - 2)
+        p.setPen(text_color)
+        p.setFont(self.font())
+        p.drawText(self.rect(), int(Qt.AlignmentFlag.AlignCenter), self.text())
+
+
+class _ToggleCard(QAbstractButton):
+
+    TRACK_W = 40.0
+    TRACK_H = 22.0
+    KNOB = 16.0
+
+    def __init__(self, icon: QIcon, title: str, description: str, metrics: _Metrics, parent=None):
+        super().__init__(parent)
+        self._icon = icon
+        self._title = title
+        self._description = description
+        self._metrics = metrics
+        self._hover = False
+        self._position = 0.0
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+        self.setToolTip(description)
+        self.setMinimumWidth(0)
+        self._knob_anim = QPropertyAnimation(self, b'position', self)
+        self._knob_anim.setDuration(170)
+        self._knob_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.toggled.connect(self._animate_knob)
+
+    def _get_position(self) -> float:
+        return self._position
+
+    def _set_position(self, value: float) -> None:
+        self._position = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    position = Property(float, _get_position, _set_position)
+
+    def _animate_knob(self, checked: bool) -> None:
+        self._knob_anim.stop()
+        if not self.isVisible():
+            self._set_position(1.0 if checked else 0.0)
+            return
+        self._knob_anim.setStartValue(self._position)
+        self._knob_anim.setEndValue(1.0 if checked else 0.0)
+        self._knob_anim.start()
+
+    def refresh_theme(self) -> None:
+        self.update()
+
+    def set_texts(self, title: str, description: str) -> None:
+        self._title = title
+        self._description = description
+        self.setToolTip(description)
+        self.updateGeometry()
+        self.update()
+
+    def _text_width(self, width: int) -> int:
+        m = self._metrics
+        return max(40, int(width) - m.card_pad * 2 - m.icon_px - m.gap - self.TRACK_W - m.gap)
+
+    def _title_font(self) -> QFont:
+        return _font_px(self.font(), self._metrics.base_px + 1, QFont.Weight.DemiBold)
+
+    def _description_font(self) -> QFont:
+        return _font_px(self.font(), max(10, self._metrics.base_px - 1))
+
+    def heightForWidth(self, width: int) -> int:
+        m = self._metrics
+        text_w = self._text_width(width)
+        title_h = _text_height(QFontMetrics(self._title_font()), self._title, text_w)
+        desc_h = _text_height(QFontMetrics(self._description_font()), self._description, text_w)
+        text_h = title_h + (4 + desc_h if desc_h else 0)
+        return max(m.icon_px + m.card_pad * 2, text_h + m.card_pad * 2)
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._metrics.feature_min_col, self.heightForWidth(self._metrics.feature_min_col))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, self.heightForWidth(self._metrics.feature_min_col))
+
+    def enterEvent(self, event) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        m = self._metrics
+        pal = palette()
+        accent = to_color(pal.get('accent', '#0078d4'))
+        on_accent = to_color(pal.get('on_accent', '#111111'))
+        bg = to_color(pal.get('card_bg', '#1b1b1b'))
+        border = to_color(pal.get('card_border', '#444444'))
+        position = self._position
+        hovered = self._hover or self.isDown()
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = 11.0
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(_mix(bg, to_color(pal.get('card_hover', '#242424')), 0.7 if hovered else 0.0))
+        p.drawRoundedRect(rect, radius, radius)
+        if position > 0:
+            tint = QColor(accent)
+            tint.setAlphaF(0.08 * position)
+            p.setBrush(tint)
+            p.drawRoundedRect(rect, radius, radius)
+        pen_color = _mix(border, accent, 0.55 if hovered else 0.55 * position)
+        p.setPen(QPen(pen_color, 1.0 + 0.4 * position))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(rect, radius, radius)
+        if self.hasFocus():
+            p.setPen(QPen(accent, 1, Qt.PenStyle.DashLine))
+            p.drawRoundedRect(rect.adjusted(3, 3, -3, -3), radius - 2, radius - 2)
+
+        pad = m.card_pad
+        icon_rect = QRectF(pad, (self.height() - m.icon_px) / 2, m.icon_px, m.icon_px)
+        if not self._icon.isNull():
+            self._icon.paint(p, icon_rect.toRect(), Qt.AlignmentFlag.AlignCenter)
+
+        text_x = pad + m.icon_px + m.gap
+        text_w = self._text_width(self.width())
+        title_font = self._title_font()
+        desc_font = self._description_font()
+        title_h = _text_height(QFontMetrics(title_font), self._title, text_w)
+        desc_h = (_text_height(QFontMetrics(desc_font), self._description, text_w)
+                  if self._description else 0)
+        desc_gap = 4 if desc_h else 0
+        text_h = title_h + desc_gap + desc_h
+        text_y = max(pad, (self.height() - text_h) / 2)
+        flags = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap)
+        p.setFont(title_font)
+        p.setPen(to_color(pal.get('primary_text', '#eaeaea')))
+        p.drawText(QRectF(text_x, text_y, text_w, title_h), flags, self._title)
+        if desc_h:
+            p.setFont(desc_font)
+            p.setPen(to_color(pal.get('muted', '#9a9a9a')))
+            p.drawText(QRectF(text_x, text_y + title_h + desc_gap, text_w, desc_h),
+                       flags, self._description)
+
+        track_w, track_h = self.TRACK_W, self.TRACK_H
+        track_x = self.width() - pad - track_w
+        track_y = (self.height() - track_h) / 2
+        track = QRectF(track_x, track_y, track_w, track_h)
+        off_track = _mix(bg, to_color(pal.get('muted', '#9a9a9a')), 0.28)
+        track_color = _mix(off_track, accent, position)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(track_color)
+        p.drawRoundedRect(track, track_h / 2, track_h / 2)
+        p.setPen(QPen(_mix(track_color, to_color(pal.get('primary_text', '#eaeaea')), 0.14), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(track.adjusted(0.5, 0.5, -0.5, -0.5),
+                          track_h / 2 - 0.5, track_h / 2 - 0.5)
+        knob = self.KNOB
+        knob_x = track.left() + 3 + (track_w - knob - 6) * position
+        knob_rect = QRectF(knob_x, track_y + (track_h - knob) / 2, knob, knob)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 38))
+        p.drawEllipse(knob_rect.adjusted(0, 1, 0, 1))
+        p.setBrush(_mix(QColor('#ffffff'), on_accent, position))
+        p.drawEllipse(knob_rect)
+
+
+class _VolumeCard(QWidget):
+
+    changed = Signal(int)
+
+    def __init__(self, icon: QIcon, title: str, description: str, value: int,
+                 metrics: _Metrics, off_text: str, parent=None):
+        super().__init__(parent)
+        self._icon = icon
+        self._title = title
+        self._description = description
+        self._metrics = metrics
+        self._off_text = off_text
+        self._hover = False
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+        self.setMinimumWidth(0)
+        self._slider = Slider(Qt.Orientation.Horizontal, self)
+        self._slider.setRange(0, 100)
+        self._slider.setValue(max(0, min(100, int(value))))
+        self._slider.valueChanged.connect(self._on_value)
+        self.setMouseTracking(True)
+
+    def refresh_theme(self) -> None:
+        self.update()
+
+    def set_texts(self, title: str, description: str) -> None:
+        self._title = title
+        self._description = description
+        self.updateGeometry()
+        self.update()
+
+    def value(self) -> int:
+        return self._slider.value()
+
+    def _title_font(self) -> QFont:
+        return _font_px(self.font(), self._metrics.base_px + 1, QFont.Weight.DemiBold)
+
+    def _description_font(self) -> QFont:
+        return _font_px(self.font(), max(10, self._metrics.base_px - 1))
+
+    def _text_width(self, width: int) -> int:
+        m = self._metrics
+        return max(40, int(width) - m.card_pad * 2 - m.icon_px - m.gap - 54)
+
+    def heightForWidth(self, width: int) -> int:
+        m = self._metrics
+        text_w = self._text_width(width)
+        title_h = _text_height(QFontMetrics(self._title_font()), self._title, text_w)
+        desc_h = _text_height(QFontMetrics(self._description_font()), self._description, text_w)
+        return m.card_pad * 2 + max(m.icon_px, title_h) + 4 + desc_h + 6 + 22
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._metrics.feature_min_col, self.heightForWidth(self._metrics.feature_min_col))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, self.heightForWidth(self._metrics.feature_min_col))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        m = self._metrics
+        self._slider.setFixedHeight(22)
+        self._slider.setGeometry(m.card_pad, self.height() - m.card_pad - 22,
+                                 max(1, self.width() - m.card_pad * 2), 22)
+
+    def enterEvent(self, event) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def _on_value(self, value: int) -> None:
+        self.changed.emit(int(value))
+        self.update()
+
+    def _value_text(self) -> str:
+        value = self.value()
+        return str(value) if value > 0 else self._off_text
+
+    def paintEvent(self, _event) -> None:
+        m = self._metrics
+        pal = palette()
+        accent = to_color(pal.get('accent', '#0078d4'))
+        bg = to_color(pal.get('card_bg', '#1b1b1b'))
+        border = to_color(pal.get('card_border', '#444444'))
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = 11.0
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(_mix(bg, to_color(pal.get('card_hover', '#242424')), 0.7 if self._hover else 0.0))
+        p.drawRoundedRect(rect, radius, radius)
+        p.setPen(QPen(border, 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(rect, radius, radius)
+
+        pad = m.card_pad
+        icon_rect = QRectF(pad, pad, m.icon_px, m.icon_px)
+        tile = QColor(accent)
+        tile.setAlphaF(0.08)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(tile)
+        p.drawRoundedRect(icon_rect, 8, 8)
+        if not self._icon.isNull():
+            self._icon.paint(p, icon_rect.toRect(), Qt.AlignmentFlag.AlignCenter)
+
+        text_x = pad + m.icon_px + m.gap
+        text_w = self._text_width(self.width())
+        title_font = self._title_font()
+        desc_font = self._description_font()
+        title_h = _text_height(QFontMetrics(title_font), self._title, text_w)
+        p.setFont(title_font)
+        p.setPen(to_color(pal.get('primary_text', '#eaeaea')))
+        flags = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap)
+        p.drawText(QRectF(text_x, pad, text_w, title_h), flags, self._title)
+        p.setFont(desc_font)
+        p.setPen(to_color(pal.get('muted', '#9a9a9a')))
+        desc_y = pad + max(m.icon_px, title_h) + 4
+        p.drawText(QRectF(text_x, desc_y, text_w, max(1, self.height() - pad - 22 - desc_y - 6)),
+                   flags, self._description)
+
+        value_font = _font_px(self.font(), m.caption_px, QFont.Weight.DemiBold)
+        p.setFont(value_font)
+        value_color = accent if self.value() > 0 else to_color(pal.get('muted', '#9a9a9a'))
+        p.setPen(value_color)
+        p.drawText(QRectF(self.width() - pad - 50, pad, 50, m.icon_px),
+                   int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), self._value_text())
+
+
+class _ChoiceCard(QAbstractButton):
+
+    def __init__(self, text: str, metrics: _Metrics, parent=None):
+        super().__init__(parent)
+        self._metrics = metrics
+        self._hover = False
+        self.setText(text)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+        self.setFont(_font_px(self.font(), metrics.base_px, QFont.Weight.DemiBold))
+        self.setFixedHeight(metrics.lang_h)
+
+    def set_selected(self, selected: bool) -> None:
+        if self.isChecked() != selected:
+            self.setChecked(selected)
+        self.update()
+
+    def heightForWidth(self, width: int) -> int:
+        return self._metrics.lang_h
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def sizeHint(self) -> QSize:
+        return QSize(max(168, self._metrics.feature_min_col // 2), self._metrics.lang_h)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, self._metrics.lang_h)
+
+    def enterEvent(self, event) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        pal = palette()
+        accent = to_color(pal.get('accent', '#0078d4'))
+        on_accent = to_color(pal.get('on_accent', '#111111'))
+        bg = to_color(pal.get('card_bg', '#1b1b1b'))
+        border = to_color(pal.get('card_border', '#444444'))
+        checked = self.isChecked()
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = 10.0
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(_mix(bg, to_color(pal.get('card_hover', '#242424')), 0.7 if self._hover else 0.0))
+        p.drawRoundedRect(rect, radius, radius)
+        if checked:
+            tint = QColor(accent)
+            tint.setAlphaF(0.10)
+            p.setBrush(tint)
+            p.drawRoundedRect(rect, radius, radius)
+        p.setPen(QPen(_mix(border, accent, 0.85 if checked else (0.35 if self._hover else 0.0)),
+                      1.8 if checked else 1.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(rect, radius, radius)
+        if self.hasFocus():
+            p.setPen(QPen(accent, 1, Qt.PenStyle.DashLine))
+            p.drawRoundedRect(rect.adjusted(3, 3, -3, -3), radius - 2, radius - 2)
+
+        pad = max(14, self._metrics.card_pad + 2)
+        check_d = 18.0
+        text_w = max(1, self.width() - pad * 2 - check_d - 10)
+        p.setPen(to_color(pal.get('primary_text', '#eaeaea')))
+        p.setFont(self.font())
+        p.drawText(QRectF(pad, 0, text_w, self.height()),
+                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), self.text())
+
+        center = QPointF(self.width() - pad - check_d / 2, self.height() / 2)
+        if checked:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(accent)
+            p.drawEllipse(center, check_d / 2, check_d / 2)
+            tick = QPainterPath(QPointF(center.x() - 4.2, center.y()))
+            tick.lineTo(center.x() - 1.2, center.y() + 3.1)
+            tick.lineTo(center.x() + 4.4, center.y() - 3.2)
+            p.setPen(QPen(on_accent, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                          Qt.PenJoinStyle.RoundJoin))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(tick)
+        else:
+            p.setPen(QPen(_mix(border, to_color(pal.get('primary_text', '#eaeaea')), 0.25), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(center, check_d / 2 - 0.5, check_d / 2 - 0.5)
+
+
+class _ThemeCard(QAbstractButton):
+
+    def __init__(self, option_id: str, label: str, swatch: tuple, media: str, kind: str,
+                 metrics: _Metrics, parent=None):
+        super().__init__(parent)
+        self.option_id = option_id
         self._label = label
-        self._bg, self._text, self._accent = (QColor(c) for c in swatch)
+        self._bg, self._text, self._accent = (to_color(c) for c in swatch)
         self._media = media
         self._kind = kind
-        self.setFixedSize(160, 122)
-        if media and kind != 'video':
-            loader = _ThumbLoader.get()
-            loader.ready.connect(self._on_thumb)
-            loader.request(media)
+        self._metrics = metrics
+        self._hover = False
+        self._requested = not media or kind == 'video'
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+        self.setMinimumWidth(0)
+        self.setToolTip(label)
 
-    def media(self) -> str:
-        return self._media
+    def set_selected(self, selected: bool) -> None:
+        if self.isChecked() != selected:
+            self.setChecked(selected)
+        self.update()
 
-    def kind(self) -> str:
-        return self._kind
+    def refresh_theme(self) -> None:
+        self.update()
+
+    def _label_font(self) -> QFont:
+        return _font_px(self.font(), max(10, self._metrics.base_px - 1), QFont.Weight.DemiBold)
+
+    def _label_height(self, width: int) -> int:
+        pad = self._metrics.theme_pad
+        return _text_height(QFontMetrics(self._label_font()), self._label,
+                            max(1, int(width) - pad * 2))
+
+    def _preview_height(self, width: int) -> int:
+        pad = self._metrics.theme_pad
+        return max(32, round((width - pad * 2) * 0.52))
+
+    def heightForWidth(self, width: int) -> int:
+        pad = self._metrics.theme_pad
+        return pad * 2 + self._preview_height(width) + 5 + self._label_height(width)
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._metrics.theme_min_col, self.heightForWidth(self._metrics.theme_min_col))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, self.heightForWidth(self._metrics.theme_min_col))
 
     def _on_thumb(self, path: str) -> None:
         if path == self._media:
             self.update()
 
-    def _paint_mock(self, p: QPainter, r: QRectF) -> None:
-        p.fillRect(r, self._bg)
+    def _paint_mock(self, p: QPainter, rect: QRectF) -> None:
+        p.fillRect(rect, self._bg)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(self._accent)
-        p.drawRoundedRect(QRectF(r.left() + 8, r.top() + 8, 26, 6), 3, 3)
-        p.drawRoundedRect(QRectF(r.right() - 30, r.bottom() - 16, 22, 9), 4.5, 4.5)
+        p.drawRoundedRect(QRectF(rect.left() + 8, rect.top() + 8, 26, 6), 3, 3)
+        p.drawRoundedRect(QRectF(rect.right() - 30, rect.bottom() - 16, 22, 9), 4.5, 4.5)
         p.setBrush(_mix(self._bg, self._text, 0.55))
-        p.drawRoundedRect(QRectF(r.left() + 8, r.top() + 22, r.width() - 16, 4), 2, 2)
-        p.drawRoundedRect(QRectF(r.left() + 8, r.top() + 32, r.width() * 0.5, 4), 2, 2)
+        p.drawRoundedRect(QRectF(rect.left() + 8, rect.top() + 22, rect.width() - 16, 4), 2, 2)
+        p.drawRoundedRect(QRectF(rect.left() + 8, rect.top() + 32, rect.width() * 0.5, 4), 2, 2)
 
-    def _paint_play(self, p: QPainter, r: QRectF) -> None:
-        c = r.center()
+    def _paint_play(self, p: QPainter, rect: QRectF) -> None:
+        c = rect.center()
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(0, 0, 0, 120))
         p.drawEllipse(c, 14, 14)
@@ -2562,172 +3045,1534 @@ class _ThemeCard(_SelectableCard):
         p.setBrush(QColor('white'))
         p.drawPath(tri)
 
-    def _paint_badge(self, p: QPainter, r: QRectF) -> None:
+    def _paint_badge(self, p: QPainter, rect: QRectF) -> None:
         text = _THUMB_BADGE.get(self._kind)
         if not text:
             return
         font = QFont(self.font())
-        font.setPixelSize(9)
+        font.setPixelSize(max(9, round(self._metrics.caption_px * 0.82)))
         font.setBold(True)
         p.setFont(font)
         width = QFontMetrics(font).horizontalAdvance(text) + 12
-        pill = QRectF(r.left() + 6, r.bottom() - 20, width, 15)
+        pill = QRectF(rect.left() + 6, rect.bottom() - 20, width, 15)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(0, 0, 0, 150))
         p.drawRoundedRect(pill, 7.5, 7.5)
         p.setPen(QColor('white'))
-        p.drawText(pill, Qt.AlignmentFlag.AlignCenter, text)
+        p.drawText(pill, int(Qt.AlignmentFlag.AlignCenter), text)
 
-    def paintEvent(self, event) -> None:
-        super().paintEvent(event)
-        p = self.paint_overlay()
+    def paintEvent(self, _event) -> None:
+        if not self._requested:
+            self._requested = True
+            loader = _ThumbLoader.get()
+            loader.ready.connect(self._on_thumb)
+            loader.request(self._media)
+        m = self._metrics
+        pal = palette()
+        accent = to_color(pal.get('accent', '#0078d4'))
+        on_accent = to_color(pal.get('on_accent', '#111111'))
+        bg = to_color(pal.get('card_bg', '#1b1b1b'))
+        border = to_color(pal.get('card_border', '#444444'))
+        checked = self.isChecked()
+        pad = m.theme_pad
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = 10.0
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        preview = QRectF(7, 7, self.width() - 14, 76)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(_mix(bg, to_color(pal.get('card_hover', '#242424')), 0.7 if self._hover else 0.0))
+        p.drawRoundedRect(rect, radius, radius)
+        if checked:
+            tint = QColor(accent)
+            tint.setAlphaF(0.09)
+            p.setBrush(tint)
+            p.drawRoundedRect(rect, radius, radius)
+        p.setPen(QPen(_mix(border, accent, 0.88 if checked else (0.35 if self._hover else 0.0)),
+                      1.9 if checked else 1.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(rect, radius, radius)
+        if self.hasFocus():
+            p.setPen(QPen(accent, 1, Qt.PenStyle.DashLine))
+            p.drawRoundedRect(rect.adjusted(3, 3, -3, -3), radius - 2, radius - 2)
+
+        label_h = self._label_height(self.width())
+        preview = QRectF(pad, pad, max(1, self.width() - pad * 2),
+                         max(1, self.height() - label_h - 5 - pad * 2))
         clip = QPainterPath()
-        clip.addRoundedRect(preview, 8, 8)
+        clip.addRoundedRect(preview, 7, 7)
         p.save()
         p.setClipPath(clip)
         pixmap = _THUMBS.get(self._media)
         if pixmap is not None and not pixmap.isNull():
             scale = max(preview.width() / pixmap.width(), preview.height() / pixmap.height())
             w, h = preview.width() / scale, preview.height() / scale
-            p.drawPixmap(preview, pixmap, QRectF((pixmap.width() - w) / 2, (pixmap.height() - h) / 2, w, h))
+            p.drawPixmap(preview, pixmap,
+                         QRectF((pixmap.width() - w) / 2, (pixmap.height() - h) / 2, w, h))
         else:
             self._paint_mock(p, preview)
             if self._kind == 'video':
                 self._paint_play(p, preview)
         p.restore()
-        p.setPen(QPen(QColor(255, 255, 255, 28), 1))
+        p.setPen(QPen(QColor(255, 255, 255, 30), 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(preview, 8, 8)
+        p.drawRoundedRect(preview, 7, 7)
         self._paint_badge(p, preview)
-        font = QFont(self.font())
-        font.setPixelSize(12)
-        p.setFont(font)
-        p.setPen(QColor(palette()['primary_text']))
-        text = QFontMetrics(font).elidedText(self._label, Qt.TextElideMode.ElideRight, self.width() - 20)
-        p.drawText(QRectF(10, 86, self.width() - 20, 30), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
-        self.draw_check(p, QPointF(self.width() - 22, 22))
+
+        label_font = self._label_font()
+        p.setFont(label_font)
+        p.setPen(accent if checked else to_color(pal.get('primary_text', '#eaeaea')))
+        flags = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap)
+        p.drawText(QRectF(pad, preview.bottom() + 5, max(1, self.width() - pad * 2), label_h),
+                   flags, self._label)
+
+        if checked:
+            center = QPointF(preview.right() - 11, preview.top() + 11)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(accent)
+            p.drawEllipse(center, 9, 9)
+            tick = QPainterPath(QPointF(center.x() - 4.2, center.y()))
+            tick.lineTo(center.x() - 1.2, center.y() + 3.1)
+            tick.lineTo(center.x() + 4.4, center.y() - 3.2)
+            p.setPen(QPen(on_accent, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                          Qt.PenJoinStyle.RoundJoin))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(tick)
+
+    def enterEvent(self, event) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
 
 
-class _FeatureCard(_SelectableCard):
+class _ResponsiveGrid(QWidget):
 
-    def __init__(self, icon, title: str, description: str, parent=None):
+    def __init__(self, gap: int, min_col: int, max_cols: int, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(66)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(14, 10, 12, 10)
-        row.setSpacing(12)
-        icon_widget = IconWidget(icon, self)
-        icon_widget.setFixedSize(20, 20)
-        icon_widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        row.addWidget(icon_widget, 0, Qt.AlignmentFlag.AlignVCenter)
-        text = QVBoxLayout()
-        text.setSpacing(1)
-        description_label = CaptionLabel(description, self)
-        description_label.setWordWrap(True)
-        self.title_label = StrongBodyLabel(title, self)
-        self.description_label = description_label
-        for label in (self.title_label, description_label):
-            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-            text.addWidget(label)
-        row.addLayout(text, 1)
-        self.switch = SwitchButton(self)
-        self.switch.setOnText('')
-        self.switch.setOffText('')
-        self.switch.setAttribute(Qt.WidgetAttribute.WA_NoMousePropagation)
-        self.switch.checkedChanged.connect(self.set_selected)
-        self.clicked.connect(lambda: self.switch.setChecked(not self.switch.isChecked()))
-        row.addWidget(self.switch, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._gap = max(0, int(gap))
+        self._min_col = max(1, int(min_col))
+        self._max_cols = max(1, int(max_cols))
+        self._items: list[QWidget] = []
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
 
+    def add(self, widget: QWidget) -> None:
+        widget.setParent(self)
+        widget.show()
+        self._items.append(widget)
 
-class _VolumeCard(_SelectableCard):
+    def columns_for(self, width: int) -> int:
+        if not self._items:
+            return 1
+        width = max(1, int(width))
+        cols = (width + self._gap) // (self._min_col + self._gap)
+        return max(1, min(self._max_cols, len(self._items), int(cols)))
 
-    changed = Signal(int)
+    def _layout_rows(self, width: int) -> tuple[list[list[QWidget]], list[int], int]:
+        width = max(1, int(width))
+        cols = self.columns_for(width)
+        col_w = (width - self._gap * (cols - 1)) / cols
+        rows: list[list[QWidget]] = []
+        heights: list[int] = []
+        for start in range(0, len(self._items), cols):
+            row = self._items[start:start + cols]
+            rows.append(row)
+            heights.append(max((_height_for_width(item, round(col_w)) for item in row), default=0))
+        total = sum(heights) + self._gap * max(0, len(heights) - 1)
+        return rows, heights, total
 
-    def __init__(self, icon, value: int, off_text, parent=None):
-        super().__init__(parent)
-        self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.setMinimumHeight(66)
-        self._off_text = off_text
-        row = QHBoxLayout(self)
-        row.setContentsMargins(14, 10, 14, 10)
-        row.setSpacing(12)
-        icon_widget = IconWidget(icon, self)
-        icon_widget.setFixedSize(20, 20)
-        row.addWidget(icon_widget, 0, Qt.AlignmentFlag.AlignVCenter)
-        text = QVBoxLayout()
-        text.setSpacing(1)
-        self.title_label = StrongBodyLabel('', self)
-        self.description_label = CaptionLabel('', self)
-        self.description_label.setWordWrap(True)
-        text.addWidget(self.title_label)
-        text.addWidget(self.description_label)
-        row.addLayout(text, 1)
-        self.slider = Slider(Qt.Orientation.Horizontal, self)
-        self.slider.setRange(0, 100)
-        self.slider.setFixedWidth(150)
-        self.slider.setValue(int(value))
-        self._value_label = CaptionLabel(self)
-        self._value_label.setFixedWidth(34)
-        self._value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.slider.valueChanged.connect(self._on_value)
-        row.addWidget(self.slider, 0, Qt.AlignmentFlag.AlignVCenter)
-        row.addWidget(self._value_label, 0, Qt.AlignmentFlag.AlignVCenter)
-        self.refresh_label()
+    def heightForWidth(self, width: int) -> int:
+        return self._layout_rows(width)[2]
 
-    def value(self) -> int:
-        return self.slider.value()
+    def hasHeightForWidth(self) -> bool:
+        return True
 
-    def refresh_label(self) -> None:
-        v = self.slider.value()
-        self._value_label.setText(str(v) if v > 0 else self._off_text())
+    def sizeHint(self) -> QSize:
+        width = max(self._min_col, self._min_col * self._max_cols + self._gap * (self._max_cols - 1))
+        return QSize(width, self.heightForWidth(width))
 
-    def _on_value(self, v: int) -> None:
-        self.refresh_label()
-        self.changed.emit(v)
-
-
-def _set_card_texts(card, title: str, description: str) -> None:
-    card.title_label.setText(title)
-    card.description_label.setText(description)
-
-
-class _GutterScrollArea(ScrollArea):
-
-    _GUTTER = 14
-
-    def __init__(self):
-        super().__init__()
-        self._gutter = False
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 0)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        content = self.widget()
-        layout = content.layout() if content is not None else None
-        if layout is None:
+        self._reposition(self.width())
+
+    def _reposition(self, width: int) -> None:
+        rows, heights, _total = self._layout_rows(width)
+        if not rows:
             return
-        need = content.minimumSizeHint().height() > self.viewport().height()
-        if need != self._gutter:
-            self._gutter = need
-            m = layout.contentsMargins()
-            layout.setContentsMargins(m.left(), m.top(), m.right() + (self._GUTTER if need else -self._GUTTER), m.bottom())
+        cols = len(rows[0])
+        col_w = (width - self._gap * (cols - 1)) / cols
+        y = 0
+        for row, row_h in zip(rows, heights):
+            x = 0.0
+            for item in row:
+                item.setGeometry(round(x), round(y), max(1, round(col_w)), max(1, int(row_h)))
+                x += col_w + self._gap
+            y += row_h + self._gap
 
 
-def _scrolling(content: QWidget, max_height: int) -> ScrollArea:
-    area = _GutterScrollArea()
-    area.setWidgetResizable(True)
-    area.setFrameShape(QFrame.Shape.NoFrame)
-    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-    area.setMaximumHeight(max_height)
-    area.setWidget(content)
-    area.enableTransparentBackground()
-    return area
+class _Page(QWidget):
+
+    def __init__(self, metrics: _Metrics, parent=None):
+        super().__init__(parent)
+        self._metrics = metrics
+        self._items: list[tuple[QWidget, int]] = []
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def add(self, widget: QWidget, gap: int = 0) -> QWidget:
+        widget.setParent(self)
+        widget.show()
+        self._items.append((widget, max(0, int(gap))))
+        return widget
+
+    def content_height(self, width: int) -> int:
+        m = self._metrics
+        inner = max(1, int(width) - m.side * 2)
+        y = m.page_top
+        for widget, gap in self._items:
+            y += gap
+            y += _height_for_width(widget, inner)
+        return y + m.page_bottom
+
+    def heightForWidth(self, width: int) -> int:
+        return self.content_height(width)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def sizeHint(self) -> QSize:
+        return QSize(600, self.content_height(600))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 0)
+
+    def refresh_theme(self) -> None:
+        for widget, _gap in self._items:
+            _refresh_widget(widget)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._reposition(self.width())
+
+    def _reposition(self, width: int) -> None:
+        m = self._metrics
+        inner = max(1, int(width) - m.side * 2)
+        y = m.page_top
+        for widget, gap in self._items:
+            y += gap
+            h = _height_for_width(widget, inner)
+            widget.setGeometry(m.side, round(y), inner, max(1, int(h)))
+            y += h
 
 
-def _theme_options() -> list[tuple[str, str, tuple[str, str, str], str, str]]:
+class _PathRow(QWidget):
+
+    def __init__(self, path: str, metrics: _Metrics, on_browse, parent=None):
+        super().__init__(parent)
+        self._metrics = metrics
+        self._on_browse = on_browse
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.edit = QLineEdit(self)
+        self.edit.setReadOnly(True)
+        self.edit.setText(path)
+        self.edit.setCursorPosition(0)
+        self.edit.setToolTip(path)
+        self.edit.setFont(_font_px(self.font(), metrics.base_px))
+        self.edit.setFixedHeight(metrics.input_h)
+        self.browse = _Button('', 'secondary', metrics, self)
+        self.browse.clicked.connect(self._on_browse)
+        self.refresh_theme()
+
+    def set_path(self, path: str) -> None:
+        self.edit.setText(path)
+        self.edit.setCursorPosition(0)
+        self.edit.setToolTip(path)
+
+    def set_browse_text(self, text: str) -> None:
+        self.browse.set_text(text)
+        self.updateGeometry()
+
+    def refresh_theme(self) -> None:
+        pal = palette()
+        self.edit.setStyleSheet(
+            'QLineEdit {'
+            f'background: {_css(pal.get("input_bg", "#1b1b1b"))};'
+            f'color: {_css(pal.get("primary_text", "#eaeaea"))};'
+            f'border: 1px solid {_css(pal.get("input_border", "#444444"))};'
+            'border-radius: 8px; padding: 0 10px;'
+            '}'
+        )
+
+    def heightForWidth(self, width: int) -> int:
+        return max(self.edit.height(), self.browse.sizeHint().height())
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def sizeHint(self) -> QSize:
+        return QSize(400, self.heightForWidth(400))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, self.heightForWidth(400))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        gap = self._metrics.gap
+        browse_w = self.browse.sizeHint().width()
+        h = self.heightForWidth(self.width())
+        self.browse.setFixedSize(browse_w, h)
+        self.browse.move(max(0, self.width() - browse_w), max(0, (h - self.browse.height()) // 2))
+        self.edit.setGeometry(0, 0, max(1, self.width() - browse_w - gap), h)
+
+
+class _StatusRow(QWidget):
+
+    def __init__(self, metrics: _Metrics, on_reset, parent=None):
+        super().__init__(parent)
+        self._metrics = metrics
+        self._on_reset = on_reset
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.label = _Label('', 'caption', metrics, self)
+        self.reset = _Button('', 'ghost', metrics, self)
+        self.reset.clicked.connect(self._on_reset)
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def set_status(self, text: str, error: bool = False) -> None:
+        self.label.set_role('error' if error else 'caption')
+        self.label.setText(text)
+        self.updateGeometry()
+
+    def set_reset_text(self, text: str) -> None:
+        self.reset.set_text(text)
+        self.updateGeometry()
+
+    def set_reset_enabled(self, enabled: bool) -> None:
+        self.reset.setEnabled(bool(enabled))
+
+    def refresh_theme(self) -> None:
+        self.label.refresh_theme()
+        self.reset.update()
+
+    def _layout_values(self, width: int) -> tuple[int, int, int]:
+        reset_w = self.reset.sizeHint().width()
+        gap = self._metrics.gap
+        label_w = max(1, int(width) - reset_w - gap)
+        label_h = _height_for_width(self.label, label_w)
+        return reset_w, gap, max(label_h, self.reset.sizeHint().height())
+
+    def heightForWidth(self, width: int) -> int:
+        return self._layout_values(width)[2]
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def sizeHint(self) -> QSize:
+        return QSize(400, self.heightForWidth(400))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 0)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        reset_w, gap, h = self._layout_values(self.width())
+        reset_h = self.reset.sizeHint().height()
+        self.reset.setFixedSize(reset_w, reset_h)
+        self.reset.move(max(0, self.width() - reset_w), max(0, (h - reset_h) // 2))
+        self.label.setGeometry(0, 0, max(1, self.width() - reset_w - gap), h)
+
+
+class _FolderList(QWidget):
+
+    def __init__(self, metrics: _Metrics, parent=None):
+        super().__init__(parent)
+        self._metrics = metrics
+        self._folders: list[str] = []
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def set_folders(self, folders: list[str]) -> None:
+        self._folders = list(folders)
+        self.updateGeometry()
+        self.update()
+
+    def _columns(self, width: int) -> int:
+        return 2 if width >= 400 else 1
+
+    def _row_h(self) -> int:
+        return max(20, QFontMetrics(_font_px(self.font(), self._metrics.caption_px)).height() + 8)
+
+    def heightForWidth(self, width: int) -> int:
+        cols = self._columns(width)
+        rows = max(1, math.ceil(max(1, len(self._folders)) / cols))
+        return 14 + rows * self._row_h() + max(0, rows - 1) * 2
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def sizeHint(self) -> QSize:
+        return QSize(400, self.heightForWidth(400))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 0)
+
+    def paintEvent(self, _event) -> None:
+        if not self._folders:
+            return
+        pal = palette()
+        accent = to_color(pal.get('accent', '#0078d4'))
+        bg = to_color(pal.get('card_bg', '#1b1b1b'))
+        border = to_color(pal.get('card_border', '#444444'))
+        text = to_color(pal.get('body_text', pal.get('primary_text', '#eaeaea')))
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.setPen(QPen(border, 1))
+        p.setBrush(bg)
+        p.drawRoundedRect(rect, 10, 10)
+        cols = self._columns(self.width())
+        rows = max(1, math.ceil(len(self._folders) / cols))
+        col_w = (self.width() - 20) / cols
+        row_h = self._row_h()
+        font = _font_px(self.font(), self._metrics.caption_px)
+        p.setFont(font)
+        for index, folder in enumerate(self._folders):
+            col = index // rows
+            row = index % rows
+            x = 10 + col * col_w
+            y = 7 + row * (row_h + 2)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(accent)
+            p.drawEllipse(QPointF(x + 4, y + row_h / 2 - 1), 2.2, 2.2)
+            p.setPen(text)
+            fm = QFontMetrics(font)
+            available = max(1, int(col_w - 18))
+            label = fm.elidedText(folder, Qt.TextElideMode.ElideMiddle, available)
+            p.drawText(QRectF(x + 12, y, available, row_h),
+                       int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), label)
+
+
+def _refresh_widget(widget: QWidget) -> None:
+    method = getattr(widget, 'refresh_theme', None)
+    if callable(method):
+        with suppress(Exception):
+            method()
+        return
+    for child in widget.findChildren(QWidget):
+        method = getattr(child, 'refresh_theme', None)
+        if callable(method):
+            with suppress(Exception):
+                method()
+
+
+class _Greeting(QWidget):
+
+    def __init__(self, metrics: _Metrics, start_code: str, parent=None):
+        super().__init__(parent)
+        self._metrics = metrics
+        self._font = _font_px(self.font(), max(19, round(metrics.base_px * 1.75)),
+                              QFont.Weight.DemiBold)
+        self._dot_area = max(12, round(metrics.base_px))
+        line_h = QFontMetrics(self._font).height()
+        self._height = line_h + self._dot_area + 8
+        self._texts = [(code, tr_for(code, 'onboarding.language_hello', 'Hello'))
+                       for code, _name in LANGUAGES]
+        self._index = next((i for i, (code, _text) in enumerate(self._texts)
+                            if code == start_code), 0)
+        self._text = self._target = self._texts[self._index][1]
+        self._reveal = 1.0
+        self._fading_out = False
+        self._locked = False
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(0)
+        self._anim = QPropertyAnimation(self, b'reveal', self)
+        self._anim.setDuration(220)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.finished.connect(self._on_fade_done)
+        self._timer = QTimer(self)
+        self._timer.setInterval(3000)
+        self._timer.timeout.connect(self._cycle)
+        register_theme_refresh(self, self.refresh_theme)
+
+    def _get_reveal(self) -> float:
+        return self._reveal
+
+    def _set_reveal(self, value: float) -> None:
+        self._reveal = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    reveal = Property(float, _get_reveal, _set_reveal)
+
+    def heightForWidth(self, _width: int) -> int:
+        return self._height
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def sizeHint(self) -> QSize:
+        return QSize(max(1, self.width()), self._height)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, self._height)
+
+    def lock_to(self, code: str) -> None:
+        self._locked = True
+        self._timer.stop()
+        found = next(((i, text) for i, (lang, text) in enumerate(self._texts)
+                      if lang == code), None)
+        if found is None:
+            return
+        self._index, target = found
+        self._target = target
+        if target == self._text:
+            self._anim.stop()
+            self._set_reveal(1.0)
+            return
+        self._fade_out()
+
+    def _cycle(self) -> None:
+        if self._locked or self._fading_out or self._anim.state() == QPropertyAnimation.State.Running:
+            return
+        self._index = (self._index + 1) % len(self._texts)
+        self._target = self._texts[self._index][1]
+        self._fade_out()
+
+    def _fade_out(self) -> None:
+        self._fading_out = True
+        self._anim.stop()
+        self._anim.setStartValue(self._reveal)
+        self._anim.setEndValue(0.0)
+        self._anim.start()
+
+    def _fade_in(self) -> None:
+        self._fading_out = False
+        self._anim.stop()
+        self._anim.setStartValue(self._reveal)
+        self._anim.setEndValue(1.0)
+        self._anim.start()
+
+    def _on_fade_done(self) -> None:
+        if self._fading_out:
+            self._text = self._target
+            self._fade_in()
+        elif self._text != self._target:
+            self._fade_out()
+
+    def refresh_theme(self) -> None:
+        self.update()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._locked:
+            self._timer.start()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self._timer.stop()
+
+    def paintEvent(self, _event) -> None:
+        pal = palette()
+        accent = to_color(pal.get('accent', '#0078d4'))
+        muted = to_color(pal.get('muted', '#9a9a9a'))
+        primary = to_color(pal.get('primary_text', '#eaeaea'))
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        ease = self._reveal * self._reveal * (3 - 2 * self._reveal)
+        p.setOpacity(ease)
+        offset = (1.0 - ease) * 6.0
+        text_rect = QRectF(0, offset, self.width(), max(1.0, self.height() - self._dot_area - 4))
+        p.setFont(self._font)
+        p.setPen(primary)
+        p.drawText(text_rect, int(Qt.AlignmentFlag.AlignCenter), self._text)
+
+        dot_y = self.height() - self._dot_area / 2 - 3
+        widths = [10.0 if i == self._index else 4.0 for i in range(len(self._texts))]
+        gap = 6.0
+        total = sum(widths) + gap * (len(widths) - 1)
+        x = (self.width() - total) / 2
+        p.setPen(Qt.PenStyle.NoPen)
+        for i, width in enumerate(widths):
+            active = i == self._index
+            p.setBrush(accent if active else _mix(muted, accent, 0.15))
+            p.drawRoundedRect(QRectF(x, dot_y - 2, width, 4), 2, 2)
+            x += width + gap
+
+
+class _Progress(QWidget):
+
+    def __init__(self, steps: int, metrics: _Metrics, parent=None):
+        super().__init__(parent)
+        self._steps = max(1, int(steps))
+        self._target = 0.0
+        self._progress = 0.0
+        self._metrics = metrics
+        self.setFixedHeight(metrics.progress_h)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._anim = QPropertyAnimation(self, b'progress', self)
+        self._anim.setDuration(380)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def _get_progress(self) -> float:
+        return self._progress
+
+    def _set_progress(self, value: float) -> None:
+        self._progress = max(0.0, float(value))
+        self.update()
+
+    progress = Property(float, _get_progress, _set_progress)
+
+    def set_step(self, index: int, animate: bool = True) -> None:
+        target = float(max(0, min(self._steps - 1, int(index))) + 1)
+        if target == self._target:
+            return
+        self._target = target
+        self._anim.stop()
+        if not animate:
+            self._set_progress(target)
+            return
+        self._anim.setStartValue(self._progress)
+        self._anim.setEndValue(target)
+        self._anim.start()
+
+    def refresh_theme(self) -> None:
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        pal = palette()
+        accent = to_color(pal.get('accent', '#0078d4'))
+        track = to_color(pal.get('surface_border', pal.get('card_border', '#444444')))
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        gap = 5
+        width = (self.width() - gap * (self._steps - 1)) / self._steps
+        height = self.height()
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(self._steps):
+            x = i * (width + gap)
+            p.setBrush(track)
+            p.drawRoundedRect(QRectF(x, 0, width, height), height / 2, height / 2)
+            fill = max(0.0, min(1.0, self._progress - i))
+            if fill > 0:
+                p.setBrush(accent)
+                p.drawRoundedRect(QRectF(x, 0, max(1.0, width * fill), height),
+                                  height / 2, height / 2)
+
+
+class _Header(QWidget):
+
+    def __init__(self, metrics: _Metrics, steps: int, parent=None):
+        super().__init__(parent)
+        self._metrics = metrics
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._layout = QVBoxLayout(self)
+        self._layout.setSpacing(0)
+        self._layout.setContentsMargins(metrics.side, metrics.top, metrics.side, metrics.header_bottom)
+
+        self.step = _Label('', 'step', metrics, self)
+        self.step.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._layout.addWidget(self.step)
+        self._layout.addSpacing(metrics.gap)
+        self.progress = _Progress(steps, metrics, self)
+        self._progress_block = QWidget(self)
+        block = QVBoxLayout(self._progress_block)
+        block.setContentsMargins(0, 0, 0, 0)
+        block.setSpacing(0)
+        block.addWidget(self.progress)
+        block.addSpacing(metrics.section_gap)
+        self._progress_block.setFixedHeight(metrics.progress_h + metrics.section_gap)
+        self._show_progress = True
+        self._layout.addWidget(self._progress_block)
+        self.title = _Label('', 'title', metrics, self)
+        self._layout.addWidget(self.title)
+        self._layout.addSpacing(metrics.title_gap)
+        self.subtitle = _Label('', 'subtitle', metrics, self)
+        self._layout.addWidget(self.subtitle)
+        self.setFixedHeight(self.measure(640))
+
+    def set_progress_visible(self, visible: bool) -> None:
+        m = self._metrics
+        self._show_progress = bool(visible)
+        self.progress.setVisible(bool(visible))
+        self._progress_block.setVisible(bool(visible))
+        self._progress_block.setFixedHeight((m.progress_h + m.section_gap) if visible else 0)
+        self.updateGeometry()
+
+    def set_texts(self, title: str, subtitle: str, step: str) -> None:
+        self.title.setText(title)
+        self.subtitle.setText(subtitle)
+        self.step.setText(step)
+        self.step.setVisible(bool(step))
+        self.updateGeometry()
+
+    def refresh_theme(self) -> None:
+        for widget in (self.step, self.title, self.subtitle, self.progress):
+            method = getattr(widget, 'refresh_theme', None)
+            if callable(method):
+                with suppress(Exception):
+                    method()
+
+    def measure(self, width: int) -> int:
+        m = self._metrics
+        inner = max(1, int(width) - m.side * 2)
+        step_h = _height_for_width(self.step, inner) if self.step.isVisible() else 0
+        title_h = _height_for_width(self.title, inner)
+        subtitle_h = _height_for_width(self.subtitle, inner) if self.subtitle.text() else 0
+        self.title.setFixedHeight(title_h)
+        self.subtitle.setFixedHeight(subtitle_h)
+        progress_h = (m.progress_h + m.section_gap) if self._show_progress else 0
+        total = (m.top + step_h + m.gap + progress_h
+                 + title_h + m.title_gap + subtitle_h + m.header_bottom)
+        self.setFixedHeight(total)
+        return total
+
+
+class _Footer(QWidget):
+
+    def __init__(self, metrics: _Metrics, parent=None):
+        super().__init__(parent)
+        self._metrics = metrics
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._layout = QHBoxLayout(self)
+        self._layout.setSpacing(12)
+        self._layout.setContentsMargins(metrics.side, metrics.footer_top,
+                                        metrics.side, metrics.footer_bottom)
+        self.back = _Button('', 'secondary', metrics, self)
+        self.next = _Button('', 'primary', metrics, self)
+        self._layout.addWidget(self.back, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._layout.addStretch(1)
+        self._layout.addWidget(self.next, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.setFixedHeight(self._measure())
+
+    def set_texts(self, back: str, next_text: str, show_back: bool) -> None:
+        self.back.set_text(back)
+        self.next.set_text(next_text)
+        self.back.setVisible(bool(show_back and back))
+        self.updateGeometry()
+
+    def refresh_theme(self) -> None:
+        self.back.update()
+        self.next.update()
+
+    def _measure(self) -> int:
+        m = self._metrics
+        return m.footer_top + max(self.back.sizeHint().height(), self.next.sizeHint().height()) + m.footer_bottom
+
+    def measure(self, width: int) -> int:
+        self.setFixedWidth(max(1, int(width)))
+        value = self._measure()
+        self.setFixedHeight(value)
+        return value
+
+    def paintEvent(self, _event) -> None:
+        pal = palette()
+        p = QPainter(self)
+        p.setPen(QPen(to_color(pal.get('card_border', '#444444')), 1))
+        p.drawLine(0, 0, self.width(), 0)
+
+
+class _Surface(QFrame):
+
+    def __init__(self, radius: int, parent=None):
+        super().__init__(parent)
+        self._radius = max(1, int(radius))
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+    def paintEvent(self, _event) -> None:
+        pal = palette()
+        bg = to_color(pal.get('dialog_bg', pal.get('card_bg', '#1b1b1b')))
+        border = to_color(pal.get('dialog_border', pal.get('card_border', '#444444')))
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(rect, self._radius, self._radius)
+        gradient = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        gradient.setColorAt(0.0, bg.lighter(107))
+        gradient.setColorAt(0.42, bg)
+        gradient.setColorAt(1.0, bg.darker(106))
+        p.fillPath(path, QBrush(gradient))
+        p.setPen(QPen(border, 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+
+class _OverlayDialog(QDialog):
+
+    def __init__(self, owner: QWidget | None, steps: int = 1):
+        super().__init__(owner.window() if owner is not None and owner.window() is not owner else owner)
+        self._owner = owner.window() if owner is not None and owner.window() is not None else owner
+        self.setObjectName('pirachestOnboardingOverlay')
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
+                            | Qt.WindowType.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setModal(True)
+        self.setStyleSheet(
+            '#pirachestOnboardingOverlay { background: transparent; border: none; }'
+        )
+        self._bounds = QRect(0, 0, 900, 600)
+        self._inset = 24
+        self._font = QFont(self.font())
+        rect = self._owner_rect()
+        self._bounds = rect
+        self._inset = max(10, min(28, round(min(rect.width(), rect.height()) * 0.045)))
+        max_w = max(1, rect.width() - self._inset * 2)
+        max_h = max(1, rect.height() - self._inset * 2)
+        self._metrics = _make_metrics(self._font, max_h < 580 or max_w < 700)
+        self._surface = _Surface(self._metrics.radius, self)
+        self._outer = QVBoxLayout(self)
+        self._outer.setContentsMargins(self._inset, self._inset, self._inset, self._inset)
+        self._outer.setSpacing(0)
+        self._outer.addWidget(self._surface, 0, Qt.AlignmentFlag.AlignCenter)
+        self._surface_layout = QVBoxLayout(self._surface)
+        self._surface_layout.setContentsMargins(0, 0, 0, 0)
+        self._surface_layout.setSpacing(0)
+        self._header = _Header(self._metrics, max(1, int(steps)), self._surface)
+        self._body = QScrollArea(self._surface)
+        self._body.setFrameShape(QFrame.Shape.NoFrame)
+        self._body.setWidgetResizable(True)
+        self._body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._body.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._body.viewport().setAutoFillBackground(False)
+        self._body.setStyleSheet('QScrollArea { background: transparent; border: none; }'
+                                 'QScrollArea > QWidget > QWidget { background: transparent; }')
+        self._footer = _Footer(self._metrics, self._surface)
+        self._surface_layout.addWidget(self._header)
+        self._surface_layout.addWidget(self._body)
+        self._surface_layout.addWidget(self._footer)
+        self._page: QWidget | None = None
+        self._refit_scheduled = False
+        self._apply_bounds()
+        if self._owner is not None:
+            self._owner.installEventFilter(self)
+
+    def _owner_rect(self) -> QRect:
+        owner = self._owner
+        rect = QRect()
+        if owner is not None and owner.width() > 80 and owner.height() > 80:
+            rect = owner.frameGeometry() if owner.isVisible() else owner.geometry()
+        screen = None
+        if owner is not None:
+            with suppress(Exception):
+                screen = owner.screen()
+        if screen is None and not rect.isNull():
+            screen = QApplication.screenAt(rect.center())
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            if rect.width() > 80 and rect.height() > 80:
+                rect = rect.intersected(available)
+            else:
+                rect = available
+        if rect.width() <= 80 or rect.height() <= 80:
+            rect = QRect(0, 0, 900, 600)
+        return rect
+
+    def _apply_bounds(self) -> None:
+        rect = self._owner_rect()
+        self._bounds = rect
+        self._inset = max(10, min(28, round(min(rect.width(), rect.height()) * 0.045)))
+        self._outer.setContentsMargins(self._inset, self._inset, self._inset, self._inset)
+        self.setGeometry(rect)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 118))
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._owner and event.type() in (QEvent.Type.Resize, QEvent.Type.Move):
+            self._apply_bounds()
+            self._request_refit()
+        return super().eventFilter(obj, event)
+
+    def showEvent(self, event) -> None:
+        self._apply_bounds()
+        super().showEvent(event)
+        self._request_refit()
+
+    def _available(self) -> tuple[int, int]:
+        return (max(1, self._bounds.width() - self._inset * 2),
+                max(1, self._bounds.height() - self._inset * 2))
+
+    def _take_page(self) -> None:
+        old = self._body.takeWidget()
+        if old is not None:
+            old.setParent(None)
+        self._page = None
+
+    def set_page(self, page: QWidget | None) -> None:
+        old = self._body.takeWidget()
+        if old is not None:
+            old.setParent(None)
+        self._page = page
+        if page is not None:
+            page.setParent(self._body)
+            self._body.setWidget(page)
+            page.show()
+        self._request_refit()
+
+    def _preferred_width(self) -> int:
+        fm = QFontMetrics(self._font)
+        factor = 44 if self._metrics.compact else 46
+        preferred = max(520, round(fm.height() * factor))
+        max_w, _max_h = self._available()
+        return max(1, min(max_w, min(840, preferred)))
+
+    def _scrollbar_width(self) -> int:
+        return max(1, self._body.verticalScrollBar().sizeHint().width())
+
+    def _refit(self) -> None:
+        self._refit_scheduled = False
+        if not self.isVisible() and self.width() <= 1:
+            return
+        self._apply_bounds()
+        max_w, max_h = self._available()
+        width = self._preferred_width()
+        width = max(1, min(width, max_w))
+        header_h = self._header.measure(width)
+        footer_h = self._footer.measure(width)
+        body_room = max(1, max_h - header_h - footer_h)
+        page = self._page
+        scroll = False
+        body_h = 1
+        page_need = 1
+        if page is not None:
+            page_need = max(1, _height_for_width(page, width))
+            if page_need > body_room:
+                scroll = True
+                narrow = max(1, width - self._scrollbar_width())
+                page_need = max(page_need, _height_for_width(page, narrow))
+                body_h = body_room
+            else:
+                body_h = page_need
+            page.setMinimumHeight(max(1, int(page_need)))
+            page.setMaximumHeight(16777215)
+        self._body.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded if scroll else Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._body.setFixedHeight(max(1, int(body_h)))
+        self._header.setFixedWidth(width)
+        self._footer.setFixedWidth(width)
+        self._surface.setFixedSize(width, max(1, header_h + body_h + footer_h))
+
+    def _request_refit(self) -> None:
+        if self._refit_scheduled:
+            return
+        self._refit_scheduled = True
+        QTimer.singleShot(0, self, self._refit)
+
+    def _refresh_theme(self) -> None:
+        self._surface.update()
+        self._header.refresh_theme()
+        self._footer.refresh_theme()
+        if self._page is not None:
+            _refresh_widget(self._page)
+        pal = palette()
+        self._body.setStyleSheet(
+            'QScrollArea { background: transparent; border: none; }'
+            'QScrollArea > QWidget > QWidget { background: transparent; }'
+            'QScrollBar:vertical { background: transparent; width: 10px; margin: 2px 1px; }'
+            f'QScrollBar::handle:vertical {{ background: {_css(pal.get("scrollbar_handle", "#666666"))};'
+            ' border-radius: 4px; min-height: 28px; }'
+            'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }'
+            'QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }'
+        )
+        self._request_refit()
+        self.update()
+
+
+@dataclass
+class _WizardState:
+    language: str
+    theme: str
+    features: dict[str, bool] = field(default_factory=dict)
+    download_root: str | None = None
+    download_subfolders: bool = True
+    prefs: dict[str, bool] = field(default_factory=dict)
+    volumes: dict[str, int] = field(default_factory=dict)
+
+    @classmethod
+    def from_settings(cls) -> '_WizardState':
+        language = current_language() if current_language() in {code for code, _name in LANGUAGES} else 'en'
+        preset = settings.theme_preset
+        if preset and preset_meta(preset) is not None:
+            theme = preset
+        else:
+            theme = 'light' if settings.theme_mode == ThemeMode.LIGHT else 'dark'
+        features = {attr: bool(getattr(settings, attr, False)) for attr, *_rest in FEATURES}
+        prefs = {
+            'tray': bool(settings.close_to_tray),
+            'notify': bool(settings.notify_on_download_complete),
+            'external': bool(settings.external_torrent_client),
+        }
+        if sys.platform == 'win32':
+            prefs['startup'] = bool(get_launch_at_startup())
+        volumes = {'sfx': int(settings.sfx_volume), 'ambiance': int(settings.ambiance_volume)}
+        return cls(language=language, theme=theme, features=features, prefs=prefs, volumes=volumes)
+
+
+class OnboardingWizard(_OverlayDialog):
+
+    _BUILDERS = (
+        '_build_language_page',
+        '_build_theme_page',
+        '_build_features_page',
+        '_build_downloads_page',
+        '_build_prefs_page',
+    )
+    _NEXT_KEYS = (
+        ('onboarding.language_continue', 'Continue'),
+        ('onboarding.theme_continue', 'Continue'),
+        ('onboarding.features_continue', 'Continue'),
+        ('onboarding.next', 'Next'),
+        ('onboarding.finish', 'Finish'),
+    )
+    _PAGE_TEXT = (
+        ('onboarding.language_title', 'Choose your language',
+         'onboarding.language_subtitle', "Choose the language you'd like to use. You can change it later in Settings."),
+        ('onboarding.theme_title', 'Choose your theme',
+         'onboarding.theme_subtitle', 'Pick a theme. You can change it any time in Settings.'),
+        ('onboarding.features_title', 'Choose Your Features',
+         'onboarding.features_subtitle', "Pick which sections you'd like to use. Everything is off by default."),
+        ('onboarding.downloads_title', 'Where should downloads go?',
+         'onboarding.downloads_subtitle', 'Pick one folder and PiraChest sets up every section inside it.'),
+        ('onboarding.prefs_title', 'A few preferences',
+         'onboarding.prefs_subtitle', 'All optional, and all changeable later in Settings.'),
+    )
+
+    def __init__(self, owner: QWidget):
+        self._state = _WizardState.from_settings()
+        super().__init__(owner, steps=5)
+        self._index = -1
+        self._pages: list[QWidget | None] = [None] * len(self._BUILDERS)
+        self._page_builders = {
+            0: self._build_language_page,
+            1: self._build_theme_page,
+            2: self._build_features_page,
+            3: self._build_downloads_page,
+            4: self._build_prefs_page,
+        }
+        self._language_cards: dict[str, _ChoiceCard] = {}
+        self._greeting: _Greeting | None = None
+        self._theme_cards: dict[str, _ThemeCard] = {}
+        self._feature_cards: dict[str, _ToggleCard] = {}
+        self._pref_cards: dict[str, _ToggleCard] = {}
+        self._volume_cards: dict[str, _VolumeCard] = {}
+        self._pending_theme: str | None = None
+        self._previewed_theme = self._state.theme
+        self._theme_timer = QTimer(self)
+        self._theme_timer.setSingleShot(True)
+        self._theme_timer.timeout.connect(self._apply_pending_theme)
+        self._footer.next.clicked.connect(self._advance)
+        self._footer.back.clicked.connect(self._back)
+        self._content_ready = True
+        self._go(0, animate=False)
+        register_theme_refresh(self, self._theme_changed)
+        register_locale_refresh(self, self._locale_changed)
+
+    def _t(self, key: str, default: str = '') -> str:
+        return tr(key, default)
+
+    def _apply_texts(self) -> None:
+        index = max(0, min(self._index, len(self._BUILDERS) - 1))
+        title_key, title_default, subtitle_key, subtitle_default = self._PAGE_TEXT[index]
+        self._header.set_texts(
+            self._t(title_key, title_default),
+            self._t(subtitle_key, subtitle_default),
+            f'{index + 1} / {len(self._BUILDERS)}',
+        )
+        self._footer.set_texts(
+            self._t('onboarding.back', 'Back'),
+            self._t(*self._NEXT_KEYS[index]),
+            index > 0,
+        )
+        self._header.progress.set_step(index)
+        if index == 3:
+            self._sync_download_texts()
+        elif index == 4:
+            self._sync_pref_texts()
+
+    def _sync_download_texts(self) -> None:
+        page = self._pages[3]
+        if not isinstance(page, _DownloadsPage):
+            return
+        page.retranslate()
+
+    def _sync_pref_texts(self) -> None:
+        page = self._pages[4]
+        if not isinstance(page, _PrefsPage):
+            return
+        page.retranslate()
+
+    def _build_page(self, index: int) -> QWidget:
+        page = self._page_builders[index]()
+        self._pages[index] = page
+        return page
+
+    def _drop_page(self, index: int) -> None:
+        page = self._pages[index]
+        if page is None:
+            return
+        if self._page is page:
+            self._take_page()
+        self._pages[index] = None
+        page.setParent(None)
+        page.deleteLater()
+        if index == 1:
+            self._theme_cards = {}
+        elif index == 2:
+            self._feature_cards = {}
+        elif index == 3:
+            self._downloads_page = None
+        elif index == 4:
+            self._pref_cards = {}
+            self._volume_cards = {}
+
+    def _drop_translated_pages(self) -> None:
+        for index in range(1, len(self._BUILDERS)):
+            self._drop_page(index)
+        if self._index > 0:
+            self._go(self._index, animate=False)
+
+    def _go(self, index: int, animate: bool = False) -> None:
+        index = max(0, min(int(index), len(self._BUILDERS) - 1))
+        page = self._pages[index]
+        if page is None:
+            page = self._build_page(index)
+        changed = page is not self._page
+        self._index = index
+        self.set_page(page)
+        self._apply_texts()
+        self._refit()
+        if animate and changed:
+            self._fade_page(page)
+
+    def _fade_page(self, page: QWidget) -> None:
+        if page.graphicsEffect() is not None:
+            page.setGraphicsEffect(None)
+        effect = QGraphicsOpacityEffect(page)
+        effect.setOpacity(0.0)
+        page.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b'opacity', effect)
+        anim.setDuration(180)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.finished.connect(
+            lambda p=page: QTimer.singleShot(0, p, lambda: p.setGraphicsEffect(None)))
+        anim.start()
+
+    def _advance(self) -> None:
+        if self._index < len(self._BUILDERS) - 1:
+            self._go(self._index + 1, animate=True)
+            return
+        self.accept()
+
+    def _back(self) -> None:
+        if self._index > 0:
+            self._go(self._index - 1, animate=True)
+
+    def _show(self, index: int, animate: bool = False) -> None:
+        self._go(index, animate)
+
+    def _retranslate(self) -> None:
+        self._apply_texts()
+        self._refit()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._advance()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape:
+            self._back()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def reject(self) -> None:
+        if self._index > 0:
+            self._back()
+            return
+
+    def closeEvent(self, event) -> None:
+        if self._index > 0:
+            self._back()
+            event.ignore()
+            return
+        event.ignore()
+
+    def _theme_changed(self) -> None:
+        if not getattr(self, '_content_ready', False):
+            return
+        self._apply_theme_controls()
+        self._refresh_theme()
+
+    def _locale_changed(self) -> None:
+        if not getattr(self, '_content_ready', False):
+            return
+        self._drop_translated_pages()
+        self._apply_texts()
+        self._refresh_theme()
+        self._request_refit()
+
+    def _apply_theme_controls(self) -> None:
+        for card in self._theme_cards.values():
+            card.refresh_theme()
+        for card in self._feature_cards.values():
+            card.refresh_theme()
+        for card in self._pref_cards.values():
+            card.refresh_theme()
+        for card in self._volume_cards.values():
+            card.refresh_theme()
+
+    def _build_language_page(self) -> QWidget:
+        page = _Page(self._metrics)
+        self._greeting = page.add(_Greeting(self._metrics, self._state.language, page), 0)
+        grid = _ResponsiveGrid(self._metrics.grid_gap, 168, 2, page)
+        self._language_cards = {}
+        for code, name in LANGUAGES:
+            card = _ChoiceCard(name, self._metrics, grid)
+            card.set_selected(code == self._state.language)
+            card.clicked.connect(lambda _checked=False, c=code: self._pick_language(c))
+            grid.add(card)
+            self._language_cards[code] = card
+        page.add(grid, 14)
+        return page
+
+    def _pick_language(self, code: str) -> None:
+        if self._greeting is not None:
+            self._greeting.lock_to(code)
+        if code == self._state.language:
+            return
+        self._state.language = code
+        for lang, card in self._language_cards.items():
+            card.set_selected(lang == code)
+        if code != current_language():
+            set_language(code)
+        self._drop_translated_pages()
+        self._apply_texts()
+        self._request_refit()
+
+    def _build_theme_page(self) -> QWidget:
+        page = _Page(self._metrics)
+        grid = _ResponsiveGrid(self._metrics.theme_gap, self._metrics.theme_min_col, 5, page)
+        self._theme_cards = {}
+        for option_id, label, swatch, media, kind in _theme_options():
+            card = _ThemeCard(option_id, label, swatch, media, kind, self._metrics, grid)
+            card.set_selected(option_id == self._state.theme)
+            card.clicked.connect(lambda _checked=False, o=option_id: self._pick_theme(o))
+            grid.add(card)
+            self._theme_cards[option_id] = card
+        page.add(grid, 0)
+        return page
+
+    def _pick_theme(self, option_id: str) -> None:
+        if option_id == self._state.theme:
+            return
+        self._state.theme = option_id
+        for oid, card in self._theme_cards.items():
+            card.set_selected(oid == option_id)
+        self._pending_theme = option_id
+        self._theme_timer.start(0)
+
+    def _apply_pending_theme(self) -> None:
+        option_id = self._pending_theme
+        self._pending_theme = None
+        if option_id is None:
+            return
+        if _activate_option(option_id):
+            self._previewed_theme = option_id
+
+    def _flush_theme_preview(self) -> None:
+        if self._pending_theme is not None:
+            self._theme_timer.stop()
+            self._apply_pending_theme()
+
+    def _build_features_page(self) -> QWidget:
+        page = _Page(self._metrics)
+        grid = _ResponsiveGrid(self._metrics.grid_gap, self._metrics.feature_min_col, 2, page)
+        self._feature_cards = {}
+        for attr, slot, fallback, desc_key, desc_default in FEATURES:
+            icon = themed_icon(slot, _feature_icon(slot), size=self._metrics.icon_px)
+            title = self._t(slot, fallback)
+            card = _ToggleCard(icon, title, self._t(desc_key, desc_default), self._metrics, grid)
+            card.setChecked(bool(self._state.features.get(attr, False)))
+            card.toggled.connect(lambda checked, a=attr: self._set_feature(a, checked))
+            grid.add(card)
+            self._feature_cards[attr] = card
+        page.add(grid, 0)
+        return page
+
+    def _set_feature(self, attr: str, checked: bool) -> None:
+        self._state.features[attr] = bool(checked)
+
+    def _build_downloads_page(self) -> QWidget:
+        page = _DownloadsPage(self._state, self._metrics)
+        self._downloads_page = page
+        page.reset_requested.connect(self._reset_downloads)
+        page.browse_requested.connect(self._browse_downloads)
+        page.subfolders_changed.connect(self._set_subfolders)
+        page.retranslate()
+        page.refresh()
+        return page
+
+    def _download_root(self) -> str:
+        return self._state.download_root or settings.download_dir
+
+    def _folders(self) -> list[str]:
+        root = self._download_root()
+        if not self._state.download_subfolders:
+            return [root]
+        changes = download_dir_changes(root, True)
+        return [changes[attr] for attr in DOWNLOAD_DIR_SUBFOLDERS]
+
+    def _refresh_downloads(self) -> None:
+        page = self._pages[3]
+        if isinstance(page, _DownloadsPage):
+            page.refresh()
+
+    def _set_subfolders(self, checked: bool) -> None:
+        self._state.download_subfolders = bool(checked)
+        self._refresh_downloads()
+        self._request_refit()
+
+    def _reset_downloads(self) -> None:
+        self._state.download_root = None
+        self._refresh_downloads()
+        self._request_refit()
+
+    def _browse_downloads(self) -> None:
+        start = self._download_root()
+        chosen = QFileDialog.getExistingDirectory(
+            self, self._t('onboarding.downloads_pick', 'Select download folder'), start)
+        if not chosen:
+            return
+        chosen = os.path.normpath(chosen)
+        problem = check_dir_writable(chosen)
+        page = self._pages[3]
+        if problem:
+            if isinstance(page, _DownloadsPage):
+                page.show_error(problem)
+            return
+        self._state.download_root = chosen
+        self._refresh_downloads()
+        self._request_refit()
+
+    def _build_prefs_page(self) -> QWidget:
+        page = _PrefsPage(self._state, self._metrics)
+        self._pref_cards = page.pref_cards
+        self._volume_cards = page.volume_cards
+        page.pref_changed.connect(self._set_pref)
+        page.volume_changed.connect(self._set_volume)
+        page.retranslate()
+        return page
+
+    def _set_pref(self, pref_id: str, checked: bool) -> None:
+        self._state.prefs[pref_id] = bool(checked)
+
+    def _set_volume(self, volume_id: str, value: int) -> None:
+        self._state.volumes[volume_id] = int(value)
+        with suppress(Exception):
+            manager = get_sound_manager()
+            if volume_id == 'sfx':
+                manager.set_sfx_volume(int(value))
+            else:
+                manager.set_ambiance_volume(int(value))
+
+    def commit(self) -> None:
+        state = self._state
+        changes: dict = {
+            'language': state.language,
+            'onboarding_completed': True,
+        }
+        if state.theme in _PLAIN_THEMES:
+            changes.update(
+                theme_mode=ThemeMode.DARK if state.theme == 'dark' else ThemeMode.LIGHT,
+                theme_preset=None,
+            )
+            fonts = None
+        else:
+            meta = preset_meta(state.theme) if state.theme else None
+            if meta is None:
+                changes.update(theme_mode=ThemeMode.DARK, theme_preset=None)
+                fonts = None
+            else:
+                changes['theme_preset'] = state.theme
+                fonts = resolve_font_families(meta)
+        changes.update(state.features)
+        root = self._download_root()
+        if (state.download_root
+                or os.path.normcase(os.path.normpath(root))
+                != os.path.normcase(os.path.normpath(settings.download_dir))
+                or not state.download_subfolders):
+            changes.update(download_dir_changes(root, state.download_subfolders))
+        changes.update(
+            close_to_tray=bool(state.prefs.get('tray', settings.close_to_tray)),
+            notify_on_download_complete=bool(state.prefs.get('notify', settings.notify_on_download_complete)),
+            external_torrent_client=bool(state.prefs.get('external', settings.external_torrent_client)),
+            sfx_volume=int(state.volumes.get('sfx', settings.sfx_volume)),
+            ambiance_volume=int(state.volumes.get('ambiance', settings.ambiance_volume)),
+        )
+        desired_startup = state.prefs.get('startup')
+        if desired_startup is not None and desired_startup != get_launch_at_startup():
+            if set_launch_at_startup(bool(desired_startup)):
+                changes['launch_at_startup'] = bool(desired_startup)
+        self._flush_theme_preview()
+        if self._previewed_theme != state.theme and _activate_option(state.theme):
+            self._previewed_theme = state.theme
+        apply_settings(**changes)
+        with suppress(Exception):
+            apply_theme_font_families(fonts)
+        save_settings(settings)
+
+
+class _DownloadsPage(_Page):
+
+    reset_requested = Signal()
+    browse_requested = Signal()
+    subfolders_changed = Signal(bool)
+
+    def __init__(self, state: _WizardState, metrics: _Metrics, parent=None):
+        super().__init__(metrics, parent)
+        self._state = state
+        self.path_row = self.add(_PathRow('', metrics, self.browse_requested.emit), 0)
+        self.status_row = self.add(_StatusRow(metrics, self.reset_requested.emit), 4)
+        self.subfolders = self.add(_ToggleCard(
+            themed_icon('settings.folder', FluentIcon.FOLDER, size=metrics.icon_px),
+            '', '', metrics), 12)
+        self.subfolders.setChecked(bool(state.download_subfolders))
+        self.subfolders.toggled.connect(self.subfolders_changed.emit)
+        self.folder_title = self.add(_Label('', 'caption', metrics), 14)
+        self.folder_list = self.add(_FolderList(metrics), 6)
+
+    def retranslate(self) -> None:
+        t = tr
+        self.path_row.set_browse_text(t('onboarding.downloads_browse', 'Browse'))
+        self.status_row.set_reset_text(t('onboarding.downloads_reset', 'Use default'))
+        self.subfolders.set_texts(t('onboarding.downloads_subfolders', 'Organize by section'),
+                                  t('onboarding.downloads_subfolders_desc',
+                                    'Each section gets its own subfolder.'))
+        self.folder_title.setText(t('onboarding.downloads_preview', 'Folders that will be used'))
+        self.updateGeometry()
+
+    def refresh_theme(self) -> None:
+        super().refresh_theme()
+        self.subfolders.refresh_theme()
+        self.status_row.refresh_theme()
+
+    def refresh(self) -> None:
+        root = self._state.download_root or settings.download_dir
+        self.path_row.set_path(root)
+        self.status_row.set_reset_enabled(self._state.download_root is not None)
+        free = free_space_bytes(root)
+        if free is None:
+            self.status_row.set_status('')
+        else:
+            self.status_row.set_status(
+                f'{format_size(free)} {tr("onboarding.downloads_free", "free on this drive")}')
+        changes = download_dir_changes(root, self._state.download_subfolders)
+        if self._state.download_subfolders:
+            folders = [os.path.basename(changes[attr].rstrip('\\/')) or changes[attr]
+                       for attr in DOWNLOAD_DIR_SUBFOLDERS]
+        else:
+            folders = [os.path.basename(os.path.normpath(root)) or root]
+        self.folder_list.set_folders(folders)
+        self.updateGeometry()
+
+    def show_error(self, problem: str) -> None:
+        self.status_row.set_status(
+            f'{tr("onboarding.downloads_error", "Can\'t use this folder:")} {problem}', error=True)
+
+
+class _PrefsPage(_Page):
+
+    pref_changed = Signal(str, bool)
+    volume_changed = Signal(str, int)
+
+    def __init__(self, state: _WizardState, metrics: _Metrics, parent=None):
+        super().__init__(metrics, parent)
+        self._state = state
+        self._metrics = metrics
+        self.pref_cards: dict[str, _ToggleCard] = {}
+        self.volume_cards: dict[str, _VolumeCard] = {}
+        grid = _ResponsiveGrid(metrics.grid_gap, metrics.feature_min_col, 2, self)
+        specs = (
+            ('startup', FluentIcon.POWER_BUTTON),
+            ('tray', FluentIcon.MINIMIZE),
+            ('notify', FluentIcon.RINGER),
+            ('external', FluentIcon.SEND),
+        )
+        for pref_id, icon in specs:
+            if pref_id == 'startup' and sys.platform != 'win32':
+                continue
+            card = _ToggleCard(themed_icon(None, icon, size=metrics.icon_px), '', '', metrics, grid)
+            card.setChecked(bool(state.prefs.get(pref_id, False)))
+            card.toggled.connect(lambda checked, p=pref_id: self.pref_changed.emit(p, checked))
+            grid.add(card)
+            self.pref_cards[pref_id] = card
+        off_text = tr('settings.volume_off', 'Off')
+        for volume_id, icon in (('sfx', FluentIcon.VOLUME), ('ambiance', FluentIcon.MUSIC)):
+            card = _VolumeCard(themed_icon(None, icon, size=metrics.icon_px), '', '',
+                               int(state.volumes.get(volume_id, 0)), metrics, off_text, grid)
+            card.changed.connect(lambda value, v=volume_id: self.volume_changed.emit(v, value))
+            grid.add(card)
+            self.volume_cards[volume_id] = card
+        self.add(grid, 0)
+
+    def retranslate(self) -> None:
+        t = tr
+        for pref_id, card in self.pref_cards.items():
+            title = t(f'onboarding.pref_{pref_id}', pref_id.title())
+            desc = t(f'onboarding.pref_{pref_id}_desc', '')
+            card.set_texts(title, desc)
+        for volume_id, card in self.volume_cards.items():
+            title = t(f'onboarding.pref_{volume_id}', volume_id.title())
+            desc = t(f'onboarding.pref_{volume_id}_desc', '')
+            card.set_texts(title, desc)
+        self.updateGeometry()
+
+    def refresh_theme(self) -> None:
+        super().refresh_theme()
+
+
+def _feature_icon(slot: str):
+    return {
+        'nav.minerva': FluentIcon.APPLICATION,
+        'nav.pc_games': FluentIcon.GAME,
+        'nav.youtube': FluentIcon.PLAY,
+        'nav.tv': FluentIcon.PROJECTOR,
+        'nav.tbhb': FluentIcon.SEARCH,
+        'nav.music': FluentIcon.MUSIC,
+        'nav.books': FluentIcon.BOOK_SHELF,
+        'nav.sailseek': FluentIcon.GLOBE,
+    }.get(slot, FluentIcon.APPLICATION)
+
+
+def _theme_options() -> list[tuple[str, str, tuple, str, str]]:
     options = [
-        (mode, tr(f'settings.theme_{mode}'), tuple(palette(dark=mode == 'dark')[k] for k in _SWATCH_KEYS), '', '')
+        (mode, tr(f'settings.theme_{mode}', 'Dark' if mode == 'dark' else 'Light'),
+         tuple(palette(dark=mode == 'dark')[k] for k in _SWATCH_KEYS), '', '')
         for mode in _PLAIN_THEMES
     ]
     for preset_id in all_preset_ids():
@@ -2738,7 +4583,8 @@ def _theme_options() -> list[tuple[str, str, tuple[str, str, str], str, str]]:
         media = (meta.background_shader_image_path if shader else meta.background_path) or ''
         ext = os.path.splitext(media)[1].lower()
         kind = 'shader' if shader else 'video' if ext in _VIDEO_EXT else 'gif' if ext == '.gif' else 'photo' if media else ''
-        options.append((preset_id, preset_label(preset_id), tuple(meta.palette[k] for k in _SWATCH_KEYS), media, kind))
+        options.append((preset_id, preset_label(preset_id),
+                        tuple(meta.palette[k] for k in _SWATCH_KEYS), media, kind))
     return options
 
 
@@ -2750,422 +4596,141 @@ def _activate_option(option_id: str) -> bool:
     return True
 
 
-def _theme_grid(on_pick, max_height: int) -> tuple[ScrollArea, dict[str, _ThemeCard]]:
-    content = QWidget()
-    grid = QGridLayout(content)
-    grid.setContentsMargins(2, 2, 2, 2)
-    grid.setSpacing(10)
-    cards: dict[str, _ThemeCard] = {}
-    columns = 4
-    for i, (option_id, label, swatch, media, kind) in enumerate(_theme_options()):
-        card = _ThemeCard(label, swatch, media, kind, content)
-        card.clicked.connect(lambda o=option_id: on_pick(o))
-        grid.addWidget(card, i // columns, i % columns)
-        cards[option_id] = card
-    grid.setColumnStretch(columns, 1)
-    return _scrolling(content, max_height), cards
+class ThemePickerDialog(_OverlayDialog):
 
-
-class ThemePickerDialog(MessageBoxBase):
-
-    def __init__(self, owner: QWidget, current: str):
+    def __init__(self, owner: QWidget, current: str,
+                 on_accept: Callable[[str], None] | None = None):
         super().__init__(owner)
+        self._header.set_progress_visible(False)
         self.theme = current
-        self.widget.setMinimumWidth(max(420, min(720, owner.width() - 48)))
-        title = SubtitleLabel(tr('onboarding.theme_title'), self.widget)
-        subtitle = BodyLabel(tr('onboarding.theme_subtitle'), self.widget)
-        subtitle.setWordWrap(True)
-        grid, self._cards = _theme_grid(self._on_pick, 372)
-        grid.setFixedHeight(372)
-        for widget in (title, subtitle, grid):
-            self.viewLayout.addWidget(widget)
-        self.viewLayout.setSpacing(8)
-        if current in self._cards:
-            self._cards[current].set_selected(True, animate=False)
-        self.yesButton.setText(tr('onboarding.theme_continue'))
-        self.cancelButton.setText(owner.tr_or('common.cancel', 'Cancel'))
-        register_theme_refresh(self, self._repaint_cards)
+        self._original = current
+        self._on_accept = on_accept
+        self._cards: dict[str, _ThemeCard] = {}
+        self._pending: str | None = None
+        self._previewed = current
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._apply_pending)
+        self._build()
+        self._header.set_texts(
+            tr('onboarding.theme_title', 'Choose your theme'),
+            tr('onboarding.theme_subtitle', 'Pick a theme. You can change it any time in Settings.'),
+            '',
+        )
+        self._footer.set_texts(
+            tr('common.cancel', 'Cancel'),
+            tr('onboarding.theme_continue', 'Continue'),
+            True,
+        )
+        self._footer.next.clicked.connect(self.accept)
+        self._footer.back.clicked.connect(self.reject)
+        register_theme_refresh(self, self._refresh_theme)
+        register_locale_refresh(self, self._retranslate)
+        self._retranslate()
+        self._refit()
 
-    def _on_pick(self, option_id: str) -> None:
-        if option_id == self.theme or option_id not in self._cards:
+    def _build(self) -> None:
+        page = _Page(self._metrics)
+        grid = _ResponsiveGrid(self._metrics.theme_gap, self._metrics.theme_min_col, 5, page)
+        self._cards = {}
+        for option_id, label, swatch, media, kind in _theme_options():
+            card = _ThemeCard(option_id, label, swatch, media, kind, self._metrics, grid)
+            card.set_selected(option_id == self.theme)
+            card.clicked.connect(lambda _checked=False, o=option_id: self._pick(o))
+            grid.add(card)
+            self._cards[option_id] = card
+        page.add(grid, 0)
+        self.set_page(page)
+        self._page = page
+
+    def _pick(self, option_id: str) -> None:
+        if option_id == self.theme:
             return
         self.theme = option_id
         for oid, card in self._cards.items():
             card.set_selected(oid == option_id)
+        self._pending = option_id
+        self._preview_timer.start(0)
 
-    def _repaint_cards(self) -> None:
-        for card in self._cards.values():
-            card.update()
+    def _apply_pending(self) -> None:
+        option_id = self._pending
+        self._pending = None
+        if option_id is None:
+            return
+        if _activate_option(option_id):
+            self._previewed = option_id
 
-def pick_theme(owner: QWidget, current: str) -> str | None:
-    dialog = ThemePickerDialog(owner, current)
+    def _flush_preview(self) -> None:
+        if self._pending is not None:
+            self._preview_timer.stop()
+            self._apply_pending()
+
+    def _restore_original(self) -> None:
+        self._preview_timer.stop()
+        self._pending = None
+        if self._previewed != self._original:
+            _activate_option(self._original)
+            self._previewed = self._original
+
+    def accept(self) -> None:
+        self._flush_preview()
+        try:
+            if self._on_accept is not None and self.theme != self._original:
+                self._on_accept(self.theme)
+        finally:
+            super().accept()
+
+    def reject(self) -> None:
+        self._restore_original()
+        super().reject()
+
+    def _retranslate(self) -> None:
+        if not self._cards:
+            return
+        self._header.set_texts(
+            tr('onboarding.theme_title', 'Choose your theme'),
+            tr('onboarding.theme_subtitle', 'Pick a theme. You can change it any time in Settings.'),
+            '',
+        )
+        self._footer.set_texts(
+            tr('common.cancel', 'Cancel'),
+            tr('onboarding.theme_continue', 'Continue'),
+            True,
+        )
+        self._request_refit()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.accept()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape:
+            self.reject()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+def pick_theme(owner: QWidget, current: str,
+               on_accept: Callable[[str], None] | None = None) -> str | None:
+    dialog = ThemePickerDialog(owner, current, on_accept)
     try:
-        if not dialog.exec() or dialog.theme == current:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
-        return dialog.theme
+        return dialog.theme if dialog.theme != current else None
     finally:
         dialog.hide()
         dialog.setParent(None)
         dialog.deleteLater()
 
 
-class OnboardingWizard(MessageBoxBase):
-
-    _NEXT_KEYS = ('onboarding.language_continue', 'onboarding.theme_continue')
-
-    _TEXT = {
-        'onboarding.next': 'Next',
-        'onboarding.finish': 'Finish',
-        'onboarding.downloads_title': 'Where should downloads go?',
-        'onboarding.downloads_subtitle': 'Pick one folder and PiraChest sets up every section inside it. You can change any of them later in Settings.',
-        'onboarding.downloads_browse': 'Browse',
-        'onboarding.downloads_reset': 'Use default',
-        'onboarding.downloads_subfolders': 'Organize by section',
-        'onboarding.downloads_subfolders_desc': 'Repacks, Music, YouTube and others each get their own subfolder',
-        'onboarding.downloads_free': 'free on this drive',
-        'onboarding.downloads_preview': 'Folders that will be used',
-        'onboarding.downloads_pick': 'Select download folder',
-        'onboarding.downloads_error': "Can't use this folder:",
-        'onboarding.prefs_title': 'A few preferences',
-        'onboarding.prefs_subtitle': 'All optional, and all changeable later in Settings.',
-        'onboarding.pref_startup': 'Launch at Windows startup',
-        'onboarding.pref_startup_desc': 'Start PiraChest when you sign in',
-        'onboarding.pref_tray': 'Keep running in the tray',
-        'onboarding.pref_tray_desc': 'Closing the window minimizes it instead of quitting',
-        'onboarding.pref_notify': 'Download notifications',
-        'onboarding.pref_notify_desc': 'Notify me when a download finishes',
-        'onboarding.pref_sfx': 'Button sounds',
-        'onboarding.pref_sfx_desc': 'Hover, click and navigation sounds. 0 turns them off',
-        'onboarding.pref_ambiance': 'Ambiance',
-        'onboarding.pref_ambiance_desc': 'A quiet looping background track. 0 turns it off',
-        'onboarding.pref_assoc': 'Open torrent files and magnet links',
-        'onboarding.pref_assoc_desc': 'Use PiraChest for .torrent files and magnet: links',
-    }
-
-    def setShadowEffect(self, *args, **kwargs) -> None:
-        self.widget.setGraphicsEffect(None)
-
-    def showEvent(self, event) -> None:
-        QDialog.showEvent(self, event)
-        self.setWindowOpacity(0.0)
-        anim = QPropertyAnimation(self, b'windowOpacity', self)
-        anim.setDuration(160)
-        anim.setStartValue(0.0)
-        anim.setEndValue(1.0)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.finished.connect(lambda: self.setWindowOpacity(1.0))
-        anim.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
-        self._show_anim = anim
-        QTimer.singleShot(200, self, lambda: self.setWindowOpacity(1.0))
-
-    def done(self, code) -> None:
-        self.widget.setGraphicsEffect(None)
-        self.setWindowOpacity(1.0)
-        QDialog.done(self, code)
-
-    def __init__(self, owner: QWidget):
-        super().__init__(owner)
-        self._owner = owner
-        self._index = 0
-        self._language = current_language() if current_language() in {code for code, *_ in LANGUAGES} else 'en'
-        self._theme = 'dark'
-        self._download_root: str | None = None
-        self.widget.setMinimumWidth(max(420, min(720, owner.width() - 48)))
-        self.buttonLayout.removeWidget(self.cancelButton)
-        self.buttonLayout.insertWidget(0, self.cancelButton, 1, Qt.AlignmentFlag.AlignVCenter)
-
-        self._pages = [self._build_language_page(), self._build_theme_page(), self._build_features_page(),
-                       self._build_downloads_page(), self._build_prefs_page()]
-        self._bar = _ProgressBar(len(self._pages))
-        self._stack = QStackedWidget()
-        for page in self._pages:
-            self._stack.addWidget(page)
-        self.viewLayout.addWidget(self._bar)
-        self.viewLayout.addSpacing(18)
-        self.viewLayout.addWidget(self._stack)
-
-        register_locale_refresh(self, self._retranslate)
-        register_theme_refresh(self, self._repaint_cards)
-        self._retranslate()
-
-
-    @staticmethod
-    def _heading_page() -> tuple[QWidget, QVBoxLayout, SubtitleLabel, BodyLabel]:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
-        title = SubtitleLabel(page)
-        subtitle = BodyLabel(page)
-        subtitle.setWordWrap(True)
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addSpacing(10)
-        return page, layout, title, subtitle
-
-    def _build_language_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self._greeting = _Greeting(page)
-        layout.addWidget(self._greeting)
-        layout.addSpacing(12)
-        grid = QGridLayout()
-        grid.setSpacing(10)
-        self._language_cards: dict[str, _LanguageCard] = {}
-        for i, (code, native_name, _greeting) in enumerate(LANGUAGES):
-            card = _LanguageCard(native_name, page)
-            card.clicked.connect(lambda c=code: self._on_language(c))
-            grid.addWidget(card, i // 2, i % 2)
-            self._language_cards[code] = card
-        layout.addLayout(grid)
-        layout.addStretch(1)
-        self._language_cards[self._language].set_selected(True, animate=False)
-        return page
-
-    def _build_theme_page(self) -> QWidget:
-        page, layout, self._theme_title, self._theme_subtitle = self._heading_page()
-        grid, self._theme_cards = _theme_grid(self._on_theme, 340)
-        layout.addWidget(grid)
-        layout.addStretch(1)
-        self._theme_cards[self._theme].set_selected(True, animate=False)
-        return page
-
-    def _build_features_page(self) -> QWidget:
-        page, layout, self._features_title, self._features_subtitle = self._heading_page()
-        grid = QGridLayout()
-        grid.setSpacing(10)
-        self._feature_cards: dict[str, _FeatureCard] = {}
-        for i, (attr, slot, icon, title, description) in enumerate(FEATURES):
-            card = _FeatureCard(themed_icon(slot, icon), title, description, page)
-            card.switch.setChecked(bool(getattr(settings, attr, False)))
-            grid.addWidget(card, i // 2, i % 2)
-            self._feature_cards[attr] = card
-        layout.addLayout(grid)
-        layout.addStretch(1)
-        return page
-
-    def _t(self, key: str) -> str:
-        return self._owner.tr_or(key, self._TEXT[key])
-
-    def _build_downloads_page(self) -> QWidget:
-        page, layout, self._downloads_title, self._downloads_subtitle = self._heading_page()
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        self._dir_edit = LineEdit(page)
-        self._dir_edit.setReadOnly(True)
-        self._dir_edit.setText(settings.download_dir)
-        self._browse_btn = PushButton(page)
-        self._browse_btn.clicked.connect(self._browse_downloads)
-        self._reset_btn = PushButton(page)
-        self._reset_btn.clicked.connect(self._reset_downloads)
-        row.addWidget(self._dir_edit, 1)
-        row.addWidget(self._browse_btn)
-        row.addWidget(self._reset_btn)
-        layout.addLayout(row)
-        self._dir_info = CaptionLabel(page)
-        self._dir_info.setWordWrap(True)
-        layout.addWidget(self._dir_info)
-        layout.addSpacing(8)
-        self._subfolders_card = _FeatureCard(FluentIcon.FOLDER, '', '', page)
-        self._subfolders_card.switch.setChecked(True)
-        layout.addWidget(self._subfolders_card)
-        layout.addSpacing(6)
-        self._preview_title = StrongBodyLabel(page)
-        layout.addWidget(self._preview_title)
-        self._preview_rows: list[CaptionLabel] = []
-        for _ in range(len(download_dir_changes('x')) - 1):
-            row_label = CaptionLabel(page)
-            row_label.setContentsMargins(10, 0, 0, 0)
-            row_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-            layout.addWidget(row_label)
-            self._preview_rows.append(row_label)
-        layout.addStretch(1)
-        self._subfolders_card.switch.checkedChanged.connect(lambda _checked: self._refresh_preview())
-        self._refresh_dir_info()
-        self._refresh_preview()
-        return page
-
-    def _build_prefs_page(self) -> QWidget:
-        page, layout, self._prefs_title, self._prefs_subtitle = self._heading_page()
-        content = QWidget()
-        grid = QGridLayout(content)
-        grid.setContentsMargins(2, 2, 2, 2)
-        grid.setSpacing(10)
-        win = sys.platform == 'win32'
-        specs = (
-            ('startup', FluentIcon.POWER_BUTTON, get_launch_at_startup(), win),
-            ('tray', FluentIcon.MINIMIZE, settings.close_to_tray, True),
-            ('notify', FluentIcon.RINGER, settings.notify_on_download_complete, True),
-            ('assoc', FluentIcon.LINK, associations_available() and not settings.associations_user_disabled, associations_available()),
-        )
-        self._pref_cards: dict[str, _FeatureCard] = {}
-        for pref_id, icon, value, shown in specs:
-            if not shown:
-                continue
-            card = _FeatureCard(icon, '', '', content)
-            card.switch.setChecked(bool(value))
-            n = len(self._pref_cards)
-            grid.addWidget(card, n // 2, n % 2)
-            self._pref_cards[pref_id] = card
-        off = lambda: self._owner.tr_or('settings.volume_off', 'Off')
-        self._volume_cards: dict[str, _VolumeCard] = {}
-        row = (len(self._pref_cards) + 1) // 2
-        for vol_id, icon, value, setter in (
-                ('sfx', FluentIcon.VOLUME, settings.sfx_volume, lambda v: get_sound_manager().set_sfx_volume(v)),
-                ('ambiance', FluentIcon.MUSIC, settings.ambiance_volume, lambda v: get_sound_manager().set_ambiance_volume(v))):
-            card = _VolumeCard(icon, value, off, content)
-            card.changed.connect(setter)
-            grid.addWidget(card, row, 0, 1, 2)
-            row += 1
-            self._volume_cards[vol_id] = card
-        for r in range(row):
-            grid.setRowStretch(r, 1)
-        layout.addWidget(_scrolling(content, 460), 1)
-        return page
-
-
-    def _refresh_dir_info(self, error: str = '') -> None:
-        if error:
-            self._dir_info.setText(f"{self._t('onboarding.downloads_error')} {error}")
-            return
-        free = free_space_bytes(self._download_root or settings.download_dir)
-        self._dir_info.setText(f"{format_size(free)} {self._t('onboarding.downloads_free')}" if free is not None else '')
-
-    def _refresh_preview(self) -> None:
-        root = self._download_root or settings.download_dir
-        folders = list(dict.fromkeys(download_dir_changes(root, self._subfolders_card.switch.isChecked()).values()))
-        for i, row_label in enumerate(self._preview_rows):
-            row_label.setVisible(i < len(folders))
-            if i < len(folders):
-                row_label.setText(folders[i])
-
-    def _browse_downloads(self) -> None:
-        start = self._download_root or settings.download_dir
-        chosen = QFileDialog.getExistingDirectory(self, self._t('onboarding.downloads_pick'), start)
-        if not chosen:
-            return
-        chosen = os.path.normpath(chosen)
-        problem = check_dir_writable(chosen)
-        if problem:
-            self._refresh_dir_info(problem)
-            return
-        self._download_root = chosen
-        self._dir_edit.setText(chosen)
-        self._refresh_dir_info()
-        self._refresh_preview()
-
-    def _reset_downloads(self) -> None:
-        self._download_root = None
-        self._dir_edit.setText(settings.download_dir)
-        self._refresh_dir_info()
-        self._refresh_preview()
-
-
-    def _on_language(self, code: str) -> None:
-        if code == self._language:
-            return
-        self._language = code
-        for lang, card in self._language_cards.items():
-            card.set_selected(lang == code)
-        self._greeting.lock_to(code)
-        set_language(code)
-
-    def _on_theme(self, option_id: str) -> None:
-        if option_id == self._theme:
-            return
-        if not _activate_option(option_id):
-            return
-        self._theme = option_id
-        for oid, card in self._theme_cards.items():
-            card.set_selected(oid == option_id)
-
-    def _go(self, index: int) -> None:
-        self._index = index
-        self._stack.setCurrentIndex(index)
-        _fade_in(self._pages[index])
-        self._bar.go_to(index)
-        self._sync_buttons()
-
-    def _sync_buttons(self) -> None:
-        last = self._index == len(self._pages) - 1
-        if self._index < len(self._NEXT_KEYS):
-            self.yesButton.setText(tr(self._NEXT_KEYS[self._index]))
-        else:
-            self.yesButton.setText(self._t('onboarding.finish' if last else 'onboarding.next'))
-        self.cancelButton.setText(self._owner.tr_or('onboarding.back', 'Back'))
-        self.cancelButton.setVisible(self._index > 0)
-
-    def _retranslate(self) -> None:
-        self._theme_title.setText(tr('onboarding.theme_title'))
-        self._theme_subtitle.setText(tr('onboarding.theme_subtitle'))
-        self._features_title.setText(tr('onboarding.features_title'))
-        self._features_subtitle.setText(tr('onboarding.features_subtitle'))
-        self._downloads_title.setText(self._t('onboarding.downloads_title'))
-        self._downloads_subtitle.setText(self._t('onboarding.downloads_subtitle'))
-        self._browse_btn.setText(self._t('onboarding.downloads_browse'))
-        self._reset_btn.setText(self._t('onboarding.downloads_reset'))
-        _set_card_texts(self._subfolders_card, self._t('onboarding.downloads_subfolders'), self._t('onboarding.downloads_subfolders_desc'))
-        self._refresh_dir_info()
-        self._preview_title.setText(self._t('onboarding.downloads_preview'))
-        self._prefs_title.setText(self._t('onboarding.prefs_title'))
-        self._prefs_subtitle.setText(self._t('onboarding.prefs_subtitle'))
-        for pref_id, card in (*self._pref_cards.items(), *self._volume_cards.items()):
-            _set_card_texts(card, self._t(f'onboarding.pref_{pref_id}'), self._t(f'onboarding.pref_{pref_id}_desc'))
-        for card in self._volume_cards.values():
-            card.refresh_label()
-        self._sync_buttons()
-
-    def _repaint_cards(self) -> None:
-        for widget in (*self.findChildren(_SelectableCard), self._bar):
-            widget.update()
-
-    def validate(self) -> bool:
-        if self._index < len(self._pages) - 1:
-            self._go(self._index + 1)
-            return False
-        return True
-
-    def reject(self) -> None:
-        if self._index > 0:
-            self._go(self._index - 1)
-
-    def commit(self) -> None:
-        changes = {'language': self._language, 'onboarding_completed': True}
-        if self._theme in _PLAIN_THEMES:
-            changes.update(theme_mode=ThemeMode.DARK if self._theme == 'dark' else ThemeMode.LIGHT, theme_preset=None)
-            fonts = None
-        else:
-            changes['theme_preset'] = self._theme
-            fonts = resolve_font_families(preset_meta(self._theme))
-        changes.update({attr: card.switch.isChecked() for attr, card in self._feature_cards.items()})
-        if self._download_root:
-            changes.update(download_dir_changes(self._download_root, self._subfolders_card.switch.isChecked()))
-        on = {pref_id: card.switch.isChecked() for pref_id, card in self._pref_cards.items()}
-        changes.update(close_to_tray=on['tray'], notify_on_download_complete=on['notify'],
-                       sfx_volume=self._volume_cards['sfx'].value(), ambiance_volume=self._volume_cards['ambiance'].value())
-        if 'startup' in on and on['startup'] != get_launch_at_startup() and set_launch_at_startup(on['startup']):
-            changes['launch_at_startup'] = on['startup']
-        register = False
-        if 'assoc' in on:
-            if on['assoc']:
-                register = True
-            elif not settings.associations_enabled:
-                changes['associations_user_disabled'] = True
-        apply_settings(**changes)
-        with suppress(Exception):
-            apply_theme_font_families(fonts)
-        save_settings(settings)
-        if register:
-            with suppress(Exception):
-                register_associations()
-
-
-def run_onboarding(owner: QWidget) -> None:
+def run_onboarding(owner: QWidget) -> bool:
     wizard = OnboardingWizard(owner)
     try:
-        wizard.exec()
-        wizard.commit()
+        accepted = wizard.exec() == QDialog.DialogCode.Accepted
+        if accepted:
+            wizard.commit()
+        return accepted
     finally:
         wizard.hide()
         wizard.setParent(None)
@@ -3177,13 +4742,13 @@ def _maybe_run_onboarding(parent: MainWindow) -> None:
         _trim_working_set_now()
         run_onboarding(parent)
         parent._sync_optional_pages()
-        with suppress(Exception):
-            parent.sailseek.apply_settings()
-        if parent.settings_page is not None:
+        if parent.settings_page is not None and parent.settings_page._built:
             parent.settings_page._populate()
         _trim_idle_working_set(600)
     else:
         _trim_idle_working_set(1800)
+    QTimer.singleShot(0, parent, parent._init_sailseek)
+    QTimer.singleShot(2500, parent, parent._freeze_gc)
     _maybe_show_vpn_disclaimer(parent)
     QTimer.singleShot(300, parent._check_update_on_startup)
     QTimer.singleShot(1500, parent, parent._start_page_preload)
@@ -3360,21 +4925,22 @@ def _donate_px(name: str, default: int) -> int:
     return default
 
 
-def _photo_path(name: str) -> str | None:
-    rel = Path('photos') / name
-    candidates = [Path(__file__).resolve().parent / rel]
+def _photo_path(*names: str) -> str | None:
+    roots = [_GUI_DIR]
     bundle = getattr(sys, '_MEIPASS', None)
     if bundle:
-        candidates.append(Path(bundle) / 'src' / 'gui' / rel)
-    return next((str(c) for c in candidates if c.is_file()), None)
+        roots.append(Path(bundle) / 'src' / 'gui')
+    return next((str(p) for n in names for r in roots if (p := r / 'photos' / n).is_file()), None)
 
 
-def _logo_ico_path() -> str | None:
-    return _photo_path('logo.ico')
-
-
-def _exe_ico_path() -> str | None:
-    return _photo_path('icon.ico')
+def _discord_icon_path() -> str | None:
+    for candidate in (_GUI_DIR.parent / 'photo' / 'd.png', _GUI_DIR / 'photo' / 'd.png'):
+        if candidate.is_file():
+            return str(candidate)
+    path = _photo_path('d.png')
+    if path is None:
+        logger.warning('Discord icon not found')
+    return path
 
 
 _WM_SETICON = 0x0080
@@ -3393,13 +4959,8 @@ def _load_native_icon(path: str, big: bool):
     return user32.LoadImageW(None, path, _IMAGE_ICON, w, h, _LR_LOADFROMFILE)
 
 
-def _donate_qr_path(key: str) -> Path | None:
-    name = f'{key}-qr.png'
-    candidates = [Path(__file__).resolve().parent / 'photos' / 'donations' / name]
-    bundle = getattr(sys, '_MEIPASS', None)
-    if bundle:
-        candidates.append(Path(bundle) / 'src' / 'gui' / 'photos' / 'donations' / name)
-    return next((c for c in candidates if c.is_file()), None)
+def _donate_qr_path(key: str) -> str | None:
+    return _photo_path(f'donations/{key}-qr.png')
 
 
 def _donate_wrap(address: str) -> str:
@@ -3597,7 +5158,6 @@ class DonateDialog(MessageBoxBase):
         with suppress(Exception):
             register_locale_refresh(self, self._apply_locale)
 
-
     def _apply_theme(self) -> None:
         self._address.refresh()
         self._qr.update()
@@ -3615,7 +5175,6 @@ class DonateDialog(MessageBoxBase):
             'USDC and USDT exist on several networks. Confirm which one before you send.'))
         self.yesButton.setText(_donate_t('donate.close', 'Close'))
         self._show_copy_idle()
-
 
     def _load_qr(self, coin: _DonateCoin) -> QPixmap | None:
         if coin.key in self._qr_cache:
@@ -3817,11 +5376,21 @@ class MainWindow(FluentWindow):
             self._media_bg = widget
         return widget
 
+    def _clear_stale_background(self) -> None:
+        shader_bg = self._shader_bg
+        if shader_bg is not None and (shader_bg.isVisible() or shader_bg._frag_path is not None):
+            shader_bg.hide()
+            shader_bg.clear()
+        self._drop_background_photo()
+        self.update()
+
     def _refresh_background_photo(self) -> None:
-        if self._defer_background_until_modal_closes():
-            return
         preset = active_preset_id()
         shader_frag = theme_shader_path(preset)
+        if self._defer_background_until_modal_closes():
+            if shader_frag is None or self._shader_bg is None:
+                self._clear_stale_background()
+                return
         if shader_frag is not None:
             self._drop_background_photo()
             shader_bg = self._ensure_shader_bg()
@@ -4115,6 +5684,8 @@ class MainWindow(FluentWindow):
         self._app_active = True
         self._prepare_gl_surface()
         app = QApplication.instance()
+        self._settings_prepare_timer = QTimer(self, singleShot=True, interval=400)
+        self._settings_prepare_timer.timeout.connect(self._prepare_settings_page)
         app.installEventFilter(self)
         app.applicationStateChanged.connect(self._on_app_state_changed)
 
@@ -4137,7 +5708,7 @@ class MainWindow(FluentWindow):
                 set_debug_console_visible(True)
         except Exception:
             logger.exception('Failed to restore debug console visibility')
-        app_icon_path = _logo_ico_path() or find_app_icon_path()
+        app_icon_path = _photo_path('logo.ico', 'icon.ico', 'icon.png', 'logo.png')
         if app_icon_path:
             self.setWindowIcon(QIcon(app_icon_path))
         self._apply_taskbar_icon()
@@ -4179,8 +5750,8 @@ class MainWindow(FluentWindow):
         self.tv_page: LazyPage | None = None
         self._books_manga_bridge = None
         self.yt_bridge = None
+        self.sailseek = None
         from src.core.downloader import DownloadManager
-        from .download_page import DownloadManagerPage
         self.download_manager = DownloadManager(self)
         if self._pending_open_targets:
             QTimer.singleShot(0, self._flush_pending_open_targets)
@@ -4191,7 +5762,12 @@ class MainWindow(FluentWindow):
 
         if settings.onboarding_completed:
             self._sync_optional_pages()
-        self.download_page = DownloadManagerPage(self.download_manager, self)
+
+        def _build_downloads():
+            from .download_page import DownloadManagerPage
+            return DownloadManagerPage(self.download_manager, self)
+
+        self.download_page = LazyPage(_build_downloads, keep_alive=True)
         self.download_page.setObjectName('downloadPage')
         self._nav_downloads = self.addSubInterface(self.download_page, themed_nav_icon('nav.downloads', FluentIcon.DOWNLOAD), tr('nav.downloads'), position=NavigationItemPosition.BOTTOM)
         self.download_manager.all_downloads_finished.connect(self._on_all_downloads_finished)
@@ -4208,8 +5784,8 @@ class MainWindow(FluentWindow):
         self.settings_page = SettingsPage(self)
         self.settings_page.bind_network(self.download_manager.net_prefs, self.download_manager.set_net_prefs)
         self.settings_page.setObjectName('settingsPage')
-        self.sailseek = SailSeekController(self)
         self._nav_settings = self.addSubInterface(self.settings_page, themed_nav_icon('nav.settings', FluentIcon.SETTING), tr('nav.settings'), position=NavigationItemPosition.BOTTOM)
+        self._settings_nav_widget = self.navigationInterface.widget('settingsPage')
         self.navigationInterface.addItem(
             routeKey='openDataFolder',
             icon=themed_nav_icon('nav.open_data_folder', FluentIcon.FOLDER),
@@ -4218,7 +5794,7 @@ class MainWindow(FluentWindow):
             selectable=False,
             position=NavigationItemPosition.BOTTOM,
         )
-        self.about_page = LazyPage(lambda: AboutPage(self), keep_alive=True)
+        self.about_page = LazyPage(self._create_about_page, keep_alive=True)
         self.about_page.setObjectName('aboutPage')
         self._nav_about = self.addSubInterface(self.about_page, themed_nav_icon('nav.about', FluentIcon.INFO), tr('nav.about'), position=NavigationItemPosition.BOTTOM)
         register_locale_refresh(self, self._refresh_nav_text)
@@ -4245,6 +5821,9 @@ class MainWindow(FluentWindow):
         _maybe_run_onboarding(self)
         self._ensure_associations_registered()
         self._ui_ready = True
+        self._settings_warmup_timer = QTimer(self, singleShot=True, interval=1000)
+        self._settings_warmup_timer.timeout.connect(self._prepare_settings_page)
+        self._settings_warmup_timer.start()
 
     def handle_external_args(self, args: list) -> None:
         targets = extract_cli_targets(args)
@@ -4267,10 +5846,35 @@ class MainWindow(FluentWindow):
                 self._force_foreground_focus()
                 return
             self.switchTo(self.download_page)
-            self.download_page._start_selective_add(target, source_label='External')
+            self.download_page.call_when_ready('_start_selective_add', target, source_label='External')
             self._force_foreground_focus()
         except Exception:
             logger.exception('Failed to open external target: %s', target)
+
+    def _init_sailseek(self) -> None:
+        if self.sailseek is not None:
+            return
+        from .sailseek import SailSeekController
+        self.sailseek = SailSeekController(self)
+        with suppress(Exception):
+            self.sailseek.apply_settings()
+
+    def _prepare_settings_page(self) -> None:
+        page = getattr(self, 'settings_page', None)
+        if page is not None:
+            page.prepare()
+
+    def _freeze_gc(self) -> None:
+        try:
+            gc.collect(1)
+            gc.freeze()
+            logger.info('Garbage collector frozen (%d objects)', gc.get_freeze_count())
+        except Exception:
+            logger.debug('Could not freeze the garbage collector', exc_info=True)
+
+    def _create_about_page(self):
+        from .about_page import AboutPage
+        return AboutPage(self)
 
     def _on_stacked_page_changed(self, _index: int) -> None:
         shader_bg = self._shader_bg
@@ -4295,6 +5899,14 @@ class MainWindow(FluentWindow):
         if not settings.notify_on_download_complete:
             return
         display_name = game_name or tr('download.rom_fallback')
+        try:
+            item = self.download_manager.get(item_id)
+            if item is not None and str(getattr(item, 'category', '') or '') == 'repacks':
+                from src.core.repacks.base import display_title
+
+                display_name = display_title(display_name)
+        except Exception:
+            logger.debug('Could not clean the download-complete title', exc_info=True)
         try:
             if self._tray_icon is not None:
                 title = self.tr_or('notifications.download_complete_title', 'Download complete')
@@ -4463,7 +6075,6 @@ class MainWindow(FluentWindow):
             chrome._frame_key = ()
         self._bg_scaled_cache = None
         with suppress(Exception):
-            from PySide6.QtGui import QPixmapCache
             QPixmapCache.clear()
         _trim_idle_working_set()
 
@@ -4506,7 +6117,7 @@ class MainWindow(FluentWindow):
 
     def _ensure_associations_registered(self) -> None:
         try:
-            if not associations_available():
+            if not associations_available() or not settings.associations_enabled:
                 return
             if not settings.associations_exe_path or associations_need_repair():
                 register_associations()
@@ -4519,7 +6130,7 @@ class MainWindow(FluentWindow):
             return
         try:
             chrome = self._chrome
-            chip = ChromeChip(tr('download.donate'), trimmed_icon(filled_icon(FluentIcon.HEART).pixmap(128, 128), fill=1.0), title_bar)
+            chip = ChromeChip(tr('download.donate'), trimmed_icon(filled_icon(FluentIcon.HEART, bake=64).pixmap(64, 64), fill=1.0), title_bar)
             chip.setObjectName('donateChip')
             chip.clicked.connect(lambda: DonateDialog(self).exec())
             if hasattr(title_bar, 'addChip'):
@@ -4569,7 +6180,7 @@ class MainWindow(FluentWindow):
                 discord_label = 'Discord'
             chip = ChromeChip(discord_label, FluentIcon.CHAT, title_bar)
             chip.setObjectName('discordChip')
-            icon_path = find_discord_icon_path()
+            icon_path = _discord_icon_path()
             pixmap = QPixmap(icon_path) if icon_path else QPixmap()
             if not pixmap.isNull():
                 chip.setIconSource(trimmed_icon(pixmap, fill=1.0))
@@ -4625,7 +6236,7 @@ class MainWindow(FluentWindow):
     def _apply_taskbar_icon(self) -> None:
         if sys.platform != 'win32':
             return
-        path = _exe_ico_path()
+        path = _photo_path('icon.ico')
         if not path:
             return
         try:
@@ -4645,7 +6256,7 @@ class MainWindow(FluentWindow):
     def _init_tray_icon(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
-        _tray = _exe_ico_path()
+        _tray = _photo_path('icon.ico')
         self._tray_icon = QSystemTrayIcon(QIcon(_tray) if _tray else self.windowIcon(), self)
         self._tray_icon.setToolTip('PiraChest')
         menu = QMenu()
@@ -4937,6 +6548,17 @@ class MainWindow(FluentWindow):
         if et == _ET_KEY:
             with suppress(Exception):
                 self._observe_konami(event)
+        elif et in (_ET_ENTER, _ET_LEAVE):
+            nav = getattr(self, '_settings_nav_widget', None)
+            if nav is not None and isinstance(obj, QWidget):
+                with suppress(RuntimeError):
+                    if obj is nav or nav.isAncestorOf(obj):
+                        timer = getattr(self, '_settings_prepare_timer', None)
+                        if timer is not None:
+                            if et == _ET_ENTER:
+                                timer.start()
+                            else:
+                                timer.stop()
         if et not in _MAIN_FILTER_TYPES:
             return super().eventFilter(obj, event)
         if et == _ET_KEY:
@@ -5013,8 +6635,9 @@ class MainWindow(FluentWindow):
                 settings.close_to_tray = True
                 apply_settings(close_to_tray=True)
                 save_settings(settings)
-                with suppress(Exception):
-                    self.settings_page._chk_close_to_tray.setChecked(True)
+                if getattr(self.settings_page, '_built', False):
+                    with suppress(Exception):
+                        self.settings_page._chk_close_to_tray.setChecked(True)
                 if self._tray_icon is not None:
                     event.ignore()
                     self.hide()
@@ -5036,6 +6659,9 @@ class MainWindow(FluentWindow):
         if bridge is not None:
             with suppress(Exception):
                 bridge.shutdown()
+        with suppress(Exception):
+            from src.core.tv.external import shutdown_external
+            shutdown_external()
         from src.core.cache import cache
         cache.clear_namespace('repacks_page')
         cache.clear_namespace('repacks_details')
@@ -5083,7 +6709,8 @@ class MainWindow(FluentWindow):
         return page
 
     def _on_yt_ffmpeg_declined(self) -> None:
-        self.settings_page._chk_youtube.setChecked(False)
+        if getattr(self.settings_page, '_built', False):
+            self.settings_page._chk_youtube.setChecked(False)
 
     def _center_scroll_nav_items(self) -> None:
         try:
@@ -5285,12 +6912,6 @@ class MainWindow(FluentWindow):
         return pages
 
     def _init_keyboard_shortcuts(self) -> None:
-        try:
-            from PySide6.QtGui import QKeySequence, QShortcut
-        except Exception:
-            logger.exception('Failed to initialize keyboard shortcuts')
-            return
-
         self._fixed_shortcuts = []
 
         def _add(key, handler):
@@ -6266,7 +7887,7 @@ def create_application(argv: list | None=None):
     app.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
     app.setApplicationName('PiraChest')
     app.setApplicationDisplayName('PiraChest')
-    _logo = _logo_ico_path()
+    _logo = _photo_path('logo.ico')
     if _logo:
         app.setWindowIcon(QIcon(_logo))
     app.setOrganizationName('PiraChest')

@@ -1,9 +1,11 @@
 import logging
 import os
 import time
+from collections import Counter
+from functools import lru_cache
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QHBoxLayout, QHeaderView, QLabel,
     QSizePolicy, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -15,18 +17,32 @@ from qfluentwidgets import (
     TransparentToolButton,
 )
 
-from src.core.tbhb.api import search_async, details_async, track_download
-from src.core.tbhb.models import TBHBEntry, TBHBDetails, CATEGORIES, category_bucket, format_date
+from src.core.models import assess_source_files, assess_title, classify_file
+from src.core.tbhb.api import details_async, search_async, track_download, uploader_profile
+from src.core.tbhb.models import (
+    CATEGORIES, TBHBEntry, TBHBDetails, UploaderReputation, category_bucket, clean_description,
+    format_date,
+)
 from src.core.worker import Priority as TaskPriority, cancel as cancel_task, submit as submit_task
 from src.core.downloader import DownloadManager
 from src.core.translations import tr, register_locale_refresh
-from src.core.theme import palette, themed_icon
+from src.core.theme import palette, themed_icon, ScrollingTextDelegate
 from .repacks_page import DownloadActionWidget
 
 logger = logging.getLogger(__name__)
 
 _PAGE_LIMIT = 15
 _AUTO_FETCHES = 4
+_SORT_FUNCS = {
+    "seeders": lambda e: (-e.seeders, -e.leechers),
+    "newest": lambda e: -e.added,
+    "largest": lambda e: -e.size,
+}
+
+
+def _best_sort(e) -> bool:
+    return e.seeders <= 0
+
 _SEARCH_TIMEOUT_MS = 30000
 _DOUBLE_SEARCH_GUARD = 0.35
 _MAX_FILE_ROWS = 300
@@ -117,6 +133,9 @@ class ColumnHeader(QWidget):
             lbl.setText(tr(f'tbhb.col_{key}', default=default))
 
 
+_assess_title_cached = lru_cache(maxsize=1024)(assess_title)
+
+
 class ResultRow(CardWidget):
     def __init__(self, entry: TBHBEntry, on_click, parent=None):
         super().__init__(parent)
@@ -138,14 +157,19 @@ class ResultRow(CardWidget):
             meta_parts.append(tr('tbhb.by_uploader', name=entry.username))
         if entry.trust:
             meta_parts.append("VIP" if entry.trust == "vip" else tr('tbhb.trusted', default='Trusted'))
-        if entry.format_guess:
-            meta_parts.append(entry.format_guess)
+        fmt = entry.format_guess
+        if fmt:
+            meta_parts.append(fmt)
+        category_name = entry.category_name
+        safety = _assess_title_cached(entry.title, category_name)
+        if safety is not None:
+            meta_parts.append(safety.summary)
         if entry.source:
             meta_parts.append(entry.source)
         title_col.addWidget(ElidedCaptionLabel(" • ".join(meta_parts)))
         layout.addLayout(title_col, 1)
 
-        layout.addWidget(_cell(entry.category_name, _COL_CAT), 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(_cell(category_name, _COL_CAT), 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(_cell(entry.size_label or "—", _COL_SIZE), 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(_cell(entry.age_label or "—", _COL_AGE), 0, Qt.AlignmentFlag.AlignVCenter)
         seed_color = pal['state_seeding'] if entry.seeders > 0 else pal['faint_text']
@@ -175,11 +199,15 @@ class ResultsList(QWidget):
         self._rows.clear()
 
     def set_entries(self, entries: list[TBHBEntry]) -> None:
-        self.clear()
-        for entry in entries:
-            row = ResultRow(entry, self._on_row_click)
-            self._layout.addWidget(row)
-            self._rows.append(row)
+        self.setUpdatesEnabled(False)
+        try:
+            self.clear()
+            for entry in entries:
+                row = ResultRow(entry, self._on_row_click)
+                self._layout.addWidget(row)
+                self._rows.append(row)
+        finally:
+            self.setUpdatesEnabled(True)
 
 
 class PaginationBar(QWidget):
@@ -224,6 +252,8 @@ class DetailsView(QWidget):
     def __init__(self, manager: DownloadManager, parent=None):
         super().__init__(parent)
         self._details: TBHBDetails | None = None
+        self._rep_for = ""
+        self._page_url = ""
         self._download_action = DownloadActionWidget(manager, "tbhb")
         self._download_action.download_started.connect(self._track_download)
         outer = QVBoxLayout(self)
@@ -240,6 +270,12 @@ class DetailsView(QWidget):
         self._copy_btn.setFixedHeight(32)
         self._copy_btn.clicked.connect(self._copy_magnet)
         top.addWidget(self._copy_btn)
+        self._page_btn = PushButton(themed_icon('tbhb.detail_page', FluentIcon.LINK),
+                                    tr('tbhb.open_page', default='Open source page'))
+        self._page_btn.setFixedHeight(32)
+        self._page_btn.setVisible(False)
+        self._page_btn.clicked.connect(self._open_page)
+        top.addWidget(self._page_btn)
         top.addStretch(1)
         outer.addLayout(top)
 
@@ -274,6 +310,8 @@ class DetailsView(QWidget):
         self._seeders_lbl = self._stat(flow, themed_icon('tbhb.stat_seeders', FluentIcon.UP))
         self._leechers_lbl = self._stat(flow, themed_icon('tbhb.stat_leechers', FluentIcon.DOWN))
         self._username_lbl = self._stat(flow, themed_icon('tbhb.stat_uploader', FluentIcon.PEOPLE))
+        self._rep_lbl = self._stat(flow, themed_icon('tbhb.stat_reputation', FluentIcon.HEART))
+        self._rep_lbl._holder.setVisible(False)
         self._format_lbl = self._stat(flow, themed_icon('tbhb.stat_format', FluentIcon.ALBUM))
         self._added_lbl = self._stat(flow, themed_icon('tbhb.stat_added', FluentIcon.CALENDAR))
         self._source_lbl = self._stat(flow, themed_icon('tbhb.stat_source', FluentIcon.GLOBE))
@@ -285,6 +323,20 @@ class DetailsView(QWidget):
         body_l.addWidget(header_card)
 
         body_l.addWidget(self._download_action)
+
+        self._desc_card = CardWidget()
+        desc_l = QVBoxLayout(self._desc_card)
+        desc_l.setContentsMargins(20, 16, 20, 16)
+        desc_l.setSpacing(8)
+        self._desc_title = StrongBodyLabel(tr('tbhb.description', default='Description'))
+        desc_l.addWidget(self._desc_title)
+        self._desc_lbl = CaptionLabel("")
+        self._desc_lbl.setWordWrap(True)
+        self._desc_lbl.setTextFormat(Qt.TextFormat.PlainText)
+        self._desc_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        desc_l.addWidget(self._desc_lbl)
+        self._desc_card.setVisible(False)
+        body_l.addWidget(self._desc_card)
 
         files_card = CardWidget()
         files_l = QVBoxLayout(files_card)
@@ -298,7 +350,7 @@ class DetailsView(QWidget):
         files_head.addStretch(1)
         files_l.addLayout(files_head)
         self._files_table = TableWidget()
-        self._files_table.setColumnCount(2)
+        self._files_table.setColumnCount(3)
         self._files_table.verticalHeader().hide()
         self._files_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._files_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
@@ -310,6 +362,8 @@ class DetailsView(QWidget):
         header = self._files_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._name_delegate = ScrollingTextDelegate(self._files_table, 0)
         self._apply_table_headers()
         self._files_table.setVisible(False)
         files_l.addWidget(self._files_table)
@@ -317,7 +371,11 @@ class DetailsView(QWidget):
         body_l.addStretch(1)
 
     def _apply_table_headers(self) -> None:
-        self._files_table.setHorizontalHeaderLabels([tr('tbhb.col_name', default='Name'), tr('tbhb.col_size', default='Size')])
+        self._files_table.setHorizontalHeaderLabels([
+            tr('tbhb.col_name', default='Name'),
+            tr('tbhb.col_type', default='Type'),
+            tr('tbhb.col_size', default='Size'),
+        ])
 
     def _stat(self, flow: FlowLayout, icon) -> BodyLabel:
         holder = QWidget()
@@ -338,6 +396,30 @@ class DetailsView(QWidget):
     def _set_optional(lbl: BodyLabel, text: str) -> None:
         lbl.setText(text)
         lbl._holder.setVisible(bool(text))
+
+    def _update_uploader(self, details: TBHBDetails) -> None:
+        name = details.username.strip()
+        if details.source.lower().startswith("nyaa") or name.lower() in ("", "anonymous", "anon", "unknown"):
+            name = ""
+        if name == self._rep_for:
+            return
+        self._rep_for = name
+        self._set_optional(self._rep_lbl, "")
+        if name:
+            submit_task(uploader_profile, args=(name,),
+                        on_done=lambda d, n=name: self._on_reputation(n, d),
+                        on_error=lambda e: None, priority=TaskPriority.LOW)
+
+    def _on_reputation(self, name: str, data: dict) -> None:
+        if name != self._rep_for:
+            return
+        rep = UploaderReputation.from_profile(data, name)
+        self._set_optional(self._rep_lbl, rep.summary)
+        self._rep_lbl.setToolTip(rep.detail)
+
+    def _open_page(self) -> None:
+        if self._page_url:
+            QDesktopServices.openUrl(QUrl(self._page_url))
 
     def _track_download(self) -> None:
         submit_task(track_download, priority=TaskPriority.LOW)
@@ -364,9 +446,16 @@ class DetailsView(QWidget):
         if details.trust:
             uploader += " · " + ("VIP" if details.trust == "vip" else tr('tbhb.trusted', default='Trusted'))
         self._username_lbl.setText(uploader)
+        self._update_uploader(details)
         self._format_lbl.setText(details.file_format or "—")
         self._set_optional(self._added_lbl, format_date(details.added))
         self._set_optional(self._source_lbl, details.source)
+        desc = clean_description(details.description)
+        self._desc_lbl.setText(desc)
+        self._desc_card.setVisible(bool(desc))
+        url = details.page_url.strip()
+        self._page_url = url if url.lower().startswith(("http://", "https://")) else ""
+        self._page_btn.setVisible(bool(self._page_url))
         self._hash_lbl.setText(tr('tbhb.hash', hash=details.info_hash) if details.info_hash else "")
         self._fill_files(details, files_state)
         self._download_action.set_details(details)
@@ -389,26 +478,46 @@ class DetailsView(QWidget):
             table.setVisible(False)
             return
         total = details.total_size_label
-        self._files_caption.setText(f"{len(files)} • {total}" if total else str(len(files)))
+        caption = f"{len(files)} • {total}" if total else str(len(files))
+        safety = assess_source_files(files, context=details.category_name, title=details.title)
+        if safety.level != "ok":
+            caption += f" • {safety.summary}"
+            self._files_caption.setToolTip(
+                f"{safety.details}\n{tr('tbhb.file_type_review', default='Review the highlighted file types before opening.')}")
+        else:
+            self._files_caption.setToolTip("")
+        self._files_caption.setText(caption)
+        highlighted = {name.lower() for name in safety.highlighted}
+        pal = palette()
         shown = files[:_MAX_FILE_ROWS]
         extra = len(files) - len(shown)
         table.setRowCount(len(shown) + (1 if extra > 0 else 0))
         right = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         for row, f in enumerate(shown):
-            name_item = QTableWidgetItem(f["name"])
-            name_item.setToolTip(f["name"])
+            name = str(f.get("name") or "")
+            base = os.path.basename(name.replace("\\", "/")).lower()
+            info = classify_file(name)
+            name_item = QTableWidgetItem(name)
+            type_item = QTableWidgetItem(info.label)
+            type_item.setToolTip(info.reason)
+            if base in highlighted:
+                type_item.setForeground(QColor(pal["state_error"] if info.risk == "dangerous" else pal["state_verifying"]))
             size_item = QTableWidgetItem(f.get("sizeLabel") or "")
             size_item.setTextAlignment(right)
             table.setItem(row, 0, name_item)
-            table.setItem(row, 1, size_item)
+            table.setItem(row, 1, type_item)
+            table.setItem(row, 2, size_item)
         if extra > 0:
             table.setItem(len(shown), 0, QTableWidgetItem(tr('tbhb.files_more', default='… and more files') + f" (+{extra})"))
             table.setItem(len(shown), 1, QTableWidgetItem(""))
+            table.setItem(len(shown), 2, QTableWidgetItem(""))
         table.setVisible(True)
 
     def refresh_locale(self) -> None:
         self._back_btn.setText(tr('tbhb.back_to_results'))
         self._copy_btn.setText(tr('tbhb.copy_magnet', default='Copy magnet'))
+        self._page_btn.setText(tr('tbhb.open_page', default='Open source page'))
+        self._desc_title.setText(tr('tbhb.description', default='Description'))
         self._files_title.setText(tr('tbhb.files', default='Files'))
         self._apply_table_headers()
 
@@ -433,6 +542,7 @@ class TBHBPage(QWidget):
         self._details_task = None
         self._details_entry_id = None
         self._pill_sets: list[dict[int, PillPushButton]] = []
+        self._source_items: list[tuple[str, int]] = []
         self._reset_results()
         self._search_watchdog = QTimer(self)
         self._search_watchdog.setSingleShot(True)
@@ -441,7 +551,6 @@ class TBHBPage(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 12)
         root.setSpacing(12)
-
 
         self._search_section = QWidget()
         search_layout = QVBoxLayout(self._search_section)
@@ -477,7 +586,6 @@ class TBHBPage(QWidget):
         search_layout.addStretch(3)
         root.addWidget(self._search_section, 1)
 
-
         self._results_section = QWidget()
         results_layout = QVBoxLayout(self._results_section)
         results_layout.setContentsMargins(0, 0, 0, 0)
@@ -500,6 +608,11 @@ class TBHBPage(QWidget):
         info_row.setSpacing(10)
         self._status_lbl = CaptionLabel("")
         info_row.addWidget(self._status_lbl, 1)
+        self._source_combo = ComboBox()
+        self._source_combo.setFixedWidth(170)
+        self._source_combo.setVisible(False)
+        self._source_combo.currentIndexChanged.connect(self._on_source_changed)
+        info_row.addWidget(self._source_combo)
         self._sort_lbl = CaptionLabel(tr('tbhb.sort_by', default='Sort by'))
         info_row.addWidget(self._sort_lbl)
         self._sort_combo = ComboBox()
@@ -528,7 +641,6 @@ class TBHBPage(QWidget):
         self._results_section.setVisible(False)
         root.addWidget(self._results_section, 1)
 
-
         self._details_view = DetailsView(manager)
         self._details_view.back_requested.connect(self._show_results)
         self._details_view.setVisible(False)
@@ -539,7 +651,6 @@ class TBHBPage(QWidget):
         esc.activated.connect(self._on_escape)
 
         register_locale_refresh(self, self._apply_locale)
-
 
     def _bind_search(self, bar: SearchLineEdit) -> None:
         bar.searchSignal.connect(self._on_search)
@@ -570,6 +681,8 @@ class TBHBPage(QWidget):
         self._sort_lbl.setText(tr('tbhb.sort_by', default='Sort by'))
         for i, text in enumerate(_sort_labels()):
             self._sort_combo.setItemText(i, text)
+        if self._source_combo.count():
+            self._source_combo.setItemText(0, tr('tbhb.all_sources', default='All sources'))
         self._column_header.refresh_locale()
         self._pagination.refresh_locale()
         self._details_view.refresh_locale()
@@ -577,7 +690,6 @@ class TBHBPage(QWidget):
             self._status_lbl.setText(tr('tbhb.loading'))
         elif self._all_entries or self._query or self._results_section.isVisible():
             self._render_page()
-
 
     def _on_escape(self) -> None:
         if self._details_view.isVisible():
@@ -595,9 +707,12 @@ class TBHBPage(QWidget):
         self._details_view.setVisible(False)
         self._results_section.setVisible(True)
 
-
     def _reset_results(self, keep_fallback: bool = False) -> None:
         self._all_entries: list[TBHBEntry] = []
+        self._source_counts: Counter = Counter()
+        self._view: list[TBHBEntry] = []
+        self._view_key = None
+        self._source_filter = ""
         self._seen: set[str] = set()
         self._server_page = -1
         self._server_exhausted = False
@@ -666,7 +781,7 @@ class TBHBPage(QWidget):
 
     def _ensure_loaded(self, use_cache: bool = True) -> None:
         need = (self._page + 1) * _PAGE_LIMIT + 1
-        if len(self._all_entries) < need and not self._server_exhausted and self._fetches_left > 0:
+        if self._visible_count() < need and not self._server_exhausted and self._fetches_left > 0:
             self._fetches_left -= 1
             self._fetch(self._server_page + 1, use_cache)
         else:
@@ -719,6 +834,7 @@ class TBHBPage(QWidget):
             self._ensure_loaded()
             return
         self._all_entries.extend(fresh)
+        self._source_counts.update(e.source for e in fresh if e.source)
         self._ensure_loaded()
 
     def _on_search_error(self, error, seq: int | None = None) -> None:
@@ -745,16 +861,16 @@ class TBHBPage(QWidget):
             self._list.clear()
             self._pagination.set_page(0, False)
 
-
     def _sorted_entries(self) -> list[TBHBEntry]:
-        entries = list(self._all_entries)
-        if self._sort_key == "seeders":
-            entries.sort(key=lambda e: (-e.seeders, -e.leechers))
-        elif self._sort_key == "newest":
-            entries.sort(key=lambda e: -e.added)
-        elif self._sort_key == "largest":
-            entries.sort(key=lambda e: -e.size)
-        return entries
+        key = (self._sort_key, self._source_filter, len(self._all_entries))
+        if key != self._view_key:
+            if self._source_filter:
+                entries = [e for e in self._all_entries if e.source == self._source_filter]
+            else:
+                entries = list(self._all_entries)
+            entries.sort(key=_SORT_FUNCS.get(self._sort_key, _best_sort))
+            self._view, self._view_key = entries, key
+        return self._view
 
     def _on_prev_page(self) -> None:
         if self._loading or self._page == 0:
@@ -770,6 +886,7 @@ class TBHBPage(QWidget):
         self._ensure_loaded()
 
     def _render_page(self) -> None:
+        self._sync_source_combo()
         view = self._sorted_entries()
         if self._page > 0 and self._page * _PAGE_LIMIT >= len(view):
             self._page = max(0, (len(view) - 1) // _PAGE_LIMIT)
@@ -799,7 +916,6 @@ class TBHBPage(QWidget):
                 return name
         return "All"
 
-
     def _open_details(self, entry: TBHBEntry) -> None:
         if self._details_task is not None:
             try:
@@ -810,7 +926,11 @@ class TBHBPage(QWidget):
         self._details_entry_id = entry.id
         self._results_section.setVisible(False)
         self._details_view.setVisible(True)
-        self._details_view.show_details(TBHBDetails.from_entry(entry), "loading")
+        base = TBHBDetails.from_entry(entry)
+        if entry.id.startswith("nyrss_"):
+            self._details_view.show_details(base, "ready")
+            return
+        self._details_view.show_details(base, "loading")
         self._details_task = details_async(
             entry.id,
             on_done=lambda d, e=entry: self._on_details_done(e, d),
@@ -831,6 +951,31 @@ class TBHBPage(QWidget):
         self._details_task = None
         self._details_view.set_files_state("error")
         InfoBar.error(tr('tbhb.details_failed_title'), str(error), position=InfoBarPosition.TOP, parent=self)
+
+    def _visible_count(self) -> int:
+        return self._source_counts[self._source_filter] if self._source_filter else len(self._all_entries)
+
+    def _sync_source_combo(self) -> None:
+        items = sorted(self._source_counts.items(), key=lambda kv: kv[0].lower())
+        if items == self._source_items:
+            return
+        self._source_items = items
+        combo = self._source_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(tr('tbhb.all_sources', default='All sources'))
+        combo.addItems([f"{name} ({n})" for name, n in items])
+        names = [name for name, _n in items]
+        combo.setCurrentIndex(names.index(self._source_filter) + 1 if self._source_filter in names else 0)
+        combo.blockSignals(False)
+        combo.setVisible(len(items) > 1)
+
+    def _on_source_changed(self, index: int) -> None:
+        self._source_filter = self._source_items[index - 1][0] if 0 < index <= len(self._source_items) else ""
+        self._page = 0
+        if not self._loading:
+            self._fetches_left = _AUTO_FETCHES
+            self._ensure_loaded()
 
     def shutdown(self) -> None:
         self._seq += 1

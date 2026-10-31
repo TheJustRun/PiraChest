@@ -11,6 +11,7 @@ from typing import Optional
 import httpx
 
 from ..config import settings
+from ..models import classify_file
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,9 @@ class StreamSource:
             parts.append(self.indexer)
         if self.pack:
             parts.append("season pack")
+        info = classify_file(self.filename or self.name)
+        if info.risk != "ok":
+            parts.append(f"{info.label} file type")
         return " · ".join(part for part in parts if part)
 
 
@@ -123,10 +127,12 @@ def looks_like_video(name: str) -> bool:
 
 def stream_score(source: StreamSource) -> float:
     weight = _QUALITY_WEIGHT.get(source.quality, 0.7)
+    info = classify_file(source.filename or source.name)
+    risk = 0.05 if info.risk == "dangerous" else 0.8 if info.risk == "caution" else 1.0
     if source.is_direct:
         direct_weight = {"4k": 1.0, "1080p": 1.0, "720p": 0.95, "480p": 0.9, "240p": 0.5}.get(
             source.quality, 0.7)
-        return 10_000.0 + direct_weight * 100.0 + (1.0 if source.filename else 0.0)
+        return (10_000.0 + direct_weight * 100.0 + (1.0 if source.filename else 0.0)) * risk
     score = float(source.seeders) * weight
     if source.size > 25 * 1024 ** 3:
         score *= 0.7
@@ -134,7 +140,7 @@ def stream_score(source: StreamSource) -> float:
         score *= 0.7
     if source.filename:
         score *= 1.05
-    return score
+    return score * risk
 
 
 def _client() -> httpx.AsyncClient:
@@ -146,7 +152,11 @@ def _client() -> httpx.AsyncClient:
 
 async def find_streams(imdb_id: str, media_type: str, season: Optional[int] = None,
                        episode: Optional[int] = None, title: str = "",
-                       year: str = "") -> list[StreamSource]:
+                       year: str = "", tmdb_id: Optional[int] = None,
+                       anilist_id: Optional[int] = None,
+                       titles: Optional[list[str]] = None,
+                       episode_count: Optional[int] = None,
+                       quick: bool = False) -> list[StreamSource]:
     has_imdb = bool(imdb_id) and str(imdb_id).startswith("tt")
     if not has_imdb and not title:
         return []
@@ -162,6 +172,17 @@ async def find_streams(imdb_id: str, media_type: str, season: Optional[int] = No
             for base_url in _extra_addon_bases(base)
         )
         providers.append(_apibay(imdb_id, media_type, season, episode))
+    if getattr(settings, "tv_external_enabled", True) and tmdb_id:
+        from . import external as external_backend
+        providers.append(external_backend.external_stream_sources(
+            tmdb_id=tmdb_id, imdb_id=imdb_id if has_imdb else "",
+            media_type=media_type, season=season, episode=episode,
+            title=title, year=year, anilist_id=anilist_id,
+            titles=titles, episode_count=episode_count, quick=quick,
+        ))
+
+    if quick:
+        return await _find_streams_quick(providers)
 
     results = await asyncio.gather(*providers, return_exceptions=True)
 
@@ -170,10 +191,52 @@ async def find_streams(imdb_id: str, media_type: str, season: Optional[int] = No
         if isinstance(result, BaseException):
             logger.info("Stream provider failed: %s: %s", type(result).__name__, result)
             continue
-        for source in result:
-            current = merged.get(source.key)
-            if current is None or _is_better(source, current):
-                merged[source.key] = source
+        _merge_sources(merged, result or [])
+    return sorted(merged.values(), key=stream_score, reverse=True)
+
+
+def _merge_sources(merged: dict[str, StreamSource], sources) -> None:
+    for source in sources:
+        current = merged.get(source.key)
+        if current is None or _is_better(source, current):
+            merged[source.key] = source
+
+
+async def _find_streams_quick(providers: list, timeout: float = 10.0) -> list[StreamSource]:
+    """Return as soon as a direct source is available.
+
+    Torrent providers keep running in parallel so torrent-only titles still
+    reach the picker, but they are cancelled the moment a direct source
+    arrives. The whole search is also capped so a slow provider cannot keep
+    the picker waiting for its long tail.
+    """
+    tasks = [asyncio.ensure_future(provider) for provider in providers]
+    merged: dict[str, StreamSource] = {}
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    pending = set(tasks)
+    try:
+        while pending:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED, timeout=remaining)
+            for task in done:
+                if task.cancelled():
+                    continue
+                error = task.exception()
+                if error is not None:
+                    logger.info("Stream provider failed: %s: %s", type(error).__name__, error)
+                    continue
+                _merge_sources(merged, task.result() or [])
+            if any(source.is_direct for source in merged.values()):
+                break
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
     return sorted(merged.values(), key=stream_score, reverse=True)
 
 

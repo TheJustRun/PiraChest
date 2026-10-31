@@ -74,12 +74,28 @@ _GREEN_COLOR_RE = re.compile(r'#339966', re.IGNORECASE)
 _TITLE_ENTITY_TAIL_RE = re.compile('&#8211;.*$')
 _TITLE_BRACKET_TAIL_RE = re.compile(r'\s*\[[^\]]*\]\s*$')
 _TITLE_REPACK_TAIL_RE = re.compile(r'\s*[-–]\s*(RePack|Repack).*$', re.IGNORECASE)
-_TITLE_PLUS_RE = re.compile(r'\s+\+\s*')
 _TITLE_PAREN_JUNK_RE = re.compile(
     r'\s*\((?=[^)]*(?:\d|multi\d*|dlc|build|update|hotfix|patch|repack))[^)]*\)\s*$', re.IGNORECASE)
+_TITLE_UNCLOSED_PAREN_RE = re.compile(
+    r'\s*\(\s*(?:\d|v(?:ersion)?\b|build\b|update\b|patch\b|hotfix\b|multi|dlc)'
+    r'[^()]*$', re.IGNORECASE)
 _TITLE_DASH_TAIL_RE = re.compile(
     r'\s*[-–—]\s*(?:v[\d][\w.\-]*|build\s+[\w.]+|update(?:\s+[\w.]+)?|'
     r'hotfix\s+[\w.]+|patch\s+[\w.]+|\d[\d.,]*.*)\s*$', re.IGNORECASE)
+
+
+def _cut_top_level_plus(text: str) -> str:
+    """Drop a `` + extras`` suffix without cutting inside parentheses."""
+    depth = 0
+    for index, char in enumerate(text):
+        if char == '(':
+            depth += 1
+        elif char == ')':
+            depth = max(0, depth - 1)
+        elif char == '+' and depth == 0 and 0 < index < len(text) - 1 \
+                and text[index - 1].isspace() and text[index + 1].isspace():
+            return text[:index].rstrip()
+    return text
 def _page_key(page: int) -> str:
     return f'p{_PER_PAGE}-{page}'
 _HOMEPAGE_TTL_S = 30.0
@@ -99,10 +115,42 @@ _BACKWARDS_COMPAT_LINE_RE = re.compile(
     r'this repack (?:is|is not|isn.t)(?:\s+\w+){0,2}\s+backwards compatible',
     re.IGNORECASE,
 )
+_SIZE_NUM = r'\d+(?:[.,]\d+)?'
+_SIZE_UNIT = r'(?:GB|MB|TB|GiB|MiB|TiB)'
+_SIZE_WITH_UNIT = rf'{_SIZE_NUM}\s*{_SIZE_UNIT}'
+_SIZE_RANGE = (
+    rf'(?:{_SIZE_WITH_UNIT}(?:\s*(?:~|～|–|—|-|to)\s*{_SIZE_WITH_UNIT})?'
+    rf'|{_SIZE_NUM}(?:\s*(?:~|～|–|—|-|to)\s*{_SIZE_NUM})?\s*{_SIZE_UNIT})'
+)
 _BARE_SIZE_FRAGMENT_RE = re.compile(
-    r'^(?:from\s+)?\d+\.?\d*\s*(?:/\s*\d+\.?\d*\s*)?(?:GB|MB|TB)\s*(?:\[\s*Selective Download\s*\])?$',
+    rf'^(?:\[\s*)?(?:from\s+)?{_SIZE_RANGE}(?:\s*/\s*{_SIZE_RANGE})?'
+    rf'(?:\s*{_SIZE_UNIT})?'
+    rf'(?:\s*\[?\s*Selective\s+Download\s*\]?)?\s*\]?\.?$',
     re.IGNORECASE,
 )
+_SELECTIVE_ONLY_RE = re.compile(r'^(?:\[\s*)?Selective\s+Download(?:\s*\])?$', re.IGNORECASE)
+
+
+def _clean_fragment(text: str) -> str:
+    value = (text or '').replace('\x00', ' ')
+    value = re.sub(r'\s+', ' ', value).strip()
+    return value.lstrip('•-* ').strip()
+
+
+def _is_bare_size_fragment(text: str) -> bool:
+    candidate = _clean_fragment(text)
+    return bool(candidate and _BARE_SIZE_FRAGMENT_RE.match(candidate))
+
+
+def _is_metadata_noise(text: str) -> bool:
+    candidate = _clean_fragment(text)
+    if not candidate:
+        return True
+    return bool(
+        _BARE_SIZE_FRAGMENT_RE.match(candidate)
+        or _LEFTOVER_LABEL_RE.match(candidate)
+        or _SELECTIVE_ONLY_RE.match(candidate)
+    )
 
 def _strip_repeatedly(rx, text: str) -> str:
     while True:
@@ -763,13 +811,17 @@ class FitGirlSource(RepackSource):
 
     @classmethod
     def _strip_metadata_line(cls, text: str) -> str:
-        remainder = text
+        # Metadata is often split around ``<strong>`` tags and joined again by
+        # the caller, leaving NUL separators. Removing them first lets value
+        # patterns recognise complete ``Repack Size: from 51.2 GB`` chains.
+        remainder = (text or '').replace('\x00', ' ')
         for _ in range(8):
             stripped = cls._strip_one_metadata_chain(remainder)
             if stripped == remainder:
                 break
             remainder = stripped
-        return remainder
+        remainder = _clean_fragment(remainder)
+        return '' if _is_metadata_noise(remainder) else remainder
 
     @classmethod
     def _strip_one_metadata_chain(cls, text: str) -> str:
@@ -812,6 +864,17 @@ class FitGirlSource(RepackSource):
         remainder = re.sub(r'(?i)^\s*[•\-\*]*\s*(?:from\s+)?[\d.]+\s*(?:GB|MB|TB)\s*(?:\[\s*Selective Download\s*\])?\s*$', '', remainder).strip()
         remainder = re.sub(r'^[•\-\*]+\s*$', '', remainder).strip()
         return remainder
+
+    @staticmethod
+    def _looks_like_prose(text: str) -> bool:
+        """Guard the fallback so headings, labels and metadata never become descriptions."""
+        value = _clean_fragment(text)
+        if len(value) < 60 or _is_metadata_noise(value):
+            return False
+        words = re.findall(r"[^\W\d_]{2,}", value, re.UNICODE)
+        if len(words) < 10:
+            return False
+        return bool(re.search(r'[.!?…]', value)) or len(value) >= 140
 
     @staticmethod
     def _parse_description_and_size(soup) -> tuple[str, str | None, dict]:
@@ -1096,8 +1159,7 @@ class FitGirlSource(RepackSource):
             lines = body.split('\n')
             kept = []
             for line in lines:
-                candidate = line.strip().lstrip('•-* ').strip()
-                if candidate and _BARE_SIZE_FRAGMENT_RE.match(candidate):
+                if _is_metadata_noise(line):
                     continue
                 kept.append(line)
             return '\n'.join(kept).strip()
@@ -1120,23 +1182,33 @@ class FitGirlSource(RepackSource):
         description = _render(game_sections)
         repack_features = _render(repack_sections)
         if not description:
+            # Some newer posts have no "Game Description" block at all. Only
+            # keep real prose here; otherwise the fallback used to pick up
+            # metadata fragments or the "Backwards Compatibility" note and
+            # present them as the game description.
             fallback_parts = []
             for p in soup.find_all('p'):
-                text = p.get_text(strip=True)
+                text = FitGirlSource._strip_metadata_line(p.get_text(' ', strip=True))
                 if not text:
                     continue
-                text = FitGirlSource._strip_metadata_line(text)
-                if not text:
+                if _is_metadata_noise(text):
                     continue
-                if _looks_like_stop_heading(text) or _looks_like_discussion_link_line(text):
+                if (_looks_like_stop_heading(text) or _looks_like_discussion_link_line(text)
+                        or _looks_like_backwards_compat_line(text)):
+                    continue
+                if text.strip().rstrip(':').strip().lower() in (
+                        _REPACK_FEATURE_HEADINGS + _GAME_DESCRIPTION_HEADINGS + _DISCARD_HEADINGS
+                        + _STOP_HEADINGS + ('backwards compatibility',)):
                     continue
                 salvaged, hit_stop_marker = _split_at_stop_marker(text)
+                salvaged = FitGirlSource._strip_metadata_line(salvaged)
                 if hit_stop_marker:
-                    if salvaged:
+                    if salvaged and FitGirlSource._looks_like_prose(salvaged):
                         fallback_parts.append(salvaged)
                     break
-                fallback_parts.append(text)
-            description = '\n\n'.join(fallback_parts).strip()
+                if FitGirlSource._looks_like_prose(text):
+                    fallback_parts.append(text)
+            description = '\n\n'.join(dict.fromkeys(fallback_parts)).strip()
         if repack_features:
             metadata['repack_features'] = repack_features
         if screenshot_urls:
@@ -1211,7 +1283,10 @@ class FitGirlSource(RepackSource):
         title = _TITLE_ENTITY_TAIL_RE.sub('', title)
         title = _strip_repeatedly(_TITLE_BRACKET_TAIL_RE, title)
         title = _TITLE_REPACK_TAIL_RE.sub('', title)
-        title = _TITLE_PLUS_RE.split(title, maxsplit=1)[0]
+        # Remove bracketed metadata and extras before splitting on ``+`` so a
+        # plus sign inside ``(v1.2 + DLC)`` cannot leave a dangling parenthesis.
         title = _strip_repeatedly(_TITLE_PAREN_JUNK_RE, title)
+        title = _strip_repeatedly(_TITLE_UNCLOSED_PAREN_RE, title)
+        title = _cut_top_level_plus(title)
         title = _strip_repeatedly(_TITLE_DASH_TAIL_RE, title)
         return title.strip(' -–—\t,:')

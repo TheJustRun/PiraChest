@@ -168,6 +168,17 @@ def tr(key: str, default: Optional[str] = None, **kwargs) -> str:
     return _format(text, kwargs) if kwargs else text
 
 
+def tr_for(lang: str, key: str, default: Optional[str] = None, **kwargs) -> str:
+    """Translate a key for a specific language, regardless of the UI language."""
+    text = _lookup(key, lang)
+    if text is None:
+        _note_missing(key, lang)
+        if default is None:
+            return key
+        text = default
+    return _format(text, kwargs) if kwargs else text
+
+
 def register_locale_refresh(widget, callback: Callable[[], None]) -> None:
     callback()
     ref = weakref.ref(widget) if widget is not None else None

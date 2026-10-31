@@ -111,15 +111,18 @@ class _PosterView(QAbstractScrollArea):
 
     def __init__(self, parent, *, vertical, cell_w, poster_h, cover_attrs, key_attr, title_attr,
                  tooltip_fn, subtitle_fn, show_caption, fallback_icon_fn, colors_fn,
-                 img_size=None, cell_h=None):
+                 img_size=None, cell_h=None, meta_fn=None, search_fn=None):
         super().__init__(parent)
         self._vertical = vertical
         self._cw, self._ph, self._caption = cell_w, poster_h, show_caption
+        self._fixed_cell_h = cell_h is not None
         self._cell_h = cell_h if cell_h is not None else (
             _LIFT + poster_h + ((_CAPTION_GAP + _CAPTION_H) if show_caption else 0))
         self._img = tuple(img_size) if img_size else (cell_w, poster_h)
         self._cover_attrs, self._key_attr, self._title_attr = cover_attrs, key_attr, title_attr
         self._tooltip_fn, self._subtitle_fn, self._icon_fn = tooltip_fn, subtitle_fn, fallback_icon_fn
+        self._meta_fn = meta_fn
+        self._search_fn = search_fn
         self._colors_fn = colors_fn or default_colors
         self._rowmode = False
 
@@ -177,7 +180,7 @@ class _PosterView(QAbstractScrollArea):
                 continue
             self._keys.add(key)
             self._entries.append(entry)
-            self._lower.append((getattr(entry, self._title_attr, '') or '').lower())
+            self._lower.append(self._entry_search_text(entry))
             if self._query in self._lower[-1]:
                 self._rows.append(len(self._entries) - 1)
             added = True
@@ -197,6 +200,17 @@ class _PosterView(QAbstractScrollArea):
 
     def refresh(self) -> None:
         self._layout()
+
+    def set_show_caption(self, on: bool) -> None:
+        on = bool(on)
+        if on == self._caption:
+            return
+        self._caption = on
+        if not self._fixed_cell_h:
+            self._cell_h = _LIFT + self._ph + ((_CAPTION_GAP + _CAPTION_H) if on else 0)
+        self._reset_requests()
+        self._layout()
+        self.viewport().update()
 
 
     def _layout(self) -> None:
@@ -235,8 +249,26 @@ class _PosterView(QAbstractScrollArea):
     def _entry(self, pos: int):
         return self._entries[self._rows[pos]]
 
+    def _entry_search_text(self, entry) -> str:
+        if self._search_fn is not None:
+            try:
+                value = self._search_fn(entry)
+                if value:
+                    return str(value).casefold()
+            except Exception:
+                pass
+        return str(getattr(entry, self._title_attr, '') or '').casefold()
+
     def _title(self, pos: int) -> str:
         return getattr(self._entry(pos), self._title_attr, '') or ''
+
+    def _meta(self, pos: int) -> str:
+        if self._meta_fn is None:
+            return ''
+        try:
+            return str(self._meta_fn(self._entry(pos)) or '')
+        except Exception:
+            return ''
 
     def _src(self, pos: int) -> str:
         entry = self._entry(pos)
@@ -420,10 +452,26 @@ class _PosterView(QAbstractScrollArea):
             box = QRect(cell.x(), cell.y() + _LIFT + self._ph + _CAPTION_GAP, self._cw, _CAPTION_H)
             p.save()
             p.setClipRect(box)
-            p.setFont(self._f_small)
-            p.setPen(self._muted)
-            p.drawText(box, int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap),
-                       self._title(pos))
+            title = self._title(pos)
+            meta = self._meta(pos)
+            title_h = 18 if meta else _CAPTION_H
+            p.setFont(self._f_title if meta else self._f_small)
+            p.setPen(self._text if meta else self._muted)
+            fm = QFontMetrics(self._f_title if meta else self._f_small)
+            p.drawText(
+                QRect(box.x(), box.y(), box.width(), title_h),
+                int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
+                fm.elidedText(title, Qt.TextElideMode.ElideRight, box.width()),
+            )
+            if meta:
+                p.setFont(self._f_small)
+                p.setPen(self._muted)
+                fm_small = QFontMetrics(self._f_small)
+                p.drawText(
+                    QRect(box.x(), box.y() + 18, box.width(), _CAPTION_H - 18),
+                    int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
+                    fm_small.elidedText(meta, Qt.TextElideMode.ElideRight, box.width()),
+                )
             p.restore()
 
     def _paint_row(self, p: QPainter, pos: int, cell: QRect) -> None:
@@ -492,7 +540,7 @@ class PosterGrid(_PosterView):
     def __init__(self, parent=None, *, header=None, cell_w=150, poster_h=210,
                  cover_attrs=('poster_path', 'poster_url'), key_attr='url', title_attr='title',
                  tooltip_fn=None, subtitle_fn=None, show_caption=False, fallback_icon_fn=None, colors_fn=None,
-                 img_size=None, cell_h=None, side=_SIDE, top=_TOP):
+                 img_size=None, cell_h=None, side=_SIDE, top=_TOP, meta_fn=None, search_fn=None):
         self._header = header
         self._header_state = (True, 0)
         self._side, self._pad_top = side, top
@@ -501,7 +549,7 @@ class PosterGrid(_PosterView):
         super().__init__(parent, vertical=True, cell_w=cell_w, poster_h=poster_h, cover_attrs=cover_attrs,
                          key_attr=key_attr, title_attr=title_attr, tooltip_fn=tooltip_fn, subtitle_fn=subtitle_fn,
                          show_caption=show_caption, fallback_icon_fn=fallback_icon_fn, colors_fn=colors_fn,
-                         img_size=img_size, cell_h=cell_h)
+                         img_size=img_size, cell_h=cell_h, meta_fn=meta_fn, search_fn=search_fn)
         if header is not None:
             header.setParent(self.viewport())
             header.installEventFilter(self)

@@ -9,6 +9,7 @@ import sys
 import time
 import warnings
 from contextlib import suppress
+from functools import partial
 from ctypes import wintypes
 from typing import Any
 
@@ -35,7 +36,6 @@ from qfluentwidgets import (
     CompactSpinBox,
     ExpandGroupSettingCard,
     FluentIcon,
-    FlowLayout,
     IndicatorPosition,
     InfoBar,
     InfoBarPosition,
@@ -405,21 +405,29 @@ def _fix_setting_card_icon_box(icon_label) -> None:
         icon_label.move(geo.x() - shift, geo.y() - shift)
 
 
+_SS_GROUP_TITLE = 'color: palette(text); font-weight: 600; font-size: 16px; background: transparent;'
+_SS_TEXT = 'color: palette(text); background: transparent;'
+_SS_MUTED = 'color: palette(placeholder-text); background: transparent;'
+
+
+def _set_ss(widget, sheet: str) -> None:
+    if widget.styleSheet() != sheet:
+        widget.setStyleSheet(sheet)
+
+
 def _restyle_setting_cards(root: QWidget) -> None:
     for group in root.findChildren(SettingCardGroup):
         title = getattr(group, 'titleLabel', None)
         if title is not None:
-            title.setStyleSheet('color: palette(text); font-weight: 600; font-size: 16px; background: transparent;')
+            _set_ss(title, _SS_GROUP_TITLE)
     for card in root.findChildren(SettingCard):
         title = getattr(card, 'titleLabel', None)
         content = getattr(card, 'contentLabel', None)
         icon_label = getattr(card, 'iconLabel', None)
         if title is not None:
-            title.setStyleSheet('color: palette(text); background: transparent;'
-                                if card.isEnabled() else
-                                'color: palette(placeholder-text); background: transparent;')
+            _set_ss(title, _SS_TEXT if card.isEnabled() else _SS_MUTED)
         if content is not None:
-            content.setStyleSheet('color: palette(placeholder-text); background: transparent;')
+            _set_ss(content, _SS_MUTED)
         if icon_label is not None:
             with suppress(Exception):
                 _fix_setting_card_icon_box(icon_label)
@@ -775,11 +783,24 @@ class _UiSoundEventFilter(QObject):
 
     _INTERESTING = frozenset((QEvent.Type.Enter, QEvent.Type.MouseButtonRelease))
 
+    @staticmethod
+    def _muted(widget) -> bool:
+        current = widget
+        for _ in range(32):
+            if current is None:
+                return False
+            if getattr(current, '_pirachest_no_sfx', False):
+                return True
+            current = current.parentWidget()
+        return False
+
     def eventFilter(self, obj, event) -> bool:
         et = event.type()
         if et not in self._INTERESTING or not isinstance(obj, QWidget) or isinstance(obj, QAbstractItemView):
             return False
         with suppress(Exception):
+            if self._muted(obj):
+                return False
             if not (isinstance(obj, QAbstractButton) or getattr(obj, '_pirachest_sfx', False) or hasattr(obj, 'clicked')):
                 return False
             if not obj.isEnabled():
@@ -868,6 +889,17 @@ def install_ui_sound_filter(app) -> None:
     _patch_menu_sfx()
 
 
+_ONOFF_CACHE: dict = {}
+
+
+def _on_off(checked: bool) -> str:
+    lang = current_language()
+    pair = _ONOFF_CACHE.get(lang)
+    if pair is None:
+        pair = _ONOFF_CACHE[lang] = (tr_or('common.off', 'Off'), tr_or('common.on', 'On'))
+    return pair[bool(checked)]
+
+
 def tr_or(key: str, fallback: str, **kwargs) -> str:
     try:
         value = tr(key, **kwargs)
@@ -892,7 +924,7 @@ class _SectionCard(ExpandGroupSettingCard):
         self.switch.checkedChanged.connect(self._sync_switch_text)
 
     def _sync_switch_text(self, checked: bool) -> None:
-        self.switch.setText(tr_or('common.on', 'On') if checked else tr_or('common.off', 'Off'))
+        self.switch.setText(_on_off(checked))
 
     def setChecked(self, checked: bool) -> None:
         self.switch.setChecked(bool(checked))
@@ -1045,7 +1077,8 @@ class SettingsPage(QWidget):
         self._capturing_shortcut = None
         self._texts: list = []
         self._icon_entries: list = []
-        self._switch_labels: list = []
+        self._switch_labels: dict = {}
+        self._last_cache_probe = 0.0
         self._switches: list = []
         self._sections: list = []
         self._combos: list = []
@@ -1060,13 +1093,20 @@ class SettingsPage(QWidget):
         self._net_apply = None
         self._net_loading = False
         self._net_widgets: dict = {}
+        self._theme_dirty = False
         self.setStyleSheet('background: transparent;')
         self._build_steps = None
+        self._pending_group_adjust: set = set()
         self._prebuild_timer = QTimer(self)
         self._prebuild_timer.setSingleShot(True)
-        self._prebuild_timer.setInterval(500)
+        self._prebuild_timer.setInterval(0)
         self._prebuild_timer.timeout.connect(self._try_prebuild)
-        self._prebuild_timer.start()
+
+    def prepare(self) -> None:
+        if self._built or self._building:
+            return
+        if not self._prebuild_timer.isActive():
+            self._prebuild_timer.start()
 
 
     def _ensure_built(self) -> None:
@@ -1095,6 +1135,9 @@ class SettingsPage(QWidget):
     def _build_ui(self, background: bool = False) -> None:
         self._building = True
         self._build_locale = current_language()
+        with suppress(Exception):
+            self.setStyleSheet(settings_qss())
+            self._surface_styled = True
         self._build_steps = self._build_slices()
         if background:
             self._advance_background_build()
@@ -1139,10 +1182,9 @@ class SettingsPage(QWidget):
         self._building = False
         self._built = True
         self._populate()
+        self._flush_group_adjust()
         register_locale_refresh(self, self._apply_locale)
-        register_theme_refresh(self, self._refresh_icons)
-        register_theme_refresh(self, self._sync_accent_button)
-        register_theme_refresh(self, self._restyle_cards)
+        register_theme_refresh(self, self._on_theme_refresh)
         if self._build_locale != current_language():
             self._apply_locale()
         pending = self._pending_bind
@@ -1235,7 +1277,6 @@ class SettingsPage(QWidget):
             setter(self._t(key, fallback, **kwargs))
 
     def _bind_item(self, combo: ComboBox, index: int, key: str, fallback: str | None = None) -> None:
-        from functools import partial
         self._bind(partial(combo.setItemText, index), key, fallback)
 
     def _track_icon(self, widget, slot: str, icon, branded: bool = False) -> None:
@@ -1249,8 +1290,29 @@ class SettingsPage(QWidget):
     def _restyle_cards(self) -> None:
         _restyle_setting_cards(self)
 
+    def _on_theme_refresh(self) -> None:
+        if not self.isVisible():
+            self._theme_dirty = True
+            return
+        self._run_theme_refresh()
+
+    def _run_theme_refresh(self) -> None:
+        self._theme_dirty = False
+        self.setUpdatesEnabled(False)
+        try:
+            self._refresh_icons()
+            self._sync_accent_button()
+            self._restyle_cards()
+            with suppress(Exception):
+                qss = settings_qss()
+                if self.styleSheet() != qss:
+                    self.setStyleSheet(qss)
+        finally:
+            self.setUpdatesEnabled(True)
+
     def _refresh_icons(self) -> None:
-        for widget, slot, icon, branded in self._icon_entries:
+        for entry in self._icon_entries:
+            widget, slot, icon, branded = entry
             target = (
                 getattr(widget, 'iconLabel', None)
                 or getattr(widget, 'iconWidget', None)
@@ -1259,7 +1321,7 @@ class SettingsPage(QWidget):
             )
             if target is not None:
                 with suppress(RuntimeError):
-                    target.setIcon(branded_icon(slot, icon) if branded else themed_icon(slot, icon))
+                    target.setIcon((branded_icon if branded else themed_icon)(slot, icon))
 
     def _sync_accent_button(self) -> None:
         button = getattr(self, '_accent_color_btn', None)
@@ -1270,12 +1332,12 @@ class SettingsPage(QWidget):
     def _track_switch_text(self, switch: SwitchButton) -> None:
         if switch in self._switch_labels:
             return
-        self._switch_labels.append(switch)
+        self._switch_labels[switch] = None
         switch.checkedChanged.connect(lambda checked, s=switch: self._set_switch_text(s, checked))
         self._set_switch_text(switch, switch.isChecked())
 
     def _set_switch_text(self, switch: SwitchButton, checked: bool) -> None:
-        switch.setText(tr_or('common.on', 'On') if checked else tr_or('common.off', 'Off'))
+        switch.setText(_on_off(checked))
 
     def _quiet(self, widget, setter, value) -> None:
         widget.blockSignals(True)
@@ -1314,10 +1376,24 @@ class SettingsPage(QWidget):
         group.show()
         self._page_layout.addSpacing(18)
 
-    @staticmethod
-    def _add_card(group: SettingCardGroup, card: QWidget) -> None:
-        group.addSettingCard(card)
+    def _add_card(self, group: SettingCardGroup, card: QWidget) -> None:
+        if card.parentWidget() is not group:
+            card.setParent(group)
+        group.cardLayout.addWidget(card)
         card.show()
+        if group not in self._pending_group_adjust:
+            self._pending_group_adjust.add(group)
+            QTimer.singleShot(0, self, self._flush_group_adjust)
+
+    def _flush_group_adjust(self) -> None:
+        pending = self._pending_group_adjust
+        if not pending:
+            return
+        groups = list(pending)
+        pending.clear()
+        for group in groups:
+            with suppress(RuntimeError):
+                group.adjustSize()
 
     def _decorate(self, card, slot: str, icon, title_key: str, title_fb, content_key: str, content_fb,
                   content_kwargs: dict | None = None) -> None:
@@ -1333,7 +1409,7 @@ class SettingsPage(QWidget):
             themed_icon(slot, icon),
             self._t(title_key, title_fb),
             self._t(content_key, content_fb, **kwargs),
-            self,
+            group,
         )
         self._decorate(card, slot, icon, title_key, title_fb, content_key, content_fb, kwargs)
         self._tail(card, *tail)
@@ -1346,6 +1422,7 @@ class SettingsPage(QWidget):
             icon=themed_icon(slot, icon),
             title=self._t(title_key, title_fb),
             content=self._t(content_key, content_fb),
+            parent=group,
         )
         self._decorate(card, slot, icon, title_key, title_fb, content_key, content_fb)
         self._tail(card, *tail)
@@ -1400,6 +1477,8 @@ class SettingsPage(QWidget):
 
     def _apply_setting(self, attr: str, value) -> None:
         apply_settings(**{attr: value})
+        if getattr(settings, attr, None) != value:
+            setattr(settings, attr, value)
         save_settings(settings)
         self.settings_changed.emit()
 
@@ -1423,6 +1502,7 @@ class SettingsPage(QWidget):
 
         self._theme_btn = PushButton(self._t('settings.theme_choose', 'Choose theme'))
         self._bind(self._theme_btn.setText, 'settings.theme_choose', 'Choose theme')
+        self._theme_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._theme_btn.clicked.connect(self._on_theme_choose_clicked)
         self._theme_reload_btn = TransparentToolButton(themed_icon('settings.theme_reload', FluentIcon.SYNC), self)
         self._track_icon(self._theme_reload_btn, 'settings.theme_reload', FluentIcon.SYNC)
@@ -1795,6 +1875,41 @@ class SettingsPage(QWidget):
             self._chk_pc_games, 'repacks', 'gog', 'repacks.tab_gog', FluentIcon.GAME,
             'settings.tab_gog_title', 'settings.tab_gog_content',
             icon_override=_repacks_tab_icon('gog'), branded=True)
+        card = self._chk_pc_games
+        self._repack_source_combo = ComboBox()
+        self._repack_source_combo.setMinimumWidth(150)
+        self._repack_source_combo.addItem(self._t('settings.repack_source_ask', 'Ask every time'), userData='ask')
+        self._bind_item(self._repack_source_combo, 0, 'settings.repack_source_ask', 'Ask every time')
+        self._repack_source_combo.addItem('1337x', userData='1337x')
+        self._repack_source_combo.addItem('RuTor', userData='rutor')
+        self._repack_source_combo.currentIndexChanged.connect(
+            lambda _i: self._save_combo(self._repack_source_combo, 'repack_preferred_source'))
+        self._combos.append((self._repack_source_combo, 'repack_preferred_source'))
+        self._add_group_row(
+            card, 'settings.repack_source', FluentIcon.DOWNLOAD,
+            'settings.repack_source_title', 'Preferred download source',
+            'settings.repack_source_content',
+            'Skip the source picker and use this mirror automatically when a repack offers several. Asks again if the mirror has no magnet link.',
+            self._repack_source_combo)
+        self._add_section_switch(
+            card, 'settings.repack_show_titles', FluentIcon.FONT,
+            'settings.repack_show_titles_title', 'Show titles under cards',
+            'settings.repack_show_titles_content', 'Display the game title below each cover in the grid.',
+            'repack_show_titles')
+        self._add_section_switch(
+            card, 'settings.steam_enrichment', FluentIcon.GLOBE,
+            'settings.steam_enrichment_title', 'Steam enrichment',
+            'settings.steam_enrichment_content',
+            'Add optional Steam details, screenshots and trailers to FitGirl games. Cached; works offline.',
+            'steam_enrichment_enabled')
+        for attr, title, content in (
+                ('steam_banner', 'Steam banner', 'Show the game hero behind the details page.'),
+                ('steam_logo', 'Steam logo', 'Show the game logo instead of the title text.'),
+                ('steam_description', 'Steam description',
+                 'Replace the repack description with Steam\'s, including images. Uses more data and memory.')):
+            self._add_section_switch(
+                card, f'settings.{attr}', FluentIcon.GAME,
+                f'settings.{attr}_title', title, f'settings.{attr}_content', content, attr)
         yield
 
         self._chk_music = self._section(
@@ -1862,7 +1977,7 @@ class SettingsPage(QWidget):
         return spin
 
     def _tv_row(self, icon, title_key: str, title_fb: str,
-                content_key: str | None, content_fb: str, widget) -> None:
+                content_key: str | None, content_fb: str, widget):
         group = self._chk_tv.addGroup(
             themed_icon('settings.tv_stream', icon),
             self._t(title_key, title_fb),
@@ -1873,6 +1988,7 @@ class SettingsPage(QWidget):
         self._bind(group.setTitle, title_key, title_fb)
         if content_key:
             self._bind(group.setContent, content_key, content_fb)
+        return group
 
     def _build_sections_tv(self):
         group = self._feature_group
@@ -1916,7 +2032,7 @@ class SettingsPage(QWidget):
             lambda checked: self._save_switch('tv_auto_pick', checked))
         self._tv_row(FluentIcon.SPEED_HIGH, 'settings.tv_auto_pick_title', 'Auto-pick stream',
                      'settings.tv_auto_pick_content',
-                     'Skip the source list and play the best match for the options below.',
+                     'Direct sources always start instantly. Turn this on to skip the list for torrents too.',
                      self._sw_auto_pick)
         yield
 
@@ -1938,6 +2054,52 @@ class SettingsPage(QWidget):
                      _inline_row(self._check('tv_tbhb_enabled', 'settings.tv_tbhb_enabled',
                                              'The Black Hole Bay')))
 
+        yield
+
+        self._external_switch = SwitchButton('', self, IndicatorPosition.RIGHT)
+        self._quiet_switch(self._external_switch, bool(settings.tv_external_enabled))
+        self._track_switch_text(self._external_switch)
+        self._external_switch.checkedChanged.connect(self._on_external_toggled)
+        self._switches.append((self._external_switch, 'tv_external_enabled'))
+        self._tv_row(FluentIcon.CLOUD, 'settings.external_providers_title', 'Native providers',
+                     'settings.external_providers_content',
+                     'Run the bundled Vyla provider inside PiraChest',
+                     self._external_switch)
+        yield
+
+        self._vyla_switch = SwitchButton('', self, IndicatorPosition.RIGHT)
+        self._quiet_switch(self._vyla_switch, bool(settings.tv_vyla_enabled))
+        self._track_switch_text(self._vyla_switch)
+        self._vyla_switch.checkedChanged.connect(
+            lambda checked: self._save_switch('tv_vyla_enabled', checked))
+        self._switches.append((self._vyla_switch, 'tv_vyla_enabled'))
+        self._tv_row(FluentIcon.GLOBE, 'settings.vyla_enabled_title', 'Vyla',
+                     'settings.vyla_enabled_content',
+                     'Resolve movies and shows through the bundled Vyla SDK',
+                     self._vyla_switch)
+        yield
+
+        self._external_status_lbl = CaptionLabel('')
+        self._external_status_lbl.setWordWrap(True)
+        self._btn_external_setup = PushButton(self._t('settings.external_setup', 'Set up runtime'))
+        self._bind(self._btn_external_setup.setText, 'settings.external_setup', 'Set up runtime')
+        self._btn_external_setup.clicked.connect(self._on_external_setup)
+        status_box = QWidget()
+        status_layout = QVBoxLayout(status_box)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setSpacing(6)
+        status_layout.addWidget(self._external_status_lbl)
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(8)
+        button_row.addWidget(self._btn_external_setup, 0, Qt.AlignmentFlag.AlignVCenter)
+        button_row.addStretch(1)
+        status_layout.addLayout(button_row)
+        self._external_status_card = self._tv_row(
+            FluentIcon.INFO, 'settings.external_status_title', 'Provider runtime',
+            'settings.external_status_content', 'Node.js and the bundled Vyla SDK',
+            status_box)
+        QTimer.singleShot(120, self._refresh_external_status)
         yield
 
         self._tv_row(FluentIcon.FOLDER, 'settings.tv_pick_size_title', 'File size',
@@ -2256,6 +2418,7 @@ class SettingsPage(QWidget):
             group, 'settings.external_client', FluentIcon.SEND,
             'settings.external_client_title', None, 'settings.external_client_content', None,
             attr='external_torrent_client')
+        yield
 
         if os.name != 'nt':
             return
@@ -2282,6 +2445,56 @@ class SettingsPage(QWidget):
         self._refresh_associations_status()
         yield
 
+
+    def _on_external_toggled(self, checked: bool) -> None:
+        self._save_switch('tv_external_enabled', checked)
+        if checked:
+            self._on_external_setup()
+        else:
+            from src.core.tv import external as external_backend
+            external_backend.shutdown_external()
+
+    def _on_external_setup(self) -> None:
+        from src.core.tv import external as external_backend
+        self._external_setup_requested = True
+        external_backend.ensure_runtime(wait=False)
+        self._refresh_external_status()
+        timer = getattr(self, '_external_timer', None)
+        if timer is None:
+            timer = self._external_timer = QTimer(self)
+            timer.setInterval(1000)
+            timer.timeout.connect(self._refresh_external_status)
+        timer.start()
+
+    def _refresh_external_status(self) -> None:
+        from src.core.tv import external as external_backend
+        status = external_backend.integration_status()
+        if status.get('provisioning'):
+            text = self._t('settings.external_status_preparing',
+                           'Preparing Node.js and provider dependencies...')
+        elif status.get('ready'):
+            text = self._t('settings.external_status_ready',
+                           'Node.js ready · Vyla SDK loaded')
+        elif status.get('error'):
+            text = self._t('settings.external_status_error',
+                           'Setup failed: {error}', error=status['error'])
+        elif status.get('node'):
+            text = self._t('settings.external_status_deps',
+                           'Node.js found. Installing provider dependencies...')
+        else:
+            text = self._t('settings.external_status_missing',
+                           'Node.js runtime not installed. Set up downloads it automatically.')
+        self._external_status_lbl.setText(text)
+        timer = getattr(self, '_external_timer', None)
+        if timer is not None and not status.get('provisioning'):
+            timer.stop()
+            if status.get('ready') and getattr(self, '_external_setup_requested', False):
+                self._external_setup_requested = False
+                InfoBar.success(
+                    title=self._t('settings.external_setup_done', 'Providers ready'),
+                    content=self._t('settings.external_setup_done_content',
+                                   'Vyla is ready to use.'),
+                    duration=3000, parent=self.window())
 
     def _build_debrid(self):
         group = self._debrid_group = self._group('settings.group_debrid', 'Debrid (WIP, needs testing)')
@@ -2730,15 +2943,19 @@ class SettingsPage(QWidget):
 
 
     def _apply_locale(self, *_args) -> None:
-        for setter, key, fallback, kwargs in list(self._texts):
-            with suppress(RuntimeError, TypeError, KeyError):
-                setter(self._t(key, fallback, **kwargs))
-        for switch in list(self._switch_labels):
-            with suppress(RuntimeError):
-                self._set_switch_text(switch, switch.isChecked())
-        if self._theme_provides_background():
-            self._bg_card.setContent(
-                self._t('settings.background_locked_by_theme', 'This theme includes its own background.'))
+        self.setUpdatesEnabled(False)
+        try:
+            for setter, key, fallback, kwargs in self._texts:
+                with suppress(RuntimeError, TypeError, KeyError):
+                    setter(self._t(key, fallback, **kwargs))
+            for switch in self._switch_labels:
+                with suppress(RuntimeError):
+                    self._set_switch_text(switch, switch.isChecked())
+            if self._theme_provides_background():
+                self._bg_card.setContent(
+                    self._t('settings.background_locked_by_theme', 'This theme includes its own background.'))
+        finally:
+            self.setUpdatesEnabled(True)
         if os.name == 'nt' and hasattr(self, '_assoc_status_lbl'):
             self._refresh_associations_status()
         self._refresh_debrid_token_state()
@@ -2752,24 +2969,33 @@ class SettingsPage(QWidget):
 
     def _on_theme_choose_clicked(self) -> None:
         from src.gui.main_window import pick_theme
-        chosen = pick_theme(self.window(), self._current_theme_id())
-        if chosen:
-            self._on_theme_selected(chosen)
 
-    def _on_theme_selected(self, option: str) -> None:
+        if getattr(self, '_theme_picker_open', False):
+            return
+        self._theme_picker_open = True
+        QTimer.singleShot(400, lambda: setattr(self, '_theme_picker_open', False))
+        self._theme_btn.clearFocus()
+        pick_theme(
+            self.window(), self._current_theme_id(),
+            on_accept=lambda option: self._on_theme_selected(option, activate=False),
+        )
+
+    def _on_theme_selected(self, option: str, activate: bool = True) -> None:
         if option in ('dark', 'light'):
             mode = ThemeMode.DARK if option == 'dark' else ThemeMode.LIGHT
             settings.theme_mode = mode
             settings.theme_preset = None
             apply_settings(theme_mode=mode, theme_preset=None)
             save_settings(settings)
-            activate_theme(None, dark=(option == 'dark'))
+            if activate:
+                activate_theme(None, dark=(option == 'dark'))
             apply_theme_font_families(None)
         else:
             meta = preset_meta(option)
             if meta is None:
                 return
-            activate_theme(option)
+            if activate:
+                activate_theme(option)
             apply_theme_font_families(resolve_font_families(meta))
             settings.theme_preset = option
             apply_settings(theme_preset=option)
@@ -2985,7 +3211,7 @@ class SettingsPage(QWidget):
             themed_icon('settings.keyboard_shortcut', FluentIcon.SETTING),
             self._t('settings.group_shortcuts', 'Keyboard shortcuts'),
             self._t('settings.group_shortcuts_content', 'Expand to view and remap every shortcut'),
-            self,
+            self._general_group,
         )
         self._shortcuts_card = card
         self._track_icon(card, 'settings.keyboard_shortcut', FluentIcon.SETTING)
@@ -3346,6 +3572,10 @@ class SettingsPage(QWidget):
 
 
     def _refresh_cache_size(self) -> None:
+        now = time.monotonic()
+        if now - self._last_cache_probe < 20.0:
+            return
+        self._last_cache_probe = now
         from src.core import worker as _worker
         from src.core.cache import app_cache_size
         _worker.submit(app_cache_size, on_done=self._cache_size_ready.emit,
@@ -3365,14 +3595,21 @@ class SettingsPage(QWidget):
         if not box.exec():
             return
         self._btn_clear_cache.setEnabled(False)
+
+        def clear_all():
+            clear_app_cache()
+            from src.core.repacks.enrichment import clear_steam_cache
+            clear_steam_cache()
+
         _worker.submit(
-            clear_app_cache,
+            clear_all,
             on_done=lambda _result: self._cache_clear_finished.emit(''),
             on_error=lambda message: self._cache_clear_finished.emit(str(message) or 'unknown error'),
             owner=self, key='cache-clear', priority=_worker.Priority.NORMAL)
 
     def _on_cache_cleared(self, error: str) -> None:
         self._btn_clear_cache.setEnabled(True)
+        self._last_cache_probe = 0.0
         self._refresh_cache_size()
         if error:
             logger.error('Failed to clear cache: %s', error)
@@ -3381,7 +3618,6 @@ class SettingsPage(QWidget):
             title=tr('settings.clear_cache_done_title'), content='',
             orient=Qt.Orientation.Horizontal, isClosable=True,
             position=InfoBarPosition.TOP_RIGHT, duration=2500, parent=self.window())
-
 
     def _on_wipe_all(self) -> None:
         box = MessageBoxBase(self.window())
@@ -3577,7 +3813,7 @@ class SettingsPage(QWidget):
 
     def _on_make_default_torrent_client(self) -> None:
         try:
-            if associations_need_repair():
+            if not settings.associations_enabled or associations_need_repair():
                 register_associations()
         except Exception:
             logger.exception('Failed to register file associations before opening Default Apps')
@@ -3644,14 +3880,11 @@ class SettingsPage(QWidget):
 
 
     def showEvent(self, event) -> None:
-        self._ensure_built()
+        if not self._built and not self._building:
+            self._build_ui(background=True)
         super().showEvent(event)
-        if not self._surface_styled:
-            self._surface_styled = True
-            with suppress(Exception):
-                qss = settings_qss()
-                if self.styleSheet() != qss:
-                    self.setStyleSheet(qss)
+        if self._theme_dirty:
+            self._run_theme_refresh()
         self._refresh_cache_size()
 
     def hideEvent(self, event) -> None:
@@ -3680,10 +3913,6 @@ def apply_theme_font_families(font_families: tuple | None) -> None:
 
 
 def apply_qfluentwidgets_font_families() -> None:
-    try:
-        from qfluentwidgets import setFontFamilies
-    except ImportError:
-        return
     with suppress(Exception):
         setFontFamilies(['Figtree', 'Segoe UI', 'Microsoft YaHei', 'PingFang SC'])
 
@@ -3722,10 +3951,6 @@ SHORTCUT_ICONS = {
 
 def shortcut_map() -> dict:
     try:
-        from PySide6.QtGui import QKeySequence
-    except Exception:
-        QKeySequence = None
-    try:
         saved = settings.keyboard_shortcuts or {}
     except Exception:
         saved = {}
@@ -3734,7 +3959,7 @@ def shortcut_map() -> dict:
         key = saved.get(action_id, default_key)
         if not isinstance(key, str) or not key.strip():
             key = default_key
-        elif QKeySequence is not None and QKeySequence(key).isEmpty():
+        elif QKeySequence(key).isEmpty():
             key = default_key
         mapping[action_id] = key
     return mapping

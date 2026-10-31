@@ -70,6 +70,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
@@ -1943,6 +1945,16 @@ class ThemeManager:
     def _apply_loop(self) -> None:
         self._notify_pending = False
         self._applying = True
+        app = QApplication.instance()
+        frozen = []
+        if app is not None:
+            for window in app.topLevelWidgets():
+                try:
+                    if window.isVisible() and window.updatesEnabled():
+                        window.setUpdatesEnabled(False)
+                        frozen.append(window)
+                except RuntimeError:
+                    pass
         try:
             while True:
                 self._emit()
@@ -1951,6 +1963,12 @@ class ThemeManager:
                 self._reapply = False
         finally:
             self._applying = False
+            # Paint once with the finished palette instead of showing every
+            # intermediate restyle pass.
+            for window in frozen:
+                with suppress(RuntimeError):
+                    window.setUpdatesEnabled(True)
+                    window.update()
 
     def _emit(self) -> None:
         if self._applied_version == self.version:
@@ -1966,7 +1984,6 @@ class ThemeManager:
                 color_changed = True
         apply_app_palette()
         _restyle_qfluent_widgets()
-        _repolish_widgets()
         apply_widget_rules()
         qconfig.themeChanged.emit(qconfig.theme)
         if color_changed:
@@ -2011,6 +2028,38 @@ class ThemeManager:
         self._watch(meta)
 
     def activate(self, preset_id: Optional[str] = None, dark: Optional[bool] = None) -> None:
+        # Hold painting for the whole switch. Setting qconfig.theme / themeColor
+        # below restyles widgets and fires themeChanged *before* _notify() runs,
+        # so without this the window can paint a half-switched frame (old and new
+        # scrollbars / backgrounds on top of each other) for a few milliseconds.
+        frozen = self._freeze_windows()
+        try:
+            self._activate_unfrozen(preset_id, dark)
+        finally:
+            self._thaw_windows(frozen)
+
+    @staticmethod
+    def _freeze_windows() -> list:
+        frozen = []
+        app = QApplication.instance()
+        if app is not None:
+            for window in app.topLevelWidgets():
+                try:
+                    if window.isVisible() and window.updatesEnabled():
+                        window.setUpdatesEnabled(False)
+                        frozen.append(window)
+                except RuntimeError:
+                    pass
+        return frozen
+
+    @staticmethod
+    def _thaw_windows(frozen: list) -> None:
+        for window in frozen:
+            with suppress(RuntimeError):
+                window.setUpdatesEnabled(True)
+                window.update()
+
+    def _activate_unfrozen(self, preset_id: Optional[str] = None, dark: Optional[bool] = None) -> None:
         meta = self.presets.get(preset_id)
         self._set_active(meta)
         if meta is not None:
@@ -2408,32 +2457,21 @@ def apply_app_palette() -> None:
 
 
 def _restyle_qfluent_widgets() -> None:
+    # Setting a style sheet on every visible widget costs hundreds of
+    # milliseconds. qfluentwidgets already ships a paint-time watcher for the
+    # ``dirty-qss`` property, so mark every managed widget and let the next
+    # paint restyle it. Painting is frozen by the caller, which coalesces all
+    # of those style recalculations into one pass.
     removes = []
-    for widget, source in list(styleSheetManager.items()):
+    for widget, _source in list(styleSheetManager.items()):
         try:
+            widget.setProperty('dirty-qss', True)
             if widget.isVisible():
-                setStyleSheet(widget, source, qconfig.theme)
-            else:
-                styleSheetManager.register(source, widget)
-                widget.setProperty('dirty-qss', True)
+                widget.update()
         except RuntimeError:
             removes.append(widget)
     for widget in removes:
         styleSheetManager.deregister(widget)
-
-
-def _repolish_widgets() -> None:
-    app = QApplication.instance()
-    if app is None:
-        return
-    for w in app.topLevelWidgets():
-        if not shiboken6.isValid(w) or w in styleSheetManager.widgets:
-            continue
-        try:
-            sheet = w.styleSheet()
-            w.setStyleSheet(sheet[:-1] if sheet.endswith(" ") else sheet + " ")
-        except RuntimeError:
-            pass
 
 
 def _repaint_now() -> None:
@@ -3264,6 +3302,11 @@ class DwmBackdrop:
 
     def __init__(self) -> None:
         self._ready = False
+        self._last_kind = None
+        self._last_frame = None
+        self._last_dark = None
+        self._last_corner = None
+        self._last_border = None
         if not IS_WIN:
             return
         try:
@@ -3341,26 +3384,35 @@ class DwmBackdrop:
             return
         build = _build()
         h = int(hwnd)
+        kind_changed = kind != self._last_kind
 
-        self._accent(h, 0)
-        if build < 10240:
+        # Only clear the backdrop when no new one replaces it below. Clearing
+        # first and re-applying right after lets DWM composite one frame with
+        # no backdrop, which shows up as a flash while switching themes.
+        replaced = (kind == "acrylic" and build >= 17134) or (kind == "blur" and build >= 6000)
+        if kind_changed and not replaced:
+            self._accent(h, 0)
+        if kind_changed and build < 10240 and kind != "blur":
             self._blur_behind(h, False)
         if build >= 22621:
             self._attr(h, 38, 1)
         elif build >= 22000:
             self._attr(h, 1029, 0)
 
-        if build >= 17763 and self._attr(h, 20, int(dark)) != 0:
-            self._attr(h, 19, int(dark))
+        if build >= 17763 and dark != self._last_dark:
+            if self._attr(h, 20, int(dark)) != 0:
+                self._attr(h, 19, int(dark))
 
         if build >= 22000:
-            self._attr(h, 33, _CORNER_PREF.get(corner or "default", 0))
-            if border is not None:
-                self._attr(h, 34, border.red() | (border.green() << 8) | (border.blue() << 16))
-            else:
-                self._attr(h, 34, 0xFFFFFFFF)
+            corner_value = _CORNER_PREF.get(corner or "default", 0)
+            if corner_value != self._last_corner:
+                self._attr(h, 33, corner_value)
+            border_value = (0xFFFFFFFF if border is None
+                            else border.red() | (border.green() << 8) | (border.blue() << 16))
+            if border_value != self._last_border:
+                self._attr(h, 34, border_value)
 
-        if build >= 6000:
+        if build >= 6000 and frame != self._last_frame:
 
             self._extend(h, byref(_Margins(-1, -1, -1, -1) if frame else _Margins(0, 0, 0, 0)))
 
@@ -3372,6 +3424,14 @@ class DwmBackdrop:
                 self._accent(h, 3, 0, 0)
             elif build >= 6000:
                 self._blur_behind(h, True)
+
+        self._last_kind = kind
+        self._last_frame = frame
+        self._last_dark = dark
+        if build >= 22000:
+            self._last_corner = _CORNER_PREF.get(corner or "default", 0)
+            self._last_border = (0xFFFFFFFF if border is None
+                                 else border.red() | (border.green() << 8) | (border.blue() << 16))
 
 
 _CHIP_BASE_STYLE: dict = {
@@ -4340,10 +4400,18 @@ class WindowChrome(QObject):
                     tint.setAlpha(153)
                 dark = isDarkTheme() if spec.dark is None else spec.dark
                 frame = theme_win7_frame(active_preset_id())
-                key = (self._kind, dark, tint.rgba(), spec.corner, frame)
+                tint_key = tint.rgba() if self._kind == "acrylic" else 0
+                key = (self._kind, dark, tint_key, spec.corner, frame)
                 if key != self._backdrop_last:
+                    last = self._backdrop_last
+                    # Dark-mode and tint-only changes need no frame
+                    # invalidation: re-applying SetWindowPos/RedrawWindow here
+                    # makes DWM composite an extra frame, which shows up as a
+                    # duplicated window flash on dark <-> light switches.
+                    structural = not last or (last[0], last[3], last[4]) != (key[0], key[3], key[4])
                     self._backdrop.apply(int(window.winId()), self._kind, dark, tint=tint, corner=spec.corner, frame=frame)
-                    self._backdrop.refresh(int(window.winId()))
+                    if structural:
+                        self._backdrop.refresh(int(window.winId()))
                     self._backdrop_last = key
 
 
@@ -4751,6 +4819,131 @@ def _spec_icon(spec, size: int = 20) -> QIcon:
         return image_icon(spec["value"], size, bool(spec.get("crop", True)))
     f = _fluent_icon_by_name(spec.get("value", ""))
     return f.icon(color=QColor(manager.palette()["icon_color"])) if f is not None else QIcon()
+
+
+class ScrollingTextDelegate(QStyledItemDelegate):
+    """Scroll an overflowing cell's text while the pointer rests on it.
+
+    The column keeps its normal width and ellipsis, so neighbouring columns do
+    not get pushed off-screen. After a short hover delay the full text slides
+    left until the end is visible, then loops.
+    """
+
+    def __init__(self, view, column: int = 0, padding: int = 16):
+        super().__init__(view)
+        self._view = view
+        self._column = column
+        self._padding = padding
+        self._index = None
+        self._offset = 0
+        self._active = False
+        self._delay = QTimer(self)
+        self._delay.setSingleShot(True)
+        self._delay.setInterval(600)
+        self._delay.timeout.connect(self._begin)
+        self._timer = QTimer(self)
+        self._timer.setInterval(30)
+        self._timer.timeout.connect(self._tick)
+        view.viewport().setMouseTracking(True)
+        view.viewport().installEventFilter(self)
+        view.setItemDelegateForColumn(column, self)
+
+    def _alive(self) -> bool:
+        return shiboken6.isValid(self._view)
+
+    def eventFilter(self, obj, event):
+        if not self._alive():
+            return False
+        if obj is self._view.viewport():
+            kind = event.type()
+            if kind == QEvent.Type.MouseMove:
+                index = self._view.indexAt(event.position().toPoint())
+                if index.isValid() and index.column() == self._column:
+                    if index != self._index:
+                        self._stop()
+                        self._index = index
+                        self._delay.start()
+                elif self._index is not None:
+                    self._stop()
+            elif kind in (QEvent.Type.Leave, QEvent.Type.Hide, QEvent.Type.Wheel):
+                self._stop()
+        return super().eventFilter(obj, event)
+
+    def _stop(self) -> None:
+        self._delay.stop()
+        self._timer.stop()
+        self._active = False
+        index, self._index = self._index, None
+        self._offset = 0
+        if index is not None and index.isValid() and self._alive():
+            self._view.viewport().update(self._view.visualRect(index))
+
+    def _begin(self) -> None:
+        if not self._alive():
+            return
+        if self._index is None or not self._index.isValid():
+            return
+        self._active = True
+        self._offset = 0
+        self._timer.start()
+        self._view.viewport().update(self._view.visualRect(self._index))
+
+    def _tick(self) -> None:
+        if not self._alive():
+            self._timer.stop()
+            self._delay.stop()
+            return
+        index = self._index
+        if index is None or not index.isValid():
+            self._stop()
+            return
+        text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        rect = self._text_rect(index, self._view.visualRect(index))
+        if rect.width() <= 0:
+            self._stop()
+            return
+        font = index.data(Qt.ItemDataRole.FontRole) or self._view.font()
+        overflow = QFontMetrics(font).horizontalAdvance(text) - rect.width()
+        if overflow <= 0:
+            self._stop()
+            return
+        self._offset += 2
+        if self._offset > overflow + 32:
+            self._timer.stop()
+            self._delay.start()
+        else:
+            self._view.viewport().update(self._view.visualRect(index))
+
+    def _text_rect(self, index, rect: QRect) -> QRect:
+        rect = QRect(rect)
+        left = self._padding
+        if index.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+            width = QApplication.style().pixelMetric(QStyle.PixelMetric.PM_IndicatorWidth)
+            left += width + 4
+        rect.setLeft(rect.left() + left)
+        rect.setRight(rect.right() - 6)
+        return rect
+
+    def paint(self, painter, option, index) -> None:
+        if index.column() != self._column or index != self._index or not self._active:
+            super().paint(painter, option, index)
+            return
+        text = option.text or str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        rect = self._text_rect(index, option.rect)
+        if rect.width() <= 0 or option.fontMetrics.horizontalAdvance(text) <= rect.width():
+            super().paint(painter, option, index)
+            return
+        original = option.text
+        option.text = ""
+        super().paint(painter, option, index)
+        option.text = original
+        painter.save()
+        painter.setClipRect(rect)
+        painter.setFont(option.font)
+        painter.setPen(option.palette.color(QPalette.ColorRole.Text))
+        y = rect.center().y() + (option.fontMetrics.ascent() - option.fontMetrics.descent()) // 2
+        painter.drawText(rect.left() - self._offset, y, text)
+        painter.restore()
 
 
 def apply_widget_rules() -> None:

@@ -621,6 +621,13 @@ def _install_ffmpeg(on_progress: Callable[[int, int], None], is_cancelled: Optio
             pass
 
 
+def install_ffmpeg(on_progress: Callable[[int, int], None],
+                   is_cancelled: Optional[Callable[[], bool]] = None) -> None:
+    """Install only ffmpeg/ffprobe into the managed tools folder."""
+    os.makedirs(_dir(), exist_ok=True)
+    _install_ffmpeg(on_progress, is_cancelled)
+
+
 def _qjs_asset() -> str:
     machine = platform.machine().lower()
     if sys.platform == "win32":

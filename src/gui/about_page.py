@@ -4,7 +4,6 @@ import logging
 import os
 import random
 from collections import deque
-from typing import Optional
 
 from PySide6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -39,47 +38,10 @@ from src.core.theme import (
     to_color,
 )
 from src.core.translations import register_locale_refresh, tr
+from .assets import DISCORD_URL, PHOTO_DIR, find_logo_path
 from .settings_page import make_smooth_scroll_area
 
 logger = logging.getLogger(__name__)
-
-
-_GUI_DIR = os.path.dirname(os.path.abspath(__file__))
-_PHOTO_DIR = os.path.join(_GUI_DIR, 'photos')
-_LOGO_CANDIDATES = ('logo.ico', 'logo.png')
-_APP_ICON_CANDIDATES = ('icon.ico', 'icon.png')
-
-
-def find_logo_path() -> Optional[str]:
-    for name in _LOGO_CANDIDATES:
-        candidate = os.path.join(_PHOTO_DIR, name)
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
-
-def find_app_icon_path() -> Optional[str]:
-    for name in _APP_ICON_CANDIDATES:
-        candidate = os.path.join(_PHOTO_DIR, name)
-        if os.path.isfile(candidate):
-            return candidate
-    return find_logo_path()
-
-
-_SRC_DIR = os.path.dirname(_GUI_DIR)
-_DISCORD_ICON_CANDIDATES = (
-    os.path.join(_SRC_DIR, 'photo', 'd.png'),
-    os.path.join(_GUI_DIR, 'photo', 'd.png'),
-    os.path.join(_PHOTO_DIR, 'd.png'),
-)
-
-
-def find_discord_icon_path() -> Optional[str]:
-    for candidate in _DISCORD_ICON_CANDIDATES:
-        if os.path.isfile(candidate):
-            return candidate
-    logger.warning('Discord icon not found; checked: %s', ', '.join(_DISCORD_ICON_CANDIDATES))
-    return None
 
 
 _SERVICE_ROWS = (
@@ -810,7 +772,7 @@ class AboutPage(QWidget):
         from PySide6.QtGui import QPainterPath, QColor as _QColor
         size = 40
         avatar_path = None
-        candidate = os.path.join(_PHOTO_DIR, 'author.png')
+        candidate = os.path.join(PHOTO_DIR, 'author.png')
         if os.path.isfile(candidate):
             avatar_path = candidate
         canvas = QPixmap(size, size)
@@ -880,6 +842,3 @@ class AboutPage(QWidget):
         for icon, mask in self._credit_icons:
             icon.setIcon(tinted_icon(mask, resolve_icon_color(), 22))
         self._snake_overlay.refresh_theme()
-
-
-DISCORD_URL = 'https://discord.gg/j7dBxTZMDE'

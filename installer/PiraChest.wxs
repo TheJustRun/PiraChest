@@ -1,0 +1,52 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="PiraChest" Manufacturer="$(var.Manufacturer)" Version="$(var.Version)" UpgradeCode="a3f6c2d1-7b4e-4c9a-8f2d-5e1b0c7a9d34" Scope="perUser" Compressed="yes">
+    <SummaryInformation Description="PiraChest installer" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of PiraChest is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <Icon Id="AppIcon.ico" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="$(var.ProjectUrl)" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch PiraChest" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="PiraChest" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="*">
+        <Shortcut Id="StartMenuShortcut" Name="PiraChest" Description="PiraChest" Target="[INSTALLFOLDER]PiraChest.exe" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon.ico" />
+        <RegistryValue Root="HKCU" Key="Software\PiraChest" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="*" Condition="DESKTOPSHORTCUT = 1">
+        <Shortcut Id="DesktopShortcut" Name="PiraChest" Description="PiraChest" Target="[INSTALLFOLDER]PiraChest.exe" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon.ico" />
+        <RegistryValue Root="HKCU" Key="Software\PiraChest" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(var.SourceDir)\**" />
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="PiraChest" Level="1" AllowAdvertise="no">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+
+    <CustomAction Id="LaunchApp" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]PiraChest.exe&quot;" Return="asyncNoWait" />
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <UI>
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="2" Condition="NOT Installed" />
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApp" Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed" />
+    </UI>
+  </Package>
+</Wix>

@@ -629,7 +629,7 @@ _AL_STATUS_MAP = {
 _FULL_QUERY = (
     "query($id:Int){Media(id:$id,type:ANIME){id idMal title{english romaji native} "
     "status format episodes seasonYear startDate{year} synonyms genres description "
-    "coverImage{large medium} "
+    "coverImage{large medium} bannerImage "
     "nextAiringEpisode{episode airingAt timeUntilAiring}}}"
 )
 
@@ -707,6 +707,7 @@ def _media_from_anilist_only(anilist_id: int, mal_id: Optional[int], al: dict) -
         "genres": al.get("genres") if isinstance(al.get("genres"), list) else [],
         "description": clean_description(al.get("description")),
         "coverImage": (al.get("coverImage") or {}).get("large") or (al.get("coverImage") or {}).get("medium"),
+        "bannerImage": al.get("bannerImage"),
     }
 
 async def _resolve_anilist(anilist_id: int) -> dict:
@@ -803,6 +804,7 @@ async def _resolve_anilist(anilist_id: int) -> dict:
                 or ((d.get("images") or {}).get("jpg") or {}).get("large_image_url")
                 or ((d.get("images") or {}).get("jpg") or {}).get("image_url")
             ),
+            "bannerImage": (al or {}).get("bannerImage"),
         }
         return media
 
@@ -832,7 +834,7 @@ async def search_anime(query: str, limit: int = 20) -> list[dict]:
         "query($search:String,$perPage:Int){Page(perPage:$perPage){"
         "media(search:$search,type:ANIME,sort:SEARCH_MATCH){"
         "id idMal title{english romaji native} status format episodes "
-        "seasonYear startDate{year} coverImage{large medium} synonyms genres description}}}"
+        "seasonYear startDate{year} coverImage{large medium} bannerImage synonyms genres description}}}"
     )
     try:
         async with _PooledClient() as client:
@@ -879,6 +881,7 @@ async def search_anime(query: str, limit: int = 20) -> list[dict]:
             "seasonYear": m.get("seasonYear"),
             "startDate": m.get("startDate"),
             "coverImage": (m.get("coverImage") or {}).get("large") or (m.get("coverImage") or {}).get("medium"),
+            "bannerImage": m.get("bannerImage"),
             "synonyms": m.get("synonyms") or [],
             "genres": m.get("genres") or [],
             "description": clean_description(m.get("description")),
@@ -892,6 +895,7 @@ async def search_anime(query: str, limit: int = 20) -> list[dict]:
                 "format": r["format"], "episodes": r["episodes"], "seasonYear": r["seasonYear"],
                 "startDate": r["startDate"], "nextAiringEpisode": None, "synonyms": r["synonyms"],
                 "genres": r["genres"], "description": r["description"], "coverImage": r["coverImage"],
+                "bannerImage": r["bannerImage"],
             })
 
     return results
@@ -901,7 +905,7 @@ _BROWSE_REFRESH_MS = 30 * MIN
 _BROWSE_LIMIT = 20
 _MEDIA_FIELDS = (
     "id idMal title{english romaji native} status format episodes seasonYear startDate{year} "
-    "coverImage{large medium} synonyms genres description"
+    "coverImage{large medium} bannerImage synonyms genres description"
 )
 _JIKAN_PATHS = {
     "trending": "/top/anime?filter=airing",
@@ -956,6 +960,7 @@ def _media_dict(m: dict) -> dict:
         "format": m.get("format"), "episodes": m.get("episodes"),
         "seasonYear": m.get("seasonYear"), "startDate": m.get("startDate"),
         "coverImage": cover.get("large") or cover.get("medium"),
+        "bannerImage": m.get("bannerImage"),
         "synonyms": m.get("synonyms") or [], "genres": m.get("genres") or [],
         "description": clean_description(m.get("description")),
     }
@@ -1290,6 +1295,367 @@ async def map_anime_ids(anilist_id: Any) -> dict:
         }
     }
 
+_SEASON_FORMATS = {"TV", "TV_SHORT", "ONA"}
+_LINK_FIELDS = (
+    _MEDIA_FIELDS
+    + " startDate{year month day} endDate{year month day}"
+    + " relations{edges{relationType(version:2) node{id type format}}}"
+)
+_node_cache = _BoundedLRU(limit=800)
+
+
+async def _fetch_nodes(ids: list[int]) -> dict[int, dict]:
+    need = [i for i in dict.fromkeys(ids) if i not in _node_cache]
+    for k in range(0, len(need), 25):
+        chunk = need[k:k + 25]
+        q = ("query{" + " ".join(f"m{n}:Media(id:{n},type:ANIME){{...F}}" for n in chunk)
+             + "}fragment F on Media{" + _LINK_FIELDS + "}")
+        data = await _al_post(q)
+        for n in chunk:
+            if data.get(f"m{n}"):
+                _node_cache.set(n, data[f"m{n}"])
+    return {i: _node_cache.get(i) for i in ids if i in _node_cache}
+
+
+def _related(node: Optional[dict], kind: str) -> Optional[int]:
+    if not node or node.get("format") not in _SEASON_FORMATS:
+        return None
+    for e in (node.get("relations") or {}).get("edges") or []:
+        n = e.get("node") or {}
+        if e.get("relationType") == kind and n.get("type") == "ANIME" and n.get("format") in _SEASON_FORMATS:
+            return n["id"]
+    return None
+
+
+async def franchise_root_ids(ids: list[int]) -> dict[int, int]:
+    root: dict[int, int] = {}
+    cur = {i: i for i in ids}
+    seen = {i: {i} for i in ids}
+    for _ in range(10):
+        nodes = await _fetch_nodes(list(set(cur.values())))
+        moved: dict[int, int] = {}
+        for origin, pos in cur.items():
+            prev = _related(nodes.get(pos), "PREQUEL")
+            if prev and prev not in seen[origin]:
+                seen[origin].add(prev)
+                moved[origin] = prev
+            else:
+                root[origin] = pos
+        if not moved:
+            break
+        cur = moved
+    for origin, pos in cur.items():
+        root.setdefault(origin, pos)
+    return root
+
+
+async def collapse_to_franchises(items: list[dict]) -> list[dict]:
+    try:
+        ids = [int(m["id"]) for m in items if m.get("id")]
+        roots = await franchise_root_ids(ids)
+    except Exception:
+        logger.warning("franchise collapse failed", exc_info=True)
+        return items
+    out, seen = [], set()
+    for m in items:
+        rid = roots.get(int(m["id"]), m["id"])
+        if rid in seen:
+            continue
+        seen.add(rid)
+        node = _node_cache.get(rid) if rid != m["id"] else None
+        out.append(_media_dict(node) if node else m)
+    return out
+
+
+_SEASONMAP_URL = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json"
+_SEASONMAP_TTL = 7 * DAY
+_smap_mem: Optional[dict] = None
+_smap_mem_at = 0.0
+_smap_retry_at = 0.0
+
+_CONT_MIN_SIM = 0.9
+_CONT_MAX_PREV_EPS = 16
+_CONT_MAX_GAP_DAYS = 240
+
+
+async def _fetch_season_map() -> dict:
+    entry = await get_entry_async("seasonmap")
+    if entry and is_fresh(entry) and entry.get("data"):
+        return entry["data"]
+    async with _PooledClient() as client:
+        resp = await client.get(_SEASONMAP_URL, timeout=httpx.Timeout(60, connect=8))
+    resp.raise_for_status()
+
+    def _pos(v: Any) -> int:
+        return v if isinstance(v, int) and v > 0 else 0
+
+    out: dict[str, list] = {}
+    for e in resp.json():
+        aid = e.get("anilist_id")
+        if not aid:
+            continue
+        season = e.get("season") or {}
+        tmdb = e.get("themoviedb_id")
+        row = [
+            _pos(e.get("tvdb_id")), _pos(season.get("tvdb")),
+            _pos(tmdb.get("tv") if isinstance(tmdb, dict) else None), _pos(season.get("tmdb")),
+        ]
+        if (row[0] and row[1]) or (row[2] and row[3]):
+            out[str(aid)] = row
+    if out:
+        await set_entry_async("seasonmap", out, _SEASONMAP_TTL)
+    return out
+
+
+async def _season_map() -> dict:
+    global _smap_mem, _smap_mem_at, _smap_retry_at
+    now = time.time()
+    if _smap_mem is not None and now - _smap_mem_at < 6 * 3600:
+        return _smap_mem
+    if now < _smap_retry_at:
+        return _smap_mem or {}
+    try:
+        _smap_mem = await _es_dedupe("seasonmap", _fetch_season_map)
+        _smap_mem_at = now
+    except Exception:
+        logger.warning("season map unavailable, using heuristics only", exc_info=True)
+        _smap_retry_at = now + 600
+    return _smap_mem or {}
+
+
+def _same_season(a: Any, b: Any, smap: dict) -> Optional[bool]:
+    ra, rb = smap.get(str(a)), smap.get(str(b))
+    if not ra or not rb:
+        return None
+    for id_i, season_i in ((0, 1), (2, 3)):
+        if ra[id_i] and ra[season_i] and rb[id_i] and rb[season_i]:
+            return ra[id_i] == rb[id_i] and ra[season_i] == rb[season_i]
+    return None
+
+
+def _to_date(d: Optional[dict]) -> Optional[date]:
+    y = (d or {}).get("year")
+    if not y:
+        return None
+    try:
+        return date(y, d.get("month") or 6, d.get("day") or 15)
+    except ValueError:
+        return None
+
+
+def _end_date(node: dict) -> Optional[date]:
+    end = _to_date(node.get("endDate"))
+    if end:
+        return end
+    start = _to_date(node.get("startDate"))
+    eps = node.get("episodes")
+    if start and eps:
+        return date.fromordinal(start.toordinal() + 7 * int(eps))
+    return start
+
+
+def _title_cores(node: dict) -> list[str]:
+    t = node.get("title") or {}
+    out = []
+    for v in (t.get("english"), t.get("romaji")):
+        words = [w for w in re.split(r"[\W_]+", (v or "").lower()) if w and not any(c.isdigit() for c in w)]
+        if words:
+            out.append(" ".join(words))
+    return out
+
+
+def _titles_related(a: str, b: str) -> bool:
+    if dice_coeff(a, b) >= _CONT_MIN_SIM:
+        return True
+    wa, wb = a.split(), b.split()
+    short, long_ = sorted((wa, wb), key=len)
+    return 0 < len(long_) - len(short) <= 2 and long_[:len(short)] == short
+
+
+def _looks_like_continuation(prev: dict, node: dict) -> bool:
+    cores_a, cores_b = _title_cores(prev), _title_cores(node)
+    if not cores_a or not cores_b:
+        return False
+    if not any(_titles_related(a, b) for a in cores_a for b in cores_b):
+        return False
+    eps = prev.get("episodes")
+    if eps and eps > _CONT_MAX_PREV_EPS:
+        return False
+    end, start = _end_date(prev), _to_date(node.get("startDate"))
+    if not end or not start:
+        return False
+    return (start - end).days <= _CONT_MAX_GAP_DAYS
+
+
+def _group_nodes(chain: list[dict], smap: dict) -> list[list[dict]]:
+    groups: list[list[dict]] = []
+    for node in chain:
+        if groups:
+            prev = groups[-1][-1]
+            same = _same_season(prev["id"], node["id"], smap)
+            if same is None:
+                same = _looks_like_continuation(prev, node)
+            if same:
+                groups[-1].append(node)
+                continue
+        groups.append([node])
+    return groups
+
+
+def _common_prefix(titles: list[str]) -> str:
+    toks = [t.split() for t in titles if t]
+    if len(toks) < 2:
+        return ""
+    out: list[str] = []
+    for words in zip(*toks):
+        if len({w.lower() for w in words}) != 1:
+            break
+        out.append(words[0])
+    base = " ".join(out).strip(" :-\u2013\u2014")
+    return base if len(base) >= 5 else ""
+
+
+async def get_seasons(anilist_id: Any) -> list[dict]:
+    key = f"seasons2:{anilist_id}"
+    entry = await get_entry_async(key)
+    if entry and is_fresh(entry):
+        return entry["data"]
+    start = int(anilist_id)
+    pos: Optional[int] = (await franchise_root_ids([start])).get(start, start)
+    chain, seen = [], set()
+    while pos and pos not in seen and len(chain) < 40:
+        seen.add(pos)
+        node = (await _fetch_nodes([pos])).get(pos)
+        if not node or node.get("format") not in _SEASON_FORMATS:
+            break
+        chain.append(node)
+        pos = _related(node, "SEQUEL")
+
+    smap = await _season_map()
+    seasons: list[dict] = []
+    for g in _group_nodes(chain, smap):
+        first, last = g[0], g[-1]
+        t = first.get("title") or {}
+        counts = [n.get("episodes") for n in g]
+        bases = [b for b in (
+            _common_prefix([(n.get("title") or {}).get("english") or "" for n in g]),
+            _common_prefix([(n.get("title") or {}).get("romaji") or "" for n in g]),
+        ) if b]
+        seasons.append({
+            "id": first["id"],
+            "ids": [n["id"] for n in g],
+            "title": t.get("english") or t.get("romaji"),
+            "baseTitles": bases,
+            "episodes": sum(c for c in counts if c) if all(counts) else None,
+            "seasonYear": first.get("seasonYear"),
+            "status": last.get("status"),
+        })
+    if start not in {i for s_ in seasons for i in s_["ids"]}:
+        seasons = []
+    for s_ in seasons:
+        for i in s_["ids"]:
+            await set_entry_async(f"seasons2:{i}", seasons, DAY)
+    await set_entry_async(key, seasons, DAY)
+    return seasons
+
+
+async def season_base_titles(anilist_id: Any) -> list[str]:
+    try:
+        aid = int(anilist_id)
+        for s_ in await get_seasons(aid):
+            if aid in s_["ids"]:
+                return list(s_.get("baseTitles") or [])
+    except Exception:
+        logger.warning("season base titles failed for %s", anilist_id, exc_info=True)
+    return []
+
+
+async def season_members(anilist_id: Any) -> list[int]:
+    aid = int(anilist_id)
+    for s_ in await get_seasons(aid):
+        if aid in s_["ids"]:
+            return list(s_["ids"])
+    return [aid]
+
+
+async def get_group_provider_episodes(anilist_id: Any, provider: str) -> dict:
+    try:
+        members = await season_members(anilist_id)
+    except Exception:
+        logger.warning("season grouping failed for %s", anilist_id, exc_info=True)
+        members = [int(anilist_id)]
+    if len(members) <= 1:
+        return await get_filtered_episodes_response(anilist_id, {provider}, False)
+
+    results = await asyncio.gather(
+        *(get_filtered_episodes_response(m, {provider}, False) for m in members),
+        return_exceptions=True,
+    )
+    entries: list[dict] = []
+    pending = None
+    for mid, resp in zip(members, results):
+        if isinstance(resp, BaseException):
+            logger.warning("group episodes failed [%s %s]: %s", provider, mid, resp)
+            continue
+        if "notAired" in resp:
+            pending = pending or resp
+            continue
+        data = resp.get(provider) or {}
+        eps = data.get("episodes") or {}
+        nums = [int(float(e.get("sourceNumber", e["number"]))) for a in ("sub", "dub") for e in eps.get(a) or []]
+        if not nums:
+            continue
+        meta = data.get("meta") or {}
+        try:
+            shift = int(meta.get("episodeOffset") or 0)
+        except (TypeError, ValueError):
+            shift = 0
+        entry = {"mid": mid, "data": data, "show": meta.get("id"), "off": shift, "lo": min(nums), "hi": max(nums)}
+        logger.info(
+            "group episodes [%s] entry=%s show=%s offset=%s range=%s-%s",
+            provider, mid, entry["show"], shift, entry["lo"], entry["hi"],
+        )
+        entries.append(entry)
+
+    parts: list[dict] = []
+    for entry in entries:
+        twin = next((
+            p for p in parts
+            if entry["show"] is not None and p["show"] == entry["show"] and p["off"] == entry["off"]
+            and entry["lo"] <= p["hi"] and p["lo"] <= entry["hi"]
+        ), None)
+        if twin is None:
+            parts.append(entry)
+        elif entry["hi"] > twin["hi"]:
+            parts[parts.index(twin)] = entry
+
+    if not parts:
+        if pending:
+            return pending
+        if not isinstance(results[0], BaseException):
+            return results[0]
+        raise results[0]
+
+    merged: dict[str, list] = {"sub": [], "dub": []}
+    top = 0
+    for e in parts:
+        base = 0 if e["lo"] > 1 else top
+        for audio in ("sub", "dub"):
+            for ep in (e["data"].get("episodes") or {}).get(audio) or []:
+                n = int(float(ep["number"]))
+                absolute = int(float(ep.get("sourceNumber", n)))
+                number = absolute if e["lo"] > 1 else n + base
+                item = {**ep, "number": number, "anilistId": e["mid"], "sourceNumber": ep["number"]}
+                if item.get("title") == f"Episode {n}":
+                    item["title"] = f"Episode {number}"
+                merged[audio].append(item)
+        top = max(top, e["hi"] + base)
+
+    first = parts[0]["data"]
+    meta = {**(first.get("meta") or {}), "members": [e["mid"] for e in parts], "grouped": len(parts) > 1}
+    return {"page": 1, "type": "filtered", provider: {**first, "meta": meta, "episodes": merged}}
+
+
 _es_inflight = _BoundedInflight(limit=64)
 _es_bg_running: set[str] = set()
 
@@ -1600,6 +1966,12 @@ async def _resolve_shared(anilist_id: Any, fresh_media: bool = False) -> tuple[O
 
     return await asyncio.gather(_safe_media(), _safe_anizip())
 
+async def invalidate_provider_caches() -> None:
+    """Drop cached provider episode lists after extensions are (re)discovered."""
+    await delete_prefix_async("episodes:")
+    await delete_prefix_async("epv:")
+
+
 async def _clear_provider_cache(anilist_id: Any, media: Optional[dict]) -> None:
     for p in _KNOWN_PROVIDER_CACHE_NAMES:
         await delete_entry_async(f"epv:{p}:{anilist_id}")
@@ -1882,6 +2254,11 @@ WATCH_PROVIDERS = {"anikoto", "animegg", "anizone", "anibd", "kaa", "animedunya"
 STREAM_PROVIDERS: set[str] = set()
 STREAM_DOWNLOAD_PROVIDERS: set[str] = set()
 
+
+def _provider_supports(name: str, method: str) -> bool:
+    provider = PROVIDER_REGISTRY.get(name)
+    return provider is not None and hasattr(provider, method)
+
 _WATCH_FALLBACK_ORDER = ["anikoto", "kaa", "anibd", "animegg", "anizone"]
 
 
@@ -1949,7 +2326,7 @@ async def handle(path: str, query: Optional[dict] = None, env: Optional[dict] = 
     m = _STREAM_DOWNLOAD_RE.match(path)
     if m:
         provider_name, anilist_id, audio, ep = m.groups()
-        if provider_name not in STREAM_DOWNLOAD_PROVIDERS:
+        if provider_name not in STREAM_DOWNLOAD_PROVIDERS and not _provider_supports(provider_name, "get_stream"):
             raise ApiError(f"Provider '{provider_name}' has no /stream/download route", 404)
         provider = PROVIDER_REGISTRY.get(provider_name)
         if provider is None or not hasattr(provider, "get_stream"):
@@ -1959,7 +2336,7 @@ async def handle(path: str, query: Optional[dict] = None, env: Optional[dict] = 
     m = _STREAM_RE.match(path)
     if m:
         provider_name, anilist_id, audio, ep = m.groups()
-        if provider_name not in STREAM_PROVIDERS:
+        if provider_name not in STREAM_PROVIDERS and not _provider_supports(provider_name, "get_stream"):
             raise ApiError(f"Provider '{provider_name}' has no /stream route", 404)
         provider = PROVIDER_REGISTRY.get(provider_name)
         if provider is None or not hasattr(provider, "get_stream"):
@@ -1969,7 +2346,7 @@ async def handle(path: str, query: Optional[dict] = None, env: Optional[dict] = 
     m = _WATCH_RE.match(path)
     if m:
         provider_name, anilist_id, audio, ep = m.groups()
-        if provider_name not in WATCH_PROVIDERS:
+        if provider_name not in WATCH_PROVIDERS and not _provider_supports(provider_name, "get_watch"):
             raise ApiError(f"Provider '{provider_name}' has no /watch route", 404)
         provider = PROVIDER_REGISTRY.get(provider_name)
         if provider is None or not hasattr(provider, "get_watch"):

@@ -82,6 +82,8 @@ Browse manga and books from available sources. Manga is considerably more develo
 
 Browse and watch movies, TV shows, series, and TV channels with metadata and details. Playback works now, and Watch Later is supported.
 
+Vyla is built in for movie and show streams. PiraChest downloads a private Node.js runtime and the SDK dependencies on first use, so there is no separate SDK to install. DASH downloads use ffmpeg; if it is missing, PiraChest offers to download it before starting the download.
+
 ### YouTube
 
 Download videos or audio with metadata and quality selection.

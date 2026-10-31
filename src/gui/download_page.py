@@ -8,18 +8,21 @@ import time
 from contextlib import suppress
 from functools import lru_cache
 
-from PySide6.QtCore import QByteArray, QPoint, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QFontMetrics, QPainter, QPen, QPixmap
+from PySide6.QtCore import QAbstractItemModel, QByteArray, QEvent, QModelIndex, QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QFontMetrics, QGuiApplication, QPainter, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
-    QAbstractButton, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QScrollArea, QVBoxLayout, QWidget,
+    QAbstractButton, QAbstractItemView, QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QScrollArea,
+    QSplitter, QStackedWidget, QStyle, QStyledItemDelegate, QTreeView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
-    CaptionLabel, CheckBox, CompactSpinBox, DoubleSpinBox, InfoBar, InfoBarPosition, LineEdit, MessageBoxBase,
-    PushButton, StrongBodyLabel, SubtitleLabel, qconfig,
+    Action, CaptionLabel, CheckBox, Pivot, CompactSpinBox, DoubleSpinBox, InfoBar, InfoBarPosition, LineEdit, MessageBoxBase,
+    PushButton, RoundMenu, StrongBodyLabel, SubtitleLabel, TransparentPushButton, qconfig,
 )
 
-from src.core.downloader import DLState, DownloadItem, DownloadManager, human_bytes, human_duration, human_speed
+from src.core.downloader import (
+    DLState, DownloadItem, DownloadManager, human_bytes, human_duration, human_speed, is_risky_file,
+)
 from src.core.theme import palette, scroll_area_qss
 from src.core.translations import register_locale_refresh, tr
 
@@ -56,6 +59,18 @@ def _pal(key: str, alpha: float | None = None) -> QColor:
     return _qc(palette()[key], alpha)
 
 
+def _download_title(item) -> str:
+    name = item.game_name or tr("download.unknown")
+    if str(getattr(item, "category", "") or "") == "repacks":
+        try:
+            from src.core.repacks.base import display_title
+
+            return display_title(name)
+        except Exception:
+            pass
+    return name
+
+
 def _font(base: QFont, px: int, weight=QFont.Weight.Normal) -> QFont:
     font = QFont(base)
     font.setPixelSize(px)
@@ -87,6 +102,8 @@ _SHAPES = {
     "check": '<path d="M20 6 9 17l-5-5"/>',
     "clock": '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
     "alert": '<circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>',
+    "chev_r": '<path d="m9 18 6-6-6-6"/>',
+    "chev_d": '<path d="m6 9 6 6 6-6"/>',
     "grip": '<circle cx="9" cy="12" r="1"/><circle cx="9" cy="5" r="1"/><circle cx="9" cy="19" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="15" cy="19" r="1"/>',
 }
 
@@ -110,6 +127,8 @@ def _blit(p: QPainter, name: str, x: float, y: float, px: int, color: QColor, dp
 
 
 def _reveal(path: str, select: bool = False) -> None:
+
+    select = select or os.path.isfile(path)
     if sys.platform.startswith("win"):
         subprocess.Popen(["explorer", "/select,", os.path.normpath(path)] if select else ["explorer", path])
     elif sys.platform == "darwin":
@@ -294,11 +313,12 @@ class DownloadItemWidget(QWidget):
     drag_started = Signal(str)
     drag_moved = Signal(str, int)
     drag_finished = Signal(str, int)
+    clicked = Signal(str)
 
     def __init__(self, item: DownloadItem, can_retry: bool, parent=None):
         super().__init__(parent)
         self.item_id, self._item, self._can_retry = item.id, item, can_retry
-        self._hover = self._down = False
+        self._hover = self._down = self._sel = False
         self._flash = False
         self.dragging = False
         self._v: dict = {}
@@ -338,7 +358,7 @@ class DownloadItemWidget(QWidget):
         self._item = item
         st, ext, torrent = item.state, item.backend == "external", item.backend == "torrent"
         err = st == DLState.error
-        pct = 100 if st in (DLState.seeding, DLState.completed) else max(0, min(100, int(item.progress)))
+        pct = 100 if st in (DLState.seeding, DLState.completed) else round(max(0.0, min(100.0, item.progress)), 1)
         kind = tr("download.kind_torrent" if torrent else "download.kind_direct")
         meta = (item.error or tr("download.unknown_error")) if err else "  ·  ".join(x for x in (item.console, item.source, kind) if x)
         down, up = human_speed(item.speed_down_kbps), human_speed(item.speed_up_kbps)
@@ -358,8 +378,8 @@ class DownloadItemWidget(QWidget):
             detail = tr("download.eta_left", eta=human_duration(item.eta)) if item.eta >= 0 else ""
         total = human_bytes(item.total_bytes) if item.total_bytes else "?"
         view = {
-            "title": item.game_name or tr("download.unknown"), "meta": meta, "err": err, "state": st, "pct": pct,
-            "pct_text": "" if err else f"{pct}%", "size_text": "" if err else f"{human_bytes(item.downloaded_bytes)} / {total}",
+            "title": _download_title(item), "meta": meta, "err": err, "state": st, "pct": pct,
+            "pct_text": "" if err else f"{pct:g}%", "size_text": "" if err else f"{human_bytes(item.downloaded_bytes)} / {total}",
             "speeds": speeds, "detail": detail, "label": tr(f"download.state_{st.name}"),
         }
         if view != self._v:
@@ -426,6 +446,9 @@ class DownloadItemWidget(QWidget):
             p.fillRect(self.rect(), _pal("accent", .10))
         elif self._hover:
             p.fillRect(self.rect(), _pal("primary_text", .045))
+        if self._sel:
+            p.fillRect(self.rect(), _pal("accent", .07))
+            p.fillRect(0, 0, 3, h, _pal("accent"))
         p.setPen(_pal("card_border"))
         p.drawLine(0, h - 1, w, h - 1)
 
@@ -477,6 +500,11 @@ class DownloadItemWidget(QWidget):
             _text(p, QRectF(pos["state"], 33, _COLS["state"], 18), v["detail"], self._f_small, muted)
 
 
+    def set_selected(self, on: bool) -> None:
+        if on != self._sel:
+            self._sel = on
+            self.update()
+
     def flash(self) -> None:
         self._flash = True
         self.update()
@@ -513,6 +541,8 @@ class DownloadItemWidget(QWidget):
         if self._down and e.button() == Qt.MouseButton.LeftButton:
             self._down = False
             self.drag_finished.emit(self.item_id, int(e.globalPosition().y()))
+        elif e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit(self.item_id)
 
 
 class _ReorderList(QScrollArea):
@@ -615,7 +645,7 @@ class TorrentSettingsDialog(MessageBoxBase):
         super().__init__(parent)
         self.recheck_requested = False
         self.widget.setMinimumWidth(460)
-        self.viewLayout.addWidget(SubtitleLabel(tr("download.torrent_settings_for", name=item.game_name), self))
+        self.viewLayout.addWidget(SubtitleLabel(tr("download.torrent_settings_for", name=_download_title(item)), self))
         self._seed = CheckBox(tr("download.seed_after_completion"))
         self._seed.setChecked(item.seed_after)
         self.viewLayout.addWidget(self._seed)
@@ -737,6 +767,693 @@ class AddTorrentDialog(MessageBoxBase):
         super().accept()
 
 
+_PRIO_KEYS = {0: "files.prio_skip", 1: "files.prio_low", 4: "files.prio_normal", 6: "files.prio_high", 7: "files.prio_max"}
+_FCOLS = ("files.col_name", "files.col_size", "files.col_done", "files.col_progress", "files.col_status",
+         "files.col_priority", "files.col_speed", "files.col_eta")
+_PROGRESS_ROLE = Qt.ItemDataRole.UserRole + 1
+_CHECKED, _UNCHECKED, _PARTIAL = Qt.CheckState.Checked, Qt.CheckState.Unchecked, Qt.CheckState.PartiallyChecked
+
+
+class _Node:
+    __slots__ = ("parent", "kids", "name", "idx", "size", "done", "speed", "prio", "last", "row", "flags", "wanted", "n", "rem", "path")
+
+    def __init__(self, parent, name, idx=-1, size=0, flags=0, path=""):
+        self.parent, self.kids, self.name, self.idx, self.size, self.flags, self.path = parent, [], name, idx, size, flags, path
+        self.done = self.speed = self.prio = self.last = self.row = self.wanted = self.n = self.rem = 0
+
+
+class _FilesModel(QAbstractItemModel):
+    requested = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._root, self._files, self._dirs, self._t, self._paused = _Node(None, ""), [], [], 0.0, False
+        self.visible = lambda: []
+        self.warn = True
+
+    def risky(self, k: _Node) -> bool:
+        if k.idx < 0 or not k.flags & 1:
+            return False
+        return self.warn or os.path.splitext(k.name)[1].lower() not in (".exe", ".bat")
+
+    def clear(self) -> None:
+        self.beginResetModel()
+        self._root, self._files, self._dirs, self._t = _Node(None, ""), [], [], 0.0
+        self.endResetModel()
+
+    def rebuild(self, tree) -> None:
+        root, dirs, files, lookup = _Node(None, ""), [], [None] * len(tree), {}
+        for i, (path, size, flags) in enumerate(tree):
+            parent, parts = root, path.split("/")
+            for d in range(len(parts) - 1):
+                key = "/".join(parts[:d + 1])
+                node = lookup.get(key)
+                if node is None:
+                    node = lookup[key] = _Node(parent, parts[d], path=key)
+                    parent.kids.append(node)
+                    dirs.append(node)
+                parent = node
+            files[i] = _Node(parent, parts[-1], i, size, flags, path)
+            parent.kids.append(files[i])
+        for d in (root, *dirs):
+            d.kids.sort(key=lambda k: (k.idx >= 0, k.name.lower()))
+            for r, k in enumerate(d.kids):
+                k.row = r
+        self.beginResetModel()
+        self._root, self._files, self._dirs, self._t = root, files, dirs[::-1] + [root], 0.0
+        self.endResetModel()
+
+    def update(self, progress, prios, paused: bool) -> None:
+        now = time.monotonic()
+        dt, self._t, self._paused = (now - self._t if self._t else 0.0), now, paused
+        for f in self._files:
+            i = f.idx
+            done = min(progress[i], f.size)
+            if dt > 0.2:
+                f.speed = .6 * max(0, done - f.done) / dt + .4 * f.speed
+                if f.speed < 64:
+                    f.speed = 0
+            locked = f.flags & 2
+            f.done, f.prio = done, prios[i]
+            f.last = f.prio or f.last
+            f.n = 0 if locked else 1
+            f.wanted = 1 if f.prio and not locked else 0
+            f.rem = f.size - done if f.wanted else 0
+        for d in self._dirs:
+            size = done = speed = n = wanted = rem = 0
+            pr = None
+            for k in d.kids:
+                size += k.size; done += k.done; speed += k.speed; n += k.n; wanted += k.wanted; rem += k.rem
+                if k.n:
+                    pr = k.prio if pr is None else (pr if pr == k.prio else -1)
+            d.size, d.done, d.speed, d.n, d.wanted, d.rem, d.prio = size, done, speed, n, wanted, rem, pr or 0
+        for i in self.visible():
+            self.dataChanged.emit(i, i.siblingAtColumn(len(_FCOLS) - 1))
+
+    def leaves(self, nodes) -> list[_Node]:
+        out, stack, seen = [], list(nodes), set()
+        while stack:
+            k = stack.pop()
+            if k.idx >= 0:
+                if k.n and k.idx not in seen:
+                    seen.add(k.idx); out.append(k)
+            else:
+                stack.extend(k.kids)
+        return out
+
+    def request(self, nodes, prio: int | None) -> None:
+        changes = {k.idx: (prio if prio is not None else (k.last or 4)) for k in self.leaves(nodes)}
+        if changes:
+            self.requested.emit(changes)
+
+    def status(self, k: _Node) -> str:
+        if not k.wanted:
+            return "files.st_skipped"
+        return "files.st_done" if not k.rem else "files.st_paused" if self._paused else "files.st_downloading" if k.speed else "files.st_waiting"
+
+    def check(self, k: _Node):
+        return _UNCHECKED if not k.wanted else _CHECKED if k.wanted == k.n else _PARTIAL
+
+    def index(self, row, col, parent=QModelIndex()):
+        p = parent.internalPointer() if parent.isValid() else self._root
+        return self.createIndex(row, col, p.kids[row]) if 0 <= row < len(p.kids) and 0 <= col < len(_FCOLS) else QModelIndex()
+
+    def parent(self, index=None):
+        if index is None:
+            return super().parent()
+        p = index.internalPointer().parent if index.isValid() else None
+        return self.createIndex(p.row, 0, p) if p is not None and p.parent is not None else QModelIndex()
+
+    def rowCount(self, parent=QModelIndex()):
+        if parent.column() > 0:
+            return 0
+        return len((parent.internalPointer() if parent.isValid() else self._root).kids)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(_FCOLS)
+
+    def flags(self, index):
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return tr(_FCOLS[section])
+        return None
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        if role != Qt.ItemDataRole.CheckStateRole or index.column() != 0:
+            return False
+        self.request([index.internalPointer()], None if value == _CHECKED or value == 2 else 0)
+        return False
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        k, col = index.internalPointer(), index.column()
+        if role == Qt.ItemDataRole.CheckStateRole:
+            return self.check(k) if col == 0 else None
+        if role == _PROGRESS_ROLE:
+            return k.done / k.size if k.size else 1.0
+        if role == Qt.ItemDataRole.ToolTipRole and col == 0:
+            return k.path + ("\n" + tr("files.risky_tip") if self.risky(k) else "")
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if col == 0:
+            return ("\u26a0 " if self.risky(k) else "") + k.name
+        if col == 1:
+            return human_bytes(k.size)
+        if col == 2:
+            return human_bytes(k.done)
+        if col == 3:
+            return f"{k.done / k.size * 100:.0f}%" if k.size else "100%"
+        if col == 4:
+            return tr(self.status(k))
+        if col == 5:
+            return tr("files.prio_mixed") if k.prio < 0 else tr(_PRIO_KEYS[min(_PRIO_KEYS, key=lambda c: abs(c - k.prio))])
+        if col == 6:
+            return human_speed(k.speed / 1024) if k.speed else ""
+        return human_duration(k.rem / k.speed) if k.speed and k.rem else ""
+
+
+class _FileDelegate(QStyledItemDelegate):
+    H = 22
+
+    def __init__(self, tree):
+        super().__init__(tree)
+        self._f = _font(tree.font(), 12)
+
+    def sizeHint(self, option, index):
+        return QSize(0, self.H)
+
+    def paint(self, p, opt, index):
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r, col, m = QRectF(opt.rect), index.column(), index.model()
+        if opt.state & QStyle.StateFlag.State_Selected:
+            p.fillRect(r, _pal("accent", .16))
+        elif opt.state & QStyle.StateFlag.State_MouseOver:
+            p.fillRect(r, _pal("primary_text", .045))
+        text, muted, dpr = _pal("primary_text"), _pal("muted"), self.parent().devicePixelRatioF()
+        display = m.data(index, Qt.ItemDataRole.DisplayRole)
+        if col == 0:
+            k, cs, cy = index.internalPointer(), m.data(index, Qt.ItemDataRole.CheckStateRole), r.center().y()
+            box = QRectF(r.left() + 4, cy - 7, 14, 14)
+            p.setPen(QPen(_pal("accent") if cs != _UNCHECKED else _pal("muted", .6), 1.2))
+            p.setBrush(_pal("accent") if cs != _UNCHECKED else Qt.GlobalColor.transparent)
+            p.drawRoundedRect(box, 3.5, 3.5)
+            if cs == _CHECKED:
+                _blit(p, "check", box.left() + 1.5, box.top() + 1.5, 11, QColor("white"), dpr, 2.6)
+            elif cs == _PARTIAL:
+                pen = QPen(QColor("white"), 2)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                p.setPen(pen)
+                p.drawLine(QPointF(box.left() + 4, cy), QPointF(box.right() - 4, cy))
+            _blit(p, "folder" if k.idx < 0 else "file", r.left() + 24, cy - 7, 14, muted, dpr, 1.6)
+            risky = m.risky(k)
+            _text(p, QRectF(r.left() + 43, r.top(), r.width() - 45, r.height()), display, self._f,
+                  _pal("state_error") if risky else text)
+        elif col == 3:
+            frac = max(0.0, min(1.0, m.data(index, _PROGRESS_ROLE)))
+            bar = QRectF(r.left() + 6, r.center().y() - 2, r.width() - 12, 4)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(_pal("primary_text", .10))
+            p.drawRoundedRect(bar, 2, 2)
+            if frac > 0:
+                p.setBrush(_pal("state_completed") if frac >= 1 else _pal("accent"))
+                p.drawRoundedRect(QRectF(bar.left(), bar.top(), max(4.0, bar.width() * frac), 4), 2, 2)
+        else:
+            right = col in (1, 2, 6, 7)
+            _text(p, r.adjusted(4, 0, -8, 0), display, self._f, text if col in (1, 4, 5) else muted, _RIGHT if right else _LEFT)
+        p.restore()
+
+    def editorEvent(self, event, model, option, index):
+        if index.column() == 0 and event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+            r = option.rect
+            if QRectF(r.left() + 2, r.center().y() - 9, 18, 18).contains(event.position()):
+                model.setData(index, _UNCHECKED if model.data(index, Qt.ItemDataRole.CheckStateRole) == _CHECKED else _CHECKED,
+                              Qt.ItemDataRole.CheckStateRole)
+                return True
+        return False
+
+
+class _FilesTree(QTreeView):
+    menu_requested = Signal(QPoint)
+    toggle_requested = Signal()
+
+    def drawBranches(self, p, rect, index):
+        if self.selectionModel().isSelected(index):
+            p.fillRect(rect, _pal("accent", .16))
+        if self.model().hasChildren(index) and rect.width() >= 14:
+            _blit(p, "chev_d" if self.isExpanded(index) else "chev_r", rect.right() - 14, rect.center().y() - 6, 12,
+                  _pal("muted"), self.devicePixelRatioF(), 2)
+
+    def contextMenuEvent(self, e):
+        self.menu_requested.emit(e.globalPos())
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Space:
+            return self.toggle_requested.emit()
+        super().keyPressEvent(e)
+
+
+class _PanelHeader(QWidget):
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(30)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.title = self.info = ""
+        self._f = _font(self.font(), 12, QFont.Weight.DemiBold)
+        self._fs = _font(self.font(), 12)
+
+    def paintEvent(self, _e):
+        p, w = QPainter(self), self.width()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        dpr = self.devicePixelRatioF()
+        p.setPen(_pal("card_border"))
+        p.drawLine(0, 0, w, 0)
+        _blit(p, "chev_d", 2, 9, 12, _pal("muted"), dpr, 2)
+        info_w = min(w * .6, QFontMetrics(self._fs).horizontalAdvance(self.info) + 8)
+        _text(p, QRectF(20, 0, w - info_w - 28, 30), self.title, self._f, _pal("primary_text"))
+        _text(p, QRectF(w - info_w - 4, 0, info_w, 30), self.info, self._fs, _pal("muted"), _RIGHT)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+
+class _Table(QTreeWidget):
+
+    def __init__(self, cols: tuple, widths: tuple, right: tuple = ()):
+        super().__init__()
+        self._cols, self._right = cols, right
+        self.setColumnCount(len(cols))
+        self.setRootIsDecorated(False)
+        self.setUniformRowHeights(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        h = self.header()
+        h.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        h.setFixedHeight(22)
+        for c, wd in enumerate(widths):
+            if wd:
+                self.setColumnWidth(c, wd)
+        self.retranslate()
+
+    def retranslate(self) -> None:
+        self.setHeaderLabels([tr(c) for c in self._cols])
+
+    def set_rows(self, rows: list) -> None:
+        self.setUpdatesEnabled(False)
+        n = self.topLevelItemCount()
+        for r, row in enumerate(rows):
+            it = self.topLevelItem(r) if r < n else None
+            if it is None:
+                it = QTreeWidgetItem(self)
+                for c in self._right:
+                    it.setTextAlignment(c, int(_RIGHT | _VCENTER))
+            for c, v in enumerate(row):
+                if it.text(c) != v:
+                    it.setText(c, v)
+        while self.topLevelItemCount() > len(rows):
+            self.takeTopLevelItem(self.topLevelItemCount() - 1)
+        self.setUpdatesEnabled(True)
+
+
+class _Bar(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(16)
+        self.frac = 0.0
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        f = _font(self.font(), 12)
+        label = tr("files.gen_progress")
+        lw = QFontMetrics(f).horizontalAdvance(label) + 10
+        _text(p, QRectF(0, 0, lw, 16), label, f, _pal("muted"))
+        bar = QRectF(lw, 5, self.width() - lw, 6)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(_pal("primary_text", .10))
+        p.drawRoundedRect(bar, 3, 3)
+        if self.frac > 0:
+            p.setBrush(_pal("state_completed") if self.frac >= 1 else _pal("accent"))
+            p.drawRoundedRect(QRectF(bar.left(), bar.top(), max(6.0, bar.width() * min(1.0, self.frac)), 6), 3, 3)
+
+
+_GENERAL = (
+    ("files.gen_transfer", (
+        (("active", "files.gen_active"), ("down", "files.gen_downloaded"), ("down_rate", "files.gen_down_speed"),
+         ("down_limit", "files.gen_down_limit"), ("ratio", "files.gen_ratio")),
+        (("eta", "files.col_eta"), ("up", "files.gen_uploaded"), ("up_rate", "files.gen_up_speed"),
+         ("up_limit", "files.gen_up_limit"), ("reannounce", "files.gen_reannounce")),
+        (("conns", "files.gen_connections"), ("seeds", "files.gen_seeds"), ("peers", "files.gen_peers"),
+         ("wasted", "files.gen_wasted"), ("seen", "files.gen_seen")))),
+    ("files.gen_information", (
+        (("size", "files.gen_total_size"), ("added", "files.gen_added"), ("private", "files.gen_private"),
+         ("hash", "files.gen_hash"), ("save_path", "files.gen_save_path"), ("comment", "files.gen_comment")),
+        (("pieces", "files.gen_pieces"), ("completed", "files.gen_completed")),
+        (("creator", "files.gen_created_by"), ("created", "files.gen_created_on")))),
+)
+
+
+def _general_values(d: dict) -> dict[str, str]:
+    B, S = human_bytes, (lambda b: human_speed(b / 1024))
+    ts = lambda t: time.strftime("%x %X", time.localtime(t)) if t and t > 0 else "-"
+    session = lambda a, b: f"{B(a)} ({tr('files.gen_session', v=B(b))})"
+    limit = lambda b: S(b) if b else tr("files.gen_unlimited")
+    return {
+        "active": human_duration(d["active"]), "down": session(d["down"], d["down_s"]), "down_rate": S(d["down_rate"]),
+        "down_limit": limit(d["down_lim"]), "ratio": f"{d['ratio']:.2f}", "eta": human_duration(d["eta"]),
+        "up": session(d["up"], d["up_s"]), "up_rate": S(d["up_rate"]), "up_limit": limit(d["up_lim"]),
+        "reannounce": human_duration(d["reannounce"]), "conns": tr("files.gen_max", n=d["conns"], m=d["max_conns"]),
+        "seeds": tr("files.gen_total", n=d["seeds"], m=d["list_seeds"]), "peers": tr("files.gen_total", n=d["peers"], m=d["list_peers"]),
+        "wasted": B(d["wasted"]), "seen": ts(d["seen"]), "size": B(d["size"]), "added": ts(d["added"]),
+        "private": tr("files.gen_yes" if d["private"] else "files.gen_no"), "hash": d["hash"], "save_path": d["save_path"],
+        "comment": d["comment"], "pieces": f"{d['pieces']} x {B(d['piece_len'])} ({tr('files.gen_have', n=d['have'])})",
+        "completed": ts(d["completed"]), "creator": d["creator"], "created": ts(d["created"]),
+    }
+
+
+class _General(QWidget):
+
+    def __init__(self):
+        super().__init__()
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 6, 8, 6)
+        root.setSpacing(4)
+        self._bar = _Bar()
+        root.addWidget(self._bar)
+        self._vals: dict[str, CaptionLabel] = {}
+        self._names: list[tuple[CaptionLabel, str]] = []
+        for head, groups in _GENERAL:
+            title = StrongBodyLabel(tr(head))
+            self._names.append((title, head))
+            root.addWidget(title)
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(3)
+            for g, rows in enumerate(groups):
+                grid.setColumnStretch(g * 2 + 1, 1)
+                for r, (key, label) in enumerate(rows):
+                    name, val = CaptionLabel(tr(label)), CaptionLabel("")
+                    name.setAlignment(_RIGHT | _VCENTER)
+                    val.setTextFormat(Qt.TextFormat.PlainText)
+                    val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                    val.setMinimumWidth(10)
+                    name.setMinimumHeight(18)
+                    val.setMinimumHeight(18)
+                    grid.addWidget(name, r, g * 2)
+                    grid.addWidget(val, r, g * 2 + 1)
+                    self._vals[key] = val
+                    self._names.append((name, label))
+            root.addLayout(grid)
+        root.addStretch(1)
+
+    def retranslate(self) -> None:
+        for w, key in self._names:
+            w.setText(tr(key))
+        self._bar.update()
+
+    def update_from(self, d: dict, item) -> None:
+        self._bar.frac = (item.progress / 100.0) if item is not None else 0.0
+        self._bar.update()
+        for k, v in _general_values(d).items():
+            if self._vals[k].text() != v:
+                self._vals[k].setText(v)
+
+
+class FilesPanel(QWidget):
+    _MIN_OPEN = 170
+    _TABS = ("general", "content", "trackers", "peers")
+
+    def __init__(self, manager: DownloadManager, parent=None):
+        super().__init__(parent)
+        self._m, self._iid, self._shape, self._h, self._split = manager, "", None, 260, None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self._head = _PanelHeader()
+        self._head.clicked.connect(self.hide)
+        lay.addWidget(self._head)
+        self._body = QWidget()
+        bl = QVBoxLayout(self._body)
+        bl.setContentsMargins(0, 0, 0, 6)
+        bl.setSpacing(2)
+        self._tabs = Pivot()
+        for key in self._TABS:
+            self._tabs.addItem(routeKey=key, text=tr(f"files.tab_{key}"), onClick=lambda *_, k=key: self._switch(k))
+        bl.addWidget(self._tabs, 0, Qt.AlignmentFlag.AlignLeft)
+        self._note = CaptionLabel("")
+        self._note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bl.addWidget(self._note, 1)
+        self._stack = QStackedWidget()
+        bl.addWidget(self._stack, 1)
+        self._general = _General()
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setWidget(self._general)
+        self._stack.addWidget(self._scroll)
+        self._stack.addWidget(self._build_content())
+        self._trackers = _Table(("files.tr_url", "files.tr_tier", "files.tr_status", "files.tr_seeds", "files.tr_peers"),
+                                (0, 50, 260, 70, 70), (1, 3, 4))
+        self._peers = _Table(("files.pe_addr", "files.pe_client", "files.pe_progress", "files.pe_down", "files.pe_up",
+                              "files.pe_downloaded", "files.pe_uploaded"), (0, 130, 80, 80, 80, 90, 90), (2, 3, 4, 5, 6))
+        self._stack.addWidget(self._trackers)
+        self._stack.addWidget(self._peers)
+        lay.addWidget(self._body, 1)
+        self._tabs.setCurrentItem("content")
+        self._stack.setCurrentIndex(1)
+        self._timer = QTimer(self, interval=500)
+        self._timer.timeout.connect(self.refresh)
+        self._apply_theme()
+        qconfig.themeChanged.connect(self._apply_theme)
+        register_locale_refresh(self, self._retranslate)
+        self.setMinimumHeight(self._MIN_OPEN)
+        self.hide()
+
+    def _build_content(self) -> QWidget:
+        w = QWidget()
+        cl = QVBoxLayout(w)
+        cl.setContentsMargins(0, 2, 0, 0)
+        cl.setSpacing(2)
+        bar = QHBoxLayout()
+        bar.setSpacing(2)
+        self._stats = CaptionLabel("")
+        bar.addWidget(self._stats, 1)
+        self._btns: dict[str, TransparentPushButton] = {}
+        for key, fn in (("files.select_all", lambda: self._all(None)), ("files.deselect_all", lambda: self._all(0))):
+            b = TransparentPushButton(tr(key))
+            b.setFixedHeight(24)
+            b.clicked.connect(lambda _=False, f=fn: f())
+            bar.addWidget(b)
+            self._btns[key] = b
+        cl.addLayout(bar)
+        self._model = _FilesModel(self)
+        self._model.requested.connect(self._apply)
+        self._tree = t = _FilesTree()
+        t.setModel(self._model)
+        t.setItemDelegate(_FileDelegate(t))
+        t.setUniformRowHeights(True)
+        t.setIndentation(16)
+        t.setExpandsOnDoubleClick(True)
+        t.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        t.setMouseTracking(True)
+        t.setFrameShape(QFrame.Shape.NoFrame)
+        t.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        h = t.header()
+        h.setSectionsMovable(False)
+        h.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for c, wd in enumerate((0, 74, 74, 96, 96, 78, 78, 70)):
+            if wd:
+                t.setColumnWidth(c, wd)
+        h.setMinimumSectionSize(40)
+        h.setFixedHeight(22)
+        t.menu_requested.connect(self._menu)
+        t.toggle_requested.connect(self._toggle_selected)
+        self._model.visible = self._visible
+        cl.addWidget(t, 1)
+        return w
+
+    def attach(self, split: QSplitter) -> None:
+        self._split = split
+        split.splitterMoved.connect(lambda *_: self._remember())
+
+    def _apply_theme(self, *_) -> None:
+        pal = palette()
+        a = _pal("accent", .16).name(QColor.NameFormat.HexArgb)
+        qss = (f"QTreeView {{ background: transparent; border: none; outline: none; color: {pal['primary_text']}; }} "
+               f"QTreeView::item:selected {{ background: {a}; color: {pal['primary_text']}; }} "
+               f"QHeaderView {{ background: transparent; }} "
+               f"QHeaderView::section {{ background: transparent; color: {pal['muted']}; border: none; "
+               f"border-bottom: 1px solid {pal['card_border']}; padding: 0 6px; font-size: 11px; }} {scroll_area_qss()}")
+        for w in (self._tree, self._trackers, self._peers):
+            w.setStyleSheet(qss)
+        self._scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; } " + scroll_area_qss())
+        self._note.setStyleSheet(f"color: {pal['muted']};")
+        self._head.update()
+
+    def _retranslate(self) -> None:
+        for key in self._TABS:
+            with suppress(Exception):
+                self._tabs.widget(key).setText(tr(f"files.tab_{key}"))
+        for key, b in self._btns.items():
+            b.setText(tr(key))
+        self._trackers.retranslate()
+        self._peers.retranslate()
+        self._general.retranslate()
+        self._model.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, len(_FCOLS) - 1)
+        self.on_item(self._m.get(self._iid))
+        self.refresh()
+
+
+    def set_item(self, iid: str) -> None:
+        item = self._m.get(iid)
+        if iid != self._iid:
+            self._iid, self._shape = iid, None
+            self._model.clear()
+            self._model.warn = item is None or item.category != "repacks"
+        self.setVisible(bool(iid))
+        self.on_item(item)
+        self.refresh()
+
+    def on_item(self, item) -> None:
+        h = self._head
+        h.title = tr("files.title") + (f"  ·  {_download_title(item)}" if item is not None else "")
+        h.info = "" if item is None else (f"\u2193 {human_speed(item.speed_down_kbps)}  ·  {item.progress:.1f}%  ·  "
+                                          f"{human_bytes(item.downloaded_bytes)} / {human_bytes(item.total_bytes)}")
+        h.update()
+
+    def showEvent(self, e) -> None:
+        super().showEvent(e)
+        if self._split is not None:
+            self._split.setSizes([max(self._split.height() - self._h, 80), self._h])
+        self._timer.start()
+        self.refresh()
+
+    def hideEvent(self, e) -> None:
+        super().hideEvent(e)
+        self._timer.stop()
+
+    def _remember(self) -> None:
+        if self.isVisible() and self.height() >= self._MIN_OPEN:
+            self._h = self.height()
+
+    def _switch(self, key: str) -> None:
+        self._stack.setCurrentIndex(self._TABS.index(key))
+        self.refresh()
+
+    def _visible(self) -> list:
+        t, out = self._tree, []
+        i, bottom = t.indexAt(t.viewport().rect().topLeft()), t.viewport().height()
+        while i.isValid() and len(out) < 200 and t.visualRect(i).top() < bottom:
+            out.append(i)
+            i = t.indexBelow(i)
+        return out
+
+    def refresh(self) -> None:
+        if not (self._iid and self.isVisible()):
+            return
+        m, tab = self._m, self._stack.currentIndex()
+        data = (m.details, m.file_state, m.trackers, m.peers)[tab](self._iid)
+        if data is None:
+            if self._shape is not None:
+                self._shape = None
+                self._model.clear()
+            self._note.setText(tr("files.unavailable"))
+            self._note.show(), self._stack.hide()
+            return
+        self._note.hide(), self._stack.show()
+        if tab == 0:
+            self._general.update_from(data, m.get(self._iid))
+        elif tab == 1:
+            self._refresh_content(data)
+        elif tab == 2:
+            self._trackers.set_rows([[host, str(tier), msg or "-", str(s) if s >= 0 else "-", str(p) if p >= 0 else "-"]
+                                     for host, tier, msg, s, p in data])
+        else:
+            self._peers.set_rows([[addr, client, f"{prog * 100:.0f}%", human_speed(dn / 1024) if dn else "",
+                                   human_speed(up / 1024) if up else "", human_bytes(dl), human_bytes(ul)]
+                                  for addr, client, prog, dn, up, dl, ul in data])
+
+    def _refresh_content(self, st: dict) -> None:
+        n = len(st["prios"])
+        if self._shape != (self._iid, n):
+            tree = self._m.file_tree(self._iid)
+            if tree is None or len(tree) != n:
+                return
+            self._model.rebuild(tree)
+            self._shape = (self._iid, n)
+            if self._model.rowCount() == 1 and self._model.index(0, 0).internalPointer().idx < 0:
+                self._tree.expand(self._model.index(0, 0))
+        self._model.update(st["progress"], st["prios"], st["state"] == DLState.paused)
+        s = st["stats"]
+        left = max(0, s["wanted"] - s["done"])
+        self._stats.setText(tr(
+            "files.stats", down=human_speed(s["down"]), up=human_speed(s["up"]), pct=f"{s['progress']:.1f}", left=human_bytes(left),
+            peers=f"{s['peers']}/{s['list_peers']}", seeds=f"{s['seeds']}/{s['list_seeds']}", ratio=f"{s['ratio']:.2f}",
+            avail=f"{s['availability']:.2f}" if s["availability"] >= 0 else "-", eta=human_duration(s["eta"])))
+
+
+    def _apply(self, changes: dict) -> None:
+        if not self._m.set_file_priorities(self._iid, changes):
+            _toast(self.window(), "warning", tr("files.title"), tr("files.keep_one"), 3000)
+        self.refresh()
+
+    def _all(self, prio) -> None:
+        self._model.request(self._model._root.kids, prio)
+
+    def _selected(self) -> list:
+        return [i.internalPointer() for i in self._tree.selectionModel().selectedRows(0)]
+
+    def _toggle_selected(self) -> None:
+        nodes = self._selected()
+        if nodes:
+            self._model.request(nodes, 0 if all(self._model.check(k) == _CHECKED for k in nodes) else None)
+
+    def _target_path(self, node) -> str | None:
+        leaf = node if node.idx >= 0 else next(iter(self._model.leaves([node])), None)
+        path = self._m.file_path(self._iid, leaf.idx) if leaf is not None else None
+        return path if node.idx >= 0 or not path else os.path.dirname(path)
+
+    def _menu(self, pos: QPoint) -> None:
+        idx = self._tree.indexAt(self._tree.viewport().mapFromGlobal(pos))
+        if idx.isValid() and not self._tree.selectionModel().isSelected(idx):
+            self._tree.setCurrentIndex(idx)
+        nodes, m = self._selected(), self._model
+        menu = RoundMenu(parent=self)
+
+        def add(menu_, key, fn):
+            a = Action(tr(key))
+            a.triggered.connect(lambda _=False: fn())
+            menu_.addAction(a)
+
+        if nodes:
+            add(menu, "files.check", lambda: m.request(nodes, None))
+            add(menu, "files.uncheck", lambda: m.request(nodes, 0))
+            sub = RoundMenu(tr("files.priority"), self)
+            for prio in (7, 6, 4, 1):
+                add(sub, _PRIO_KEYS[prio], lambda p=prio: m.request(nodes, p))
+            menu.addMenu(sub)
+            menu.addSeparator()
+        add(menu, "files.select_all", lambda: self._all(None))
+        add(menu, "files.deselect_all", lambda: self._all(0))
+        add(menu, "files.expand_all", self._tree.expandAll)
+        add(menu, "files.collapse_all", self._tree.collapseAll)
+        if len(nodes) == 1:
+            node, path = nodes[0], self._target_path(nodes[0])
+            menu.addSeparator()
+            if path:
+                add(menu, "files.show_in_folder", lambda: _reveal(path, select=node.idx >= 0))
+                add(menu, "files.copy_path", lambda: QGuiApplication.clipboard().setText(os.path.normpath(path)))
+            add(menu, "files.copy_name", lambda: QGuiApplication.clipboard().setText(node.path))
+        menu.exec(pos)
+
+
 class DownloadManagerPage(QWidget):
     def __init__(self, manager: DownloadManager, parent=None):
         super().__init__(parent)
@@ -745,6 +1462,7 @@ class DownloadManagerPage(QWidget):
         self._manager = manager
         self._filelist_thread = None
         self._rows: dict[str, DownloadItemWidget] = {}
+        self._selected = ""
         self._pending: set[str] = set()
         self._diag: dict = {}
         self._diag_at = 0.0
@@ -784,8 +1502,23 @@ class DownloadManagerPage(QWidget):
         self._list.setObjectName("downloadQueueList")
         self._list.order_changed.connect(manager.reorder)
         self._empty = _EmptyState()
-        root.addWidget(self._list, 1)
-        root.addWidget(self._empty, 1)
+        top_box = QWidget()
+        tl = QVBoxLayout(top_box)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(0)
+        tl.addWidget(self._list, 1)
+        tl.addWidget(self._empty, 1)
+        self._panel = FilesPanel(manager)
+        self._split = QSplitter(Qt.Orientation.Vertical)
+        self._split.setChildrenCollapsible(False)
+        self._split.setHandleWidth(6)
+        self._split.setStyleSheet("QSplitter::handle { background: transparent; }")
+        self._split.addWidget(top_box)
+        self._split.addWidget(self._panel)
+        self._split.setStretchFactor(0, 1)
+        self._split.setStretchFactor(1, 0)
+        self._panel.attach(self._split)
+        root.addWidget(self._split, 1)
         self._apply_theme()
         qconfig.themeChanged.connect(self._on_theme)
 
@@ -833,6 +1566,8 @@ class DownloadManagerPage(QWidget):
         row.request_open_file.connect(self._on_open_file)
         row.request_open_folder.connect(self._on_open_folder)
         row.request_settings.connect(self._on_settings)
+        row.clicked.connect(self._select)
+        row.set_selected(item.id == self._selected)
         self._list.add_row(row)
         self._rows[item.id] = row
 
@@ -840,6 +1575,17 @@ class DownloadManagerPage(QWidget):
         has = bool(self._rows)
         self._list.setVisible(has)
         self._empty.setVisible(not has)
+
+    def _select(self, item_id: str) -> None:
+        if item_id == self._selected:
+            self._panel.setVisible(bool(item_id) and self._panel.isHidden())
+            return
+        if (old := self._rows.get(self._selected)) is not None:
+            old.set_selected(False)
+        self._selected = item_id
+        if (row := self._rows.get(item_id)) is not None:
+            row.set_selected(True)
+        self._panel.set_item(item_id)
 
     def _on_added(self, item_id: str) -> None:
         item = self._manager.get(item_id)
@@ -860,11 +1606,16 @@ class DownloadManagerPage(QWidget):
             item, row = self._manager.get(item_id), self._rows.get(item_id)
             if item is not None and row is not None:
                 row.update_from_item(item, self._diag)
+                if item_id == self._selected:
+                    self._panel.on_item(item)
 
     def _on_removed(self, item_id: str) -> None:
         row = self._rows.pop(item_id, None)
         if row is None:
             return
+        if item_id == self._selected:
+            self._selected = ""
+            self._panel.set_item("")
         self._list.remove_row(row)
         row.setParent(None)
         row.deleteLater()

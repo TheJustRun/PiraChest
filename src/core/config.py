@@ -258,6 +258,12 @@ class Settings:
     onboarding_completed: bool = False
     sync_prompt_shown: bool = False
     pc_games_enabled: bool = False
+    steam_enrichment_enabled: bool = False
+    steam_banner: bool = False
+    steam_logo: bool = False
+    steam_description: bool = False
+    steam_proxy_url: str = ''
+    repack_show_titles: bool = False
     minerva_enabled: bool = False
     minerva_extract_roms: bool = False
     music_enabled: bool = False
@@ -278,6 +284,11 @@ class Settings:
     tv_stream_connect_timeout: int = 60
     tv_stream_prebuffer_mb: int = 4
     tv_stream_clear_on_exit: bool = False
+    tv_external_enabled: bool = True
+    tv_vyla_enabled: bool = True
+    tv_external_auto_setup: bool = True
+    tv_external_timeout: int = 30
+    tv_node_path: str = ''
     tv_skip_intro: bool = False
     tv_skip_credits: bool = False
     tv_autonext: bool = False
@@ -852,7 +863,8 @@ def register_associations(exe_path: str | None = None) -> bool:
         return False
 
 def should_auto_register_associations() -> bool:
-    return associations_available() and not settings.associations_exe_path and not settings.associations_user_disabled
+    # Never claim torrent/magnet associations without an explicit opt-in.
+    return associations_available() and bool(settings.associations_enabled)
 
 
 def ensure_associations_repaired() -> bool:

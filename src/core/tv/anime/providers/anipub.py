@@ -8,6 +8,7 @@ from urllib.parse import quote
 from ..anime_backend import (
     MIN, SHOW_IDENTITY_TTL, UA, build_titles, episode_meta, expected_count, fetch_html,
     fetch_json, title_score, get_media, get_entry as get, set_entry as cache_set, is_fresh,
+    season_base_titles,
 )
 from . import megaplay
 
@@ -27,14 +28,14 @@ _WS_RE = re.compile(r"\s+")
 
 def _search_queries(titles: list[str]) -> list[str]:
     queries: list[str] = []
-    for title in titles[:2]:
+    for title in titles:
         title = (title or "").strip()
         stripped = _WS_RE.sub(" ", _STRIP_RE.sub("", title)).strip(" -:")
         no_parens = _WS_RE.sub(" ", _PAREN_RE.sub(" ", title)).strip(" -:")
         for candidate in (title, stripped, no_parens):
             if len(candidate) >= _SEARCH_MIN_LEN and candidate not in queries:
                 queries.append(candidate)
-    return queries[:4]
+    return queries[:5]
 
 
 async def search(query: str) -> list[dict]:
@@ -89,30 +90,66 @@ async def scrape_series(slug: str) -> list[dict]:
     return _episodes_from_details(await _fetch_details(slug))
 
 
+def _words(text: str) -> list[str]:
+    return [w for w in re.split(r"[^\w']+", (text or "").lower()) if w and not any(ch.isdigit() for ch in w)]
+
+
+def _loose_queries(titles: list[str], tried: list[str]) -> list[str]:
+    seen = {q.lower() for q in tried}
+    out: list[str] = []
+    for size in (3, 2):
+        for title in titles:
+            words = _words(title)
+            for i in range(len(words) - size + 1):
+                q = " ".join(words[i:i + size])
+                if q not in seen:
+                    seen.add(q)
+                    out.append(q)
+    return out[:10]
+
+
+def _containment(a: str, b: str) -> float:
+    wa, wb = set(_words(a)), set(_words(b))
+    if min(len(wa), len(wb)) < 2:
+        return 0.0
+    return len(wa & wb) / min(len(wa), len(wb))
+
+
 async def _find_show(media: dict, ctx: dict) -> dict:
     titles = build_titles(media, ctx.get("anizip"))
-    queries = _search_queries(titles)
+    extra = [t for t in await season_base_titles((media or {}).get("id")) if t not in titles]
+    scoring_titles = [t for t in (titles[:2] + extra) if t]
+    queries = _search_queries(scoring_titles)
     if not queries:
         raise RuntimeError(f"anipub: no searchable titles for AniList {(media or {}).get('id')}")
 
-    results = await asyncio.gather(*(search(q) for q in queries), return_exceptions=True)
+    async def _collect(qs: list[str]) -> dict[str, dict]:
+        found: dict[str, dict] = {}
+        for result in await asyncio.gather(*(search(q) for q in qs), return_exceptions=True):
+            if isinstance(result, BaseException):
+                logger.warning("anipub search failed: %s: %s", type(result).__name__, result)
+                continue
+            for candidate in result:
+                found.setdefault(candidate["slug"], candidate)
+        return found
 
-    candidates: dict[str, dict] = {}
-    for result in results:
-        if isinstance(result, BaseException):
-            logger.warning("anipub search failed: %s: %s", type(result).__name__, result)
-            continue
-        for candidate in result:
-            candidates.setdefault(candidate["slug"], candidate)
+    candidates = await _collect(queries)
+    loose = not candidates
+    if loose:
+        loose_queries = _loose_queries(scoring_titles, queries)
+        queries = queries + loose_queries
+        candidates = await _collect(loose_queries)
     if not candidates:
-        raise RuntimeError(f"AniPub search: no candidates for {titles[:1]}")
+        raise RuntimeError(f"AniPub search: no candidates for {titles[:1]} (tried {queries})")
 
     scored: list[dict] = []
     for candidate in candidates.values():
         score = max(
-            (title_score(t, candidate["text"], candidate.get("finder") or "") for t in titles[:2] if t),
+            (title_score(t, candidate["text"], candidate.get("finder") or "") for t in scoring_titles),
             default=0.0,
         )
+        if loose:
+            score = max(score, 0.75 * max((_containment(t, candidate["text"]) for t in scoring_titles), default=0.0))
         if score >= 0.5:
             scored.append({**candidate, "score": score})
     scored.sort(key=lambda c: c["score"], reverse=True)

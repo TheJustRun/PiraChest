@@ -52,17 +52,54 @@ jobs:
         shell: pwsh
         run: Set-Content -Path VERSION -Value "${{ needs.version.outputs.version }}" -NoNewline
 
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2 2>$null
+          if ($LASTEXITCODE -ne 0) { dotnet tool update --global wix --version 5.0.2 }
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append
+
       - name: Build with PyInstaller
         shell: cmd
+        env:
+          SKIP_MSI: "1"
         run: build.bat
 
-      - name: Zip + checksum
+      - name: Build MSI installer
         shell: pwsh
         run: |
           if (-not (Test-Path dist/PiraChest/PiraChest.exe)) { Write-Error "Build output missing"; exit 1 }
           if (Test-Path dist/PiraChest/data) { Remove-Item dist/PiraChest/data -Recurse -Force }
+          New-Item -ItemType Directory -Force package | Out-Null
+          $ver = ("${{ needs.version.outputs.version }}" -split '-')[0]
+          $exe = (Resolve-Path dist/PiraChest/PiraChest.exe).Path
+          $ico = Get-ChildItem -Recurse -File -Filter *.ico | Where-Object { $_.FullName -notmatch '[\\/](dist|build|package|\.venv|venv|node_modules|site-packages)[\\/]' } | Sort-Object Length -Descending | Select-Object -First 1 -ExpandProperty FullName
+          $iconSrc = if ($ico) { $ico } else { $exe }
+          Add-Type -AssemblyName System.Drawing
+          $png = Join-Path $env:GITHUB_WORKSPACE 'package/PiraChest-icon.png'
+          try {
+            $icon = if ($ico) { [System.Drawing.Icon]::new($ico, 256, 256) } else { [System.Drawing.Icon]::ExtractAssociatedIcon($exe) }
+            $icon.ToBitmap().Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
+          } catch {
+            [System.Drawing.Icon]::ExtractAssociatedIcon($exe).ToBitmap().Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
+          }
+          $msiName = "PiraChest-${{ needs.version.outputs.tag }}-Windows-x64.msi"
+          $msi = Join-Path $env:GITHUB_WORKSPACE "package/$msiName"
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          wix build installer/PiraChest.wxs -arch x64 -ext WixToolset.UI.wixext `
+            -d Version=$ver -d SourceDir=dist/PiraChest -d IconFile="$iconSrc" `
+            -d Manufacturer="${{ github.repository_owner }}" -d ProjectUrl="https://github.com/${{ github.repository }}" `
+            -o "$msi"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "MSI_PATH=$msi" >> $env:GITHUB_ENV
+
+      - name: Zip + checksums
+        shell: pwsh
+        run: |
           $name = "PiraChest-${{ needs.version.outputs.tag }}-Windows-x64.zip"
-          $out = Join-Path $env:GITHUB_WORKSPACE $name
+          $out = Join-Path $env:GITHUB_WORKSPACE "package/$name"
           Push-Location dist/PiraChest
           if (Get-Command 7z -ErrorAction SilentlyContinue) {
             7z a -tzip -mx=9 -mmt=on "$out" * | Out-Null
@@ -70,18 +107,18 @@ jobs:
             Compress-Archive -Path * -DestinationPath $out -CompressionLevel Optimal
           }
           Pop-Location
-          $hash = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name" | Set-Content "$out.sha256" -Encoding utf8NoBOM
+          foreach ($f in @($out, $env:MSI_PATH)) {
+            $hash = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            "$hash  $(Split-Path $f -Leaf)" | Set-Content "$f.sha256" -Encoding utf8NoBOM
+          }
           $mb = [math]::Round((Get-ChildItem dist/PiraChest -Recurse -File | Measure-Object Length -Sum).Sum / 1MB, 1)
           "Onedir size: $mb MB" >> $env:GITHUB_STEP_SUMMARY
-          "ZIP_PATH=$out" >> $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-zip
-          path: |
-            ${{ env.ZIP_PATH }}
-            ${{ env.ZIP_PATH }}.sha256
+          name: windows-package
+          path: package/*
+          if-no-files-found: error
 
   release:
     name: GitHub Release
@@ -91,7 +128,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: windows-zip
+          name: windows-package
           path: release-files
 
       - uses: softprops/action-gh-release@v2
@@ -99,13 +136,50 @@ jobs:
           tag_name: ${{ needs.version.outputs.tag }}
           name: "PiraChest ${{ needs.version.outputs.tag }}"
           body: |
-            PiraChest ${{ needs.version.outputs.version }} (Windows x64, portable).
+            PiraChest ${{ needs.version.outputs.version }} (Windows x64).
 
-            Download the ZIP, extract it, and run `PiraChest.exe`.
-            The `.sha256` file contains the checksum used by the built-in updater.
+            **Install:** download the MSI and run it. Choose the install location in the setup wizard. It installs for the current user with a Start Menu shortcut, no admin prompt, and no forced file associations.
+            **Portable:** download the ZIP, extract it, and run `PiraChest.exe`. The ZIP `.sha256` file contains the checksum used by the built-in updater; the MSI `.sha256` verifies the installer.
+          generate_release_notes: true
           prerelease: ${{ contains(needs.version.outputs.version, '-') }}
           fail_on_unmatched_files: true
           files: release-files/*
+
+  discord:
+    name: Announce on Discord
+    needs: [ version, release ]
+    if: needs.version.outputs.is_new == 'true'
+    runs-on: ubuntu-latest
+    env:
+      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Post release to Discord
+        if: env.WEBHOOK_URL != ''
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          REPO="${{ github.repository }}"
+          EXPECTED_CHANNEL="1548012719779749910"
+          ACTUAL_CHANNEL=$(curl -fsS "$WEBHOOK_URL" | jq -r '.channel_id')
+          if [ "$ACTUAL_CHANNEL" != "$EXPECTED_CHANNEL" ]; then
+            echo "::error::Webhook posts to channel $ACTUAL_CHANNEL, expected $EXPECTED_CHANNEL"
+            exit 1
+          fi
+          JSON=$(gh release view "$TAG" --repo "$REPO" --json body,url,isPrerelease,assets)
+          BODY=$(jq -r '.body' <<< "$JSON" | sed -e 's/^### /**/;s/^## /**/' | head -c 3800)
+          URL=$(jq -r '.url' <<< "$JSON")
+          MSI=$(jq -r '[.assets[].url | select(endswith(".msi"))][0] // empty' <<< "$JSON")
+          ZIP=$(jq -r '[.assets[].url | select(endswith(".zip"))][0] // empty' <<< "$JSON")
+          jq -n --arg role "<@&1548027542353477743>" --arg title "PiraChest $TAG" --arg url "$URL" \
+                --arg body "$BODY" --arg msi "$MSI" --arg zip "$ZIP" --arg repo "$REPO" '
+            {username: "GitHub",
+             avatar_url: "https://github.com/\($repo | split("/")[0]).png",
+             content: $role,
+             allowed_mentions: {parse: [], roles: ["1548027542353477743"]},
+             embeds: [{title: $title, url: $url, color: 5814783,
+                       description: ($body + "\n\n[Installer (MSI)](\($msi)) | [Portable (ZIP)](\($zip))"),
+                       footer: {text: "PiraChest Changelog"}}]}' > payload.json
+          curl -fsS -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL"
 
   chocolatey:
     name: Publish to Chocolatey
@@ -117,7 +191,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: windows-zip
+          name: windows-package
           path: release-files
 
       - name: Package and push (skipped without API key)
@@ -128,36 +202,38 @@ jobs:
           $tag = "${{ needs.version.outputs.tag }}"
           $repo = "${{ github.repository }}"
           $owner = "${{ github.repository_owner }}"
-          $zip = "PiraChest-$tag-Windows-x64.zip"
-          $sha = (Get-Content "release-files/$zip.sha256").Split()[0]
-          $url = "https://github.com/$repo/releases/download/$tag/$zip"
+          $msi = "PiraChest-$tag-Windows-x64.msi"
+          $sha = (Get-Content "release-files/$msi.sha256").Split()[0]
+          $url = "https://github.com/$repo/releases/download/$tag/$msi"
+          $iconUrl = "https://github.com/$repo/releases/download/$tag/PiraChest-icon.png"
 
           New-Item -ItemType Directory -Force pkg/tools | Out-Null
 
           @'
           $ErrorActionPreference = 'Stop'
           if (-not [Environment]::Is64BitOperatingSystem) { throw 'PiraChest is x64 only.' }
-          $toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-          Install-ChocolateyZipPackage `
+          Install-ChocolateyPackage `
             -PackageName $env:ChocolateyPackageName `
-            -Url '__URL__' `
-            -UnzipLocation $toolsDir `
-            -Checksum '__CHECKSUM__' `
-            -ChecksumType 'sha256'
-          $exe = Join-Path $toolsDir 'PiraChest.exe'
-          if (-not (Test-Path $exe)) { throw 'PiraChest.exe missing after extraction.' }
-          Set-Content -Path (Join-Path $toolsDir '.pirachest-choco') -Value '1' -Encoding ascii
+            -FileType 'msi' `
+            -SilentArgs '/qn /norestart' `
+            -Url64bit '__URL__' `
+            -Checksum64 '__CHECKSUM__' `
+            -ChecksumType64 'sha256' `
+            -ValidExitCodes @(0, 3010)
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\PiraChest'
+          $exe = Join-Path $dir 'PiraChest.exe'
+          if (-not (Test-Path $exe)) { throw "PiraChest.exe missing at $exe after install." }
+          Set-Content -Path (Join-Path $dir '.pirachest-choco') -Value '1' -Encoding ascii
           Install-BinFile -Name 'pirachest' -Path $exe
-          $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\PiraChest.lnk'
-          Install-ChocolateyShortcut -ShortcutFilePath $shortcut -TargetPath $exe `
-            -WorkingDirectory $toolsDir -Description 'PiraChest'
           '@.Replace('__URL__', $url).Replace('__CHECKSUM__', $sha) | Set-Content pkg/tools/chocolateyinstall.ps1 -Encoding utf8NoBOM
 
           @'
           $ErrorActionPreference = 'Stop'
           Uninstall-BinFile -Name 'pirachest'
-          $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\PiraChest.lnk'
-          if (Test-Path $shortcut) { Remove-Item $shortcut -Force }
+          $keys = Get-UninstallRegistryKey -SoftwareName 'PiraChest*'
+          foreach ($key in $keys) {
+            Start-ChocolateyProcessAsAdmin -Statements "/x $($key.PSChildName) /qn /norestart" -ExeToRun 'msiexec.exe' -ValidExitCodes @(0, 3010, 1605, 1614, 1641)
+          }
           '@ | Set-Content pkg/tools/chocolateyuninstall.ps1 -Encoding utf8NoBOM
 
           @"
@@ -167,6 +243,7 @@ jobs:
               <id>pirachest</id>
               <version>$ver</version>
               <title>PiraChest</title>
+              <iconUrl>$iconUrl</iconUrl>
               <authors>$owner</authors>
               <projectUrl>https://github.com/$repo</projectUrl>
               <projectSourceUrl>https://github.com/$repo</projectSourceUrl>

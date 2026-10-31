@@ -5,7 +5,6 @@ import logging
 import math
 import os
 import random
-import re
 import time
 from functools import partial
 from types import SimpleNamespace
@@ -51,9 +50,6 @@ def _provider_badge(provider: str):
 
 
 _DEFAULT_BACKDROP = '#ff6a3d'
-_BRACKET_RE = re.compile('\\s*\\[[^\\]]*\\]\\s*$')
-_DASH_REPACK_RE = re.compile('\\s*[-–]\\s*(RePack|Repack).*$', re.IGNORECASE)
-_TAIL_RE = re.compile('\\s*[-–+]\\s*(v[\\d][\\w.\\-]*|build\\s+[\\w.]+|update\\s+[\\w.]+|hotfix\\s+[\\w.]+|patch\\s+[\\w.]+|\\(?\\s*build\\s+[\\w.]+\\s*\\)?|\\d+\\s*dlcs?(?:/bonuses)?|all\\s+dlcs?|bonus\\s+content)\\s*$', re.IGNORECASE)
 _lazy_cache: dict = {}
 _placeholders: dict = {}
 _LANG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lang')
@@ -257,16 +253,13 @@ def _on(key: str) -> bool:
 
 def _clean_repack_title(raw: str) -> str:
     title = raw or ''
-    for rx in (_BRACKET_RE, None, _TAIL_RE):
-        if rx is None:
-            title = _DASH_REPACK_RE.sub('', title)
-            continue
-        while True:
-            new = rx.sub('', title)
-            if new == title:
-                break
-            title = new
-    return title.strip(' -–\t') or raw
+    try:
+        from src.core.repacks.base import display_title
+
+        return display_title(title) or title
+    except Exception:
+        logger.debug('Could not clean repack title', exc_info=True)
+        return title
 
 
 def _set_scroll_content(area: QScrollArea, widget: QWidget) -> None:
@@ -715,10 +708,10 @@ class _FeaturedCard(QFrame):
         self._lay.setContentsMargins(self._PAD, 24, self._PAD, 24)
         col = QVBoxLayout()
         col.setSpacing(6)
-        self._eyebrow = CaptionLabel('')
-        self._title = TitleLabel('')
+        self._eyebrow = self._plain_label(12, QFont.Weight.Bold)
+        self._title = self._plain_label(28, QFont.Weight.DemiBold)
         self._title.setWordWrap(True)
-        self._body = BodyLabel('')
+        self._body = self._plain_label(14, QFont.Weight.Normal)
         self._body.setWordWrap(True)
         self._btn = _FeaturedButton('')
         self._btn.setFixedHeight(36)
@@ -734,6 +727,20 @@ class _FeaturedCard(QFrame):
         col.addWidget(self._btn, 0, Qt.AlignmentFlag.AlignAbsolute | Qt.AlignmentFlag.AlignLeft)
         col.addStretch(1)
         self._lay.addLayout(col, 1)
+
+    @staticmethod
+    def _plain_label(px: int, weight) -> QLabel:
+        lbl = QLabel('')
+        font = QFont(lbl.font())
+        font.setPixelSize(px)
+        font.setWeight(weight)
+        lbl.setFont(font)
+        lbl.setStyleSheet('background: transparent;')
+        return lbl
+
+    @staticmethod
+    def _rgba(c: QColor) -> str:
+        return f'rgba({c.red()},{c.green()},{c.blue()},{c.alpha()})'
 
     def _activate(self) -> None:
         if self._btn.isVisible():
@@ -847,11 +854,12 @@ class _FeaturedCard(QFrame):
         self._c0 = _blend(self._c0, self._c1, self._ct)
         self._c1 = QColor(solid)
         self._restart(self._color_anim, '_ct')
-        text = _readable_text_color(solid)
-        muted = 'rgba(0,0,0,0.72)' if text == '#1a1a1a' else 'rgba(255,255,255,0.85)'
-        self._eyebrow.setStyleSheet(f'color: {muted}; font-weight: 700;')
-        self._title.setStyleSheet(f'color: {text};')
-        self._body.setStyleSheet(f'color: {muted};')
+        dark_text = _readable_text_color(solid) == '#1a1a1a'
+        text = QColor('#1a1a1a') if dark_text else QColor('#ffffff')
+        muted = QColor(0, 0, 0, 200) if dark_text else QColor(255, 255, 255, 225)
+        self._eyebrow.setStyleSheet(f'background: transparent; color: {self._rgba(muted)};')
+        self._title.setStyleSheet(f'background: transparent; color: {self._rgba(text)};')
+        self._body.setStyleSheet(f'background: transparent; color: {self._rgba(muted)};')
         bg = QColor(solid).lighter(140)
         self._btn.set_base(bg)
 

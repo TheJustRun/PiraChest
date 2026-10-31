@@ -55,14 +55,17 @@ if errorlevel 1 (
     exit /b 1
 )
 
+if exist "dist\PiraChest\data" rmdir /s /q "dist\PiraChest\data"
+
 echo [build] Pruning...
-python tools\prune_build.py
+set "PRUNE_ARGS=--msi"
+if defined SKIP_MSI set "PRUNE_ARGS="
+python tools\prune_build.py %PRUNE_ARGS%
 if errorlevel 1 (
     echo [error] Build pruning failed.
     exit /b 1
 )
 
-if exist "dist\PiraChest\data" rmdir /s /q "dist\PiraChest\data"
-
 echo [done] dist\PiraChest\PiraChest.exe
+for %%f in ("dist\PiraChest-*-Windows-x64.msi") do @if exist "%%f" echo [done] %%~ff
 exit /b 0

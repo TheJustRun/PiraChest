@@ -1,5 +1,7 @@
 import logging
+import threading
 import time
+from collections import OrderedDict
 import requests
 from src.core.config import network
 from src.core.cache import cache
@@ -7,6 +9,8 @@ from src.core import worker
 
 _TTL_SHORT = 3600
 _TTL_LONG = 21600
+_TTL_DETAIL = 86400
+_MEM_MAX = 128
 logger = logging.getLogger(__name__)
 
 _session = requests.Session()
@@ -60,8 +64,49 @@ def _tbhb_fallback(path: str, params: dict | None) -> dict | None:
     return None
 
 
+_mem: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+_inflight: dict[str, threading.Event] = {}
+_lock = threading.Lock()
+
+
 def _get(path: str, params: dict | None = None, ttl: int = _TTL_SHORT, use_cache: bool = True) -> dict:
     key = _key(path, params)
+    while True:
+        with _lock:
+            hit = _mem.get(key)
+            if use_cache and hit is not None and time.time() - hit[0] < ttl:
+                _mem.move_to_end(key)
+                return hit[1]
+            event = _inflight.get(key)
+            if event is None:
+                _inflight[key] = event = threading.Event()
+                leader = True
+            else:
+                leader = False
+        if leader:
+            break
+        event.wait(20)
+        with _lock:
+            hit = _mem.get(key)
+            if hit is not None and time.time() - hit[0] < ttl:
+                return hit[1]
+            if key not in _inflight:
+                _inflight[key] = event = threading.Event()
+                break
+    try:
+        data = _load(key, path, params, ttl, use_cache)
+        with _lock:
+            _mem[key] = (time.time(), data)
+            while len(_mem) > _MEM_MAX:
+                _mem.popitem(last=False)
+        return data
+    finally:
+        with _lock:
+            _inflight.pop(key, None)
+        event.set()
+
+
+def _load(key: str, path: str, params: dict | None, ttl: int, use_cache: bool) -> dict:
     if use_cache:
         cached = cache.load("tmdb", key, ttl_seconds=ttl)
         if cached is not None:
@@ -120,6 +165,29 @@ def credits(media_type: str, tmdb_id: int, use_cache: bool = True) -> dict:
 
 def external_ids(media_type: str, tmdb_id: int, use_cache: bool = True) -> dict:
     return _get(f"/{media_type}/{tmdb_id}/external_ids", None, _TTL_LONG, use_cache)
+
+
+_MOVIE_FULL = {"append_to_response": "credits,external_ids,images,recommendations,videos",
+               "include_image_language": "en,null", "include_video_language": "en,null"}
+
+
+def movie_full(tmdb_id: int, use_cache: bool = True) -> dict:
+    return _get(f"/movie/{tmdb_id}", _MOVIE_FULL, _TTL_DETAIL, use_cache)
+
+
+_prefetched: set[int] = set()
+
+
+def prefetch_movies(ids, limit: int = 6) -> None:
+    for tmdb_id in list(ids)[:limit]:
+        if not isinstance(tmdb_id, int) or tmdb_id in _prefetched:
+            continue
+        _prefetched.add(tmdb_id)
+        worker.submit(movie_full, args=(tmdb_id,), priority=worker.Priority.LOW)
+
+
+def collection(collection_id: int, use_cache: bool = True) -> dict:
+    return _get(f"/collection/{collection_id}", None, _TTL_DETAIL, use_cache)
 
 
 def season(tv_id: int, season_number: int, use_cache: bool = True) -> dict:
@@ -260,6 +328,29 @@ def anime_skip_segments(anilist_id, number, fallback: dict | None = None) -> dic
     return skip_segments("movie" if movie else "tv", tid, imdb or None, season, ep)
 
 
+def anime_banner(anilist_id) -> str:
+    key = str(anilist_id)
+    hit = cache.load("anime_banner", key, ttl_seconds=_TTL_SKIP)
+    if isinstance(hit, dict):
+        return hit.get("url") or ""
+    url = ""
+    try:
+        resp = _session.get("https://api.ani.zip/mappings", params={"anilist_id": anilist_id}, timeout=8)
+        if resp.status_code != 200:
+            return ""
+        images = resp.json().get("images") or []
+        if isinstance(images, dict):
+            images = [{"coverType": k, "url": v} for k, v in images.items()]
+        for kind in ("fanart", "banner"):
+            url = next((i.get("url") for i in images if isinstance(i, dict) and str(i.get("coverType")).lower() == kind and i.get("url")), "")
+            if url:
+                break
+    except (requests.RequestException, ValueError, AttributeError):
+        return ""
+    cache.save("anime_banner", key, {"url": url})
+    return url
+
+
 def _async(fn):
     def wrapper(*args, on_done=None, on_error=None, **kwargs):
         return worker.submit(fn, args=args, kwargs=kwargs, on_done=on_done, on_error=on_error)
@@ -276,4 +367,10 @@ details_async = _async(details)
 credits_async = _async(credits)
 external_ids_async = _async(external_ids)
 season_async = _async(season)
+def movie_full_async(tmdb_id, on_done=None, on_error=None):
+    return worker.submit(movie_full, args=(tmdb_id,), on_done=on_done, on_error=on_error, priority=worker.Priority.HIGH)
+
+
+collection_async = _async(collection)
 skip_segments_async = _async(skip_segments)
+anime_banner_async = _async(anime_banner)

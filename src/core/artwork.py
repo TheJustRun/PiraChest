@@ -31,6 +31,8 @@ _COOLDOWN = 5.0
 _TOUCH_AFTER = 6 * 3600.0
 _SWATCH = 40
 _COLOR_LIMIT = 512
+_AVIF_MAX_PIXELS = 20_000_000
+_STEAM_IMAGE_HOSTS = ('steamstatic.com', 'steampowered.com', 'steamcommunity.com')
 _UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
        'Chrome/124.0 Safari/537.36')
 _WIKIMEDIA_UA = 'PiraChest/1.0 (desktop app; +https://github.com/) httpx'
@@ -222,7 +224,7 @@ def _dims(size) -> tuple[int, int]:
     return value, value
 
 
-def _decode(path: str, width: int, height: int, mode: int, dpr: float) -> QImage:
+def _decode(path: str, width: int, height: int, mode: int, dpr: float, src: str = "") -> QImage:
     pw, ph = round(width * dpr), round(height * dpr)
     reader = QImageReader(path)
     reader.setDecideFormatFromContent(True)
@@ -237,18 +239,120 @@ def _decode(path: str, width: int, height: int, mode: int, dpr: float) -> QImage
         if mode == COVER:
             reader.setScaledClipRect(QRect((tw - pw) // 2, (th - ph) // 2, min(pw, tw), min(ph, th)))
     image = reader.read()
+    if image.isNull() and src and _steam_hosted(src):
+        image = _decode_avif(path)            # Qt lacks an AVIF plugin; Steam serves AVIF extras
+        image = _fit(image, pw, ph, mode)
     if image.isNull():
         return image
     if not known and pw > 0 and ph > 0:
-        ratio = Qt.AspectRatioMode.KeepAspectRatioByExpanding if mode == COVER else Qt.AspectRatioMode.KeepAspectRatio
-        image = image.scaled(pw, ph, ratio, Qt.TransformationMode.SmoothTransformation)
-        if mode == COVER and (image.width() > pw or image.height() > ph):
-            image = image.copy((image.width() - pw) // 2, (image.height() - ph) // 2, pw, ph)
+        image = _fit(image, pw, ph, mode)
     fmt = QImage.Format.Format_ARGB32_Premultiplied if image.hasAlphaChannel() else QImage.Format.Format_RGB32
     if image.format() != fmt:
         image = image.convertToFormat(fmt)
     image.setDevicePixelRatio(dpr)
     return image
+
+
+def _fit(image: QImage, pw: int, ph: int, mode: int) -> QImage:
+    if image.isNull() or pw <= 0 or ph <= 0:
+        return image
+    ratio = Qt.AspectRatioMode.KeepAspectRatioByExpanding if mode == COVER else Qt.AspectRatioMode.KeepAspectRatio
+    image = image.scaled(pw, ph, ratio, Qt.TransformationMode.SmoothTransformation)
+    if mode == COVER and (image.width() > pw or image.height() > ph):
+        image = image.copy((image.width() - pw) // 2, (image.height() - ph) // 2, pw, ph)
+    return image
+
+
+def _steam_hosted(src: str) -> bool:
+    try:
+        host = (urlsplit(src).hostname or '').casefold()
+    except ValueError:
+        return False
+    return any(host == suffix or host.endswith('.' + suffix) for suffix in _STEAM_IMAGE_HOSTS)
+
+
+def _avif_frame_image(frame) -> QImage:
+    """Convert a PyAV frame to a Qt image while keeping its alpha channel."""
+    frame = frame.reformat(format='rgba')
+    plane = frame.planes[0]
+    return QImage(bytes(plane), frame.width, frame.height, plane.line_size,
+                  QImage.Format.Format_RGBA8888).copy()
+
+
+def _avif_container(path: str):
+    with open(path, 'rb') as fh:
+        head = fh.read(64)
+    if len(head) < 12 or head[4:8] != b'ftyp' or (b'avif' not in head and b'avis' not in head):
+        return None
+    import av                                        # optional, already shipped for video
+
+    return av.open(path)
+
+
+def _decode_avif(path: str) -> QImage:
+    """Decode the first AVIF frame with PyAV, but only for Steam-hosted images."""
+    try:
+        container = _avif_container(path)
+        if container is None:
+            return QImage()
+        with container:
+            stream = container.streams.video[0]
+            if (stream.width or 0) * (stream.height or 0) > _AVIF_MAX_PIXELS:
+                return QImage()
+            for frame in container.decode(stream):
+                if frame.width * frame.height > _AVIF_MAX_PIXELS:
+                    return QImage()
+                return _avif_frame_image(frame)
+    except Exception:
+        logger.debug('AVIF decode failed', exc_info=True)
+    return QImage()
+
+
+def avif_animation(path: str, max_frames: int = 240) -> list[tuple[QImage, int]]:
+    """Return ``(image, delay_ms)`` pairs for an animated AVIF/AVIF sequence.
+
+    Static AVIF files produce a single frame.  Decoding happens on a worker
+    thread; the Qt image objects are safe to hand back to the GUI thread.
+    """
+    frames: list[tuple[QImage, int]] = []
+    try:
+        container = _avif_container(path)
+        if container is None:
+            return frames
+        with container:
+            stream = container.streams.video[0]
+            if (stream.width or 0) * (stream.height or 0) > _AVIF_MAX_PIXELS:
+                return frames
+            time_base = float(stream.time_base or 0.04)
+            previous = 0.0
+            for frame in container.decode(stream):
+                if frame.width * frame.height > _AVIF_MAX_PIXELS:
+                    break
+                try:
+                    stamp = float(frame.pts * time_base) if frame.pts is not None else previous + 0.04
+                except (TypeError, ValueError):
+                    stamp = previous + 0.04
+                delay = stamp - previous if frames else max(0.02, stamp)
+                delay = min(0.5, max(0.02, delay))
+                frames.append((_avif_frame_image(frame), int(round(delay * 1000))))
+                previous = stamp
+                if len(frames) >= max_frames:
+                    break
+    except Exception:
+        logger.debug('AVIF animation decode failed', exc_info=True)
+    return frames
+
+
+def image_file(src) -> str:
+    """Resolve a remote image to its cached local file (used by QMovie for GIFs)."""
+    value = str(src or '')
+    if not value:
+        return ''
+    try:
+        path = _resolve(value)
+    except Exception:
+        return ''
+    return path if path and os.path.isfile(path) else ''
 
 
 def _swatches(path: str, count: int) -> list[QColor]:
@@ -450,7 +554,7 @@ class _Images:
             self._decode_stage(key, req, path)
 
     def _decode_stage(self, key: tuple, req: _Req, path: str) -> None:
-        req.job = engine().submit(_decode, (path, key[1], key[2], key[3], key[4]),
+        req.job = engine().submit(_decode, (path, key[1], key[2], key[3], key[4], key[0]),
                                   on_done=lambda img, k=key, p=path: self._on_decoded(k, p, img),
                                   on_error=lambda _e, k=key: self._fail(k), key=('dec',) + key,
                                   priority=req.prio, pool=CPU)

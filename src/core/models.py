@@ -1,5 +1,7 @@
 from __future__ import annotations
 import hashlib
+import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -233,3 +235,216 @@ class MediaPage:
     entries: list
     page: int
     has_more: bool
+
+
+# --- File-type / source safety ------------------------------------------------
+# Download sources are checked locally by extension. This is deliberately
+# conservative: it never blocks a download, it only highlights file types that
+# deserve a second look. Game repacks routinely contain installers, so the
+# assessment depends on the surrounding category.
+
+_FILE_KINDS: dict[str, tuple[str, ...]] = {
+    'video': ('.mkv', '.mp4', '.avi', '.m4v', '.mov', '.webm', '.wmv', '.flv', '.mpg',
+              '.mpeg', '.ts', '.m2ts', '.vob', '.3gp', '.ogv'),
+    'audio': ('.mp3', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.wav', '.wma', '.alac',
+              '.ape', '.wv', '.tta', '.dsf', '.dff', '.m4b'),
+    'subtitle': ('.srt', '.ass', '.ssa', '.vtt', '.sub', '.idx', '.sup'),
+    'archive': ('.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.zst', '.tgz',
+                '.tbz2', '.lz', '.lzma'),
+    'disc': ('.iso', '.img', '.mdf', '.mds', '.nrg', '.cue', '.bin', '.cso', '.chd',
+             '.gcm', '.wbfs', '.xci', '.nsp'),
+    'rom': ('.nes', '.sfc', '.smc', '.gba', '.gbc', '.gb', '.nds', '.n64', '.z64', '.v64',
+            '.gen', '.md', '.sms', '.gg', '.pce', '.a26', '.a78', '.ws', '.wsc', '.3ds',
+            '.cia', '.rvz'),
+    'installer': ('.exe', '.msi', '.msix', '.appx', '.dmg', '.pkg', '.apk', '.jar'),
+    'document': ('.pdf', '.txt', '.rtf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+                 '.odt', '.ods', '.odp', '.nfo', '.md', '.csv', '.json', '.xml'),
+    'ebook': ('.epub', '.mobi', '.azw', '.azw3', '.fb2', '.cbz', '.cbr', '.cb7', '.djvu'),
+    'image': ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tif', '.tiff', '.svg',
+              '.ico', '.heic'),
+    'stream': ('.m3u8', '.mpd'),
+}
+
+_DANGEROUS_EXTENSIONS = frozenset({
+    '.bat', '.cmd', '.com', '.cpl', '.hta', '.js', '.jse', '.lnk', '.msc', '.pif',
+    '.ps1', '.psm1', '.reg', '.scr', '.url', '.vbe', '.vbs', '.wsf', '.wsh',
+})
+_MACRO_EXTENSIONS = frozenset({'.docm', '.dotm', '.xlsm', '.xltm', '.xlam', '.pptm', '.potm', '.ppam'})
+_DOUBLE_EXTENSION_RE = re.compile(
+    r'\.(?:jpe?g|png|gif|webp|bmp|mp4|mkv|avi|mov|webm|mp3|flac|wav|m4a|pdf|epub|'
+    r'docx?|xlsx?|pptx?|txt|nfo|zip|rar|7z|iso)\.(?:exe|scr|com|bat|cmd|ps1|vbs|'
+    r'js|jse|wsf|hta|lnk|pif|msi)$',
+    re.IGNORECASE,
+)
+_REASONS = {
+    'video': 'Playable video file',
+    'audio': 'Playable audio file',
+    'subtitle': 'Subtitle file',
+    'archive': 'Compressed archive; inspect before extracting',
+    'disc': 'Disc or cartridge image',
+    'rom': 'Game ROM image',
+    'installer': 'Windows installer or executable program',
+    'document': 'Document file',
+    'ebook': 'E-book file',
+    'image': 'Image file',
+    'stream': 'Streaming playlist',
+    'script': 'Script or shortcut that can run code when opened',
+    'shortcut': 'Shortcut that can launch another program',
+    'batch': 'Batch script that runs commands when opened',
+    'macro': 'Document with macros; macros can run code',
+    'other': 'No executable extension detected',
+}
+_EXPECTED_KINDS = {
+    # Only the repack page treats .bat launchers as expected; .cmd is never
+    # neutralised because it is far more often used to hide commands.
+    'repack': frozenset({'installer', 'batch', 'archive', 'disc', 'rom', 'document', 'image', 'other'}),
+    'game': frozenset({'installer', 'archive', 'disc', 'rom', 'document', 'image', 'other'}),
+    'software': frozenset({'installer', 'archive', 'disc', 'document', 'image', 'other'}),
+    'video': frozenset({'video', 'subtitle', 'stream', 'archive', 'image', 'document', 'other'}),
+    'audio': frozenset({'audio', 'subtitle', 'archive', 'image', 'document', 'other'}),
+    'ebook': frozenset({'ebook', 'document', 'archive', 'image', 'subtitle', 'other'}),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class FileSafety:
+    kind: str
+    label: str
+    risk: str  # ok | caution | dangerous
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class SourceSafety:
+    level: str  # ok | caution | dangerous
+    summary: str
+    details: str
+    highlighted: tuple[str, ...] = ()
+
+
+def _extension(name: str) -> str:
+    base = os.path.basename(str(name or '').replace('\\', '/')).lower()
+    if '.' not in base:
+        return ''
+    return '.' + base.rsplit('.', 1)[-1]
+
+
+def classify_file(name: str) -> FileSafety:
+    """Classify one path by extension without trusting or opening it.
+
+    ``label`` is the concrete extension shown in the UI (``mp4``, ``exe``),
+    while ``kind`` is the broad category used for context-aware assessment.
+    """
+    base = os.path.basename(str(name or '').replace('\\', '/')).strip()
+    ext = _extension(base)
+    label = ext.lstrip('.') or 'no ext'
+    if not base:
+        return FileSafety('other', 'no ext', 'ok', _REASONS['other'])
+    if _DOUBLE_EXTENSION_RE.search(base):
+        return FileSafety('script', label, 'dangerous',
+                          'A media or document name ends in an executable extension')
+    if ext in _DANGEROUS_EXTENSIONS:
+        if ext == '.bat':
+            kind = 'batch'
+        elif ext == '.cmd':
+            kind = 'script'
+        elif ext in {'.lnk', '.url'}:
+            kind = 'shortcut'
+        else:
+            kind = 'script'
+        return FileSafety(kind, label, 'dangerous', _REASONS[kind])
+    if ext in _MACRO_EXTENSIONS:
+        return FileSafety('macro', label, 'caution', _REASONS['macro'])
+    if ext in _FILE_KINDS['installer']:
+        return FileSafety('installer', label, 'caution', _REASONS['installer'])
+    for kind, extensions in _FILE_KINDS.items():
+        if ext in extensions:
+            return FileSafety(kind, label, 'ok', _REASONS[kind])
+    if not ext:
+        return FileSafety('other', 'no ext', 'ok', _REASONS['other'])
+    return FileSafety('other', label, 'ok', 'Unrecognised file type')
+
+
+def _context_key(context: str) -> str:
+    text = str(context or '').strip().lower()
+    if 'repack' in text:
+        return 'repack'
+    if any(token in text for token in ('game', 'console', 'rom')):
+        return 'game'
+    if any(token in text for token in ('movie', 'tv', 'video', 'series', 'anime', 'stream')):
+        return 'video'
+    if any(token in text for token in ('music', 'audio', 'album', 'song')):
+        return 'audio'
+    if any(token in text for token in ('book', 'manga', 'ebook', 'comic')):
+        return 'ebook'
+    if any(token in text for token in ('app', 'software', 'program', 'tool')):
+        return 'software'
+    return 'other'
+
+
+def assess_source_files(files, context: str = '', title: str = '') -> SourceSafety:
+    """Summarise the file mix of a torrent without blocking anything.
+
+    `files` may contain paths or dicts with a ``name`` key. The context is a
+    source category such as ``Repacks``, ``Video`` or ``Books``. Installers are
+    expected for games/software, and ``.bat`` launchers are expected only on
+    the repack page; other scripts, including ``.cmd``, are always highlighted.
+    """
+    names: list[str] = []
+    for entry in files or ():
+        if isinstance(entry, dict):
+            name = entry.get('name') or entry.get('path') or ''
+        else:
+            name = str(entry or '')
+        base = os.path.basename(name.replace('\\', '/')).strip()
+        if base:
+            names.append(base)
+    if not names:
+        if title:
+            info = classify_file(title)
+            expected = _EXPECTED_KINDS.get(_context_key(context), _EXPECTED_KINDS['video'])
+            if info.risk != 'ok' and not (info.kind == 'batch' and info.kind in expected):
+                return SourceSafety(info.risk, f'{info.label} file', info.reason, (title,))
+        return SourceSafety('ok', 'File types look expected', '', ())
+    expected = _EXPECTED_KINDS.get(_context_key(context), _EXPECTED_KINDS['video'])
+    dangerous: list[str] = []
+    caution: list[str] = []
+    for name in names:
+        info = classify_file(name)
+        if info.risk == 'dangerous':
+            # Repacks commonly ship batch launchers; they are still shown as
+            # their concrete extension but are not treated as a warning there.
+            if info.kind == 'batch' and info.kind in expected:
+                continue
+            dangerous.append(name)
+        elif info.risk == 'caution' and info.kind not in expected:
+            caution.append(name)
+        elif info.kind not in expected:
+            caution.append(name)
+    if dangerous:
+        sample = ', '.join(dangerous[:3])
+        details = 'Risky file types: ' + sample
+        if len(dangerous) > 3:
+            details += f' and {len(dangerous) - 3} more'
+        return SourceSafety('dangerous', f'{len(dangerous)} risky file type(s)', details, tuple(dangerous))
+    if caution:
+        sample = ', '.join(caution[:3])
+        details = 'Review these files: ' + sample
+        if len(caution) > 3:
+            details += f' and {len(caution) - 3} more'
+        return SourceSafety('caution', 'Review file types', details, tuple(caution))
+    return SourceSafety('ok', 'File types look expected', '', ())
+
+
+def assess_title(title: str, context: str = '') -> SourceSafety | None:
+    """Return a warning when a title itself advertises a risky file type."""
+    info = classify_file(title)
+    if info.risk == 'ok':
+        return None
+    expected = _EXPECTED_KINDS.get(_context_key(context), _EXPECTED_KINDS['video'])
+    if info.kind == 'batch' and info.kind in expected:
+        return None
+    if info.risk == 'caution' and info.kind in expected:
+        return None
+    base = os.path.basename(str(title or '').replace('\\', '/')).strip()
+    return SourceSafety(info.risk, f'{info.label} file', info.reason, (base,))
