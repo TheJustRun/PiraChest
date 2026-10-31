@@ -74,6 +74,7 @@ jobs:
           New-Item -ItemType Directory -Force package | Out-Null
           $ver = ("${{ needs.version.outputs.version }}" -split '-')[0]
           $exe = (Resolve-Path dist/PiraChest/PiraChest.exe).Path
+          $srcDir = (Resolve-Path dist/PiraChest).Path
           $ico = Get-ChildItem -Recurse -File -Filter *.ico | Where-Object { $_.FullName -notmatch '[\\/](dist|build|package|\.venv|venv|node_modules|site-packages)[\\/]' } | Sort-Object Length -Descending | Select-Object -First 1 -ExpandProperty FullName
           $iconSrc = if ($ico) { $ico } else { $exe }
           Add-Type -AssemblyName System.Drawing
@@ -89,7 +90,7 @@ jobs:
           wix extension add -g WixToolset.UI.wixext/5.0.2
           if ($LASTEXITCODE -ne 0) { exit 1 }
           wix build installer/PiraChest.wxs -arch x64 -ext WixToolset.UI.wixext `
-            -d Version=$ver -d SourceDir=dist/PiraChest -d IconFile="$iconSrc" `
+            -d Version=$ver -d SourceDir="$srcDir" -d IconFile="$iconSrc" `
             -d Manufacturer="${{ github.repository_owner }}" -d ProjectUrl="https://github.com/${{ github.repository }}" `
             -o "$msi"
           if ($LASTEXITCODE -ne 0) { exit 1 }
