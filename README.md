@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/github/downloads/TheJustRun/PiraChest/total?label=Downloads" alt="Downloads">
   <img src="https://img.shields.io/github/stars/TheJustRun/PiraChest?label=Stars" alt="Stars">
   <img src="https://img.shields.io/github/issues/TheJustRun/PiraChest?label=Issues" alt="Issues">
-  <img src="https://img.shields.io/badge/Status-Beta-blue" alt="Beta">
+  <img src="https://img.shields.io/badge/Status-Stable-green" alt="Stable">
   <img src="https://img.shields.io/badge/Platform-Windows-blue" alt="Windows">
   <img src="https://img.shields.io/badge/License-PolyForm%20Noncommercial-lightgrey" alt="License">
 </p>
@@ -20,9 +20,6 @@
 The idea is simple: stop jumping between a million different apps and websites when you can have the stuff you actually use in one place.
 
 And yes, you can customize the hell out of it.
-
-> [!WARNING]
-> PiraChest is in beta now. That's a big step up from alpha, but it's still not finished. Expect bugs, unfinished features, and the occasional thing that worked yesterday suddenly deciding it doesn't want to work today. Especially Debrid, which is still very much a work in progress.
 
 ## Download
 
@@ -70,19 +67,15 @@ Browse games in a grid, check game details, look at upcoming releases, and choos
 
 Search for music, play tracks, choose audio quality, and customize the lyrics panel.
 
-### Anime
-
-Search, browse details, watch episodes, and download episodes or entire seasons. Anime discovery is in now too, and AniPub is the default streamer.
-
 ### Manga and Books
 
 Browse manga and books from available sources. Manga is considerably more developed; books are limited because finding reliable sources is a pain.
 
-### Movies and TV
+### Movies, TV Shows, IPTV and Anime
 
-Browse and watch movies, TV shows, series, and TV channels with metadata and details. Playback works now, and Watch Later is supported.
+Browse and watch movies, TV shows, series, anime, and TV channels with metadata and details. Playback works now, and Watch Later is supported.
 
-Vyla is built in for movie and show streams. PiraChest downloads a private Node.js runtime and the SDK dependencies on first use, so there is no separate SDK to install. DASH downloads use ffmpeg; if it is missing, PiraChest offers to download it before starting the download.
+Vyla is built in for movie and show streams. PiraChest downloads a private Node.js runtime and the SDK dependencies on first use, so there is no separate SDK to install. DASH downloads use FFmpeg, if it is missing, PiraChest offers to download it before starting the download. PiraChest also has torrent support, you can select between direct or torrent sources.
 
 ### YouTube
 
@@ -110,6 +103,7 @@ TBHB is currently the only torrent aggregator integrated into PiraChest, with it
 * Peer limits
 * Seeding ratio and time limits
 * Force recheck
+* Many details 
 
 ### Customization
 
@@ -127,25 +121,6 @@ You can customize things like:
 * Other visual details
 
 Themes can now control their own appearance independently instead of being stuck to the global accent color, and they can follow your accent color if you want. They can also bring their own configurable settings, custom icons, images, GIFs, videos, and GPU shaders. Want to share your theme or show off what you've made? There's a [Discord server](https://discord.gg/kkPbmpgMTF) for that. Guides and documentation are on the [website](https://justrun.is-a.dev/pirachest/).
-
-## What's New in Beta
-
-The big focus for beta was making the app faster, more polished, more customizable, easier to use, and much more stable. A lot of that work isn't immediately visible — navigation, caching, threading, rendering, resource management, stability, and internal architecture all got significant improvements.
-
-Some highlights:
-
-* **Sailseek**: global search across movies, shows, games, music, anime, manga, settings, and more, with a customizable keyboard shortcut.
-* **Picture-in-Picture**: the video player supports PiP now, and the PiP window can stay above other windows.
-* **Movie and TV playback**: movies and shows actually play now, and Watch Later is in.
-* **Unified Downloads page**: one dedicated place for download management with better controls and more consistent state handling.
-* **Settings backup and restore**: back up and restore your PiraChest configuration.
-* **Better updates**: changelogs show before you accept an update, plus a Don't Show Again option and a proper cancel option. Updates preserve your settings and downloads.
-* **RSS checking**: PiraChest can check supported RSS sources for updates/content.
-* **Context menus**: quicker access to relevant actions across many parts of the app.
-* **Keyboard navigation**: broader keyboard navigation and customizable shortcuts throughout the interface.
-* **Experimental features**: an Experimental settings category with stuff still being tested, like install-on-download and a theme maker.
-* **Debrid**: initial Debrid integration is in, but it's unfinished and needs testing. Expect things to break or change.
-* **Localization**: added Russian and Dutch.
 
 ## Roadmap
 
@@ -233,7 +208,7 @@ Stuff that's done, stuff that's planned, and stuff that might take longer than I
 PiraChest is in beta. Here's what isn't ready yet:
 
 * Debrid support is unfinished and needs testing.
-* Book sources are limited.
+* Book support is not yet available.
 * TBHB is currently the only integrated torrent aggregator.
 * Some parts of the app are still rough or incomplete.
 
@@ -258,7 +233,7 @@ There is a difference between PiraChest itself and the services it connects to, 
 ## AI-Assisted Development
 
 This app has been AI-assisted using a local LLM (Qwen 3.6 35B) to help with the backend. Without it, I probably wouldn't have gotten the torrent per-file downloading system working, and I would've shot myself dead.
-tho things by it can break stuff or introduce issues, that's why i don't rely on it a lot.
+tho things can break or introduce issues, that's why I don't rely on it a lot.
 
 ## Support PiraChest
 
