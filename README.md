@@ -1,8 +1,8 @@
 ![PiraChest Banner](https://github.com/user-attachments/assets/9ec37694-bbe5-410c-80bb-191f57f63eb1)
 
 <p align="center">
-  <a href="https://justrun.is-a.dev/pirachest/"><img src="https://img.shields.io/badge/🌐%20Website-PiraChest-blue?style=for-the-badge" alt="Website"></a>
-  <a href="https://discord.gg/kkPbmpgMTF"><img src="https://img.shields.io/badge/Discord-Join%20the%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://justrun.is-a.dev/pirachest/"><img src="https://cdn.jsdelivr.net/gh/JMcrafter26/badges@main/src/assets/documentation/website/cozy.svg" alt="Website"></a>
+  <a href="https://discord.gg/kkPbmpgMTF"><img src="https://cdn.jsdelivr.net/gh/JMcrafter26/badges@main/src/assets/social/discord-plural/cozy.svg" alt="Discord"></a>
 </p>
 
 <p align="center">
@@ -20,6 +20,8 @@
 The idea is simple: stop jumping between a million different apps and websites when you can have the stuff you actually use in one place.
 
 And yes, you can customize the hell out of it.
+
+<img src="https://cdn.jsdelivr.net/gh/JMcrafter26/badges@main/src/assets/built-with/python/cozy.svg" alt="madewithpython">
 
 ## Download
 
@@ -232,8 +234,12 @@ There is a difference between PiraChest itself and the services it connects to, 
 
 ## AI-Assisted Development
 
-This app has been AI-assisted using a local LLM (Qwen 3.6 35B) to help with the backend. Without it, I probably wouldn't have gotten the torrent per-file downloading system working, and I would've shot myself dead.
+This app has been AI-assisted using a local LLM (Qwen 3.6 35B) and other very limited free-tier AIs to help with the backend, stress testing, and polish. Without it, I probably wouldn't have gotten the torrent per-file downloading system working, and I would've shot myself dead.
 tho things can break or introduce issues, that's why I don't rely on it a lot.
+
+## Your Contribution is VERY welcome
+Your contributions are needed and are very welcome no matter what or how. Contributions from localization (it's insanely easy, you just make a new JSON, change the name, and the app will pick it up automatically). I'm not proud of using AI-generated localizations for most of the app, I'm sorry and am planning to change that, but I need you, and also contributions such as donations, word of mouth, and all are welcome and appreciated.
+
 
 ## Support PiraChest
 
@@ -305,6 +311,15 @@ I'm not encouraging piracy or copyright infringement. You're responsible for wha
 >
 > If you misuse the software, **that's your responsibility. Fuck you.**
 
+
 ## Project Stats
 
-[![Star History](https://api.star-history.com/svg?repos=TheJustRun/PiraChest&type=Date)](https://star-history.com/#TheJustRun/PiraChest&Date)
+<p align="center">
+  <img src="https://img.shields.io/github/stars/TheJustRun/PiraChest?style=for-the-badge&logo=github&label=Stars" />
+  <img src="https://img.shields.io/github/forks/TheJustRun/PiraChest?style=for-the-badge&logo=git&label=Forks" />
+  <img src="https://img.shields.io/github/downloads/TheJustRun/PiraChest/total?style=for-the-badge&logo=github&label=Downloads" />
+</p>
+
+<p align="center">
+  <img src="https://api.star-history.com/svg?repos=TheJustRun/PiraChest&type=Date" width="100%" />
+</p>
