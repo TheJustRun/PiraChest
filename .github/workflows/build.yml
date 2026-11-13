@@ -18,6 +18,7 @@ jobs:
       is_new: ${{ steps.ver.outputs.is_new }}
       canary: ${{ steps.ver.outputs.canary }}
       slug: ${{ steps.ver.outputs.slug }}
+      display: ${{ steps.ver.outputs.display }}
       app_name: ${{ steps.ver.outputs.app_name }}
     steps:
       - uses: actions/checkout@v4
@@ -25,17 +26,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          V=$(sed -n '1p' VERSION | tr -d '[:space:]')
+          RAW=$(sed -n '1p' VERSION | tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
           C=$(sed -n '2,$p' VERSION | tr -d '[:space:]')
-          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid VERSION: $V" >&2
+          if ! [[ "$RAW" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(.*)$ ]]; then
+            echo "Invalid VERSION: must start with X.Y.Z (got: $RAW)" >&2
             exit 1
           fi
+          SAFE=$(printf '%s' "${BASH_REMATCH[2]}" | sed -E 's/[^0-9A-Za-z.]+/-/g; s/^[-.]+//; s/[-.]+$//')
+          V="${BASH_REMATCH[1]}${SAFE:+-$SAFE}"
           case "$C" in
             1|canary=1|is_canary=1) CANARY=1; SLUG=PiraChest-Canary; APP="PiraChest Canary" ;;
             *) CANARY=0; SLUG=PiraChest; APP="PiraChest" ;;
           esac
           echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "display=$RAW" >> "$GITHUB_OUTPUT"
           echo "tag=v$V" >> "$GITHUB_OUTPUT"
           echo "canary=$CANARY" >> "$GITHUB_OUTPUT"
           echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
@@ -197,7 +201,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
-          name: "${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.tag }}"
+          name: "${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.display }}"
           body: |
             ${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.version }} (Windows x64).
 
