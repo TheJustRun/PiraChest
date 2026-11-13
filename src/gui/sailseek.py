@@ -6,9 +6,12 @@ import os
 import re
 import sys
 import time
+import difflib
+import unicodedata
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Callable, Optional
 
 from PySide6.QtCore import (
@@ -57,12 +60,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from PySide6.QtWidgets import QToolTip
 from qfluentwidgets import Action, FluentIcon, RoundMenu
 
 from src.core.artwork import images
 from src.core.config import settings
 from src.core.translations import register_locale_refresh, tr
-from src.core.theme import palette, register_theme_refresh, themed_icon, to_color
+from src.core.theme import palette, register_theme_refresh, themed_icon, to_color, animations_enabled
 from src.core import worker
 from src.core.worker import Priority
 
@@ -96,9 +100,9 @@ _RICKROLL_URL = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
 _RESULT_ROLE = Qt.ItemDataRole.UserRole + 1
 
 _CATEGORY_ORDER = (
-    'downloads', 'games', 'roms', 'movies', 'tv', 'anime', 'manga', 'books',
+    'downloads', 'games', 'roms', 'movies', 'tv', 'anime', 'manga',
 )
-_ONLINE_CATEGORIES = ('movies', 'tv', 'anime', 'manga', 'books')
+_ONLINE_CATEGORIES = ('movies', 'tv', 'anime', 'manga')
 _GAME_SOURCES = ('fitgirl', 'gog')
 
 _CATEGORY_ICONS = {
@@ -106,7 +110,6 @@ _CATEGORY_ICONS = {
     'tv': FluentIcon.PROJECTOR,
     'anime': FluentIcon.PLAY,
     'manga': FluentIcon.DICTIONARY,
-    'books': FluentIcon.BOOK_SHELF,
     'games': FluentIcon.GAME,
     'downloads': FluentIcon.DOWNLOAD,
     'roms': FluentIcon.APPLICATION,
@@ -130,6 +133,7 @@ class SailSeekResult:
     action: Optional[Callable[[], None]] = None
     secondary: list[tuple[str, Callable[[], None]]] = field(default_factory=list)
     progress: Optional[float] = None
+    badge_keys: Optional[Callable[[], list]] = None
 
 
 def _type_label(kind: str) -> str:
@@ -138,7 +142,6 @@ def _type_label(kind: str) -> str:
         'tv': tr('sailseek.type_series', 'Series'),
         'anime': tr('sailseek.type_anime', 'Anime'),
         'manga': tr('sailseek.type_manga', 'Manga'),
-        'book': tr('sailseek.type_book', 'Book'),
     }.get(kind, kind.title())
 
 
@@ -163,26 +166,211 @@ def _screen_for_cursor():
     return screen or QGuiApplication.primaryScreen()
 
 
+_SS_ROMAN = {'ii': '2', 'iii': '3', 'iv': '4', 'v': '5', 'vi': '6', 'vii': '7', 'viii': '8', 'ix': '9', 'x': '10', 'xi': '11', 'xii': '12'}
+_SS_NUMBERS = {'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10'}
+_SS_ALIASES = {'gta': 'grand theft auto', 'rdr': 'red dead redemption', 'lotr': 'lord of the rings', 'nfs': 'need for speed', 'cod': 'call of duty', 'dbz': 'dragon ball z', 'aot': 'attack on titan', 'got': 'game of thrones'}
+_SS_STOP = frozenset({'the', 'a', 'an', 'of', 'and', 'to', 'in', 'on', 'for'})
+_SS_CACHE: dict[str, str] = {}
+
+
 def _normalize_query(text: str) -> str:
-    return ' '.join(str(text or '').split())
+    value = re.sub(r'\s+', ' ', str(text or '')).strip()
+    return value.strip('"\'.,;:!?()[]{}<>')
 
 
-def _match_score(query: str, title: str, extra: str = '') -> Optional[int]:
-    q = query.casefold()
-    title_f = (title or '').casefold()
-    hay = f'{title_f} {extra or ""}'.casefold()
+def _fold(text: str) -> str:
+    text = str(text or '')
+    hit = _SS_CACHE.get(text)
+    if hit is not None:
+        return hit
+    plain = unicodedata.normalize('NFKD', unicodedata.normalize('NFKC', text).casefold())
+    plain = ''.join(c for c in plain if not unicodedata.combining(c))
+    plain = plain.replace('&', ' and ').replace('+', ' and ').replace("'", '').replace('\u2019', '').replace('`', '')
+    plain = re.sub(r'[^0-9a-z\u0400-\u04ff\u3040-\u30ff\u4e00-\u9fff]+', ' ', plain)
+    out = ' '.join(_SS_ROMAN.get(w, _SS_NUMBERS.get(w, w)) for w in plain.split())
+    if len(_SS_CACHE) > 6000:
+        _SS_CACHE.clear()
+    _SS_CACHE[text] = out
+    return out
+
+
+def _ss_stem(word: str) -> str:
+    if len(word) > 3:
+        if word.endswith('ies'):
+            return word[:-3] + 'y'
+        if word.endswith(('sses', 'shes', 'ches', 'xes')):
+            return word[:-2]
+        if word.endswith('s') and not word.endswith('ss'):
+            return word[:-1]
+    return word
+
+
+def _ss_close(a: str, b: str) -> bool:
+    if len(a) < 4 or len(b) < 4:
+        return False
+    limit = 2 if max(len(a), len(b)) >= 12 else 1
+    if abs(len(a) - len(b)) > limit:
+        return False
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i]
+        best = i
+        for j, cb in enumerate(b, 1):
+            value = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb))
+            current.append(value)
+            best = min(best, value)
+        if best > limit:
+            return False
+        previous = current
+    return previous[-1] <= limit
+
+
+def _ss_word_hit(term: str, words: list[str], fuzzy: bool = True) -> bool:
+    stem = _ss_stem(term)
+    for word in words:
+        if word == term or _ss_stem(word) == stem or (len(term) >= 2 and word.startswith(term)):
+            return True
+    alias = (_SS_ALIASES.get(term) or '').split()
+    if alias and any(words[i:i + len(alias)] == alias for i in range(max(1, len(words) - len(alias) + 1))):
+        return True
+    return fuzzy and any(_ss_close(term, word) for word in words)
+
+
+@lru_cache(maxsize=8192)
+def _match_score(query: str, title: str, extra: str = ''):
+    q, t = _fold(query), _fold(title)
     if not q:
-        return 4
-    if title_f == q:
         return 0
-    if title_f.startswith(q):
+    if not t:
+        return None
+    if t == q:
+        return 0
+    qc, tc = q.replace(' ', ''), t.replace(' ', '')
+    if t.startswith(q) or tc.startswith(qc):
         return 1
-    if q in title_f:
+    if q in t or (len(qc) >= 3 and qc in tc):
         return 2
-    terms = q.split()
-    if terms and all(term in hay for term in terms):
+    words = [_ss_stem(w) for w in q.split()]
+    terms = [w for w in words if w not in _SS_STOP] or words
+    hay = t.split()
+    if all(_ss_word_hit(term, hay, False) for term in terms):
         return 3
+    extra_words = f'{t} {_fold(extra)}'.split()
+    if extra and all(_ss_word_hit(term, extra_words, False) for term in terms):
+        return 4
+    if all(_ss_word_hit(term, hay) for term in terms):
+        return 5
+    if extra and all(_ss_word_hit(term, extra_words) for term in terms):
+        return 6
+    if 4 <= len(qc) <= 40 and 4 <= len(tc) <= 68:
+        limit = 1 if max(len(qc), len(tc)) < 12 else 2
+        if abs(len(qc) - len(tc)) <= limit:
+            previous = list(range(len(tc) + 1))
+            for i, ca in enumerate(qc, 1):
+                current = [i]
+                best = i
+                for j, cb in enumerate(tc, 1):
+                    value = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb))
+                    current.append(value)
+                    best = min(best, value)
+                if best > limit:
+                    break
+                previous = current
+            else:
+                if previous[-1] <= limit:
+                    return 5
     return None
+
+
+def _query_variants(query: str) -> list[str]:
+    q = _normalize_query(query)
+    if not q:
+        return []
+    out = [q]
+    if re.search(r'[&+]', q):
+        out.append(' '.join(re.sub(r'\s*[&+]\s*', ' and ', q).split()))
+    if re.search(r'\band\b', q, re.I):
+        out.append(re.sub(r'\band\b', '&', q, flags=re.I))
+    expanded = []
+    for word in q.split():
+        alias = _SS_ALIASES.get(_fold(word))
+        expanded.extend(alias.split() if alias else [word])
+    out.append(' '.join(expanded))
+    plain = _fold(q)
+    out.append(plain)
+    out.append(' '.join(w for w in plain.split() if w not in _SS_STOP))
+    seen: set[str] = set()
+    unique = []
+    for value in out:
+        key = value.casefold()
+        if value and key not in seen:
+            seen.add(key)
+            unique.append(value)
+    return unique
+
+
+@lru_cache(maxsize=4096)
+def _highlight_spans(text: str, query: str) -> list[tuple[int, int]]:
+    folded_source = unicodedata.normalize('NFKD', str(text or '').casefold())
+    chars: list[str] = []
+    positions: list[int] = []
+    for index, ch in enumerate(folded_source):
+        if unicodedata.combining(ch):
+            continue
+        if ch == '&':
+            for part in ' and ':
+                chars.append(part)
+                positions.append(index)
+        elif ch.isalnum() or ch.isspace() or '\u0400' <= ch <= '\u04ff' or '\u3040' <= ch <= '\u9fff':
+            chars.append(' ' if ch.isspace() else ch)
+            positions.append(index)
+        else:
+            chars.append(' ')
+            positions.append(index)
+    folded: list[str] = []
+    kept: list[int] = []
+    for ch, pos in zip(chars, positions):
+        if ch == ' ' and (not folded or folded[-1] == ' '):
+            continue
+        folded.append(ch)
+        kept.append(pos)
+    while folded and folded[-1] == ' ':
+        folded.pop()
+        kept.pop()
+    packed = ''.join(ch for ch in folded if ch != ' ')
+    packed_positions = [pos for ch, pos in zip(folded, kept) if ch != ' ']
+    needles = [w for w in _fold(query).split() if w not in _SS_STOP]
+    spans: list[tuple[int, int]] = []
+    for needle in needles:
+        for source, mapping in (((''.join(folded)), kept), (packed, packed_positions)):
+            start = 0
+            while needle:
+                found = source.find(needle, start)
+                if found < 0:
+                    break
+                left = mapping[found]
+                right = mapping[found + len(needle) - 1] + 1
+                spans.append((left, max(left + 1, right)))
+                start = found + len(needle)
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for left, right in spans:
+        if merged and left <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], right))
+        else:
+            merged.append((left, right))
+    return merged
+
+
+def _first_hit(fetch: Callable[[str], Any], query: str) -> Any:
+    data = fetch(query)
+    if data:
+        return data
+    for alt in _query_variants(query)[1:]:
+        found = fetch(alt)
+        if found:
+            return found
+    return data
 
 
 def _format_year(value: Any) -> str:
@@ -213,7 +401,6 @@ _PREFIXES = {
     's': 'tv', 'tv': 'tv', 'series': 'tv',
     'a': 'anime', 'anime': 'anime',
     'mg': 'manga', 'manga': 'manga',
-    'b': 'books', 'book': 'books', 'books': 'books',
 }
 _PREFIX_RE = re.compile(r'^\s*([A-Za-z]{1,9}):\s?(.*)$', re.S)
 
@@ -228,8 +415,47 @@ def _category_label(key: str) -> str:
         'tv': tr('sailseek.category_tv', 'TV'),
         'anime': tr('sailseek.category_anime', 'Anime'),
         'manga': tr('sailseek.category_manga', 'Manga'),
-        'books': tr('sailseek.category_books', 'Books'),
     }.get(key, key.title())
+
+
+_BADGE_PX = 16
+_BADGE_GAP = 4
+_BANNER_H = 14
+
+
+_banner_cache: dict[int, Optional[QPixmap]] = {}
+
+
+def _banner_pix(height: int) -> Optional[QPixmap]:
+    if height in _banner_cache:
+        return _banner_cache[height]
+    pix = None
+    try:
+        from .repacks_page import _PHOTO_DIR
+        from src.core.theme import icon_override_pixmap
+
+        pix = icon_override_pixmap('badge.hypervisor', height, True)
+        if pix is None or pix.isNull():
+            pix = QPixmap(os.path.join(_PHOTO_DIR, 'hv_banner.png'))
+            if not pix.isNull():
+                pix = pix.scaledToHeight(height * 2, Qt.TransformationMode.SmoothTransformation)
+                pix.setDevicePixelRatio(2.0)
+    except Exception:
+        pix = None
+    if pix is not None and pix.isNull():
+        pix = None
+    _banner_cache[height] = pix
+    return pix
+
+
+def _badge_pix(key: str) -> Optional[QPixmap]:
+    try:
+        from .repacks_page import _badge_pixmap
+
+        pix = _badge_pixmap(key, _BADGE_PX, True)
+        return pix if pix is not None and not pix.isNull() else None
+    except Exception:
+        return None
 
 
 def _clean_game_title(raw: str) -> str:
@@ -271,6 +497,7 @@ class _ResultsModel(QAbstractListModel):
         self._items: list[SailSeekResult] = []
         self._pixmaps: dict[str, QPixmap] = {}
         self._rows: dict[str, int] = {}
+        self.query = ''
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
@@ -348,6 +575,7 @@ class _ResultDelegate(QStyledItemDelegate):
         self._hint_font = QFont()
         self._tm = self._sm = self._hm = None
         self._elide: dict[tuple, str] = {}
+        self._badge_hits: dict[int, list] = {}
         self._icons: dict[str, Any] = {}
         self._empty_icon: Any = None
         self.refresh()
@@ -369,6 +597,21 @@ class _ResultDelegate(QStyledItemDelegate):
 
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
         return QSize(option.rect.width(), _ROW_H)
+
+    def helpEvent(self, event, view, option, index) -> bool:
+        if event.type() == QEvent.Type.ToolTip:
+            for rect, key in self._badge_hits.get(index.row(), ()):
+                if rect.adjusted(-2, -2, 2, 2).contains(event.pos()):
+                    try:
+                        from .repacks_page import _badge_text
+
+                        QToolTip.showText(event.globalPos(), _badge_text(key)[0], view)
+                        return True
+                    except Exception:
+                        break
+            QToolTip.hideText()
+            return False
+        return super().helpEvent(event, view, option, index)
 
     def _ensure_fonts(self, font: QFont) -> None:
         key = font.toString()
@@ -438,15 +681,77 @@ class _ResultDelegate(QStyledItemDelegate):
 
         text_left = icon_rect.right() + 12
         text_right = row.right() - 70
+        keys = []
+        if item.badge_keys is not None:
+            try:
+                keys = list(item.badge_keys())
+            except Exception:
+                keys = []
+        items = []
+        for k in keys:
+            if k == 'hypervisor':
+                pix = _banner_pix(_BANNER_H)
+                if pix is not None:
+                    dpr = max(1.0, pix.devicePixelRatio())
+                    items.append((k, pix, int(pix.width() / dpr), int(pix.height() / dpr)))
+            else:
+                pix = _badge_pix(k)
+                if pix is not None:
+                    items.append((k, pix, _BADGE_PX, _BADGE_PX))
+        badge_w = sum(w + _BADGE_GAP for _k, _p, w, _h in items) + (4 if items else 0)
         text_w = max(20, text_right - text_left)
+        title_w = max(20, text_w - badge_w)
         th, sh = self._tm.height(), self._sm.height()
         y0 = row.top() + max(2, (row.height() - (th + sh + 1)) // 2)
 
         painter.setFont(self._title_font)
         painter.setPen(fg)
-        painter.drawText(QRect(text_left, y0, text_w, th),
-                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                         self._elided(item.title, 0, self._tm, text_w))
+        elided_title = self._elided(item.title, 0, self._tm, title_w)
+        spans = []
+        query = getattr(model, 'query', '') or ''
+        if query:
+            try:
+                spans = _highlight_spans(elided_title, query)
+            except Exception:
+                spans = []
+        if spans:
+            hot = self._sel_fg if selected else self._accent
+            cursor = text_left
+            position = 0
+            for left, right in spans:
+                if left > position:
+                    part = elided_title[position:left]
+                    painter.setPen(fg)
+                    painter.drawText(QRect(cursor, y0, text_w, th),
+                                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, part)
+                    cursor += self._tm.horizontalAdvance(part)
+                part = elided_title[left:right]
+                painter.setPen(hot)
+                painter.drawText(QRect(cursor, y0, text_w, th),
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, part)
+                cursor += self._tm.horizontalAdvance(part)
+                position = right
+            if position < len(elided_title):
+                painter.setPen(fg)
+                painter.drawText(QRect(cursor, y0, text_w, th),
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                                 elided_title[position:])
+        else:
+            painter.drawText(QRect(text_left, y0, text_w, th),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             elided_title)
+        hits = []
+        if items:
+            bx = text_left + self._tm.horizontalAdvance(elided_title) + 6
+            for key, pix, w, h in items:
+                rect = QRect(bx, y0 + (th - h) // 2, w, h)
+                painter.drawPixmap(rect, pix)
+                hits.append((rect, key))
+                bx += w + _BADGE_GAP
+        if hits:
+            self._badge_hits[index.row()] = hits
+        else:
+            self._badge_hits.pop(index.row(), None)
         painter.setFont(self._sub_font)
         painter.setPen(sub_fg)
         painter.drawText(QRect(text_left, y0 + th + 1, text_w, sh),
@@ -924,6 +1229,12 @@ class SailSeekWindow(QWidget):
         self._view.setModel(self._model)
         self._delegate = _ResultDelegate(self._view)
         self._view.setItemDelegate(self._delegate)
+        try:
+            from .repacks_page import pink_paw_store
+
+            pink_paw_store().changed.connect(self._view.viewport().update)
+        except Exception:
+            pass
         self._view.clicked.connect(self._on_clicked)
         self._view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._view.customContextMenuRequested.connect(self._on_context_menu)
@@ -991,7 +1302,7 @@ class SailSeekWindow(QWidget):
             return
         self._target = target
         self._height_anim.stop()
-        if not animate or not self.isVisible() or abs(target - self.height()) < 2:
+        if not animate or not animations_enabled() or not self.isVisible() or abs(target - self.height()) < 2:
             self._apply_height(target)
             return
         self._height_anim.setStartValue(self.height())
@@ -1053,9 +1364,13 @@ class SailSeekWindow(QWidget):
         super().showEvent(event)
         self._art_timer.start()
         try:
-            self._fade.stop()
-            self.setWindowOpacity(0.0)
-            self._fade.start()
+            if not animations_enabled():
+                self._fade.stop()
+                self.setWindowOpacity(1.0)
+            else:
+                self._fade.stop()
+                self.setWindowOpacity(0.0)
+                self._fade.start()
         except Exception:
             self.setWindowOpacity(1.0)
         if self._busy:
@@ -1258,6 +1573,7 @@ class SailSeekWindow(QWidget):
         self._art_timer.start()
 
     def set_results(self, results: list[SailSeekResult], panel: bool = True) -> None:
+        self._model.query = getattr(self, '_query', '') or ''
         if bool(panel) == self._panel_on and [r.uid for r in results] == self._model.uids():
             self._model.set_results(results)
             self._count = len(results)
@@ -2372,7 +2688,7 @@ class SailSeekController(QObject):
             return tr('sailseek.hint_filter', 'Type to search {category}',
                       category=_category_label(self._filter))
         return tr('sailseek.hint',
-                  'Search PC Games, movies, TV, anime, manga, books and downloads.')
+                  'Search PC Games, movies, TV, anime, manga and downloads.')
 
     def _online_status(self) -> str:
         if self._online_error:
@@ -2419,8 +2735,6 @@ class SailSeekController(QObject):
                 return bool(getattr(settings, 'tv_enabled', True)) and is_tab_enabled('tv', tab)
             if key == 'manga':
                 return bool(getattr(settings, 'books_enabled', True)) and is_tab_enabled('books', 'manga')
-            if key == 'books':
-                return bool(getattr(settings, 'books_enabled', True)) and is_tab_enabled('books', 'books')
             if key == 'games':
                 return bool(getattr(settings, 'pc_games_enabled', True))
             if key == 'roms':
@@ -2559,6 +2873,10 @@ class SailSeekController(QObject):
             from .repacks_page import _decorate_repack_entry
         except Exception:
             _decorate_repack_entry = None
+        try:
+            from .repacks_page import badges_for, pink_paw_store
+        except Exception:
+            badges_for = pink_paw_store = None
         for entry in entries or []:
             if _decorate_repack_entry is not None:
                 try:
@@ -2588,9 +2906,13 @@ class SailSeekController(QObject):
             subtitle = f'{source_label} · {tr("sailseek.type_pc_game", "PC game")}'
             if meta:
                 subtitle = f'{subtitle} · {meta}'
+            if pink_paw_store is not None:
+                with suppress(Exception):
+                    pink_paw_store().request(source)
             results.append(SailSeekResult(
                 uid=f'repack:{source}:{url or title}', category='games', title=title,
                 subtitle=subtitle,
+                badge_keys=(lambda e=entry: badges_for(e)) if badges_for is not None else None,
                 image=image, score=score, action=lambda e=entry: self._open_repack(e),
                 secondary=[(tr('sailseek.action_open_source', 'Open source page'),
                             lambda u=url: self._open_url(u))],
@@ -2610,49 +2932,56 @@ class SailSeekController(QObject):
     @staticmethod
     def _fetch_tmdb_movies(query: str) -> list[dict]:
         from src.core.tv import tmdb
-        data = tmdb.search('movie', query, 1)
-        return [item for item in (data.get('results') or [])
-                if not item.get('adult') and (item.get('title') or item.get('name'))]
+
+        def run(q: str) -> list[dict]:
+            data = tmdb.search('movie', q, 1)
+            return [item for item in (data.get('results') or [])
+                    if not item.get('adult') and (item.get('title') or item.get('name'))]
+        return _first_hit(run, query)
 
     @staticmethod
     def _fetch_tmdb_tv(query: str) -> list[dict]:
         from src.core.tv import tmdb
-        data = tmdb.search('tv', query, 1)
-        return [item for item in (data.get('results') or [])
-                if not item.get('adult') and (item.get('title') or item.get('name'))]
+
+        def run(q: str) -> list[dict]:
+            data = tmdb.search('tv', q, 1)
+            return [item for item in (data.get('results') or [])
+                    if not item.get('adult') and (item.get('title') or item.get('name'))]
+        return _first_hit(run, query)
 
     @staticmethod
     def _fetch_manga(query: str) -> list:
         from src.core.books.manga import manager as manga_manager
-        result = manga_manager.search_all(query, 1)
-        return list(getattr(result, 'entries', None) or [])
-
-    @staticmethod
-    def _fetch_books(query: str) -> list:
-        from src.core.books import manager as books_manager
-        page = books_manager.search_all(query, 1)
-        return list(getattr(page, 'entries', None) or [])
+        return _first_hit(lambda q: list(getattr(manga_manager.search_all(q, 1), 'entries', None) or []), query)
 
     @staticmethod
     def _fetch_roms(query: str, limit: int = 8) -> list[dict]:
         from src.core.minerva import database as db
-        return db.search_roms(query=query, limit=limit)
+        return _first_hit(lambda q: db.search_roms(query=q, limit=limit), query)
 
-    def _submit_game(self, source: str, query: str, generation: int) -> None:
-        on_done = lambda page, s=source, g=generation, q=query: self._on_game_search(s, page, g, q)
+    def _submit_game(self, source: str, query: str, generation: int, alts: Optional[list] = None) -> None:
+        if alts is None:
+            alts = _query_variants(query)[1:]
+            send = query
+        else:
+            send = alts.pop(0)
+        on_done = lambda page, s=source, g=generation, q=query, a=alts: self._on_game_search(s, page, g, q, None, a)
         on_error = lambda error, s=source, g=generation, q=query: self._on_game_search(
             s, None, g, q, error)
         try:
             worker.fetch_search_async(
-                source, query, 1, on_done=on_done, on_error=on_error,
+                source, send, 1, on_done=on_done, on_error=on_error,
                 use_cache=True, owner=self)
         except Exception:
             logger.exception('Could not start SailSeek %s search', source)
             self._on_game_search(source, None, generation, query, RuntimeError('search did not start'))
 
     def _on_game_search(self, source: str, page, generation: int, query: str,
-                        error=None) -> None:
+                        error=None, alts: Optional[list] = None) -> None:
         if generation != self._generation or query != self._query:
+            return
+        if error is None and page is not None and alts and not getattr(page, 'entries', None):
+            self._submit_game(source, query, generation, alts)
             return
         if self._pending > 0:
             self._pending -= 1
@@ -2686,14 +3015,21 @@ class SailSeekController(QObject):
                               on_error=on_error, owner=self, priority=Priority.NORMAL)
             elif category == 'anime':
                 from src.core.tv.anime import anime_backend
-                worker.submit_coro(anime_backend.search_cached, args=(query, self._per_source_limit()),
+
+                async def _anime_search(q: str, limit: int):
+                    data = await anime_backend.search_cached(q, limit)
+                    if data:
+                        return data
+                    for alt in _query_variants(q)[1:]:
+                        found = await anime_backend.search_cached(alt, limit)
+                        if found:
+                            return found
+                    return data
+                worker.submit_coro(_anime_search, args=(query, self._per_source_limit()),
                                    on_done=on_done, on_error=on_error, owner=self,
                                    priority=Priority.NORMAL)
             elif category == 'manga':
                 worker.submit(self._fetch_manga, args=(query,), on_done=on_done,
-                              on_error=on_error, owner=self, priority=Priority.NORMAL)
-            elif category == 'books':
-                worker.submit(self._fetch_books, args=(query,), on_done=on_done,
                               on_error=on_error, owner=self, priority=Priority.NORMAL)
         except Exception:
             logger.exception('Could not start SailSeek %s search', category)
@@ -2756,8 +3092,6 @@ class SailSeekController(QObject):
                 results = self._map_anime(data)[:limit]
             elif category == 'manga':
                 results = self._map_manga(data)[:limit]
-            elif category == 'books':
-                results = self._map_books(data)[:limit]
         except Exception:
             logger.exception('Could not map SailSeek %s results', category)
             return []
@@ -2818,24 +3152,6 @@ class SailSeekController(QObject):
                 uid=f'manga:{getattr(item, "id", title)}', category='manga', title=title,
                 subtitle=subtitle, image=str(getattr(item, 'cover_url', '') or ''), score=2,
                 action=lambda entry=item: self._open_manga(entry),
-            ))
-        return results
-
-    def _map_books(self, entries) -> list[SailSeekResult]:
-        results = []
-        for item in entries or []:
-            title = str(getattr(item, 'title', '') or '')
-            if not title:
-                continue
-            year = _format_year(getattr(item, 'year', ''))
-            author = str(getattr(item, 'author', '') or '')
-            provider = str(getattr(item, 'provider', '') or '').title()
-            subtitle = ' · '.join(str(x) for x in (_type_label('book'), author, year, provider) if x)
-            results.append(SailSeekResult(
-                uid=f'book:{getattr(item, "provider", "")}:{getattr(item, "id", title)}',
-                category='books', title=title, subtitle=subtitle,
-                image=str(getattr(item, 'artwork_url', '') or ''), score=2,
-                action=lambda entry=item: self._open_book(entry),
             ))
         return results
 
@@ -3022,20 +3338,6 @@ class SailSeekController(QObject):
                 page.open_manga_detail(entry)
         except Exception:
             logger.exception('Could not open manga detail')
-
-    def _open_book(self, entry) -> None:
-        self._restore_main_window()
-        page = getattr(self._mw, 'books_page', None)
-        if page is None:
-            return
-        try:
-            self._mw.switchTo(page)
-            if hasattr(page, 'call_when_ready'):
-                page.call_when_ready('open_detail', entry)
-            else:
-                page.open_detail(entry)
-        except Exception:
-            logger.exception('Could not open book detail')
 
     def _open_repack(self, entry) -> None:
         self._restore_main_window()

@@ -26,12 +26,16 @@ _STORE = os.path.join(paths.cache_dir, 'images')
 _MAX_BYTES = 16 * 1024 * 1024
 _PIXMAP_BUDGET = 64 * 1024 * 1024
 _DISK_BUDGET = 512 * 1024 * 1024
-_MISS_TTL = 60.0
+_MISS_TTL = 6.0
 _COOLDOWN = 5.0
 _TOUCH_AFTER = 6 * 3600.0
 _SWATCH = 40
 _COLOR_LIMIT = 512
 _AVIF_MAX_PIXELS = 20_000_000
+_AVIF_ANIM_WIDTH = 480
+_AVIF_ANIM_FRAMES = 120
+_AVIF_ANIM_BUDGET = 32 * 1024 * 1024
+_TRIM_EVERY = 64 * 1024 * 1024
 _STEAM_IMAGE_HOSTS = ('steamstatic.com', 'steampowered.com', 'steamcommunity.com')
 _UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
        'Chrome/124.0 Safari/537.36')
@@ -44,6 +48,27 @@ _client = None
 _client_lock = threading.Lock()
 _cooldown: dict[str, float] = {}
 _cooldown_lock = threading.Lock()
+_trim_growth = 0
+_trim_scheduled = False
+_trim_lock = threading.Lock()
+
+
+def _request_trim() -> None:
+    global _trim_scheduled
+    with _trim_lock:
+        if _trim_scheduled:
+            return
+        _trim_scheduled = True
+    engine().submit(_trim_store, priority=Priority.PREFETCH, pool=IO)
+
+
+def _note_store_growth(size: int) -> None:
+    global _trim_growth
+    with _trim_lock:
+        _trim_growth += max(0, int(size))
+        due = _trim_growth >= _TRIM_EVERY
+    if due:
+        _request_trim()
 
 
 def _http_client():
@@ -103,13 +128,37 @@ def _headers(url: str) -> dict:
     return {'Referer': origin + '/', 'Origin': origin}
 
 
+_host_sems: dict = {}
+
+
+def _host_sem(host: str):
+    with _cooldown_lock:
+        sem = _host_sems.get(host)
+        if sem is None:
+            sem = _host_sems[host] = threading.BoundedSemaphore(6)
+        return sem
+
+
 def _download(url: str, dest: str) -> None:
     import httpx
     host = urlsplit(url).netloc.lower()
-    with _cooldown_lock:
-        cooling = _cooldown.get(host, 0.0) > time.monotonic()
-    if cooling:
-        raise _Quiet(f'{host} is cooling down after a connection failure')
+    with _host_sem(host):
+        for attempt in (0, 1):
+            with _cooldown_lock:
+                wait = _cooldown.get(host, 0.0) - time.monotonic()
+            if wait > 0:
+                time.sleep(min(wait, _COOLDOWN))
+            try:
+                _download_once(url, dest)
+                return
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout):
+                if attempt:
+                    raise
+
+
+def _download_once(url: str, dest: str) -> None:
+    import httpx
+    host = urlsplit(url).netloc.lower()
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     tmp = f'{dest}.{os.getpid()}.{threading.get_ident()}.part'
     try:
@@ -125,6 +174,7 @@ def _download(url: str, dest: str) -> None:
         if not size:
             raise ValueError('empty image response')
         os.replace(tmp, dest)
+        _note_store_growth(size)
     except httpx.HTTPError as exc:
         exc.quiet = True
         if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
@@ -153,26 +203,32 @@ def _resolve(src: str) -> str:
 
 
 def _trim_store() -> None:
-    files, total = [], 0
-    for root, _dirs, names in os.walk(_STORE):
-        for name in names:
-            path = os.path.join(root, name)
-            try:
-                st = os.stat(path)
-            except OSError:
-                continue
-            if name.endswith('.part') and time.time() - st.st_mtime > 3600:
-                _rm(path)
-                continue
-            files.append((st.st_mtime, st.st_size, path))
-            total += st.st_size
-    if total <= _DISK_BUDGET:
-        return
-    for _mtime, size, path in sorted(files):
-        _rm(path)
-        total -= size
-        if total <= _DISK_BUDGET * 0.8:
-            break
+    global _trim_growth, _trim_scheduled
+    try:
+        files, total = [], 0
+        for root, _dirs, names in os.walk(_STORE):
+            for name in names:
+                path = os.path.join(root, name)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                if name.endswith('.part') and time.time() - st.st_mtime > 3600:
+                    _rm(path)
+                    continue
+                files.append((st.st_mtime, st.st_size, path))
+                total += st.st_size
+        if total <= _DISK_BUDGET:
+            return
+        for _mtime, size, path in sorted(files):
+            _rm(path)
+            total -= size
+            if total <= _DISK_BUDGET * 0.8:
+                break
+    finally:
+        with _trim_lock:
+            _trim_growth = 0
+            _trim_scheduled = False
 
 
 def _wipe_store() -> None:
@@ -240,7 +296,7 @@ def _decode(path: str, width: int, height: int, mode: int, dpr: float, src: str 
             reader.setScaledClipRect(QRect((tw - pw) // 2, (th - ph) // 2, min(pw, tw), min(ph, th)))
     image = reader.read()
     if image.isNull() and src and _steam_hosted(src):
-        image = _decode_avif(path)            # Qt lacks an AVIF plugin; Steam serves AVIF extras
+        image = _decode_avif(path, pw, ph, mode)
         image = _fit(image, pw, ph, mode)
     if image.isNull():
         return image
@@ -271,12 +327,23 @@ def _steam_hosted(src: str) -> bool:
     return any(host == suffix or host.endswith('.' + suffix) for suffix in _STEAM_IMAGE_HOSTS)
 
 
-def _avif_frame_image(frame) -> QImage:
-    """Convert a PyAV frame to a Qt image while keeping its alpha channel."""
-    frame = frame.reformat(format='rgba')
+def _avif_frame_image(frame, width: int = 0, height: int = 0) -> QImage:
+    if width > 0 and height > 0 and (frame.width != width or frame.height != height):
+        frame = frame.reformat(width=width, height=height, format='rgba')
+    else:
+        frame = frame.reformat(format='rgba')
     plane = frame.planes[0]
     return QImage(bytes(plane), frame.width, frame.height, plane.line_size,
                   QImage.Format.Format_RGBA8888).copy()
+
+
+def _avif_target(width: int, height: int, max_width: int, max_height: int = 0) -> tuple[int, int]:
+    if width <= 0 or height <= 0:
+        return 0, 0
+    scale = max_width / width if max_width and width > max_width else 1.0
+    if max_height and height * scale > max_height:
+        scale = max_height / height
+    return max(1, round(width * scale)), max(1, round(height * scale))
 
 
 def _avif_container(path: str):
@@ -284,13 +351,12 @@ def _avif_container(path: str):
         head = fh.read(64)
     if len(head) < 12 or head[4:8] != b'ftyp' or (b'avif' not in head and b'avis' not in head):
         return None
-    import av                                        # optional, already shipped for video
+    import av
 
     return av.open(path)
 
 
-def _decode_avif(path: str) -> QImage:
-    """Decode the first AVIF frame with PyAV, but only for Steam-hosted images."""
+def _decode_avif(path: str, width: int = 0, height: int = 0, mode: int = COVER) -> QImage:
     try:
         container = _avif_container(path)
         if container is None:
@@ -299,21 +365,22 @@ def _decode_avif(path: str) -> QImage:
             stream = container.streams.video[0]
             if (stream.width or 0) * (stream.height or 0) > _AVIF_MAX_PIXELS:
                 return QImage()
+            tw = th = 0
+            if width > 0 and height > 0 and stream.width and stream.height:
+                pick = max if mode == COVER else min
+                scale = pick(width / stream.width, height / stream.height)
+                tw, th = max(1, round(stream.width * scale)), max(1, round(stream.height * scale))
             for frame in container.decode(stream):
                 if frame.width * frame.height > _AVIF_MAX_PIXELS:
                     return QImage()
-                return _avif_frame_image(frame)
+                return _avif_frame_image(frame, tw, th)
     except Exception:
         logger.debug('AVIF decode failed', exc_info=True)
     return QImage()
 
 
-def avif_animation(path: str, max_frames: int = 240) -> list[tuple[QImage, int]]:
-    """Return ``(image, delay_ms)`` pairs for an animated AVIF/AVIF sequence.
-
-    Static AVIF files produce a single frame.  Decoding happens on a worker
-    thread; the Qt image objects are safe to hand back to the GUI thread.
-    """
+def avif_animation(path: str, max_frames: int = _AVIF_ANIM_FRAMES,
+                   max_width: int = _AVIF_ANIM_WIDTH) -> list[tuple[QImage, int]]:
     frames: list[tuple[QImage, int]] = []
     try:
         container = _avif_container(path)
@@ -323,6 +390,10 @@ def avif_animation(path: str, max_frames: int = 240) -> list[tuple[QImage, int]]
             stream = container.streams.video[0]
             if (stream.width or 0) * (stream.height or 0) > _AVIF_MAX_PIXELS:
                 return frames
+            tw, th = _avif_target(stream.width or 0, stream.height or 0, max_width)
+            frame_bytes = max(1, tw * th * 4)
+            budget_frames = max(1, _AVIF_ANIM_BUDGET // frame_bytes)
+            limit = max(1, min(int(max_frames), budget_frames))
             time_base = float(stream.time_base or 0.04)
             previous = 0.0
             for frame in container.decode(stream):
@@ -334,9 +405,9 @@ def avif_animation(path: str, max_frames: int = 240) -> list[tuple[QImage, int]]
                     stamp = previous + 0.04
                 delay = stamp - previous if frames else max(0.02, stamp)
                 delay = min(0.5, max(0.02, delay))
-                frames.append((_avif_frame_image(frame), int(round(delay * 1000))))
+                frames.append((_avif_frame_image(frame, tw, th), int(round(delay * 1000))))
                 previous = stamp
-                if len(frames) >= max_frames:
+                if len(frames) >= limit:
                     break
     except Exception:
         logger.debug('AVIF animation decode failed', exc_info=True)
@@ -344,7 +415,6 @@ def avif_animation(path: str, max_frames: int = 240) -> list[tuple[QImage, int]]
 
 
 def image_file(src) -> str:
-    """Resolve a remote image to its cached local file (used by QMovie for GIFs)."""
     value = str(src or '')
     if not value:
         return ''
@@ -376,10 +446,13 @@ def _swatches(path: str, count: int) -> list[QColor]:
             acc[1] += g
             acc[2] += b
             acc[3] += 1
+    def weight(acc: list) -> float:
+        return acc[3] * (0.3 + QColor(acc[0] // acc[3], acc[1] // acc[3], acc[2] // acc[3]).getHsv()[1] / 255)
+
     picked: list[QColor] = []
-    for acc in sorted(buckets.values(), key=lambda a: a[3], reverse=True):
+    for acc in sorted(buckets.values(), key=weight, reverse=True):
         c = QColor(acc[0] // acc[3], acc[1] // acc[3], acc[2] // acc[3])
-        if all(abs(c.red() - p.red()) + abs(c.green() - p.green()) + abs(c.blue() - p.blue()) >= 60 for p in picked):
+        if all(abs(c.red() - p.red()) + abs(c.green() - p.green()) + abs(c.blue() - p.blue()) >= 110 for p in picked):
             picked.append(c)
         if len(picked) >= count:
             break
@@ -392,10 +465,19 @@ def _swatches(path: str, count: int) -> list[QColor]:
 
 
 def _colors_job(src: str, count: int) -> list[QColor]:
+    from .cache import cache
+    key = f"{hashlib.blake2b(src.encode('utf-8', 'ignore'), digest_size=16).hexdigest()}:{count}"
+    saved = cache.load('palette2', key, None)
+    if isinstance(saved, list) and len(saved) == count:
+        colors = [QColor(c) for c in saved if isinstance(c, str)]
+        if len(colors) == count and all(c.isValid() for c in colors):
+            return colors
     try:
         colors = _swatches(_resolve(src), count)
     except Exception:
         colors = []
+    if colors:
+        cache.save('palette2', key, [c.name() for c in colors])
     return colors or [QColor(c) for c in _FALLBACK_COLORS[:count]]
 
 
@@ -438,7 +520,7 @@ class _Images:
             return 0
         if not self._trimmed:
             self._trimmed = True
-            engine().submit(_trim_store, priority=Priority.PREFETCH, pool=IO)
+            _request_trim()
         self._seq += 1
         token = self._seq
         self._tokens[token] = key

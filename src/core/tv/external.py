@@ -21,6 +21,7 @@ import ssl
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.request
@@ -39,6 +40,9 @@ _DEPS = {
 }
 _ASSET_VERSION = "2"
 _TIMEOUT_FLOOR = 8
+_SDK_REGISTRY = "https://registry.npmjs.org/@vyla-entertainment/sdk/latest"
+_SDK_MAX_BYTES = 64 << 20
+_vyla_update_lock = threading.Lock()
 
 _BUNDLED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "node")
 _BUNDLED_VYLA = os.path.join(_BUNDLED_DIR, "vyla_sdk")
@@ -254,7 +258,11 @@ def _sync_assets_unlocked() -> None:
     except OSError:
         pass
     _copy_if_changed(os.path.join(_BUNDLED_DIR, "vyla_bridge.mjs"), _VYLA_BRIDGE)
-    if current != signature or not os.path.isdir(_VYLA_DIR):
+    installed = _read_sdk_version(_VYLA_DIR)
+    bundled = _read_sdk_version(_BUNDLED_VYLA)
+    stale = not installed or (
+        bundled and _version_tuple(installed) < _version_tuple(bundled))
+    if current != signature or stale:
         if os.path.isdir(_BUNDLED_VYLA):
             shutil.copytree(_BUNDLED_VYLA, _VYLA_DIR, dirs_exist_ok=True)
         with open(marker, "w", encoding="utf-8") as fh:
@@ -281,6 +289,142 @@ def _sync_assets_unlocked() -> None:
             )
 
 
+def _version_tuple(text: str) -> tuple:
+    parts = []
+    for piece in text.split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _read_sdk_version(path: str) -> str:
+    try:
+        with open(os.path.join(path, "package.json"), encoding="utf-8") as fh:
+            version = json.load(fh).get("version")
+        return str(version) if version else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def vyla_sdk_version() -> str:
+    """Installed SDK version, falling back to the bundled one."""
+    return _read_sdk_version(_VYLA_DIR) or _read_sdk_version(_BUNDLED_VYLA)
+
+
+def _stop_bridges() -> None:
+    with _bridges_lock:
+        bridges = list(_bridges.values())
+        _bridges.clear()
+    for bridge in bridges:
+        try:
+            bridge.stop()
+        except Exception:
+            logger.debug("Could not stop Vyla bridge", exc_info=True)
+
+
+def _download_file(url: str, target: str) -> None:
+    request = urllib.request.Request(url, headers={"User-Agent": "PiraChest"})
+    written = 0
+    with urllib.request.urlopen(request, timeout=60, context=ssl.create_default_context()) as response, \
+            open(target, "wb") as fh:
+        while True:
+            chunk = response.read(256 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > _SDK_MAX_BYTES:
+                raise RuntimeError("Vyla SDK download is unexpectedly large")
+            fh.write(chunk)
+
+
+def _merge_sdk_dependencies(package_dir: str) -> None:
+    """Keep the shared integration package in sync with the SDK's runtime deps."""
+    try:
+        with open(os.path.join(package_dir, "package.json"), encoding="utf-8") as fh:
+            wanted = json.load(fh).get("dependencies") or {}
+    except (OSError, ValueError):
+        return
+    if not isinstance(wanted, dict):
+        return
+    path = os.path.join(_INTEGRATIONS_DIR, "package.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = {"private": True, "name": "pirachest-integrations", "version": "1.0.0"}
+    deps = data.setdefault("dependencies", {})
+    changed = False
+    for name, spec in wanted.items():
+        if name not in deps:
+            deps[name] = spec
+            changed = True
+    if changed:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=2))
+
+
+def update_vyla_sdk() -> str:
+    """Download the latest published Vyla SDK and swap it in atomically.
+
+    Returns the new version string. Raises on network, validation or file
+    errors so the settings page can surface a useful message.
+    """
+    if not _vyla_update_lock.acquire(blocking=False):
+        raise RuntimeError("A Vyla SDK update is already running")
+    staging = ""
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(_SDK_REGISTRY, headers={"User-Agent": "PiraChest"}),
+                timeout=30, context=ssl.create_default_context()) as response:
+            meta = json.loads(response.read().decode("utf-8"))
+        tarball = ((meta.get("dist") or {}).get("tarball") or "").strip()
+        if not tarball.startswith(("http://", "https://")):
+            raise RuntimeError("The registry did not return a download URL")
+        latest = str(meta.get("version") or "").strip()
+        os.makedirs(_INTEGRATIONS_DIR, exist_ok=True)
+        staging = tempfile.mkdtemp(prefix="vyla-", dir=_INTEGRATIONS_DIR)
+        archive = os.path.join(staging, "sdk.tgz")
+        extracted = os.path.join(staging, "extract")
+        _download_file(tarball, archive)
+        with tarfile.open(archive, "r:gz") as tf:
+            try:
+                tf.extractall(extracted, filter="data")
+            except TypeError:
+                tf.extractall(extracted)
+        package = os.path.join(extracted, "package")
+        version = _read_sdk_version(package)
+        if not version or not os.path.isfile(os.path.join(package, "src", "sdk.js")):
+            raise RuntimeError("The downloaded package is not a valid Vyla SDK")
+        _stop_bridges()
+        backup = ""
+        if os.path.isdir(_VYLA_DIR):
+            backup = _VYLA_DIR + f".old-{int(time.time())}"
+            os.replace(_VYLA_DIR, backup)
+        try:
+            os.replace(package, _VYLA_DIR)
+        except Exception:
+            if backup and not os.path.isdir(_VYLA_DIR):
+                os.replace(backup, _VYLA_DIR)
+            raise
+        if backup:
+            shutil.rmtree(backup, ignore_errors=True)
+        _merge_sdk_dependencies(_VYLA_DIR)
+        with _cache_lock:
+            _cache.clear()
+        node = find_node()
+        if node:
+            try:
+                _install_deps(node, force=True)
+            except Exception as exc:
+                logger.warning("Vyla SDK updated but dependencies failed: %s", exc)
+        logger.info("Vyla SDK updated to %s (latest %s)", version, latest)
+        return version
+    finally:
+        if staging:
+            shutil.rmtree(staging, ignore_errors=True)
+        _vyla_update_lock.release()
+
+
 def _npm_command(node: str) -> Optional[list[str]]:
     node_dir = os.path.dirname(node)
     candidates = [
@@ -299,8 +443,8 @@ def _npm_command(node: str) -> Optional[list[str]]:
     return None
 
 
-def _install_deps(node: str) -> None:
-    if _deps_ready():
+def _install_deps(node: str, force: bool = False) -> None:
+    if not force and _deps_ready():
         return
     npm = _npm_command(node)
     if not npm:
@@ -729,4 +873,5 @@ def vyla_subtitles(imdb_id: str = "", tmdb_id: Optional[int] = None,
 def integration_status() -> dict:
     status = runtime_status()
     status["vyla_sdk"] = os.path.isdir(_VYLA_DIR)
+    status["vyla_version"] = vyla_sdk_version()
     return status

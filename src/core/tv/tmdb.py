@@ -1,7 +1,11 @@
+import datetime
 import logging
+import random
+import re
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import requests
 from src.core.config import network
 from src.core.cache import cache
@@ -194,6 +198,130 @@ def season(tv_id: int, season_number: int, use_cache: bool = True) -> dict:
     return _get(f"/tv/{tv_id}/season/{season_number}", None, _TTL_LONG, use_cache)
 
 
+_rng = random.SystemRandom()
+_RANDOM_MIN_VOTES = 3
+_RANDOM_BATCH = 8
+_RANDOM_ROUNDS = 5
+_FALLBACK_MAX_ID = {"movie": 1_500_000, "tv": 320_000}
+_max_ids: dict[str, tuple[float, int]] = {}
+
+
+def _latest_id(media_type: str) -> int:
+    with _lock:
+        hit = _max_ids.get(media_type)
+        if hit is not None and time.time() - hit[0] < _TTL_LONG:
+            return hit[1]
+    try:
+        resp = _session.get(f"{network.tmdb_proxy_base}/{media_type}/latest", timeout=10)
+        resp.raise_for_status()
+        value = int(resp.json().get("id"))
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
+        logger.warning("TMDB latest id lookup failed for %s", media_type)
+        return _FALLBACK_MAX_ID[media_type]
+    if value < 1:
+        return _FALLBACK_MAX_ID[media_type]
+    with _lock:
+        _max_ids[media_type] = (time.time(), value)
+    return value
+
+
+def _probe(media_type: str, tmdb_id: int) -> dict | None:
+    try:
+        resp = _session.get(f"{network.tmdb_proxy_base}/{media_type}/{tmdb_id}", timeout=8)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _presentable(data: dict, today: str) -> bool:
+    if data.get("adult") or not data.get("poster_path") or not (data.get("overview") or "").strip():
+        return False
+    date = data.get("release_date") or data.get("first_air_date") or ""
+    return bool(date) and date <= today
+
+
+def _remote_random(media_type: str, exclude: int | None) -> dict | None:
+    try:
+        resp = _session.get(f"{network.tmdb_proxy_base}/random/{media_type}",
+                            params={"exclude": exclude} if exclude else None, timeout=25)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+    return data if isinstance(data, dict) and data.get("id") else None
+
+
+def random_title(media_type: str, exclude: int | None = None) -> dict:
+    remote = _remote_random(media_type, exclude)
+    if remote:
+        return remote
+    top = _latest_id(media_type)
+    today = datetime.date.today().isoformat()
+    tried: set[int] = set()
+    fallback = None
+    with ThreadPoolExecutor(max_workers=_RANDOM_BATCH) as pool:
+        for _ in range(1):
+            ids = []
+            while len(ids) < _RANDOM_BATCH:
+                tmdb_id = _rng.randint(1, top)
+                if tmdb_id not in tried and tmdb_id != exclude:
+                    tried.add(tmdb_id)
+                    ids.append(tmdb_id)
+            for data in pool.map(lambda i: _probe(media_type, i), ids):
+                if not data or not _presentable(data, today):
+                    continue
+                if (data.get("vote_count") or 0) >= _RANDOM_MIN_VOTES:
+                    return data
+                if fallback is None:
+                    fallback = data
+    return fallback or {}
+
+
+_GENRE_ALIASES = {"scifi": "sciencefiction", "sci": "sciencefiction", "romcom": "romance"}
+
+
+def _norm_genre(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
+
+
+def genres(media_type: str, use_cache: bool = True) -> list:
+    return _get(f"/genre/{media_type}/list", None, _TTL_DETAIL, use_cache).get("genres") or []
+
+
+def resolve_genres(media_type: str, names) -> dict:
+    pool = genres(media_type)
+    by_norm = {_norm_genre(g.get("name", "")): g for g in pool}
+    ids, tags, missing, seen = [], [], [], set()
+    for name in names:
+        key = _norm_genre(name)
+        found = by_norm.get(key) or by_norm.get(_GENRE_ALIASES.get(key, ""))
+        if found is None and key:
+            for cand in pool:
+                if key in (_norm_genre(p) for p in re.split(r"[&,]", cand.get("name", ""))):
+                    found = cand
+                    break
+        if found is None:
+            missing.append(name)
+        elif found["id"] not in seen:
+            seen.add(found["id"])
+            ids.append(found["id"])
+            tags.append(found["name"])
+    return {"tags": tags, "ids": ids, "missing": missing,
+            "pool": [g.get("name", "") for g in pool]}
+
+
+def discover(media_type: str, genre_ids, page: int = 1, use_cache: bool = True) -> dict:
+    today = datetime.date.today().isoformat()
+    date_key = "primary_release_date.lte" if media_type == "movie" else "first_air_date.lte"
+    params = {"with_genres": ",".join(str(i) for i in genre_ids), "sort_by": "popularity.desc",
+              "include_adult": "false", date_key: today, "page": page}
+    return _get(f"/discover/{media_type}", params, _TTL_SHORT, use_cache)
+
+
 _TTL_SKIP = 7 * 86400
 _TTL_SKIP_MISS = 6 * 3600
 
@@ -367,6 +495,11 @@ details_async = _async(details)
 credits_async = _async(credits)
 external_ids_async = _async(external_ids)
 season_async = _async(season)
+random_title_async = _async(random_title)
+resolve_genres_async = _async(resolve_genres)
+discover_async = _async(discover)
+
+
 def movie_full_async(tmdb_id, on_done=None, on_error=None):
     return worker.submit(movie_full, args=(tmdb_id,), on_done=on_done, on_error=on_error, priority=worker.Priority.HIGH)
 

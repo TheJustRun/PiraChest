@@ -46,26 +46,6 @@ class GameItem(MediaItem):
         return cls(**_media_item_kwargs(data), platform=data.get('platform', ''), developer=data.get('developer', ''), genre=data.get('genre', ''))
 
 @dataclass(slots=True)
-class BookItem(MediaItem):
-    author: str = ''
-    isbn: str = ''
-    pages: int = 0
-    description: str = ''
-    formats: dict = field(default_factory=dict)
-    subjects: list = field(default_factory=list)
-    language: str = ''
-    year: str = ''
-
-    def to_dict(self) -> dict:
-        d = super(BookItem, self).to_dict()
-        d.update(author=self.author, isbn=self.isbn, pages=self.pages, description=self.description, formats=dict(self.formats), subjects=list(self.subjects), language=self.language, year=self.year)
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict) -> 'BookItem':
-        return cls(**_media_item_kwargs(data), author=data.get('author', ''), isbn=data.get('isbn', ''), pages=data.get('pages', 0), description=data.get('description', ''), formats=dict(data.get('formats') or {}), subjects=list(data.get('subjects') or []), language=data.get('language', ''), year=data.get('year', ''))
-
-@dataclass(slots=True)
 class MusicItem(MediaItem):
     artist: str = ''
     album: str = ''
@@ -237,11 +217,6 @@ class MediaPage:
     has_more: bool
 
 
-# --- File-type / source safety ------------------------------------------------
-# Download sources are checked locally by extension. This is deliberately
-# conservative: it never blocks a download, it only highlights file types that
-# deserve a second look. Game repacks routinely contain installers, so the
-# assessment depends on the surrounding category.
 
 _FILE_KINDS: dict[str, tuple[str, ...]] = {
     'video': ('.mkv', '.mp4', '.avi', '.m4v', '.mov', '.webm', '.wmv', '.flv', '.mpg',
@@ -295,8 +270,6 @@ _REASONS = {
     'other': 'No executable extension detected',
 }
 _EXPECTED_KINDS = {
-    # Only the repack page treats .bat launchers as expected; .cmd is never
-    # neutralised because it is far more often used to hide commands.
     'repack': frozenset({'installer', 'batch', 'archive', 'disc', 'rom', 'document', 'image', 'other'}),
     'game': frozenset({'installer', 'archive', 'disc', 'rom', 'document', 'image', 'other'}),
     'software': frozenset({'installer', 'archive', 'disc', 'document', 'image', 'other'}),
@@ -310,13 +283,13 @@ _EXPECTED_KINDS = {
 class FileSafety:
     kind: str
     label: str
-    risk: str  # ok | caution | dangerous
+    risk: str
     reason: str
 
 
 @dataclass(frozen=True, slots=True)
 class SourceSafety:
-    level: str  # ok | caution | dangerous
+    level: str
     summary: str
     details: str
     highlighted: tuple[str, ...] = ()
@@ -330,11 +303,6 @@ def _extension(name: str) -> str:
 
 
 def classify_file(name: str) -> FileSafety:
-    """Classify one path by extension without trusting or opening it.
-
-    ``label`` is the concrete extension shown in the UI (``mp4``, ``exe``),
-    while ``kind`` is the broad category used for context-aware assessment.
-    """
     base = os.path.basename(str(name or '').replace('\\', '/')).strip()
     ext = _extension(base)
     label = ext.lstrip('.') or 'no ext'
@@ -383,13 +351,6 @@ def _context_key(context: str) -> str:
 
 
 def assess_source_files(files, context: str = '', title: str = '') -> SourceSafety:
-    """Summarise the file mix of a torrent without blocking anything.
-
-    `files` may contain paths or dicts with a ``name`` key. The context is a
-    source category such as ``Repacks``, ``Video`` or ``Books``. Installers are
-    expected for games/software, and ``.bat`` launchers are expected only on
-    the repack page; other scripts, including ``.cmd``, are always highlighted.
-    """
     names: list[str] = []
     for entry in files or ():
         if isinstance(entry, dict):
@@ -412,8 +373,6 @@ def assess_source_files(files, context: str = '', title: str = '') -> SourceSafe
     for name in names:
         info = classify_file(name)
         if info.risk == 'dangerous':
-            # Repacks commonly ship batch launchers; they are still shown as
-            # their concrete extension but are not treated as a warning there.
             if info.kind == 'batch' and info.kind in expected:
                 continue
             dangerous.append(name)
@@ -437,7 +396,6 @@ def assess_source_files(files, context: str = '', title: str = '') -> SourceSafe
 
 
 def assess_title(title: str, context: str = '') -> SourceSafety | None:
-    """Return a warning when a title itself advertises a risky file type."""
     info = classify_file(title)
     if info.risk == 'ok':
         return None

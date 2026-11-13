@@ -14,6 +14,51 @@ from datetime import datetime, timezone
 from PySide6.QtCore import QObject, Signal
 logger = logging.getLogger(__name__)
 
+
+def _read_app_version() -> tuple[str, bool]:
+    bases = [getattr(sys, '_MEIPASS', ''), os.path.dirname(os.path.abspath(__file__))]
+    if getattr(sys, 'frozen', False):
+        bases.insert(0, os.path.dirname(os.path.abspath(sys.executable)))
+    for base in bases:
+        if not base:
+            continue
+        current = os.path.abspath(base)
+        for _ in range(4):
+            try:
+                with open(os.path.join(current, 'VERSION'), encoding='utf-8') as fh:
+                    lines = [line.strip() for line in fh.read().splitlines()]
+            except OSError:
+                lines = []
+            if lines:
+                version = lines[0] or '0.0.0-dev'
+                flag = False
+                for line in lines[1:]:
+                    if line in ('0', '1'):
+                        flag = line == '1'
+                        continue
+                    key, _, value = line.partition('=')
+                    if key.strip().lower() in ('canary', 'is_canary'):
+                        flag = value.strip().lower() in ('1', 'true', 'yes', 'on')
+                return version, flag
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+    return '0.0.0-dev', False
+
+
+VERSION, IS_CANARY = _read_app_version()
+if os.environ.get('PIRACHEST_CANARY', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+    IS_CANARY = True
+APP_NAME = 'PiraChest Canary' if IS_CANARY else 'PiraChest'
+COMPANY_NAME = 'JustRun'
+SLUG = 'PiraChest-Canary' if IS_CANARY else 'PiraChest'
+EXE_NAME = f'{APP_NAME}.exe'
+ICON_FILE = 'icon_c.ico' if IS_CANARY else 'icon.ico'
+LOGO_FILE = 'logo_c.ico' if IS_CANARY else 'logo.ico'
+UPGRADE_CODE = 'b7e0d3f2-9c41-4e8a-a6d5-2f7c1e9b4a68' if IS_CANARY else 'a3f6c2d1-7b4e-4c9a-8f2d-5e1b0c7a9d34'
+
+
 def _detect_app_root() -> str:
     if getattr(sys, 'frozen', False):
         return os.path.dirname(os.path.abspath(sys.executable))
@@ -47,7 +92,7 @@ def is_admin() -> bool:
 
 _STARTUP_RUN_KEY_PATH = r'Software\Microsoft\Windows\CurrentVersion\Run'
 _STARTUP_APPROVED_KEY_PATH = r'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-_STARTUP_VALUE_NAME = 'PiraChest'
+_STARTUP_VALUE_NAME = APP_NAME
 
 def _startup_command() -> str:
     if getattr(sys, 'frozen', False):
@@ -149,7 +194,7 @@ class Paths:
     data_dir: str = field(default_factory=lambda: os.path.join(_APP_DATA_DIR, 'index'))
     db_path: str = field(default_factory=lambda: os.path.join(_APP_DATA_DIR, 'index', 'minerva_index.db'))
     download_root: str = field(default_factory=lambda: os.path.join(_APP_DATA_DIR, 'downloads'))
-    torrent_cache: str = field(default_factory=lambda: os.path.join(_APP_DATA_DIR, 'downloads', 'torrents'))
+    torrent_cache: str = field(default_factory=lambda: os.path.join(_APP_DATA_DIR, 'cache', 'torrents'))
     cache_dir: str = field(default_factory=lambda: os.path.join(_APP_DATA_DIR, 'cache'))
     stream_cache: str = field(default_factory=lambda: os.path.join(_APP_DATA_DIR, 'cache', 'stream'))
     config_dir: str = field(default_factory=lambda: os.path.join(_APP_DATA_DIR, 'config'))
@@ -188,7 +233,6 @@ DOWNLOAD_DIR_SUBFOLDERS: dict[str, str] = {
     'download_dir_anime': 'anime',
     'download_dir_youtube': 'youtube',
     'download_dir_manga': 'manga',
-    'download_dir_books': 'books',
     'download_dir_tbhb': 'tbhb',
 }
 
@@ -242,18 +286,19 @@ class Settings:
     download_dir_anime: str = _dir_field('download_dir_anime')
     download_dir_youtube: str = _dir_field('download_dir_youtube')
     download_dir_manga: str = _dir_field('download_dir_manga')
-    download_dir_books: str = _dir_field('download_dir_books')
     download_dir_tbhb: str = _dir_field('download_dir_tbhb')
     speed_limit: int = 0
     upload_speed_limit: int = 0
     torrent_port: int = 6881
     max_active_downloads: int = 3
     http_connections: int = 8
+    min_free_space_mb: int = 512
     net: dict = field(default_factory=dict)
     seed_time: int = 0
     delete_torrent_after: bool = True
     theme_mode: str = ThemeMode.DARK
     theme_preset: str | None = None
+    animations_enabled: bool = True
     hide_vpn_disclaimer: bool = False
     onboarding_completed: bool = False
     sync_prompt_shown: bool = False
@@ -313,6 +358,7 @@ class Settings:
     sailseek_categories: dict = field(default_factory=dict)
     youtube_enabled: bool = False
     tbhb_enabled: bool = False
+    tbhb_disclaimer_seen: bool = False
     accent_color: str = APP_ACCENT_COLOR
     close_to_tray: bool = False
     external_torrent_client: bool = False
@@ -326,6 +372,8 @@ class Settings:
     associations_exe_path: str = ''
     associations_user_disabled: bool = False
     skip_update_tag: str = ''
+    auto_check_updates: bool = True
+    canary_updates: bool = False
     notify_on_download_complete: bool = True
     sfx_volume: int = 45
     ambiance_volume: int = 0
@@ -340,13 +388,14 @@ class Settings:
     tabvis_tv_series_enabled: bool = True
     tabvis_tv_anime_enabled: bool = True
     tabvis_tv_channels_enabled: bool = True
-    tabvis_books_books_enabled: bool = False
     tabvis_books_manga_enabled: bool = True
     auto_install_games: bool = False
     experimental_acknowledged: bool = False
+    last_install_dir: str = ''
 
 
     keyboard_shortcuts: dict = field(default_factory=dict)
+    nav_order: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -408,6 +457,7 @@ _RANGES: dict[str, tuple[float, float]] = {
     'torrent_port': (0, 65535),
     'max_active_downloads': (1, 64),
     'http_connections': (1, 64),
+    'min_free_space_mb': (0, 10_000_000),
     'sfx_volume': (0, 100),
     'ambiance_volume': (0, 100),
     'background_image_blur': (0, 40),
@@ -727,6 +777,17 @@ def set_tab_enabled(scope: str, key: str, value: bool) -> bool:
     tab_visibility_bus.changed.emit(scope)
     return True
 
+NAV_SOURCE_KEYS = ('minerva', 'pc_games', 'music', 'books', 'youtube', 'tv', 'tbhb')
+
+def nav_order() -> list[str]:
+    saved = settings.nav_order if isinstance(settings.nav_order, list) else []
+    order: list[str] = []
+    for key in saved:
+        if key in NAV_SOURCE_KEYS and key not in order:
+            order.append(key)
+    order.extend(key for key in NAV_SOURCE_KEYS if key not in order)
+    return order
+
 def apply_settings(**kwargs) -> None:
     for key, value in kwargs.items():
         if key not in Settings.__dataclass_fields__:
@@ -764,10 +825,10 @@ def resolve_theme(qfluent_set_theme) -> None:
     qfluent_set_theme(theme)
     logger.info('Theme resolved to %s (mode=%s)', theme, mode)
 
-_APP_NAME = 'PiraChest'
-_PROG_ID_TORRENT = 'PiraChest.Torrent'
-_PROG_ID_MAGNET = 'PiraChest.MagnetURL'
-_CAPABILITIES_KEY = r'Software\PiraChest\Capabilities'
+_APP_NAME = APP_NAME
+_PROG_ID_TORRENT = f'{SLUG}.Torrent'
+_PROG_ID_MAGNET = f'{SLUG}.MagnetURL'
+_CAPABILITIES_KEY = rf'Software\{SLUG}\Capabilities'
 _REGISTERED_APPS_KEY = r'Software\RegisteredApplications'
 
 def _current_exe_path() -> str:
@@ -863,7 +924,6 @@ def register_associations(exe_path: str | None = None) -> bool:
         return False
 
 def should_auto_register_associations() -> bool:
-    # Never claim torrent/magnet associations without an explicit opt-in.
     return associations_available() and bool(settings.associations_enabled)
 
 
@@ -883,7 +943,7 @@ def extract_cli_targets(argv: list[str]) -> list[str]:
             targets.append(os.path.abspath(arg))
     return targets
 
-_SINGLE_INSTANCE_SERVER_NAME = 'PiraChest-SingleInstance'
+_SINGLE_INSTANCE_SERVER_NAME = f'{SLUG}-SingleInstance'
 _SINGLE_INSTANCE_SEP = '\x1e'
 
 class SingleInstance:

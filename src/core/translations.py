@@ -169,7 +169,6 @@ def tr(key: str, default: Optional[str] = None, **kwargs) -> str:
 
 
 def tr_for(lang: str, key: str, default: Optional[str] = None, **kwargs) -> str:
-    """Translate a key for a specific language, regardless of the UI language."""
     text = _lookup(key, lang)
     if text is None:
         _note_missing(key, lang)

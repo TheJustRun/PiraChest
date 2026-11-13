@@ -4,6 +4,7 @@ import datetime as _dt
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import html
@@ -19,9 +20,9 @@ from urllib.parse import urljoin
 
 import httpx
 from PySide6.QtCore import (
-    Qt, QSize, Signal, QTimer, QEvent, QUrl, QObject,
+    Qt, QSize, Signal, QTimer, QEvent, QUrl, QObject, QVariantAnimation, QEasingCurve,
 )
-from PySide6.QtGui import QIcon, QFont, QColor, QPixmap, QDesktopServices
+from PySide6.QtGui import QIcon, QFont, QColor, QPixmap, QDesktopServices, QBrush
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import QPushButton as _QPushButton
@@ -43,6 +44,13 @@ from functools import partial
 from shiboken6 import isValid as _qt_is_valid
 from src.core.artwork import images, FIT
 
+def _clean_query(text: str) -> str:
+    value = re.sub(r'\s+', ' ', str(text or '')).strip()
+    return value.strip('"\'.,;:!?()[]{}<>')
+
+from .repacks_page import _tm_contains, _tm_variants
+
+
 _LOGO_SIZE = (48, 48)
 from src.core.tv import channels as channels_backend
 from src.core.tv import streams as stream_backend
@@ -52,16 +60,17 @@ from src.core.config import settings
 
 import zlib
 from collections import OrderedDict
-from PySide6.QtCore import QAbstractListModel, QElapsedTimer, QModelIndex, QPoint, QRect, QRectF, QSettings
+from PySide6.QtCore import QAbstractListModel, QElapsedTimer, QModelIndex, QPoint, QPointF, QRect, QRectF, QSettings
 from PySide6.QtGui import QActionGroup, QCursor, QIconEngine, QFontMetrics, QGuiApplication, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QBoxLayout, QFrame, QMenu, QStyle, QStyledItemDelegate,
-                               QToolButton, QToolTip)
-from qfluentwidgets import Action, ListView, RoundMenu
+                               QToolButton, QToolTip, QDoubleSpinBox)
+from qfluentwidgets import Action, ListView, RoundMenu, TableItemDelegate, themeColor
 from src.core.models import AnimeItem, assess_source_files, classify_file
 from src.core.net import LazyHttpClient, shared_ssl_context
 from src.core.translations import tr, register_locale_refresh
-from src.core.theme import to_color, palette, apply_pivot_theme, apply_tool_button_theme, apply_label_theme, count_badge_qss, register_theme_refresh, themed_icon, apply_slot_icon_theme, ScrollingTextDelegate
+from src.core.theme import to_color, palette, apply_pivot_theme, apply_tool_button_theme, apply_label_theme, count_badge_qss, register_theme_refresh, themed_icon, apply_slot_icon_theme
 from .home_page import MediaPageBase
+from .repacks_page import make_tag_chip, show_tag_menu, toggled_tags, bind_enter, split_tags, join_tags, partition_resolved
 from .grid import PosterGrid, PosterStrip, ViewModeButton, attrs_subtitle, grid_colors as _grid_colors
 
 
@@ -178,16 +187,6 @@ class WatchLaterStore(QObject):
         self.changed.emit()
         return True
 
-    def toggle(self, entry: dict) -> bool:
-        with self._lock:
-            self._ensure_loaded()
-            present = self.entry_key(entry) in self._items
-        if present:
-            self.remove(entry.get('media_type'), entry.get('id'), entry.get('season'), entry.get('episode'))
-            return False
-        self.add(entry)
-        return True
-
 
 _watch_later_store: Optional[WatchLaterStore] = None
 
@@ -205,6 +204,139 @@ for _c in ((.18, .62, .04, .45, .04, .28), (.04, .14, .15, .06, .27, .06), (.37,
            (.54, .12, .63, .06, .73, .06), (.85, .06, .96, .14, .96, .28), (.96, .45, .82, .62, .5, .88)):
     _HEART.cubicTo(*_c)
 _HEART.closeSubpath()
+
+
+def _genre_pill(text: str, parent=None, on_click=None) -> PillPushButton:
+    pill = PillPushButton(text, parent)
+    pill.setChecked(True)
+    pill.setCheckable(False)
+    if on_click is not None:
+        pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        pill.setToolTip(tr('tv.genre.show', default='Show titles tagged "{genre}"', genre=text))
+        pill.clicked.connect(lambda _checked=False, t=text: on_click(t))
+    else:
+        pill.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def _repolish():
+        style = pill.style()
+        style.unpolish(pill)
+        style.polish(pill)
+        pill.update()
+    register_theme_refresh(pill, _repolish)
+    return pill
+
+
+def _genre_key(name: str) -> str:
+    return re.sub(r'[^a-z0-9]+', '', (name or '').lower())
+
+
+def _suggest_genres(name: str, pool, limit: int = 3) -> list:
+    import difflib
+    key = _genre_key(name)
+    keys = {_genre_key(g): g for g in pool if g}
+    for g in [g for g in pool if g]:
+        for word in re.findall(r'[A-Za-z0-9]{3,}', g):
+            keys.setdefault(_genre_key(word), g)
+    picked: list = []
+    if len(key) >= 2:
+        for k in sorted((k for k in keys if k.startswith(key) or key in k), key=lambda k: (not k.startswith(key), len(k))):
+            if keys[k] not in picked:
+                picked.append(keys[k])
+    scored = sorted(((difflib.SequenceMatcher(None, key, k).ratio(), k) for k in keys), reverse=True)
+    best = scored[0][0] if scored else 0.0
+    for ratio, k in scored:
+        if ratio < 0.6 or ratio < best - 0.15:
+            break
+        if keys[k] not in picked:
+            picked.append(keys[k])
+    return picked[:limit]
+
+
+_RNG = random.SystemRandom()
+
+
+class _DiceButton(QToolButton):
+
+    def __init__(self, tip: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(32, 32)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setToolTip(tip)
+        self.setAccessibleName(tip)
+        self._hover = 0.0
+        self._angle = 0.0
+        self._hover_anim = QVariantAnimation(self)
+        self._hover_anim.setDuration(160)
+        self._hover_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._hover_anim.valueChanged.connect(self._set_hover)
+        self._spin_anim = QVariantAnimation(self)
+        self._spin_anim.setStartValue(0.0)
+        self._spin_anim.setEndValue(360.0)
+        self._spin_anim.setDuration(520)
+        self._spin_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._spin_anim.valueChanged.connect(self._set_angle)
+        self._spin_anim.finished.connect(lambda: self._set_angle(0.0))
+        self.pressed.connect(self._roll)
+
+    def set_busy(self, busy: bool) -> None:
+        self._spin_anim.setLoopCount(-1 if busy else 1)
+        if busy:
+            self._roll()
+
+    def _roll(self) -> None:
+        if self._spin_anim.state() != QVariantAnimation.State.Running:
+            self._spin_anim.start()
+
+    def _set_hover(self, value) -> None:
+        self._hover = float(value)
+        self.update()
+
+    def _set_angle(self, value) -> None:
+        self._angle = float(value)
+        self.update()
+
+    def _fade_to(self, target: float) -> None:
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self._hover)
+        self._hover_anim.setEndValue(target)
+        self._hover_anim.start()
+
+    def enterEvent(self, event) -> None:
+        self._fade_to(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._fade_to(0.0)
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        ink = to_color(palette().get('primary_text', '#ffffff'), '#ffffff')
+        h = max(self._hover, 1.0 if self.hasFocus() else 0.0)
+        alpha = 42 if self.isDown() else int(28 * h)
+        if alpha:
+            bg = QColor(ink)
+            bg.setAlpha(alpha)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(bg)
+            p.drawRoundedRect(QRectF(self.rect()), 6, 6)
+        side = 15.0
+        p.translate(self.width() / 2, self.height() / 2)
+        p.rotate(-12.0 * self._hover + self._angle)
+        scale = 0.9 if self.isDown() else 1.0 + 0.08 * self._hover
+        p.scale(scale, scale)
+        p.setOpacity(0.8 + 0.2 * self._hover)
+        p.setPen(QPen(ink, 1.6))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(-side / 2, -side / 2, side, side), 3.4, 3.4)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(ink)
+        off = side * 0.25
+        for dx, dy in ((-1, -1), (1, -1), (0, 0), (-1, 1), (1, 1)):
+            p.drawEllipse(QPointF(dx * off, dy * off), 1.3, 1.3)
+        p.end()
 
 
 class _WatchLaterButton(PushButton):
@@ -519,29 +651,72 @@ _SOURCE_NAMES = {"torrentio": "Torrentio", "apibay": "The Pirate Bay",
                  "tbhb": "The Black Hole Bay", "addon": "Addon"}
 
 
+def _theme_color(key: str, fallback: str) -> QColor:
+    color = QColor(str(palette().get(key) or ""))
+    return color if color.isValid() else QColor(fallback)
+
+
+class _StreamRowDelegate(TableItemDelegate):
+    _LEFT = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+    _RIGHT = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+    _ALIGN = (_LEFT, _LEFT, _LEFT, _RIGHT, _RIGHT, _LEFT)
+
+    def sizeHint(self, option, index) -> QSize:
+        return QSize(option.rect.width(), 30)
+
+    def paint(self, painter, option, index) -> None:
+        rect, column, dark = option.rect, index.column(), isDarkTheme()
+        painter.save()
+        painter.setClipRect(rect)
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(rect, QColor(255, 255, 255, 28) if dark else QColor(0, 0, 0, 20))
+        elif index.row() == getattr(self, "hoverRow", -1):
+            painter.fillRect(rect, QColor(255, 255, 255, 12) if dark else QColor(0, 0, 0, 9))
+        brush = index.data(Qt.ItemDataRole.ForegroundRole)
+        if isinstance(brush, QBrush):
+            color = brush.color()
+        elif column == 0:
+            color = _theme_color("primary_text", "#ffffff" if dark else "#1a1a1a")
+        else:
+            color = _theme_color("muted", "#9a9a9a" if dark else "#666666")
+        font = QFont(option.font)
+        if column:
+            font.setPointSizeF(max(font.pointSizeF() - 0.5, 7.5))
+        painter.setFont(font)
+        painter.setPen(color)
+        width = max(rect.width() - 20, 10)
+        text = QFontMetrics(font).elidedText(str(index.data(Qt.ItemDataRole.DisplayRole) or ""),
+                                             Qt.TextElideMode.ElideRight, width)
+        painter.drawText(QRectF(rect.left() + 10, rect.top(), width, rect.height()), int(self._ALIGN[column]), text)
+        painter.restore()
+
+
 class _StreamPickerDialog(MessageBoxBase):
     _COLUMNS = (
         ("tv.stream.col_name", "Name", 0),
-        ("tv.stream.col_type", "Type", 72),
-        ("tv.stream.col_quality", "Quality", 94),
-        ("tv.stream.col_size", "Size", 94),
-        ("tv.stream.col_peers", "Peers", 86),
-        ("tv.stream.col_source", "Source", 150),
+        ("tv.stream.col_type", "Type", 76),
+        ("tv.stream.col_quality", "Quality", 76),
+        ("tv.stream.col_size", "Size", 84),
+        ("tv.stream.col_peers", "Peers", 64),
+        ("tv.stream.col_source", "Source", 120),
     )
 
     def __init__(self, sources: list, title: str, parent=None, action: str = "play") -> None:
         super().__init__(parent)
         self._pirachest_no_sfx = True
         self._sources = list(sources)
+        dark = isDarkTheme()
+        lay = self.viewLayout
+        lay.setSpacing(8)
 
-        self.titleLabel = SubtitleLabel(tr("tv.download.pick_title", default="Choose a source to download")
-                                        if action == "download"
-                                        else tr("tv.stream.pick_title", default="Choose a stream"), self)
-        self.viewLayout.addWidget(self.titleLabel)
+        self.titleLabel = StrongBodyLabel(tr("tv.download.pick_title", default="Choose a source to download")
+                                          if action == "download"
+                                          else tr("tv.stream.pick_title", default="Choose a stream"), self)
+        lay.addWidget(self.titleLabel)
 
-        for_label = StrongBodyLabel(title, self)
+        for_label = BodyLabel(title, self)
         for_label.setWordWrap(True)
-        self.viewLayout.addWidget(for_label)
+        lay.addWidget(for_label)
 
         hint = CaptionLabel(tr("tv.download.pick_hint",
                                default="You pick exactly which files to grab on the next step.") if action == "download"
@@ -549,7 +724,7 @@ class _StreamPickerDialog(MessageBoxBase):
                                     default="Direct sources start instantly. For torrents, more seeders stream more smoothly."), self)
         hint.setWordWrap(True)
         apply_label_theme(hint, "muted")
-        self.viewLayout.addWidget(hint)
+        lay.addWidget(hint)
         safety = assess_source_files(
             [source.label or source.name for source in self._sources
              if not getattr(source, "is_direct", False)], context="video")
@@ -558,35 +733,59 @@ class _StreamPickerDialog(MessageBoxBase):
             warning.setWordWrap(True)
             warning.setToolTip(safety.details)
             warning.setStyleSheet(f"color: {palette()['state_verifying']};")
-            self.viewLayout.addWidget(warning)
+            lay.addWidget(warning)
 
-        self._table = TableWidget(self)
-        self._table.setBorderVisible(True)
-        self._table.setBorderRadius(8)
-        self._table.setWordWrap(False)
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._table.setAlternatingRowColors(False)
-        self._table.setColumnCount(len(self._COLUMNS))
-        self._table.setHorizontalHeaderLabels([tr(key, default=default) for key, default, _w in self._COLUMNS])
-        header = self._table.horizontalHeader()
+        table = self._table = TableWidget(self)
+        table.setBorderVisible(False)
+        table.setWordWrap(False)
+        table.setShowGrid(False)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setAlternatingRowColors(False)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        table.viewport().setAutoFillBackground(False)
+        table.setItemDelegate(_StreamRowDelegate(table))
+        table.setColumnCount(len(self._COLUMNS))
+        table.setHorizontalHeaderLabels([tr(key, default=default) for key, default, _w in self._COLUMNS])
+        header = table.horizontalHeader()
         header.setStretchLastSection(False)
+        header.setHighlightSections(False)
+        header.setMinimumSectionSize(48)
+        header.setFixedHeight(26)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for column, (_key, _default, width) in enumerate(self._COLUMNS[1:], start=1):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
-            self._table.setColumnWidth(column, width)
-        self._table.verticalHeader().setVisible(False)
-        self._table.verticalHeader().setDefaultSectionSize(38)
-        self._table.setRowCount(len(self._sources))
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            table.setColumnWidth(column, width)
+            table.horizontalHeaderItem(column).setTextAlignment(
+                (Qt.AlignmentFlag.AlignRight if column in (3, 4) else Qt.AlignmentFlag.AlignLeft)
+                | Qt.AlignmentFlag.AlignVCenter)
+        table.horizontalHeaderItem(0).setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        line = "rgba(255,255,255,0.10)" if dark else "rgba(0,0,0,0.10)"
+        muted = palette().get("muted") or "#9a9a9a"
+        header.setStyleSheet(
+            f"QHeaderView{{background:transparent;border:none;border-bottom:1px solid {line};}}"
+            f"QHeaderView::section{{background:transparent;color:{muted};border:none;"
+            f"border-right:1px solid {line};padding:0 10px;font-size:11px;}}"
+            f"QHeaderView::section:last{{border-right:none;}}")
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(30)
+        table.setRowCount(len(self._sources))
         for row, source in enumerate(self._sources):
             self._fill_row(row, source)
         if self._sources:
-            self._table.selectRow(0)
-            self._table.setCurrentCell(0, 0)
-        self._table.cellDoubleClicked.connect(lambda _row, _col: self.accept())
-        self._table.setMinimumHeight(340)
-        self.viewLayout.addWidget(self._table)
+            table.selectRow(0)
+            table.setCurrentCell(0, 0)
+        table.cellDoubleClicked.connect(lambda _row, _col: self.accept())
+        table.setMinimumHeight(320)
+
+        box = QFrame(self)
+        box.setObjectName("streamBox")
+        box.setStyleSheet(f"#streamBox{{background:{'rgba(0,0,0,0.28)' if dark else 'rgba(0,0,0,0.045)'};border-radius:8px;}}")
+        box_lay = QVBoxLayout(box)
+        box_lay.setContentsMargins(4, 2, 4, 4)
+        box_lay.addWidget(table)
+        lay.addWidget(box, 1)
 
         if action == "download":
             self.yesButton.setText(tr("tv.download.pick", default="Download"))
@@ -595,13 +794,19 @@ class _StreamPickerDialog(MessageBoxBase):
             self.yesButton.setText(tr("tv.stream.play", default="Play"))
             self.yesButton.setIcon(_play_icon(follow=True))
         self.cancelButton.setText(tr("tv.stream.cancel", default="Cancel"))
-        self.widget.setMinimumWidth(760)
+        self.yesButton.setFixedHeight(32)
+        self.cancelButton.setFixedHeight(32)
+        self.buttonGroup.setMinimumHeight(56)
+        self.buttonLayout.setContentsMargins(24, 12, 24, 12)
+        self.widget.setMinimumWidth(840)
+        self.widget.setMaximumWidth(980)
 
     def _fill_row(self, row: int, source) -> None:
         label = source.label or source.name or source.info_hash
         info = classify_file(label)
         name = QTableWidgetItem(label)
         name.setData(Qt.ItemDataRole.UserRole, row)
+        name.setToolTip(label)
         type_item = QTableWidgetItem(info.label)
         type_item.setToolTip(info.reason)
         if info.risk != "ok":
@@ -611,18 +816,15 @@ class _StreamPickerDialog(MessageBoxBase):
         if source.detail:
             source_item.setToolTip(source.detail)
         cells = (
-            (name, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
-            (type_item, Qt.AlignmentFlag.AlignCenter),
-            (QTableWidgetItem(source.quality or "\u2014"), Qt.AlignmentFlag.AlignCenter),
-            (QTableWidgetItem(stream_backend.human_size(source.size) if source.size else "\u2014"),
-             Qt.AlignmentFlag.AlignCenter),
-            (QTableWidgetItem("Direct" if getattr(source, "is_direct", False)
-                              else (str(source.seeders) if source.seeders else "\u2014")),
-             Qt.AlignmentFlag.AlignCenter),
-            (source_item, Qt.AlignmentFlag.AlignCenter),
+            name,
+            type_item,
+            QTableWidgetItem(source.quality or "\u2014"),
+            QTableWidgetItem(stream_backend.human_size(source.size) if source.size else "\u2014"),
+            QTableWidgetItem("Direct" if getattr(source, "is_direct", False)
+                             else (str(source.seeders) if source.seeders else "\u2014")),
+            source_item,
         )
-        for column, (item, alignment) in enumerate(cells):
-            item.setTextAlignment(alignment)
+        for column, item in enumerate(cells):
             self._table.setItem(row, column, item)
 
     def chosen(self):
@@ -630,56 +832,201 @@ class _StreamPickerDialog(MessageBoxBase):
         return self._sources[row] if 0 <= row < len(self._sources) else None
 
 
+class _HoverTree(TreeWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.hover = None
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+
+    def _set_hover(self, item) -> None:
+        if item is not self.hover:
+            self.hover = item
+            self.viewport().update()
+
+    def mouseMoveEvent(self, event) -> None:
+        self._set_hover(self.itemAt(event.position().toPoint()))
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._set_hover(None)
+        super().leaveEvent(event)
+
+
+class _FileListDelegate(QStyledItemDelegate):
+    _LEFT = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+    _RIGHT = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+
+    def __init__(self, tree: _HoverTree):
+        super().__init__(tree)
+        self._tree = tree
+
+    def sizeHint(self, option, index) -> QSize:
+        return QSize(option.rect.width(), 28)
+
+    def paint(self, painter, option, index) -> None:
+        tree, rect, column, dark = self._tree, option.rect, index.column(), isDarkTheme()
+        item = tree.itemFromIndex(index.siblingAtColumn(0))
+        painter.save()
+        painter.setClipRect(rect)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if item is not None and item is tree.hover:
+            painter.fillRect(rect, QColor(255, 255, 255, 12) if dark else QColor(0, 0, 0, 9))
+        muted = _theme_color("muted", "#9a9a9a" if dark else "#666666")
+        font = QFont(option.font)
+        left = rect.left() + 10
+        if column == 0:
+            box = QRectF(left, rect.center().y() - 7, 14, 14)
+            if item is not None and item.checkState(0) == Qt.CheckState.Checked:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(themeColor()))
+                painter.drawRoundedRect(box, 3, 3)
+                pen = QPen(QColor("#ffffff"), 1.7)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(pen)
+                c, mark = box.center(), QPainterPath()
+                mark.moveTo(c.x() - 3.4, c.y() + 0.2)
+                mark.lineTo(c.x() - 1.0, c.y() + 2.6)
+                mark.lineTo(c.x() + 3.6, c.y() - 2.6)
+                painter.drawPath(mark)
+            else:
+                painter.setPen(QPen(muted, 1.2))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(box.adjusted(0.6, 0.6, -0.6, -0.6), 3, 3)
+            left = int(box.right()) + 8
+            color, align = _theme_color("primary_text", "#ffffff" if dark else "#1a1a1a"), self._LEFT
+        else:
+            font.setPointSizeF(max(font.pointSizeF() - 0.5, 7.5))
+            brush = index.data(Qt.ItemDataRole.ForegroundRole)
+            color = brush.color() if isinstance(brush, QBrush) else muted
+            align = self._RIGHT if column == 2 else self._LEFT
+        width = max(rect.right() - 10 - left, 10)
+        painter.setFont(font)
+        painter.setPen(color)
+        painter.drawText(QRectF(left, rect.top(), width, rect.height()), int(align),
+                         QFontMetrics(font).elidedText(str(index.data(Qt.ItemDataRole.DisplayRole) or ""),
+                                                       Qt.TextElideMode.ElideRight, int(width)))
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index) -> bool:
+        etype = event.type()
+        if etype == QEvent.Type.MouseButtonRelease:
+            if event.button() != Qt.MouseButton.LeftButton:
+                return False
+        elif not (etype == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Select)):
+            return False
+        item = self._tree.itemFromIndex(index.siblingAtColumn(0))
+        if item is None:
+            return False
+        item.setCheckState(0, Qt.CheckState.Unchecked if item.checkState(0) == Qt.CheckState.Checked
+                           else Qt.CheckState.Checked)
+        return True
+
+
+def _resolve_manager(owner):
+    if owner._download_manager is None:
+        win = owner.window()
+        owner._download_manager = next(
+            (v for o in (win, *vars(win).values()) for v in getattr(o, "__dict__", {}).values()
+             if type(v).__name__ == "DownloadManager"), None)
+    return owner._download_manager
+
+
+def _check_tree(parent, headers: list, widths: tuple, header_visible: bool = True):
+    dark = isDarkTheme()
+    tree = _HoverTree(parent)
+    tree.setColumnCount(len(headers))
+    tree.setHeaderLabels(headers)
+    tree.setHeaderHidden(not header_visible)
+    tree.setRootIsDecorated(False)
+    tree.setIndentation(0)
+    tree.setUniformRowHeights(True)
+    tree.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+    tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    tree.setBorderVisible(False)
+    tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    tree.viewport().setAutoFillBackground(False)
+    tree.setMinimumHeight(320)
+    tree.setItemDelegate(_FileListDelegate(tree))
+    header = tree.header()
+    header.setStretchLastSection(False)
+    header.setSectionsMovable(False)
+    header.setHighlightSections(False)
+    header.setMinimumSectionSize(56)
+    header.setFixedHeight(26)
+    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+    for column, width in enumerate(widths, start=1):
+        header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+        tree.setColumnWidth(column, width)
+    header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    line = "rgba(255,255,255,0.10)" if dark else "rgba(0,0,0,0.10)"
+    muted = palette().get("muted") or "#9a9a9a"
+    header.setStyleSheet(
+        f"QHeaderView{{background:transparent;border:none;border-bottom:1px solid {line};}}"
+        f"QHeaderView::section{{background:transparent;color:{muted};border:none;"
+        f"border-right:1px solid {line};padding:0 10px;font-size:11px;}}"
+        f"QHeaderView::section:last{{border-right:none;}}")
+    box = QFrame(parent)
+    box.setObjectName("checkBox")
+    box.setStyleSheet(f"#checkBox{{background:{'rgba(0,0,0,0.28)' if dark else 'rgba(0,0,0,0.045)'};border-radius:8px;}}")
+    box_lay = QVBoxLayout(box)
+    box_lay.setContentsMargins(4, 2, 4, 4)
+    box_lay.addWidget(tree)
+    return tree, box
+
+
 class _TorrentFilesDialog(MessageBoxBase):
-    def __init__(self, entries: list, title: str, parent=None,
-                 preset_season: Optional[int] = None, preset_episode: Optional[int] = None,
-                 safety=None) -> None:
+    def __init__(self, entries: list, title: str, parent=None, safety=None) -> None:
         super().__init__(parent)
         self._items: list = []
+        muted = palette().get("muted") or "#9a9a9a"
+        lay = self.viewLayout
+        lay.setSpacing(8)
 
-        self.titleLabel = SubtitleLabel(tr("tv.download.files_title", default="Files to download"), self)
-        self.viewLayout.addWidget(self.titleLabel)
+        self.titleLabel = StrongBodyLabel(tr("tv.download.files_title", default="Files to download"), self)
+        lay.addWidget(self.titleLabel)
 
-        for_label = StrongBodyLabel(title, self)
+        for_label = BodyLabel(title, self)
         for_label.setWordWrap(True)
-        self.viewLayout.addWidget(for_label)
+        lay.addWidget(for_label)
 
         if safety is not None and safety.level != "ok":
             warning = CaptionLabel(f"{safety.summary}. {tr('tbhb.file_type_review')}", self)
             warning.setWordWrap(True)
             warning.setToolTip(safety.details)
             warning.setStyleSheet(f"color: {palette()['state_error' if safety.level == 'dangerous' else 'state_verifying']};")
-            self.viewLayout.addWidget(warning)
+            lay.addWidget(warning)
 
+        bar = QHBoxLayout()
         self._all_chk = CheckBox(tr("tv.download.select_all", default="Select all"), self)
         self._all_chk.setChecked(True)
         self._all_chk.stateChanged.connect(self._on_select_all)
-        self.viewLayout.addWidget(self._all_chk)
+        self._count_lbl = CaptionLabel("", self)
+        self._count_lbl.setStyleSheet(f"color: {muted};")
+        bar.addWidget(self._all_chk)
+        bar.addStretch(1)
+        bar.addWidget(self._count_lbl)
+        lay.addLayout(bar)
 
-        self._tree = TreeWidget(self)
-        self._tree.setHeaderLabels([tr("tv.download.col_file", default="File"),
-                                    tr("tv.download.col_type", default="Type"),
-                                    tr("repacks.size", default="Size")])
-        header = self._tree.header()
-        header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self._tree.setColumnWidth(1, 72)
-        self._tree.setColumnWidth(2, 92)
-        self._tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        self._name_delegate = ScrollingTextDelegate(self._tree, 0, padding=4)
-        self._tree.setBorderVisible(True)
-        self._tree.setBorderRadius(8)
-        self._tree.setMinimumHeight(300)
-        self._tree.itemChanged.connect(self._on_item_changed)
-        self.viewLayout.addWidget(self._tree)
-        self._build_tree(entries, preset_season, preset_episode)
+        tree, box = _check_tree(self, [tr("tv.download.col_file", default="File"),
+                                       tr("tv.download.col_type", default="Type"),
+                                       tr("repacks.size", default="Size")], (80, 96))
+        self._tree = tree
+        tree.headerItem().setTextAlignment(2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        tree.itemChanged.connect(self._on_item_changed)
+        lay.addWidget(box, 1)
+        self._build_tree(entries)
 
         self.yesButton.setText(tr("tv.download.pick", default="Download"))
         self.yesButton.setIcon(FluentIcon.DOWNLOAD)
         self.cancelButton.setText(tr("tv.stream.cancel", default="Cancel"))
-        self.widget.setMinimumWidth(640)
+        self.yesButton.setFixedHeight(32)
+        self.cancelButton.setFixedHeight(32)
+        self.buttonGroup.setMinimumHeight(56)
+        self.buttonLayout.setContentsMargins(24, 12, 24, 12)
+        self.widget.setMinimumWidth(780)
+        self.widget.setMaximumWidth(940)
 
     @staticmethod
     def _label(entry: dict) -> str:
@@ -689,17 +1036,7 @@ class _TorrentFilesDialog(MessageBoxBase):
             return f"{head}  ·  {entry['name']}"
         return entry["name"]
 
-    @staticmethod
-    def _preselected(entry: dict, preset_season, preset_episode) -> bool:
-        if preset_episode is not None:
-            if entry.get("episode") != preset_episode:
-                return False
-            return entry.get("season") in (None, preset_season)
-        if preset_season is not None:
-            return entry.get("season") == preset_season
-        return True
-
-    def _build_tree(self, entries: list, preset_season, preset_episode) -> None:
+    def _build_tree(self, entries: list) -> None:
         self._tree.blockSignals(True)
         self._tree.clear()
         self._items = []
@@ -716,10 +1053,8 @@ class _TorrentFilesDialog(MessageBoxBase):
                 item.setForeground(1, QColor(palette()["state_error" if info.risk == "dangerous"
                                                     else "state_verifying"]))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(0, Qt.CheckState.Checked if self._preselected(entry, preset_season, preset_episode)
-                               else Qt.CheckState.Unchecked)
-            item.setTextAlignment(1, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
-            item.setTextAlignment(2, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+            item.setCheckState(0, Qt.CheckState.Checked)
+            item.setToolTip(0, entry["name"])
             self._items.append((entry, item))
         self._tree.blockSignals(False)
         self._sync_select_all()
@@ -730,6 +1065,7 @@ class _TorrentFilesDialog(MessageBoxBase):
         for _entry, item in self._items:
             item.setCheckState(0, checked)
         self._tree.blockSignals(False)
+        self._update_count()
 
     def _on_item_changed(self, *_args) -> None:
         self._sync_select_all()
@@ -739,6 +1075,12 @@ class _TorrentFilesDialog(MessageBoxBase):
         self._all_chk.blockSignals(True)
         self._all_chk.setChecked(bool(states) and states == {Qt.CheckState.Checked})
         self._all_chk.blockSignals(False)
+        self._update_count()
+
+    def _update_count(self) -> None:
+        picked = [entry for entry, item in self._items if item.checkState(0) == Qt.CheckState.Checked]
+        self._count_lbl.setText(f"{len(picked)} / {len(self._items)} \u00b7 "
+                                f"{stream_backend.human_size(sum(entry['size'] for entry in picked))}")
 
     def selected_indices(self) -> list:
         return sorted(entry["index"] + 1 for entry, item in self._items
@@ -1339,9 +1681,9 @@ class _CountrySelectionDialog(MessageBoxBase):
         self._update_summary()
 
     def _on_search(self, text: str) -> None:
-        q = text.strip().lower()
+        q = text.strip()
         for i, n in enumerate(self._model.low):
-            self._view.setRowHidden(i, bool(q) and q not in n)
+            self._view.setRowHidden(i, bool(q) and not _tm_contains(q, n))
 
     def _update_summary(self) -> None:
         n = sum(self._model.on)
@@ -1696,16 +2038,16 @@ class _ChannelsTab(QWidget):
 
     def _apply_filters_now(self, *_a) -> None:
         self._filter_timer.stop()
-        q = self._search.text().strip().lower()
+        q = self._search.text().strip()
         sf, cf, gf = (self._facet(c) for c in (self._source_combo, self._country_combo, self._group_combo))
         rows = self._all
         if sf is None and cf is None and gf is None and not q:
             out = rows
         elif q:
             if self._keys is None:
-                self._keys = [f"{c.get('name') or ''}\n{c.get('group') or ''}".lower() for c in rows]
+                self._keys = [f"{c.get('name') or ''}\n{c.get('group') or ''}" for c in rows]
             out = [c for c, k in zip(rows, self._keys, strict=True)
-                   if q in k and (sf is None or c["source_id"] == sf)
+                   if _tm_contains(q, k) and (sf is None or c["source_id"] == sf)
                    and (cf is None or c.get("country") == cf) and (gf is None or c.get("group") == gf)]
         else:
             out = [c for c in rows if (sf is None or c["source_id"] == sf)
@@ -1872,7 +2214,6 @@ def _meta_field(label: str, value_widget: QWidget, parent=None) -> QWidget:
     return container
 
 
-
 def _tmdb_img(path, size: str) -> str:
     return (tmdb.image_url(path, size) or "") if path else ""
 
@@ -1957,6 +2298,15 @@ class _MediaRow(QWidget):
 
 
 class _LeftClickCard(CardWidget):
+    def paintEvent(self, e) -> None:
+        if (self.isHover or self.isPressed) and not self.underMouse():
+            self.isHover = self.isPressed = False
+        super().paintEvent(e)
+
+    def hideEvent(self, e) -> None:
+        self.isHover = self.isPressed = False
+        super().hideEvent(e)
+
     def mouseReleaseEvent(self, e) -> None:
         if e.button() != Qt.MouseButton.LeftButton:
             self.isPressed = False
@@ -2000,10 +2350,112 @@ class _EpisodeThumb(_LeftClickCard):
             self._thumb_lbl.setPixmap(pixmap)
 
 
-class _MediaDetailsView(QWidget):
+class _SplitPlayButton(PrimaryPushButton):
+    menuRequested = Signal(QPoint)
+    _ARROW_W = 34
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._accented = False
+        self._arrow_hot = False
+        self.setMouseTracking(True)
+        self.setFixedHeight(32)
+        self.setIconSize(QSize(20, 20))
+        font = QFont(self.font())
+        font.setPointSizeF(10.5)
+        font.setWeight(QFont.Weight.Medium)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
+        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
+        font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+        self.setFont(font)
+
+    def set_accent(self, base: str = "") -> None:
+        self._accented = bool(base)
+        if not base:
+            self.setStyleSheet("")
+            self.update()
+            return
+        col = QColor(base)
+
+        def grad(top, bottom):
+            return (f"qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 {top.name()},stop:1 {bottom.name()})")
+
+        pad = f"padding:5px {self._ARROW_W + 18}px 5px 38px;min-height:20px;"
+        self.setStyleSheet(
+            f"PrimaryPushButton{{background:{grad(col.lighter(106), col.darker(104))};color:#fff;border:none;border-radius:5px;{pad}}}"
+            f"PrimaryPushButton:hover{{background:{grad(col.lighter(118), col.lighter(106))};}}"
+            f"PrimaryPushButton:pressed{{background:{grad(col.darker(108), col.darker(116))};}}"
+            "PrimaryPushButton:disabled{background-color:rgba(128,128,128,70);color:rgba(255,255,255,120);}")
+        self.update()
+
+    def _in_arrow(self, x: float) -> bool:
+        return x >= self.width() - self._ARROW_W
+
+    def mouseMoveEvent(self, e) -> None:
+        hot = self._in_arrow(e.position().x())
+        if hot != self._arrow_hot:
+            self._arrow_hot = hot
+            self.update()
+        super().mouseMoveEvent(e)
+
+    def leaveEvent(self, e) -> None:
+        self._arrow_hot = False
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._in_arrow(e.position().x()):
+            self.menuRequested.emit(self.mapToGlobal(self.rect().bottomLeft()))
+            return
+        super().mousePressEvent(e)
+
+    def contextMenuEvent(self, e) -> None:
+        self.menuRequested.emit(e.globalPos())
+
+    def paintEvent(self, e) -> None:
+        super().paintEvent(e)
+        ink = QColor("#fff") if self._accented or not isDarkTheme() else QColor("#000")
+        if not self.isEnabled():
+            ink.setAlphaF(0.4)
+        seam = QColor(ink)
+        seam.setAlphaF(ink.alphaF() * 0.35)
+        x, h = self.width() - self._ARROW_W, self.height()
+        ax, cy = x + self._ARROW_W / 2, h / 2
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._arrow_hot and self.isEnabled():
+            glow = QColor(ink)
+            glow.setAlphaF(0.2)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(glow)
+            p.drawRoundedRect(QRectF(x + 2, 3, self._ARROW_W - 5, h - 6), 4, 4)
+        p.setPen(QPen(seam, 1))
+        p.drawLine(QPointF(x, 7), QPointF(x, h - 7))
+        p.setPen(QPen(ink, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.drawPolyline([QPointF(ax - 4, cy - 2), QPointF(ax, cy + 2), QPointF(ax + 4, cy - 2)])
+        p.end()
+
+
+class _DetailsChrome:
+    def set_top_inset(self, px: int) -> None:
+        left, top, right, bottom = self._content_margins
+        self._content_layout.setContentsMargins(left, top + px, right, bottom)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.banner_changed.emit()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self.banner_changed.emit()
+
+
+class _MediaDetailsView(_DetailsChrome, QWidget):
     POSTER_WIDTH = 220
     POSTER_HEIGHT = 330
     banner_changed = Signal()
+    genre_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2043,8 +2495,6 @@ class _MediaDetailsView(QWidget):
         self._stream_session: Any = None
         self._download_manager: Any = None
         self._download_task_id: Optional[str] = None
-        self._download_target: Optional[tuple] = None
-        self._download_preset: tuple = (None, None)
         self._download_pending = False
         self._autoplay_episode = False
         self._auto_pick = False
@@ -2065,7 +2515,6 @@ class _MediaDetailsView(QWidget):
         back_btn = PushButton(themed_icon('tv.media_back', FluentIcon.LEFT_ARROW), tr("tv.movies.back", default="Back"), self)
         back_btn.setFixedHeight(32)
         back_btn.clicked.connect(self._on_back)
-        outer.addWidget(back_btn, 0, Qt.AlignmentFlag.AlignLeft)
 
         scroll = SmoothScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -2081,16 +2530,33 @@ class _MediaDetailsView(QWidget):
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(4, 4, 20, 32)
         content_layout.setSpacing(24)
+        self._content_layout = content_layout
+        self._content_margins = (4, 4, 20, 32)
+        content_layout.addWidget(back_btn, 0, Qt.AlignmentFlag.AlignLeft)
 
         top_row = QHBoxLayout()
         top_row.setSpacing(28)
         top_row.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        self._poster_lbl = ImageLabel(content)
+        cover = QWidget(content)
+        cover.setFixedWidth(self.POSTER_WIDTH)
+        cover_col = QVBoxLayout(cover)
+        cover_col.setContentsMargins(0, 0, 0, 0)
+        cover_col.setSpacing(8)
+
+        self._poster_lbl = ImageLabel(cover)
         self._poster_lbl.setBorderRadius(10, 10, 10, 10)
         self._poster_lbl.setFixedSize(self.POSTER_WIDTH, self.POSTER_HEIGHT)
         self._poster_lbl.setStyleSheet(f"background: {palette()['poster_fallback_bg']};")
-        top_row.addWidget(self._poster_lbl, 0, Qt.AlignmentFlag.AlignTop)
+        cover_col.addWidget(self._poster_lbl)
+
+        self._watch_btn = _SplitPlayButton(_play_icon(follow=True), tr("tv.watch", default="Watch"), cover)
+        self._watch_btn.clicked.connect(self._on_watch)
+        self._watch_btn.menuRequested.connect(self._show_source_menu)
+        self._watch_btn.setVisible(bool(getattr(settings, "tv_stream_enabled", True)))
+        cover_col.addWidget(self._watch_btn)
+
+        top_row.addWidget(cover, 0, Qt.AlignmentFlag.AlignTop)
 
         info_col = QVBoxLayout()
         info_col.setSpacing(14)
@@ -2117,31 +2583,18 @@ class _MediaDetailsView(QWidget):
 
         watch_row = QHBoxLayout()
         watch_row.setSpacing(10)
-        self._watch_btn = PrimaryPushButton(_play_icon(follow=True),
-                                            tr("tv.watch", default="Watch"), content)
-        self._watch_btn.setIconSize(QSize(20, 20))
-        self._watch_btn.clicked.connect(self._on_watch)
-        self._watch_btn.setVisible(bool(getattr(settings, "tv_stream_enabled", True)))
-        watch_row.addWidget(self._watch_btn)
-        self._sources_btn = PushButton(FluentIcon.MENU,
-                                       tr("tv.stream.choose_source", default="Choose source"), content)
-        self._sources_btn.clicked.connect(self._on_choose_source)
-        self._sources_btn.setVisible(bool(getattr(settings, "tv_stream_enabled", True)))
-        watch_row.addWidget(self._sources_btn)
         self._wl_btn = _WatchLaterButton(content)
         self._wl_btn.clicked.connect(self._on_toggle_watch_later)
         self._wl_btn.hide()
         watch_row.addWidget(self._wl_btn)
-        self._tmdb_btn = PushButton(FluentIcon.LINK, "TMDB", content)
-        self._tmdb_btn.clicked.connect(lambda: QDesktopServices.openUrl(
-            QUrl(f"https://www.themoviedb.org/{self._media_type}/{self._media_id}")))
-        self._tmdb_btn.hide()
-        watch_row.addWidget(self._tmdb_btn)
-        self._download_btn = PushButton(themed_icon('tv.download', FluentIcon.DOWNLOAD),
-                                        tr("tv.download.btn", default="Download"), content)
-        self._download_btn.clicked.connect(lambda: self._on_download())
-        self._download_btn.hide()
-        watch_row.addWidget(self._download_btn)
+        self._imdb_btn = PushButton(FluentIcon.LINK, "IMDb", content)
+        self._imdb_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self._imdb_url)))
+        self._imdb_btn.hide()
+        watch_row.addWidget(self._imdb_btn)
+        self._trailer_btn = PushButton(FluentIcon.VIDEO, tr("tv.movies.trailer", default="Trailer"), content)
+        self._trailer_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self._trailer_url)))
+        self._trailer_btn.hide()
+        watch_row.addWidget(self._trailer_btn)
         self._stream_spinner = _Spinner(content)
         self._stream_spinner.hide()
         watch_row.addWidget(self._stream_spinner)
@@ -2156,19 +2609,6 @@ class _MediaDetailsView(QWidget):
         self._tags_layout.setSpacing(8)
         self._tags_layout.addStretch(1)
         info_col.addWidget(self._tags_container)
-
-        links_row = QHBoxLayout()
-        links_row.setSpacing(8)
-        self._trailer_btn = PushButton(FluentIcon.VIDEO, tr("tv.movies.trailer", default="Trailer"), content)
-        self._trailer_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self._trailer_url)))
-        self._trailer_btn.hide()
-        links_row.addWidget(self._trailer_btn)
-        self._imdb_btn = PushButton(FluentIcon.LINK, "IMDb", content)
-        self._imdb_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self._imdb_url)))
-        self._imdb_btn.hide()
-        links_row.addWidget(self._imdb_btn)
-        links_row.addStretch(1)
-        info_col.addLayout(links_row)
 
         overview_header = StrongBodyLabel(tr("tv.movies.overview", default="Overview"), content)
         apply_label_theme(overview_header, "primary_text")
@@ -2399,12 +2839,8 @@ class _MediaDetailsView(QWidget):
         self._current_season = self._current_episode = 1
         self._pending_play_episode = None
         self._download_pending = False
-        self._download_target = None
-        self._download_preset = (None, None)
         self._autoplay_episode = False
         self._watch_btn.setVisible(bool(getattr(settings, "tv_stream_enabled", True)))
-        self._sources_btn.setVisible(bool(getattr(settings, "tv_stream_enabled", True)))
-        self._download_btn.setVisible(self._download_manager is not None)
         self._raw = raw if isinstance(raw, dict) else {}
         self._update_watch_label()
         self._update_watch_later_btn()
@@ -2415,10 +2851,7 @@ class _MediaDetailsView(QWidget):
         self._overview_lbl.setText("")
         self._cast_lbl.setText("")
         self._pending_poster_url = None
-        try:
-            self._watch_btn.setStyleSheet("")
-        except RuntimeError:
-            pass
+        self._watch_btn.set_accent()
         self._clear_tags()
         self._episodes_section.setVisible(media_type == "tv")
         self._clear_episodes()
@@ -2474,7 +2907,6 @@ class _MediaDetailsView(QWidget):
         }
 
     def _update_watch_later_btn(self) -> None:
-        self._tmdb_btn.setVisible(self._media_id is not None)
         if self._media_id is None:
             self._wl_btn.hide()
             return
@@ -2524,8 +2956,9 @@ class _MediaDetailsView(QWidget):
 
         self._clear_tags()
         for genre in data.get("genres") or []:
-            tag = PillPushButton(genre.get("name", ""), self._tags_container)
-            tag.setCheckable(False)
+            if not genre.get("name"):
+                continue
+            tag = _genre_pill(genre["name"], self._tags_container, self.genre_requested.emit)
             tag.setFixedHeight(28)
             self._tags_layout.insertWidget(self._tags_layout.count() - 1, tag)
             self._genre_tags.append(tag)
@@ -2558,15 +2991,7 @@ class _MediaDetailsView(QWidget):
             return
         h, s, l, _a = c.getHsl()
         c = QColor.fromHsl(max(h, 0), max(s, 90), min(max(l, 70), 135))
-        hover, press = c.lighter(115).name(), c.darker(115).name()
-
-
-        self._watch_btn.setStyleSheet(
-            f"PrimaryPushButton{{background-color:{c.name()};color:#fff;border:1px solid {press};"
-            f"border-radius:5px;padding:5px 18px 5px 38px;min-height:20px;}}"
-            f"PrimaryPushButton:hover{{background-color:{hover};}}"
-            f"PrimaryPushButton:pressed{{background-color:{press};}}"
-            "PrimaryPushButton:disabled{background-color:rgba(128,128,128,70);color:rgba(255,255,255,120);}")
+        self._watch_btn.set_accent(c.name())
 
     def _on_credits(self, data: dict) -> None:
         cast = [c["name"] for c in (data.get("cast") or [])[:10]]
@@ -2688,19 +3113,17 @@ class _MediaDetailsView(QWidget):
                               tr("tv.watchlater_episode_remove", default="Remove episode from watch later") if saved
                               else tr("tv.watchlater_episode_add", default="Add episode to watch later"),
                               triggered=lambda: self._toggle_episode_watch_later(episode)))
-        if self._download_manager is not None:
-            menu.addSeparator()
-            menu.addAction(Action(FluentIcon.DOWNLOAD,
-                                  tr("tv.download.episode", default="Download this episode..."),
-                                  triggered=lambda: self._on_download(episode=episode)))
-            menu.addAction(Action(FluentIcon.DOWNLOAD,
-                                  tr("tv.download.season", default="Download season {season}...", season=season),
-                                  triggered=lambda: self._on_download(season=True)))
+        menu.addSeparator()
+        menu.addAction(Action(FluentIcon.DOWNLOAD,
+                              tr("tv.download.episode", default="Download this episode..."),
+                              triggered=lambda: self._on_download(episode=episode)))
         menu.exec(pos)
 
     def set_download_manager(self, manager) -> None:
         self._download_manager = manager
-        self._download_btn.setVisible(manager is not None and self._media_id is not None)
+
+    def _manager(self):
+        return _resolve_manager(self)
 
     def start_watch(self) -> None:
         if self._media_id is None or not getattr(settings, "tv_stream_enabled", True):
@@ -2711,80 +3134,106 @@ class _MediaDetailsView(QWidget):
             self._autoplay_episode = True
 
     def start_download(self) -> None:
-        if self._download_manager is None or self._media_id is None:
+        if self._media_id is None:
             return
         if self._imdb_id or self._title_lbl.text():
             self._on_download()
         else:
             self._download_pending = True
 
-    def _on_download(self, episode: Optional[dict] = None, season: bool = False) -> None:
-        if self._download_manager is None or self._media_id is None:
+    def _on_download(self, episode: Optional[dict] = None) -> None:
+        title = self._title_lbl.text()
+        if self._media_id is None or self._download_task_id is not None:
             return
-        has_imdb = bool(self._imdb_id) and str(self._imdb_id).startswith("tt")
-        if not has_imdb and not self._title_lbl.text():
+        if self._manager() is None:
+            InfoBar.error(title=tr("tv.download.failed_title", default="Download failed"),
+                          content=tr("tv.download.no_manager", default="The download manager is not available."),
+                          duration=5000, parent=self)
+            return
+        if not (self._imdb_id or title):
             InfoBar.warning(title=tr("tv.stream.no_imdb_title", default="Cannot search streams"),
-                            content=tr("tv.stream.no_imdb_body", default="This title has no IMDb id to look up."),
+                            content=tr("tv.stream.no_imdb_body", default="This title has no name to look up."),
                             duration=4000, parent=self)
             return
-        if self._download_task_id is not None:
-            return
-        preset_episode = int((episode or {}).get("episode_number") or 0) or None
-        if self._media_type == "tv":
-            season_number = int(self._current_season or 1)
-            if preset_episode is not None:
-                self._download_target = self._download_preset = (season_number, preset_episode)
-            else:
-                self._download_target = self._download_preset = (season_number, None)
-        else:
-            self._download_target, self._download_preset = None, (None, None)
-        self._pick_download_source()
-
-    def _pick_download_source(self) -> None:
-        season, episode = self._download_target or (None, None)
-        self._set_streaming(True, tr("tv.download.searching", default="Looking for sources to download..."))
+        tv = self._media_type == "tv"
+        sn = int(self._current_season or 1) if tv else None
+        number = int((episode or {}).get("episode_number") or self._current_episode or 1) if tv else None
+        label = f"{title} - S{sn:02d}E{number:02d}" if tv else title
 
         def _done(sources: list) -> None:
-            self._download_task_id = None
-            self._set_streaming(False)
-            sources = list(sources or [])
+            self._download_idle()
             if not sources:
                 InfoBar.warning(title=tr("tv.stream.none_title", default="No streams found"),
-                                content=tr("tv.stream.none_body",
-                                           default="No playable sources were found for this title."),
+                                content=tr("tv.stream.none_body", default="No playable sources were found for this title."),
                                 duration=5000, parent=self)
                 return
-            title = self._title_lbl.text()
-            if episode:
-                title = tr("tv.stream.pick_for", default="{title} (S{season}E{episode})",
-                           title=title, season=season, episode=episode)
-            dialog = _StreamPickerDialog(sources, title, self.window(), action="download")
-            if dialog.exec() == QDialog.DialogCode.Accepted and (source := dialog.chosen()) is not None:
-                if getattr(source, "is_direct", False):
-                    self._download_direct_source(source)
-                else:
-                    self._fetch_download_files(source)
+            dialog = _StreamPickerDialog(sources, label, self.window(), action="download")
+            if dialog.exec() == QDialog.DialogCode.Accepted and dialog.chosen() is not None:
+                self._download_source(dialog.chosen(), label, sn, number)
 
-        def _failed(message: str) -> None:
-            self._download_task_id = None
-            self._set_streaming(False)
-            InfoBar.error(title=tr("tv.stream.search_failed", default="Source search failed"),
-                          content=str(message), duration=6000, parent=self)
-
+        self._set_streaming(True, tr("tv.download.searching", default="Looking for sources to download..."))
         self._download_task_id = _worker_module.submit_coro(
             _find_media_sources,
-            args=(self._imdb_id, self._media_type, season, episode, self._title_lbl.text(),
-                  self._media_year(), self._media_id),
-            on_done=_done, on_error=_failed)
+            args=(self._imdb_id, self._media_type, sn, number, title, self._media_year(), self._media_id, False),
+            on_done=_done, on_error=self._download_error)
+
+    def _download_idle(self) -> None:
+        self._download_task_id = None
+        self._set_streaming(False)
+
+    def _download_error(self, message: str) -> None:
+        self._download_idle()
+        InfoBar.error(title=tr("tv.download.failed_title", default="Download failed"),
+                      content=str(message), duration=6000, parent=self)
+
+    def _download_source(self, source, label: str, season: Optional[int], number: Optional[int]) -> None:
+        if getattr(source, "is_direct", False):
+            self._download_direct_source(source, (season, number) if season and number else None)
+            return
+        magnet = source.magnet or (stream_backend.magnet_for(source.info_hash, source.name) if source.info_hash else source.name)
+
+        def _done(files: list) -> None:
+            self._download_idle()
+            entries = _torrent_file_entries(files or [])
+            if not entries:
+                InfoBar.warning(title=tr("tv.download.no_files_title", default="Nothing to download"),
+                                content=tr("tv.download.no_files_body", default="This torrent has no matching video file."),
+                                duration=5000, parent=self)
+                return
+            if season is None:
+                dialog = _TorrentFilesDialog(entries, label, self.window(),
+                                             assess_source_files([e["name"] for e in entries], context="video"))
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                ids = dialog.selected_indices()
+            else:
+                matched = [e for e in entries if e["season"] in (None, season) and e["episode"] == number]
+                matched = matched or (entries if len(entries) == 1 else [])
+                if not matched:
+                    InfoBar.warning(title=tr("tv.download.no_files_title", default="Nothing to download"),
+                                    content=tr("tv.download.no_episode_body", default="This torrent doesn't contain that episode."),
+                                    duration=5000, parent=self)
+                    return
+                ids = [max(matched, key=lambda e: e["size"])["index"] + 1]
+            try:
+                self._manager().add(
+                    torrent_file=magnet, file_id=ids[0], file_ids=ids, game_name=label,
+                    console=self._title_lbl.text(),
+                    source=source.indexer or _SOURCE_NAMES.get(source.source, source.source or "Torrent"),
+                    category="tv")
+            except Exception as exc:
+                logger.exception("Could not queue the download")
+                self._download_error(f"{type(exc).__name__}: {exc}")
+                return
+            InfoBar.success(title=tr("tv.download.queued_title", default="Download queued"),
+                            content=label, duration=3000, parent=self)
+
+        self._set_streaming(True, tr("tv.download.reading", default="Reading torrent files..."))
+        self._download_task_id = _worker_module.submit(
+            self._manager().fetch_file_list, args=(magnet,),
+            kwargs={"timeout_secs": 45.0, "category": "tv"}, on_done=_done, on_error=self._download_error)
 
     def _ensure_ffmpeg_ready(self, source) -> bool:
-        """Prompt for ffmpeg when a DASH download needs it.
-
-        Returns True when the download can start immediately. When ffmpeg is
-        missing and the user agrees to install it, the install runs in the
-        background and starts the download through ``_start_direct_download``
-        once it finishes.
-        """
         if ".mpd" not in (getattr(source, "url", "") or "").lower() or _resolve_ffmpeg():
             return True
 
@@ -2859,20 +3308,20 @@ class _MediaDetailsView(QWidget):
         dialog.open()
         return False
 
-    def _download_direct_source(self, source) -> None:
-        manager = self._download_manager
+    def _download_direct_source(self, source, ep: Optional[tuple] = None) -> None:
+        manager = self._manager()
         if manager is None or not getattr(source, "url", ""):
             return
         if not self._ensure_ffmpeg_ready(source):
             return
-        self._start_direct_download(source)
+        self._start_direct_download(source, ep)
 
-    def _start_direct_download(self, source) -> None:
-        manager = self._download_manager
+    def _start_direct_download(self, source, ep: Optional[tuple] = None) -> None:
+        manager = self._manager()
         if manager is None or not getattr(source, "url", ""):
             return
         title = self._title_lbl.text() or "Video"
-        season, episode = self._stream_episode or (None, None)
+        season, episode = ep or self._stream_episode or (None, None)
         suffix = f" - S{int(season):02d}E{int(episode):02d}" if season and episode else ""
         base = f"{_sanitize_filename(title)}{suffix}"
         dest_dir = os.path.join(settings.download_dir, _sanitize_filename(title))
@@ -2906,74 +3355,6 @@ class _MediaDetailsView(QWidget):
             content=tr("tv.download.queued_direct", default="The direct stream was added to Downloads."),
             duration=2500, parent=self.window())
 
-    def _fetch_download_files(self, source) -> None:
-        manager = self._download_manager
-        if manager is None:
-            return
-        self._set_streaming(True, tr("tv.download.reading_files", default="Reading the torrent's file list..."))
-
-        def _done(files) -> None:
-            self._download_task_id = None
-            self._set_streaming(False)
-            self._offer_download_files(source, files or [])
-
-        def _failed(message: str) -> None:
-            self._download_task_id = None
-            self._set_streaming(False)
-            InfoBar.error(title=tr("tv.download.files_failed", default="Could not read the torrent"),
-                          content=str(message), duration=6000, parent=self)
-
-        self._download_task_id = _worker_module.submit(
-            manager.fetch_file_list, args=(source.magnet or source.name,),
-            kwargs={"timeout_secs": 45.0, "category": "tv"},
-            on_done=_done, on_error=_failed)
-
-    def _offer_download_files(self, source, files: list) -> None:
-        entries = _torrent_file_entries(files)
-        if not entries:
-            InfoBar.warning(title=tr("tv.download.no_files_title", default="Nothing to download"),
-                            content=tr("tv.download.no_files_body",
-                                       default="This torrent has no video files to pick."),
-                            duration=5000, parent=self)
-            return
-        preset_season, preset_episode = self._download_preset
-        safety = assess_source_files([path for path, _size in files or ()], context="video",
-                                     title=self._title_lbl.text())
-        dialog = _TorrentFilesDialog(entries, self._title_lbl.text(), self.window(),
-                                     preset_season=preset_season, preset_episode=preset_episode,
-                                     safety=safety)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        indices = dialog.selected_indices()
-        if indices:
-            self._queue_torrent_download(source, indices)
-
-    def _queue_torrent_download(self, source, indices: list) -> None:
-        manager = self._download_manager
-        if manager is None:
-            return
-        season, episode = self._download_target or (None, None)
-        title = self._title_lbl.text()
-        if self._media_type != "tv":
-            game_name = title
-        elif episode:
-            game_name = f"{title} - S{int(season or 1):02d}E{int(episode):02d}"
-        else:
-            game_name = f"{title} - {tr('tv.download.season_label', default='Season {season}', season=int(season or 1))}"
-        try:
-            manager.add(torrent_file=source.magnet or source.name, file_id=indices[0], file_ids=indices,
-                        game_name=game_name, console=title,
-                        source=source.indexer or _SOURCE_NAMES.get(source.source, source.source or "Torrent"),
-                        category="tv")
-        except Exception as exc:
-            logger.exception("Could not queue the download")
-            InfoBar.error(title=tr("tv.download.failed_title", default="Download failed"),
-                          content=f"{type(exc).__name__}: {exc}", duration=6000, parent=self)
-            return
-        InfoBar.success(title=tr("tv.download.queued_title", default="Download queued"),
-                        content=game_name, duration=3000, parent=self)
-
-
     def _episode_target(self) -> Optional[tuple[int, int]]:
         return (self._current_season, self._current_episode) if self._media_type == "tv" else None
 
@@ -2990,10 +3371,19 @@ class _MediaDetailsView(QWidget):
             return
         self._open_stream_picker()
 
-    def _on_choose_source(self) -> None:
+    def _show_source_menu(self, pos: QPoint) -> None:
         if self._media_id is None or not getattr(settings, "tv_stream_enabled", True):
             return
-        self._open_stream_picker(force_picker=True)
+        menu = RoundMenu(parent=self)
+        pick = Action(FluentIcon.MENU, tr("tv.stream.pick_title", default="Choose a stream"), menu)
+        pick.triggered.connect(lambda _=False: self._open_stream_picker(force_picker=True))
+        menu.addAction(pick)
+        menu.addSeparator()
+        download = Action(FluentIcon.DOWNLOAD, tr("tv.download.choose", default="Download..."), menu)
+        download.triggered.connect(lambda _=False: self._on_download())
+        menu.addAction(download)
+        menu.closedSignal.connect(menu.deleteLater)
+        menu.exec(pos)
 
     def _on_alt_stream(self, _stream: dict) -> None:
         self._open_stream_picker(force_picker=True)
@@ -3003,9 +3393,6 @@ class _MediaDetailsView(QWidget):
             if force_picker:
                 self._picker_forced = True
                 if self._source_quick:
-                    # The in-flight quick search may cancel torrent providers
-                    # as soon as it finds a direct source. An explicit picker
-                    # request deserves the complete list instead.
                     _worker_module.cancel(self._source_task_id)
                     self._source_task_id = None
                     self._source_quick = False
@@ -3466,6 +3853,23 @@ class _MediaTab(MediaPageBase):
         self._search_task_id: Optional[str] = None
         self._download_manager: Any = None
         self._force = False
+        self._random_token = 0
+        self._random_task_id: Optional[str] = None
+        self._last_random: Any = None
+        self._genre_names: list[str] = []
+        self._genre_ids: list = []
+        self._genre_excl: list = []
+        self._genre_excl_ids: set = set()
+        self._want_exc: list = []
+        self._genre_missing: list[str] = []
+        self._genre_seq = 0
+        self._last_genre_query: list = []
+        self._genre_pool: list = []
+        self._genre_page = 0
+        self._genre_has_more = True
+        self._genre_loading = False
+        self._genre_stale = 0
+        self._genre_task_id: Optional[str] = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -3485,8 +3889,9 @@ class _MediaTab(MediaPageBase):
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(400)
         self._search_timer.timeout.connect(self._on_search_commit)
-        self._search_box.textChanged.connect(lambda _t: self._search_timer.start())
+        self._search_box.textChanged.connect(self._on_search_text_changed)
         self._search_box.searchSignal.connect(self._on_search_commit)
+        bind_enter(self._search_box, self._on_search_commit)
         self._search_box.clearSignal.connect(self._on_search_commit)
         self._search_box.setMinimumWidth(280)
         self._search_box.setMaximumWidth(360)
@@ -3514,7 +3919,51 @@ class _MediaTab(MediaPageBase):
         self._refresh_btn.setToolTip(tr("tv.refresh", default="Refresh"))
         self._refresh_btn.clicked.connect(self.refresh)
         search_row.addWidget(self._refresh_btn)
+        self._dice_btn = _DiceButton(tr("tv.random", default="Surprise me"), self._browse_page)
+        self._dice_btn.clicked.connect(self._surprise_me)
+        search_row.addWidget(self._dice_btn)
         browse_layout.addLayout(search_row)
+
+        self._genre_bar = QWidget(self._browse_page)
+        self._genre_bar.setStyleSheet('background: transparent;')
+        bar_row = QHBoxLayout(self._genre_bar)
+        bar_row.setContentsMargins(0, 0, 0, 0)
+        bar_row.setSpacing(8)
+        self._genre_hint = CaptionLabel('', self._genre_bar)
+        apply_label_theme(self._genre_hint, 'muted')
+        self._genre_pill_row = QHBoxLayout()
+        self._genre_pill_row.setContentsMargins(0, 0, 0, 0)
+        self._genre_pill_row.setSpacing(6)
+        self._genre_note = CaptionLabel('', self._genre_bar)
+        apply_label_theme(self._genre_note, 'muted')
+        self._genre_note.setVisible(False)
+        self._genre_add = TransparentToolButton(FluentIcon.ADD, self._genre_bar)
+        apply_tool_button_theme(self._genre_add)
+        self._genre_add.setFixedSize(24, 24)
+        self._genre_add.setIconSize(QSize(12, 12))
+        self._genre_add.setToolTip(tr('tv.genre.add', default='Add or remove genres'))
+        self._genre_add.clicked.connect(lambda _c=False: self._open_genre_menu())
+        self._genre_clear = TransparentToolButton(FluentIcon.CLOSE, self._genre_bar)
+        apply_tool_button_theme(self._genre_clear)
+        self._genre_clear.setFixedSize(24, 24)
+        self._genre_clear.setIconSize(QSize(12, 12))
+        self._genre_clear.setToolTip(tr('tv.genre.back', default='Back to browsing'))
+        self._genre_clear.clicked.connect(lambda _c=False: self._clear_genres())
+        bar_row.addWidget(self._genre_hint)
+        bar_row.addLayout(self._genre_pill_row)
+        bar_row.addWidget(self._genre_add)
+        bar_row.addWidget(self._genre_clear)
+        bar_row.addWidget(self._genre_note)
+        bar_row.addStretch(1)
+        self._genre_bar.setVisible(False)
+        browse_layout.addWidget(self._genre_bar)
+        self._suggest_bar = QWidget(self._browse_page)
+        self._suggest_bar.setStyleSheet('background: transparent;')
+        self._suggest_row = QHBoxLayout(self._suggest_bar)
+        self._suggest_row.setContentsMargins(0, 0, 0, 0)
+        self._suggest_row.setSpacing(8)
+        self._suggest_bar.setVisible(False)
+        browse_layout.addWidget(self._suggest_bar)
 
         self._status_lbl = BodyLabel("", self._browse_page)
         self._status_lbl.hide()
@@ -3544,6 +3993,7 @@ class _MediaTab(MediaPageBase):
                                        subtitle_fn=attrs_subtitle("subtitle"), colors_fn=_grid_colors)
         self._search_grid.poster_clicked.connect(lambda item: self._open_details(item.raw, self._media_type))
         self._search_grid.context_requested.connect(self._on_card_menu)
+        self._search_grid.near_bottom.connect(self._on_genre_near_bottom)
         self._search_grid.hide()
         self._view_btn = ViewModeButton(self._search_grid, parent=self._browse_page,
                                         list_tip=tr("tv.list_view", default="List view"),
@@ -3557,6 +4007,7 @@ class _MediaTab(MediaPageBase):
         self._stack.addWidget(self._browse_page)
 
         self._details = self._create_details()
+        self._details.genre_requested.connect(self._on_genre_pill)
         self._stack.addWidget(self._details)
 
         self._watchlater_view = _WatchLaterView(self)
@@ -3580,6 +4031,8 @@ class _MediaTab(MediaPageBase):
         try:
             if self._query:
                 self._on_search_commit()
+            elif self._genre_names or self._genre_excl:
+                self._restart_genre_list()
             else:
                 for key, _title_key in self._categories:
                     self._load_category(key)
@@ -3626,7 +4079,14 @@ class _MediaTab(MediaPageBase):
         return out
 
     def _on_search_commit(self) -> None:
-        self._query = self._search_box.text().strip()
+        text = self._search_box.text()
+        tags = self._parse_tag_query(text)
+        if tags is not None:
+            self._search_timer.stop()
+            self._search_genres(tags)
+            return
+        self._leave_genre_mode()
+        self._query = _clean_query(text)
         if self._search_task_id is not None:
             _worker_module.cancel(self._search_task_id)
         if not self._query:
@@ -3652,13 +4112,373 @@ class _MediaTab(MediaPageBase):
         self._search_task_id = self._start_search(self._query, _on_done, _on_error)
 
     def _start_search(self, query: str, on_done, on_error):
-        return tmdb.search_async(self._media_type, query, 1, use_cache=not self._force, on_error=on_error,
-                                 on_done=lambda data: on_done(self._filter_released(data.get("results") or [])))
+        alts = _tm_variants(query)[1:]
+
+        def _done(data) -> None:
+            results = self._filter_released(data.get("results") or [])
+            if not results and alts:
+                self._search_task_id = tmdb.search_async(self._media_type, alts.pop(0), 1, use_cache=not self._force,
+                                                         on_error=on_error, on_done=_done)
+                return
+            on_done(results)
+        return tmdb.search_async(self._media_type, query, 1, use_cache=not self._force, on_error=on_error, on_done=_done)
 
     def _render_search(self, results: list[dict]) -> None:
         self._search_grid.set_entries([self._wrap(item) for item in results])
+        self._search_grid.set_highlight(self._query)
         self._search_grid.show()
         self._view_btn.show()
+
+    _TAG_QUERY_RE = re.compile(r'^\s*tags?\s*[:\uff1a]\s*(.*)$', re.IGNORECASE | re.DOTALL)
+
+    @classmethod
+    def _parse_tag_query(cls, text: str):
+        match = cls._TAG_QUERY_RE.match(text or '')
+        if not match:
+            return None
+        seen: set = set()
+        tags: list = []
+        for part in re.split(r'[,;]+', match.group(1)):
+            tag = re.sub(r'\s+', ' ', part).strip()
+            if tag and tag.lower() not in seen:
+                seen.add(tag.lower())
+                tags.append(tag)
+        return tags
+
+    def _on_search_text_changed(self, _text: str) -> None:
+        if self._parse_tag_query(self._search_box.text()) is not None:
+            self._search_timer.stop()
+            return
+        self._search_timer.start()
+
+    def _set_genre_status(self, text: str) -> None:
+        self._status_lbl.setText(text)
+        self._status_lbl.setVisible(bool(text))
+
+    def _on_genre_pill(self, name: str) -> None:
+        self._search_genres([name])
+
+    def _start_resolve_genres(self, names, on_done, on_error):
+        return tmdb.resolve_genres_async(self._media_type, names, on_done=on_done, on_error=on_error)
+
+    def _start_genre_page(self, page: int, on_done, on_error):
+        def _done(data: dict) -> None:
+            total = int(data.get("total_pages") or 1)
+            on_done({"page": page, "has_more": page < min(total, 500),
+                     "items": self._filter_released(data.get("results") or [])})
+        return tmdb.discover_async(self._media_type, list(self._genre_ids), page,
+                                   use_cache=not self._force, on_done=_done, on_error=on_error)
+
+    def _search_genres(self, tags: list) -> None:
+        if self._stack.currentWidget() is not self._browse_page:
+            self._show_grid()
+        if not tags:
+            self._set_genre_status(tr('tv.genre.hint', default='Type genres after "tag:", e.g.  tag:action, mystery  then press Enter.'))
+            return
+        self._genre_seq += 1
+        seq = self._genre_seq
+        self._last_genre_query = list(tags)
+        want_inc, self._want_exc = split_tags(tags)
+        tags = want_inc + self._want_exc
+        self._clear_genre_suggestions()
+        self._set_genre_status(tr('tv.genre.looking_up', default='Looking up genres\u2026'))
+        try:
+            self._start_resolve_genres(
+                list(tags),
+                on_done=lambda res, s=seq: self._on_genres_resolved(s, res),
+                on_error=lambda msg, s=seq: self._on_genres_lookup_failed(s, msg))
+        except Exception:
+            logger.exception("Failed to start genre lookup")
+            self._on_genres_lookup_failed(seq, "")
+
+    def _on_genres_lookup_failed(self, seq: int, message: str) -> None:
+        if seq != self._genre_seq or not _qt_is_valid(self):
+            return
+        logger.error("%s genre lookup failed: %s", self._media_type, message)
+        self._set_genre_status(tr('tv.genre.lookup_failed', default='Genre lookup failed. Try again in a moment.'))
+
+    def _on_genres_resolved(self, seq: int, result) -> None:
+        if seq != self._genre_seq or not _qt_is_valid(self):
+            return
+        found = [str(t) for t in (result or {}).get('tags') or ()]
+        ids = list((result or {}).get('ids') or [])
+        missing = [str(t) for t in (result or {}).get('missing') or ()]
+        pool = [str(t) for t in (result or {}).get('pool') or ()]
+        if pool:
+            self._genre_pool = pool
+        if not found:
+            names = ', '.join(f'"{m}"' for m in missing) or 'that'
+            self._set_genre_status(tr('tv.genre.unknown', default='No genre named {names}. Check the spelling (e.g. tag:action, mystery).', names=names))
+            self._show_genre_suggestions(missing, pool)
+            return
+        self._set_genre_status('')
+        if len(ids) == len(found):
+            id_of = {n: i for n, i in zip(found, ids)}
+        else:
+            id_of = {}
+        inc, exc = partition_resolved(found, self._want_exc)
+        exc_ids = {int(id_of[n]) for n in exc if n in id_of and str(id_of[n]).lstrip('-').isdigit()}
+        ids = [id_of[n] for n in inc if n in id_of] if id_of else ids
+        found = inc
+        if found == self._genre_names and exc == self._genre_excl and self._search_grid.isVisible():
+            self._genre_missing = missing
+            self._sync_genre_bar()
+            self._show_genre_suggestions(missing, pool)
+            return
+        self._genre_excl = list(exc)
+        self._genre_excl_ids = exc_ids
+        self._enter_genre_mode(found, ids, missing)
+        self._show_genre_suggestions(missing, pool)
+
+    def _open_genre_menu(self) -> None:
+        if self._genre_pool:
+            show_tag_menu(self._genre_add, self._genre_pool, self._all_genre_tokens(), self._on_genre_menu_pick, self._on_genre_exclude)
+
+    def _all_genre_tokens(self) -> list:
+        return join_tags(self._genre_names, self._genre_excl)
+
+    def _on_genre_exclude(self, name: str) -> None:
+        self._on_genre_menu_pick(name, True)
+
+    def _on_genre_menu_pick(self, name: str, exclude: bool = False) -> None:
+        names = toggled_tags(self._all_genre_tokens(), name, exclude)
+        if names:
+            self._search_genres(names)
+        else:
+            self._clear_genres()
+
+    def _clear_genre_suggestions(self) -> None:
+        while self._suggest_row.count():
+            item = self._suggest_row.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._suggest_bar.setVisible(False)
+
+    def _show_genre_suggestions(self, missing: list, pool) -> None:
+        self._clear_genre_suggestions()
+        shown = False
+        for name in missing:
+            close = _suggest_genres(name, pool)
+            if not close:
+                continue
+            hint = CaptionLabel(tr('tv.genre.did_you_mean', default='Did you mean, instead of "{name}":', name=name),
+                                self._suggest_bar)
+            apply_label_theme(hint, 'muted')
+            self._suggest_row.addWidget(hint)
+            for label in close:
+                pill = _genre_pill(label, self._suggest_bar, lambda t, m=name: self._retry_genre(m, t))
+                pill.adjustSize()
+                self._suggest_row.addWidget(pill)
+            shown = True
+        if shown:
+            self._suggest_row.addStretch(1)
+        self._suggest_bar.setVisible(shown)
+
+    def _retry_genre(self, missing: str, suggestion: str) -> None:
+        def norm(t: str) -> str:
+            return re.sub(r'\s+', ' ', t or '').strip().lower()
+        query, replaced = [], False
+        for t in self._last_genre_query:
+            if norm(t.lstrip('-')) == norm(missing):
+                query.append(('-' if t.startswith('-') else '') + suggestion)
+                replaced = True
+            else:
+                query.append(t)
+        if not replaced:
+            query.append(suggestion)
+        self._search_genres(query)
+
+    def _enter_genre_mode(self, found: list, ids: list, missing: list) -> None:
+        self._cancel_genre_task()
+        if self._search_task_id is not None:
+            _worker_module.cancel(self._search_task_id)
+            self._search_task_id = None
+        self._search_timer.stop()
+        self._query = ""
+        self._genre_names = list(found)
+        self._genre_ids = list(ids)
+        self._genre_missing = list(missing)
+        self._genre_page = 0
+        self._genre_has_more = True
+        self._genre_loading = False
+        self._genre_stale = 0
+        self._search_box.blockSignals(True)
+        self._search_box.setText('tag:' + ', '.join(self._all_genre_tokens()))
+        self._search_box.blockSignals(False)
+        self._rows_scroll.hide()
+        self._search_grid.clear()
+        self._search_grid.show()
+        self._view_btn.show()
+        self._sync_genre_bar()
+        self._load_next_genre_page()
+
+    def _sync_genre_bar(self) -> None:
+        while self._genre_pill_row.count():
+            item = self._genre_pill_row.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._genre_note.setText('')
+        self._genre_note.setVisible(False)
+        self._clear_genre_suggestions()
+        on = bool(self._genre_names or self._genre_excl)
+        if on:
+            for name in self._all_genre_tokens():
+                pill = make_tag_chip(name, self._genre_bar, self._on_genre_menu_pick)
+                pill.adjustSize()
+                self._genre_pill_row.addWidget(pill)
+            self._genre_hint.setText(
+                (tr('tv.genre.showing_all', default='Showing titles with all of these genres') if len(self._genre_names) > 1
+                 else tr('tv.genre.showing', default='Showing titles tagged')) if self._genre_names
+                else tr('tv.genre.hiding', default='Hiding titles tagged'))
+            if self._genre_missing:
+                self._genre_note.setText(tr('tv.genre.ignored', default='Ignored unknown: {names}',
+                                            names=', '.join(self._genre_missing)))
+                self._genre_note.setVisible(True)
+        self._genre_bar.setVisible(on)
+
+    def _cancel_genre_task(self) -> None:
+        if self._genre_task_id is not None:
+            _worker_module.cancel(self._genre_task_id)
+            self._genre_task_id = None
+
+    def _leave_genre_mode(self) -> None:
+        self._genre_seq += 1
+        self._cancel_genre_task()
+        self._genre_names = []
+        self._genre_ids = []
+        self._genre_excl = []
+        self._genre_excl_ids = set()
+        self._genre_missing = []
+        self._genre_loading = False
+        self._sync_genre_bar()
+
+    def _clear_genres(self) -> None:
+        self._leave_genre_mode()
+        self._query = ""
+        self._search_box.blockSignals(True)
+        self._search_box.setText('')
+        self._search_box.blockSignals(False)
+        self._search_grid.hide()
+        self._search_grid.clear()
+        self._view_btn.hide()
+        self._rows_scroll.show()
+        self._set_genre_status('')
+
+    def _restart_genre_list(self) -> None:
+        self._genre_seq += 1
+        self._cancel_genre_task()
+        self._genre_page = 0
+        self._genre_has_more = True
+        self._genre_loading = False
+        self._genre_stale = 0
+        self._search_grid.clear()
+        self._load_next_genre_page()
+
+    def _load_next_genre_page(self) -> None:
+        if not _qt_is_valid(self) or self._genre_loading or not self._genre_has_more or not (self._genre_names or self._genre_excl):
+            return
+        self._genre_loading = True
+        seq = self._genre_seq
+        try:
+            self._genre_task_id = self._start_genre_page(
+                self._genre_page + 1,
+                on_done=lambda res, s=seq: self._on_genre_page(s, res),
+                on_error=lambda msg, s=seq: self._on_genre_page_failed(s, msg))
+        except Exception:
+            logger.exception("Failed to start genre page load")
+            self._on_genre_page_failed(seq, "")
+
+    def _on_genre_page(self, seq: int, result: dict) -> None:
+        if seq != self._genre_seq or not _qt_is_valid(self) or not _qt_is_valid(self._search_grid):
+            return
+        self._genre_task_id = None
+        self._genre_loading = False
+        page = int(result.get("page") or 0)
+        if self._genre_page and page <= self._genre_page:
+            return
+        self._genre_page = page
+        self._genre_has_more = bool(result.get("has_more"))
+        raw = result.get("items") or []
+        excl = self._genre_excl_ids
+        items = [i for i in raw if not excl.intersection(int(g) for g in (i.get("genre_ids") or ()) if str(g).isdigit())] if excl else raw
+        if raw and not items and self._genre_has_more:
+            QTimer.singleShot(0, self._load_next_genre_page)
+            return
+        before = self._search_grid.count_entries()
+        self._search_grid.append_entries([self._wrap(item) for item in items])
+        added = self._search_grid.count_entries() - before
+        if added == 0 and items:
+            self._genre_stale += 1
+            if self._genre_stale >= 3:
+                self._genre_has_more = False
+        elif added > 0:
+            self._genre_stale = 0
+        if self._search_grid.count_entries() == 0 and not self._genre_has_more:
+            self._set_genre_status(tr('tv.genre.empty', default='No titles found for these genres.'))
+        else:
+            self._set_genre_status('')
+        QTimer.singleShot(150, self._on_genre_near_bottom)
+
+    def _on_genre_page_failed(self, seq: int, message: str) -> None:
+        if seq != self._genre_seq or not _qt_is_valid(self):
+            return
+        self._genre_task_id = None
+        self._genre_loading = False
+        logger.error("%s genre page load failed: %s", self._media_type, message)
+        self._set_genre_status(tr("tv.movies.load_error", default="Failed to load"))
+
+    def _on_genre_near_bottom(self) -> None:
+        if not (self._genre_names or self._genre_excl) or not _qt_is_valid(self) or not _qt_is_valid(self._search_grid):
+            return
+        if self._genre_loading or not self._genre_has_more:
+            return
+        bar = self._search_grid.verticalScrollBar()
+        if bar.maximum() - bar.value() > self._search_grid._NEAR_BOTTOM_THRESHOLD_PX:
+            return
+        self._load_next_genre_page()
+
+    def _start_random(self, exclude, on_done, on_error):
+        return tmdb.random_title_async(self._media_type, exclude,
+                                       on_done=lambda res: on_done(res or None), on_error=on_error)
+
+    def _open_random(self, item) -> None:
+        self._last_random = item.get("id")
+        self._open_details(item, self._media_type)
+
+    def _surprise_me(self) -> None:
+        self._random_token += 1
+        token = self._random_token
+        if self._random_task_id is not None:
+            _worker_module.cancel(self._random_task_id)
+            self._random_task_id = None
+        self._dice_btn.set_busy(True)
+
+        def _finish(item) -> None:
+            if token != self._random_token or not _qt_is_valid(self):
+                return
+            self._random_task_id = None
+            self._dice_btn.set_busy(False)
+            if not item:
+                InfoBar.warning(
+                    title=tr("tv.random_failed_title", default="Couldn't pick a title"),
+                    content=tr("tv.random_failed", default="Nothing came back this time. Try again in a moment."),
+                    parent=self.window(), duration=2500, isClosable=True,
+                )
+                return
+            try:
+                self._open_random(item)
+            except Exception:
+                logger.exception("Failed to open random %s title", self._media_type)
+
+        def _fail(msg) -> None:
+            logger.error("%s random pick error: %s", self._media_type, msg)
+            _finish(None)
+
+        try:
+            self._random_task_id = self._start_random(self._last_random, _finish, _fail)
+        except Exception:
+            logger.exception("Failed to start random pick")
+            _finish(None)
 
     def _open_details(self, item: dict, media_type: str) -> None:
         try:
@@ -3721,9 +4541,8 @@ class _MediaTab(MediaPageBase):
         if getattr(settings, 'tv_stream_enabled', True) and self._media_type == 'movie':
             menu.addAction(Action(_play_icon(), tr('tv.stream.play', default='Play'),
                                   triggered=lambda: self._open_and_watch(raw)))
-        if self._download_manager is not None:
-            menu.addAction(Action(FluentIcon.DOWNLOAD, tr('tv.download.action', default='Download...'),
-                                  triggered=lambda: self._open_and_download(raw)))
+        menu.addAction(Action(FluentIcon.DOWNLOAD, tr('tv.download.action', default='Download...'),
+                              triggered=lambda: self._open_and_download(raw)))
         saved = watch_later_store().has(self._media_type, raw.get('id'))
         menu.addAction(Action(themed_icon('tv.watchlater', FluentIcon.HEART),
                               tr('tv.watchlater_remove', default='Remove from watch later') if saved
@@ -3764,11 +4583,19 @@ class _MediaTab(MediaPageBase):
     def _apply_locale(self, *_args) -> None:
         self._search_box.setPlaceholderText(tr(self._SEARCH_PH[0], default=self._SEARCH_PH[1]))
         self._sync_watchlater_badge()
+        self._dice_btn.setToolTip(tr("tv.random", default="Surprise me"))
+        self._genre_clear.setToolTip(tr('tv.genre.back', default='Back to browsing'))
+        self._sync_genre_bar()
         self._watchlater_view.apply_locale()
 
     def shutdown(self) -> None:
         if self._search_task_id is not None:
             _worker_module.cancel(self._search_task_id)
+        self._random_token += 1
+        if self._random_task_id is not None:
+            _worker_module.cancel(self._random_task_id)
+            self._random_task_id = None
+        self._leave_genre_mode()
         self._details.shutdown()
         self._watchlater_view.shutdown()
         try:
@@ -3861,8 +4688,28 @@ async def _browse_anime(category: str) -> list[AnimeItem]:
     return [AnimeItem.from_anilist_media(r) for r in results]
 
 
+async def _resolve_anime_genres(names: list) -> dict:
+    return await anime_backend.resolve_genres(names)
+
+
+async def _browse_anime_genres(tags: list, page: int) -> dict:
+    items, more = await anime_backend.browse_genres(tags, page)
+    return {"page": page, "has_more": more, "items": [AnimeItem.from_anilist_media(m) for m in items]}
+
+
+async def _random_anime(exclude: Any) -> list[AnimeItem]:
+    media = await anime_backend.random_anime(exclude)
+    return [AnimeItem.from_anilist_media(media)] if media else []
+
+
 async def _search_anime(query: str) -> list[AnimeItem]:
-    results = await anime_backend.search_cached(query)
+    cleaned = _clean_query(query)
+    results = await anime_backend.search_cached(cleaned)
+    if not results:
+        for alt in _tm_variants(cleaned)[1:]:
+            results = await anime_backend.search_cached(alt)
+            if results:
+                break
     results = await anime_backend.collapse_to_franchises(results)
     return [AnimeItem.from_anilist_media(r) for r in results]
 
@@ -4088,10 +4935,9 @@ class _RelayHandler(BaseHTTPRequestHandler):
                     self.send_header(h, v)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            for chunk in upstream.iter_raw(chunk_size=1 << 16):
-                if chunk:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+            for chunk in upstream.iter_raw(chunk_size=1 << 18):
+                self.wfile.write(chunk)
+            self.wfile.flush()
         finally:
             upstream.close()
 
@@ -4288,10 +5134,17 @@ class HlsRelayServer:
                         else:
                             raise _UpstreamError(r.status_code)
                     else:
+                        ctype = r.headers.get("Content-Type", "application/octet-stream")
+                        limit = (4 << 20) if ("mpegurl" in ctype.lower() or ".m3u8" in url.lower()) else self.ENTRY_MAX_BYTES
                         length = r.headers.get("Content-Length")
-                        if length and length.isdigit() and int(length) > self.ENTRY_MAX_BYTES:
+                        if length and length.isdigit() and int(length) > limit:
                             raise _NotCacheable()
-                        return r.read(), r.headers.get("Content-Type", "application/octet-stream")
+                        data = bytearray()
+                        for chunk in r.iter_bytes(1 << 16):
+                            data += chunk
+                            if len(data) > limit:
+                                raise _NotCacheable()
+                        return bytes(data), ctype
             except httpx.HTTPError as exc:
                 last = exc
                 if _is_cert_error(exc):
@@ -4683,168 +5536,76 @@ class _SeekSlider(QSlider):
             e.accept()
 
 
-_SUB_FONTS = ("Segoe UI", "Arial", "Verdana", "Tahoma", "Trebuchet MS", "Georgia", "Consolas", "Comic Sans MS")
-_SUB_COLORS = (("White", "#ffffff"), ("Yellow", "#ffe94d"), ("Cyan", "#6be3ff"), ("Green", "#7dff8a"),
-               ("Pink", "#ff9ad5"), ("Orange", "#ffb347"))
-_SUB_SIZES = (("Small", 16), ("Medium", 22), ("Large", 28), ("Extra large", 36), ("Huge", 46))
-_SUB_OUTLINES = (("None", 0.0), ("Thin", 1.5), ("Medium", 3.0), ("Thick", 4.5))
-_SUB_DEFAULTS = {"font": "Segoe UI", "size": 22, "bold": True, "color": "#ffffff", "outline": 0.0,
-                 "bg": False, "x": 0.5, "y": 0.96}
+class _SubDelayPopup(QFrame):
+    changed = Signal(int)
 
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent, Qt.WindowType.Popup)
+        self.setObjectName("subDelay")
+        self.setStyleSheet(
+            "#subDelay{background:#2c2c31;border:1px solid rgba(255,255,255,40);border-radius:8px;}"
+            "QLabel{color:#fff;background:transparent;font:12px 'Segoe UI Variable Text','Segoe UI',sans-serif;}"
+            "QPushButton{background:rgba(255,255,255,18);color:#fff;border:none;border-radius:5px;padding:5px 6px;}"
+            "QPushButton:hover{background:rgba(255,255,255,36);}"
+            "QDoubleSpinBox{background:rgba(255,255,255,14);color:#fff;border:1px solid rgba(255,255,255,40);"
+            "border-radius:5px;padding:4px;selection-background-color:rgba(255,255,255,60);}")
+        self._ms = 0
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(10)
+        self._title = QLabel(tr("anime.sub_delay_title", default="Subtitle delay"), self)
+        self._title.setStyleSheet("font-weight:600;")
+        lay.addWidget(self._title)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self._spin = QDoubleSpinBox(self)
+        self._spin.setDecimals(3)
+        self._spin.setRange(-3600.0, 3600.0)
+        self._spin.setSingleStep(0.1)
+        self._spin.setSuffix(" s")
+        self._spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        self._spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._spin.setFixedWidth(110)
+        self._spin.setKeyboardTracking(False)
+        self._spin.valueChanged.connect(lambda v: self._emit(round(v * 1000)))
+        for text, step in (("\u22121 s", -1000), ("\u22120.1", -100)):
+            row.addWidget(self._step_button(text, step))
+        row.addWidget(self._spin)
+        for text, step in (("+0.1", 100), ("+1 s", 1000)):
+            row.addWidget(self._step_button(text, step))
+        lay.addLayout(row)
+        self._hint = QLabel(tr("anime.sub_delay_hint", default="Positive shows subtitles later, negative earlier."), self)
+        lay.addWidget(self._hint)
+        self._reset = _QPushButton(tr("anime.sub_delay_reset", default="Reset"), self)
+        self._reset.clicked.connect(lambda: self._emit(0, sync=True))
+        lay.addWidget(self._reset)
 
-def _load_sub_style() -> dict:
-    st = dict(_SUB_DEFAULTS)
-    try:
-        qs = QSettings("AnimePlayer", "Subtitles")
-        for k, d in _SUB_DEFAULTS.items():
-            v = qs.value(k)
-            if v is None:
-                continue
-            st[k] = (str(v).lower() == "true") if isinstance(d, bool) else type(d)(v)
-    except Exception:
-        pass
-    return st
+    def _step_button(self, text: str, step: int) -> _QPushButton:
+        btn = _QPushButton(text, self)
+        btn.setFixedWidth(52)
+        btn.clicked.connect(lambda: self._emit(self._ms + step, sync=True))
+        return btn
 
-
-def _save_sub_style(st: dict) -> None:
-    try:
-        qs = QSettings("AnimePlayer", "Subtitles")
-        for k, v in st.items():
-            qs.setValue(k, v)
-    except Exception:
-        pass
-
-
-class _SubtitleOverlay(QWidget):
-    def __init__(self, player: "AnimePlayerWidget", owner: Optional[QWidget] = None) -> None:
-        super().__init__(owner or player, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowDoesNotAcceptFocus | Qt.WindowType.NoDropShadowWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setCursor(Qt.CursorShape.SizeAllCursor)
-        self.setToolTip("Drag to move \u00b7 scroll to resize \u00b7 double-click to reset \u00b7 right-click for style")
-        self._p = player
-        self._lines: list[str] = []
-        self._font = QFont()
-        self._pad = 8
-        self._drag: Optional[tuple] = None
-        self._last_key = None
-
-    def set_text(self, text: str) -> None:
-        self._lines_src = text
-        self.refresh(force=True)
-
-    def _video_rect(self) -> QRect:
-        v = self._p._vid()
-        return QRect(v.mapToGlobal(QPoint(0, 0)), v.size())
-
-    def refresh(self, force: bool = False) -> None:
-        p = self._p
-        text = getattr(self, "_lines_src", "")
-        v = p._vid()
-        if not text or not v.isVisible() or v.visibleRegion().isEmpty():
-            self.hide()
+    def _emit(self, ms: int, sync: bool = False) -> None:
+        if ms == self._ms and not sync:
             return
-        vr = self._video_rect()
-        key = (vr.x(), vr.y(), vr.width(), vr.height())
-        if not force and key == self._last_key and self.isVisible():
-            return
-        self._last_key = key
-        st = p._sub_style
-        scale = max(0.5, vr.width() / 800)
-        f = QFont(st["font"])
-        f.setPixelSize(max(8, int(st["size"] * scale)))
-        f.setBold(bool(st["bold"]))
-        self._font = f
-        fm = QFontMetrics(f)
-        maxw = int(vr.width() * 0.9)
-        lines: list[str] = []
-        for raw in text.split("\n"):
-            cur = ""
-            for word in raw.split():
-                t = f"{cur} {word}".strip()
-                if cur and fm.horizontalAdvance(t) > maxw:
-                    lines.append(cur)
-                    cur = word
-                else:
-                    cur = t
-            lines.append(cur)
-        self._lines = lines
-        ol = st["outline"] * scale
-        self._pad = int(ol + 8 * scale)
-        w = max(fm.horizontalAdvance(l) for l in lines) + 2 * self._pad
-        h = len(lines) * fm.lineSpacing() + 2 * self._pad
-        x = int(vr.x() + st["x"] * vr.width() - w / 2)
-        y = int(vr.y() + st["y"] * vr.height() - h)
-        x = max(vr.left(), min(x, vr.right() - w))
-        y = max(vr.top(), min(y, vr.bottom() - h))
-        self.setGeometry(x, y, w, h)
-        if not self.isVisible():
-            self.show()
-        self.update()
+        self._ms = ms
+        if sync:
+            self._spin.blockSignals(True)
+            self._spin.setValue(ms / 1000)
+            self._spin.blockSignals(False)
+        self.changed.emit(ms)
 
-    def paintEvent(self, _e) -> None:
-        if not self._lines:
-            return
-        st = self._p._sub_style
-        pt = QPainter(self)
-        pt.setRenderHint(QPainter.RenderHint.Antialiasing)
-        scale = max(0.5, self._video_rect().width() / 800)
-        if st["bg"]:
-            pt.setPen(Qt.PenStyle.NoPen)
-            pt.setBrush(QColor(0, 0, 0, 150))
-            pt.drawRoundedRect(self.rect(), 8, 8)
-        fm = QFontMetrics(self._font)
-        path = QPainterPath()
-        y = self._pad + fm.ascent()
-        for line in self._lines:
-            path.addText((self.width() - fm.horizontalAdvance(line)) / 2, y, self._font, line)
-            y += fm.lineSpacing()
-        if st["outline"] > 0:
-            pen = QPen(QColor(0, 0, 0, 235), st["outline"] * scale * 2)
-            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            pt.setPen(pen)
-            pt.setBrush(Qt.BrushStyle.NoBrush)
-            pt.drawPath(path)
-        pt.setPen(Qt.PenStyle.NoPen)
-        pt.setBrush(QColor(st["color"]))
-        pt.drawPath(path)
-
-    def mousePressEvent(self, e) -> None:
-        if e.button() == Qt.MouseButton.LeftButton:
-            self._drag = (e.globalPosition().toPoint(), self.pos())
-            e.accept()
-
-    def mouseMoveEvent(self, e) -> None:
-        if self._drag is None:
-            return
-        vr = self._video_rect()
-        d = e.globalPosition().toPoint() - self._drag[0]
-        n = self._drag[1] + d
-        self.move(max(vr.left(), min(n.x(), vr.right() - self.width())),
-                  max(vr.top(), min(n.y(), vr.bottom() - self.height())))
-
-    def mouseReleaseEvent(self, e) -> None:
-        if self._drag is None:
-            return
-        self._drag = None
-        vr = self._video_rect()
-        st = self._p._sub_style
-        st["x"] = round((self.x() + self.width() / 2 - vr.x()) / max(1, vr.width()), 4)
-        st["y"] = round((self.y() + self.height() - vr.y()) / max(1, vr.height()), 4)
-        _save_sub_style(st)
-        self._last_key = None
-
-    def mouseDoubleClickEvent(self, e) -> None:
-        self._p._set_sub_style(x=_SUB_DEFAULTS["x"], y=_SUB_DEFAULTS["y"])
-
-    def wheelEvent(self, e) -> None:
-        st = self._p._sub_style
-        self._p._set_sub_style(size=max(10, min(80, st["size"] + (2 if e.angleDelta().y() > 0 else -2))))
-        e.accept()
-
-    def contextMenuEvent(self, e) -> None:
-        self._p._style_menu.exec(e.globalPos())
+    def popup(self, ms: int, at: QPoint) -> None:
+        self._ms = ms
+        self._spin.blockSignals(True)
+        self._spin.setValue(ms / 1000)
+        self._spin.blockSignals(False)
+        self.adjustSize()
+        self.move(at - QPoint(0, self.sizeHint().height()))
+        self.show()
+        self._spin.setFocus()
+        self._spin.selectAll()
 
 
 class _Bar(QWidget):
@@ -5039,7 +5800,6 @@ class _PipWindow(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-        self._layout = lay
         self._player = player
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -5113,7 +5873,6 @@ def _clamp_rect(rect: QRect, min_w: int, min_h: int) -> QRect:
 
 
 class AnimePlayerWidget(QWidget):
-    closed = Signal()
     close_requested = Signal()
     alt_stream_requested = Signal(dict)
     playback_error = Signal(str)
@@ -5184,7 +5943,6 @@ class AnimePlayerWidget(QWidget):
         self._alt_opts: list = []
         self._quality_label = ""
         self._sub_gen = 0
-        self._sub_style = _load_sub_style()
         self._sub_pref: Optional[str] = None
         self._stream_gen = 0
         self._vod_retries = 0
@@ -5334,13 +6092,10 @@ class AnimePlayerWidget(QWidget):
         self._video_widget.installEventFilter(self)
         bar.installEventFilter(self)
 
-        self._sub_ov = _SubtitleOverlay(self)
         self._bubble = _SkipBubble(self)
         self._loader = _LoadingOverlay(self)
-        self._ov_timer = QTimer(self)
-        self._ov_timer.setInterval(120)
-        self._ov_timer.timeout.connect(self._sub_ov.refresh)
-        self._style_menu = self._build_style_menu()
+        self._delay_popup = _SubDelayPopup(self)
+        self._delay_popup.changed.connect(self._set_sub_delay)
 
         self._hide_timer = QTimer(self)
         self._hide_timer.setInterval(2500)
@@ -5981,11 +6736,7 @@ class AnimePlayerWidget(QWidget):
         self._show_sub_text("")
 
     def _show_sub_text(self, text: str) -> None:
-        self._sub_ov.set_text(text)
-        if text:
-            self._ov_timer.start()
-        else:
-            self._ov_timer.stop()
+        self._video_widget.videoSink().setSubtitleText(text)
 
     def _on_manifest_subs_ready(self, subs: list) -> None:
         if self._external_subs:
@@ -6002,14 +6753,24 @@ class AnimePlayerWidget(QWidget):
         if cues:
             self._update_subtitle(self._player.position())
 
+    def _set_sub_delay(self, ms: int) -> None:
+        self._sub_delay_ms = ms
+        self._cue_text = ""
+        if self._cues:
+            self._update_subtitle(self._player.position())
+
     def _nudge_sub_delay(self, delta_ms: int) -> None:
         if not self._cues:
             self._osd(tr("anime.sub_delay_na", default="No external subtitles to shift"))
             return
-        self._sub_delay_ms += delta_ms
-        self._cue_text = ""
-        self._update_subtitle(self._player.position())
+        self._set_sub_delay(self._sub_delay_ms + delta_ms)
         self._osd(tr("anime.sub_delay", default="Subtitle delay: {ms} ms").format(ms=f"{self._sub_delay_ms:+d}"))
+
+    def _show_delay_popup(self) -> None:
+        if not self._cues:
+            self._osd(tr("anime.sub_delay_na", default="No external subtitles to shift"))
+            return
+        self._delay_popup.popup(self._sub_delay_ms, self._sub_btn.mapToGlobal(QPoint(0, 0)))
 
     def _update_subtitle(self, ms: int) -> None:
         ms -= self._sub_delay_ms
@@ -6091,47 +6852,9 @@ class AnimePlayerWidget(QWidget):
             grp.addAction(act)
             act.triggered.connect(partial(self._on_subtitle_picked, i))
         menu.addSeparator()
-        menu.addMenu(self._style_menu)
-
-    def _set_sub_style(self, **kw) -> None:
-        self._sub_style.update(kw)
-        _save_sub_style(self._sub_style)
-        self._sub_ov.refresh(force=True)
-
-    def _build_style_menu(self) -> QMenu:
-        m = QMenu(tr("anime.subtitle_style", default="Subtitle style"), self)
-        m.setStyleSheet(_MENU_QSS)
-        st = self._sub_style
-
-        def group(title, options, key, label=lambda o: o[0], value=lambda o: o[1]):
-            sub = m.addMenu(title)
-            grp = QActionGroup(sub)
-            for o in options:
-                a = sub.addAction(label(o))
-                a.setCheckable(True)
-                a.setChecked(abs(float(st[key]) - float(value(o))) < 1e-6 if isinstance(value(o), (int, float)) and not isinstance(value(o), bool) else st[key] == value(o))
-                grp.addAction(a)
-                a.triggered.connect(partial(self._set_sub_style, **{key: value(o)}))
-
-        def _lbl(prefix: str):
-            return lambda o: tr(f"anime.sub_{prefix}.{o[0].lower().replace(' ', '_')}", default=o[0])
-
-        group(tr("anime.sub_style.font", default="Font"), _SUB_FONTS, "font", label=lambda o: o, value=lambda o: o)
-        group(tr("anime.sub_style.size", default="Size"), _SUB_SIZES, "size", label=_lbl("size"))
-        group(tr("anime.sub_style.color", default="Color"), _SUB_COLORS, "color", label=_lbl("color"))
-        group(tr("anime.sub_style.outline", default="Outline"), _SUB_OUTLINES, "outline", label=_lbl("outline"))
-        bold = m.addAction(tr("anime.sub_style.bold", default="Bold"))
-        bold.setCheckable(True)
-        bold.setChecked(bool(st["bold"]))
-        bold.toggled.connect(lambda v: self._set_sub_style(bold=bool(v)))
-        bg = m.addAction(tr("anime.sub_style.background", default="Background box"))
-        bg.setCheckable(True)
-        bg.setChecked(bool(st["bg"]))
-        bg.toggled.connect(lambda v: self._set_sub_style(bg=bool(v)))
-        m.addSeparator()
-        m.addAction(tr("anime.sub_style.reset_position", default="Reset position")).triggered.connect(
-            lambda: self._set_sub_style(x=_SUB_DEFAULTS["x"], y=_SUB_DEFAULTS["y"]))
-        return m
+        delay = menu.addAction(tr("anime.sub_delay_menu", default="Subtitle delay\u2026"))
+        delay.setEnabled(bool(self._cues))
+        delay.triggered.connect(self._show_delay_popup)
 
     def _populate_subtitle_options(self) -> None:
         self._sub_entries = [("off", -1, "")]
@@ -6272,17 +6995,10 @@ class AnimePlayerWidget(QWidget):
         self._bubble.deleteLater()
         self._bubble = _SkipBubble(self, owner)
         self._refresh_bubble()
-        self._sub_ov.hide()
-        self._sub_ov.deleteLater()
-        self._sub_ov = _SubtitleOverlay(self, owner)
-        self._ov_timer.timeout.disconnect()
-        self._ov_timer.timeout.connect(self._sub_ov.refresh)
         self._loader.set_active(False)
         self._loader.deleteLater()
         self._loader = _LoadingOverlay(self, owner)
         self._loader.set_active(self._busy_on)
-        if self._cue_text:
-            self._show_sub_text(self._cue_text)
 
     def enter_fullscreen(self) -> None:
         if self._is_fullscreen:
@@ -6427,15 +7143,12 @@ class AnimePlayerWidget(QWidget):
 
     def hideEvent(self, event) -> None:
         self._bubble.set_state(None, None)
-        self._sub_ov.hide()
         if not self._suppress_hide and not self._pip_active and self._playing():
             self._player.pause()
             self._auto_paused = True
         super().hideEvent(event)
 
     def showEvent(self, event) -> None:
-        if self._cue_text:
-            QTimer.singleShot(0, lambda: self._sub_ov.refresh(force=True))
         if self._auto_paused:
             self._player.play()
             self._auto_paused = False
@@ -6609,7 +7322,8 @@ def _resolve_ffmpeg() -> Optional[str]:
     return None
 
 def _download_hls_pure(url: str, referer: Optional[str], headers: dict, dest_path: str, item_id, download_manager, is_cancelled=None) -> None:
-    import time
+    import subprocess
+    import tempfile
     from urllib.parse import urljoin
 
     req_headers = {"User-Agent": _UA}
@@ -6617,95 +7331,280 @@ def _download_hls_pure(url: str, referer: Optional[str], headers: dict, dest_pat
         req_headers["Referer"] = referer
     req_headers.update(headers)
 
-    def _get(u: str) -> httpx.Response:
-        r = _ad_hoc_client.get(u, headers=req_headers, timeout=20)
-        r.raise_for_status()
-        return r
+    _SEGMENT_MAX = 32 << 20
+    _KEY_MAX = 64 << 10
+    _PLAYLIST_MAX = 4 << 20
+    _ATTR_RE = re.compile(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)')
+    _WORKERS = 4
 
-    text = _get(url).text
-    if "#EXT-X-STREAM-INF" in text:
-        variants = [urljoin(url, ln.strip()) for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+    def _attrs(line: str) -> dict[str, str]:
+        return {key.upper(): value.strip('"') for key, value in _ATTR_RE.findall(line)}
+
+    def _read(u: str, limit: int) -> bytes:
+        buf = bytearray()
+        with _ad_hoc_client.stream("GET", u, headers=req_headers, timeout=30) as r:
+            r.raise_for_status()
+            for chunk in r.iter_bytes(1 << 16):
+                if is_cancelled and is_cancelled():
+                    raise RuntimeError("Cancelled")
+                buf.extend(chunk)
+                if len(buf) > limit:
+                    raise RuntimeError("HLS resource is too large")
+        return bytes(buf)
+
+    def _text(u: str) -> str:
+        return _read(u, _PLAYLIST_MAX).decode("utf-8", "replace")
+
+    def _small(u: str, limit: int) -> bytes:
+        return _read(u, limit)
+
+    def _parse_media(base: str, text: str):
+        map_url = map_key = map_iv = None
+        key_url = key_iv = None
+        sequence = 0
+        segs: list[tuple[str, Optional[str], Optional[bytes]]] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            upper = line.upper()
+            if upper.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                try:
+                    sequence = max(0, int(line.split(":", 1)[1].strip()))
+                except ValueError:
+                    sequence = 0
+            elif upper.startswith("#EXT-X-MAP:"):
+                attrs = _attrs(line)
+                if attrs.get("URI"):
+                    map_url = urljoin(base, attrs["URI"])
+                    map_key = key_url
+                    map_iv = key_iv or ((sequence.to_bytes(16, "big")) if key_url else None)
+            elif upper.startswith("#EXT-X-KEY:"):
+                attrs = _attrs(line)
+                method = (attrs.get("METHOD") or "NONE").upper()
+                key_url = urljoin(base, attrs["URI"]) if method != "NONE" and attrs.get("URI") else None
+                match = _KEY_IV_RE.search(line)
+                key_iv = bytes.fromhex(match.group(1)) if match else None
+            elif not line.startswith("#"):
+                iv = key_iv or ((sequence + len(segs)).to_bytes(16, "big") if key_url else None)
+                segs.append((urljoin(base, line), key_url, iv))
+        return map_url, map_key, map_iv, segs
+
+    def _media(base: str) -> tuple:
+        text = _text(base)
+        if "#EXT-X-STREAM-INF" in text:
+            pending = None
+            variants = []
+            for raw in text.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.upper().startswith("#EXT-X-STREAM-INF:"):
+                    pending = _attrs(line)
+                elif not line.startswith("#") and pending is not None:
+                    pending["URI"] = line
+                    variants.append(pending)
+                    pending = None
+            if variants:
+                chosen = max(variants, key=lambda v: int(v.get("BANDWIDTH") or 0))
+                base = urljoin(base, chosen["URI"])
+                text = _text(base)
+        return _parse_media(base, text)
+
+    master_url = url
+    master = _text(url)
+    audio_url = None
+    if "#EXT-X-STREAM-INF" in master:
+        audio_groups: dict[str, list[dict]] = {}
+        pending = None
+        variants = []
+        for raw in master.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            upper = line.upper()
+            if upper.startswith("#EXT-X-MEDIA:") and "TYPE=AUDIO" in upper:
+                attrs = _attrs(line)
+                if attrs.get("URI"):
+                    audio_groups.setdefault(attrs.get("GROUP-ID", ""), []).append(attrs)
+            elif upper.startswith("#EXT-X-STREAM-INF:"):
+                pending = _attrs(line)
+            elif not line.startswith("#") and pending is not None:
+                pending["URI"] = line
+                variants.append(pending)
+                pending = None
         if variants:
-            url = variants[-1]
-            text = _get(url).text
+            chosen = max(variants, key=lambda v: int(v.get("BANDWIDTH") or 0))
+            url = urljoin(url, chosen["URI"])
+            entries = audio_groups.get(chosen.get("AUDIO", ""), [])
+            if entries:
+                pick = next((e for e in entries if (e.get("DEFAULT") or "").upper() == "YES"), entries[0])
+                audio_url = urljoin(master_url, pick["URI"])
+            master = _text(url)
 
-    seg_urls: list[str] = []
-    key_url = None
-    key_iv = None
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("#EXT-X-KEY"):
-            m = _KEY_URI_RE.search(line)
-            if m:
-                key_url = urljoin(url, m.group(1))
-            iv_m = _KEY_IV_RE.search(line)
-            if iv_m:
-                key_iv = bytes.fromhex(iv_m.group(1))
-        elif line and not line.startswith("#"):
-            seg_urls.append(urljoin(url, line))
-
+    map_url, map_key, map_iv, seg_urls = _parse_media(url, master)
     if not seg_urls:
         raise RuntimeError("No segments found in HLS playlist")
 
-    key_bytes = _get(key_url).content if key_url else None
+    key_cache: dict[str, bytes] = {}
     cipher_cls = None
     AES = None
     Cipher = algorithms = modes = None
-    if key_bytes:
-        try:
-            from Crypto.Cipher import AES
-            cipher_cls = "pycryptodome"
-        except ImportError:
-            try:
-                from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-                cipher_cls = "cryptography"
-            except ImportError:
-                raise RuntimeError("Encrypted stream requires the pycryptodome or cryptography package") from None
 
-    total_segments = len(seg_urls)
+    def _key(u: str) -> bytes:
+        if u not in key_cache:
+            key_cache[u] = _small(u, _KEY_MAX)
+        return key_cache[u]
+
+    def _decrypt(data: bytes, key_u: str, iv: bytes) -> bytes:
+        nonlocal cipher_cls, AES, Cipher, algorithms, modes
+        if cipher_cls is None:
+            try:
+                from Crypto.Cipher import AES
+                cipher_cls = "pycryptodome"
+            except ImportError:
+                try:
+                    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+                    cipher_cls = "cryptography"
+                except ImportError:
+                    raise RuntimeError("Encrypted stream requires the pycryptodome or cryptography package") from None
+        if cipher_cls == "pycryptodome":
+            out = AES.new(_key(key_u), AES.MODE_CBC, iv).decrypt(data)
+        else:
+            decryptor = Cipher(algorithms.AES(_key(key_u)), modes.CBC(iv)).decryptor()
+            out = decryptor.update(data) + decryptor.finalize()
+        pad = out[-1] if out else 0
+        if 1 <= pad <= 16 and len(out) >= pad and out.endswith(bytes([pad]) * pad):
+            out = out[:-pad]
+        return out
+
+    tmpdir = tempfile.mkdtemp(prefix="pirachest-hls-", dir=os.path.dirname(dest_path) or ".")
     downloaded_bytes = 0
     start_time = time.time()
     last_emit = 0.0
     last_bytes = 0
     last_time = start_time
     avg_seg_size = 0.0
+    try:
+        def _fetch(idx: int, seg: tuple[str, Optional[str], Optional[bytes]]):
+            seg_url, key_url, key_iv = seg
+            part = os.path.join(tmpdir, f"{idx:06d}.part")
+            if key_url:
+                data = _small(seg_url, _SEGMENT_MAX)
+                if is_cancelled and is_cancelled():
+                    raise RuntimeError("Cancelled")
+                data = _decrypt(data, key_url, key_iv if key_iv else idx.to_bytes(16, "big"))
+                with open(part, "wb") as fh:
+                    fh.write(data)
+                return part, len(data)
+            written = 0
+            with _ad_hoc_client.stream("GET", seg_url, headers=req_headers, timeout=30) as resp:
+                resp.raise_for_status()
+                with open(part, "wb") as fh:
+                    for chunk in resp.iter_bytes(1 << 18):
+                        if is_cancelled and is_cancelled():
+                            raise RuntimeError("Cancelled")
+                        written += len(chunk)
+                        if written > _SEGMENT_MAX:
+                            raise RuntimeError("HLS segment is too large")
+                        fh.write(chunk)
+            return part, written
 
-    with open(dest_path, "wb") as fh:
-        for idx, seg_url in enumerate(seg_urls):
-            if is_cancelled and is_cancelled():
-                raise RuntimeError("Cancelled")
-            resp = _get(seg_url)
-            data = resp.content
-            if key_bytes:
-                iv = key_iv if key_iv else idx.to_bytes(16, "big")
-                if cipher_cls == "pycryptodome":
-                    data = AES.new(key_bytes, AES.MODE_CBC, iv).decrypt(data)
-                else:
-                    decryptor = Cipher(algorithms.AES(key_bytes), modes.CBC(iv)).decryptor()
-                    data = decryptor.update(data) + decryptor.finalize()
+        def _write_map(fh, u, key_u, iv):
+            if not u:
+                return 0
+            data = _small(u, _SEGMENT_MAX)
+            if key_u:
+                data = _decrypt(data, key_u, iv if iv else b"\0" * 16)
             fh.write(data)
-            seg_size = len(data)
-            downloaded_bytes += seg_size
-            avg_seg_size = seg_size if idx == 0 else avg_seg_size * 0.8 + seg_size * 0.2
+            return len(data)
 
-            now = time.time()
-            if now - last_emit > 0.3 or idx == total_segments - 1:
-                elapsed = now - last_time
-                speed_kbps = ((downloaded_bytes - last_bytes) / 1024) / elapsed if elapsed > 0 else 0.0
-                last_bytes = downloaded_bytes
-                last_time = now
-                last_emit = now
-                progress = (idx + 1) / total_segments * 100
-                remaining = total_segments - (idx + 1)
-                estimated_total = downloaded_bytes + int(avg_seg_size * remaining)
-                download_manager.update_external(
-                    item_id,
-                    downloaded_bytes=downloaded_bytes,
-                    total_bytes=max(estimated_total, downloaded_bytes),
-                    progress=progress,
-                    speed_down_kbps=speed_kbps,
-                )
-    return dest_path
+        def _concat(segs, out_path: str, start_frac: float, end_frac: float,
+                    start_map=None, start_key=None, start_iv=None) -> int:
+            nonlocal downloaded_bytes, last_emit, last_bytes, last_time, avg_seg_size
+            total = len(segs)
+            written_total = 0
+            with open(out_path, "wb") as fh:
+                written_total += _write_map(fh, start_map, start_key, start_iv)
+                with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
+                    futures = {}
+                    next_submit = 0
+                    for idx in range(total):
+                        if is_cancelled and is_cancelled():
+                            raise RuntimeError("Cancelled")
+                        while next_submit < total and next_submit < idx + _WORKERS:
+                            futures[next_submit] = pool.submit(_fetch, next_submit, segs[next_submit])
+                            next_submit += 1
+                        part, size = futures.pop(idx).result()
+                        with open(part, "rb") as src:
+                            shutil.copyfileobj(src, fh, 1 << 20)
+                        try:
+                            os.remove(part)
+                        except OSError:
+                            pass
+                        written_total += size
+                        downloaded_bytes += size
+                        avg_seg_size = size if idx == 0 else avg_seg_size * 0.8 + size * 0.2
+                        now = time.time()
+                        if now - last_emit > 0.3 or idx == total - 1:
+                            elapsed = now - last_time
+                            speed_kbps = ((downloaded_bytes - last_bytes) / 1024) / elapsed if elapsed > 0 else 0.0
+                            last_bytes = downloaded_bytes
+                            last_time = now
+                            last_emit = now
+                            progress = (start_frac + (end_frac - start_frac) * (idx + 1) / total) * 100
+                            remaining = total - (idx + 1)
+                            estimated_total = downloaded_bytes + int(avg_seg_size * remaining)
+                            download_manager.update_external(
+                                item_id,
+                                downloaded_bytes=downloaded_bytes,
+                                total_bytes=max(estimated_total, downloaded_bytes),
+                                progress=progress,
+                                speed_down_kbps=speed_kbps,
+                            )
+            return written_total
+
+        video_part = os.path.join(tmpdir, "video.ts")
+        _concat(seg_urls, video_part, 0.0, 0.85 if audio_url else 1.0, map_url, map_key, map_iv)
+
+        audio_part = None
+        if audio_url:
+            try:
+                a_map, a_key, a_iv, audio_segs = _media(audio_url)
+                if audio_segs:
+                    audio_part = os.path.join(tmpdir, "audio.ts")
+                    _concat(audio_segs, audio_part, 0.85, 1.0, a_map, a_key, a_iv)
+            except Exception:
+                if is_cancelled and is_cancelled():
+                    raise
+                logger.warning("HLS audio rendition failed; keeping video track", exc_info=True)
+                audio_part = None
+
+        if audio_part and os.path.getsize(audio_part) > 0:
+            ffmpeg = _resolve_ffmpeg()
+            if ffmpeg:
+                kwargs = {}
+                if os.name == "nt":
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    kwargs["startupinfo"] = startupinfo
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                try:
+                    subprocess.run(
+                        [ffmpeg, "-y", "-loglevel", "error", "-i", video_part,
+                         "-i", audio_part, "-c", "copy", "-f", "mpegts", dest_path],
+                        check=True, timeout=900, **kwargs)
+                    return dest_path
+                except Exception:
+                    logger.warning("HLS remux failed; falling back to video only", exc_info=True)
+            else:
+                logger.warning("HLS stream has a separate audio rendition but ffmpeg is unavailable; "
+                               "downloading video only")
+
+        os.replace(video_part, dest_path)
+        return dest_path
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _download_ffmpeg_stream(url: str, referer: Optional[str], headers: dict, dest_path: str,
@@ -6994,127 +7893,82 @@ _QUALITY_CAPABLE_PROVIDERS = {"animegg"}
 _SUBTITLE_CAPABLE_PROVIDERS = {"animedunya", "anipub", "anikoto", "kaa", "anizone"}
 
 class AnimeDownloadDialog(MessageBoxBase):
+    _NON_PROVIDERS = {"page", "type", "mappings", "_unknownProviders"}
+    _GENERIC_TITLE = re.compile(r"(?i)(?:episode|ep\.?)\s*#?\s*\d+(?:\.\d+)?")
+
     def __init__(self, episodes_by_provider: dict, default_provider: Optional[str], default_audio: str,
                  parent=None, preset_episode: Any = None) -> None:
         super().__init__(parent)
         self._episodes_by_provider = episodes_by_provider
-        self._checkboxes: list[tuple[dict, CheckBox]] = []
+        self._items: list[tuple[dict, QTreeWidgetItem]] = []
         self._preset_episode = _episode_key_number(preset_episode)
+        lay = self.viewLayout
+        lay.setSpacing(8)
+        lay.addWidget(SubtitleLabel(tr("anime.download_dialog_title", default="Download Episodes"), self))
 
-        self.titleLabel = SubtitleLabel(tr("anime.download_dialog_title", default="Download Episodes"), self)
-        self.viewLayout.addWidget(self.titleLabel)
-
-        layout = self.viewLayout
-        layout.setSpacing(12)
-
-        form_row = QHBoxLayout()
-        form_row.setSpacing(10)
-
-        _non_provider_keys = {"page", "type", "mappings", "_unknownProviders"}
-        provider_names = sorted(
+        names = sorted(
             name for name, pdata in episodes_by_provider.items()
-            if name not in _non_provider_keys
-            and isinstance(pdata, dict) and not pdata.get("error")
-            and isinstance(pdata.get("episodes"), dict) and pdata["episodes"].get("sub")
-        )
+            if name not in self._NON_PROVIDERS and isinstance(pdata, dict) and not pdata.get("error")
+            and isinstance(pdata.get("episodes"), dict) and pdata["episodes"].get("sub"))
 
-        self._provider_combo = ComboBox()
-        self._provider_combo.setFixedWidth(150)
-        for name in provider_names:
-            self._provider_combo.addItem(name, userData=name)
-        if default_provider in provider_names:
-            self._provider_combo.setCurrentIndex(provider_names.index(default_provider))
+        def combo(entries: list, current: int = 0) -> ComboBox:
+            box = ComboBox()
+            for label, value in entries:
+                box.addItem(label, userData=value)
+            box.setCurrentIndex(current)
+            return box
 
-        form_row.addWidget(StrongBodyLabel(tr("anime.provider", default="Provider")))
-        form_row.addWidget(self._provider_combo)
-        form_row.addStretch(1)
-
-        self._audio_container = QWidget()
-        audio_container_layout = QHBoxLayout(self._audio_container)
-        audio_container_layout.setContentsMargins(0, 0, 0, 0)
-        audio_container_layout.setSpacing(10)
-        self._audio_combo = ComboBox()
-        self._audio_combo.addItem(tr("anime.sub", default="Sub"), userData="sub")
-        self._audio_combo.addItem(tr("anime.dub", default="Dub"), userData="dub")
-        self._audio_combo.setCurrentIndex(1 if default_audio == "dub" else 0)
-        audio_container_layout.addWidget(self._audio_combo)
-        form_row.addWidget(self._audio_container)
-
-        layout.addLayout(form_row)
-
-        quality_row = QHBoxLayout()
-        quality_row.setSpacing(10)
-
-        self._quality_container = QWidget()
-        quality_container_layout = QHBoxLayout(self._quality_container)
-        quality_container_layout.setContentsMargins(0, 0, 0, 0)
-        quality_container_layout.setSpacing(10)
-        self._quality_combo = ComboBox()
-        for label, value in (
-            (tr("anime.quality_best", default="Best available"), "best"),
-            ("1080p", "1080"),
-            ("720p", "720"),
-            ("480p", "480"),
-            ("360p", "360"),
-            (tr("anime.quality_worst", default="Worst available"), "worst"),
-        ):
-            self._quality_combo.addItem(label, userData=value)
-        quality_container_layout.addWidget(StrongBodyLabel(tr("anime.quality", default="Quality")))
-        quality_container_layout.addWidget(self._quality_combo, 1)
-        quality_row.addWidget(self._quality_container, 1)
-
-        self._subtitle_container = QWidget()
-        subtitle_container_layout = QHBoxLayout(self._subtitle_container)
-        subtitle_container_layout.setContentsMargins(0, 0, 0, 0)
-        subtitle_container_layout.setSpacing(10)
-        self._subtitle_combo = ComboBox()
-        for label, value in (
+        self._provider_combo = combo([(n, n) for n in names], names.index(default_provider) if default_provider in names else 0)
+        self._audio_combo = combo([(tr("anime.sub", default="Sub"), "sub"), (tr("anime.dub", default="Dub"), "dub")],
+                                  1 if default_audio == "dub" else 0)
+        self._quality_combo = combo([
+            (tr("anime.quality_best", default="Best available"), "best"), ("1080p", "1080"), ("720p", "720"),
+            ("480p", "480"), ("360p", "360"), (tr("anime.quality_worst", default="Worst available"), "worst")])
+        self._subtitle_combo = combo([
             (tr("anime.subtitles_none", default="No subtitles"), "none"),
             (tr("anime.subtitles_auto", default="Auto (default track)"), "auto"),
             (tr("anime.subtitles_all", default="All languages"), "all"),
-            ("English", "english"),
-            ("Spanish", "spanish"),
-            ("French", "french"),
-            ("German", "german"),
-            ("Portuguese", "portuguese"),
-            ("Arabic", "arabic"),
-            ("Japanese", "japanese"),
-        ):
-            self._subtitle_combo.addItem(label, userData=value)
-        subtitle_container_layout.addWidget(StrongBodyLabel(tr("anime.subtitles", default="Subtitles")))
-        subtitle_container_layout.addWidget(self._subtitle_combo, 1)
-        quality_row.addWidget(self._subtitle_container, 1)
+            ("English", "english"), ("Spanish", "spanish"), ("French", "french"), ("German", "german"),
+            ("Portuguese", "portuguese"), ("Arabic", "arabic"), ("Japanese", "japanese")])
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        fields = ((tr("anime.provider", default="Provider"), self._provider_combo),
+                  (tr("anime.audio", default="Audio"), self._audio_combo),
+                  (tr("anime.quality", default="Quality"), self._quality_combo),
+                  (tr("anime.subtitles", default="Subtitles"), self._subtitle_combo))
+        self._fields = {}
+        for i, (label, widget) in enumerate(fields):
+            self._fields[widget] = _meta_field(label, widget, self)
+            grid.addWidget(self._fields[widget], i // 2, i % 2)
+        lay.addLayout(grid)
 
-        self._quality_row_widget = QWidget()
-        self._quality_row_widget.setLayout(quality_row)
-        layout.addWidget(self._quality_row_widget)
+        bar = QHBoxLayout()
+        self._all_chk = CheckBox(tr("anime.select_all", default="Select All"), self)
+        self._all_chk.stateChanged.connect(self._on_select_all)
+        self._count_lbl = CaptionLabel("", self)
+        apply_label_theme(self._count_lbl, "muted")
+        bar.addWidget(self._all_chk)
+        bar.addStretch(1)
+        bar.addWidget(self._count_lbl)
+        lay.addLayout(bar)
 
-        self._select_all_chk = CheckBox(tr("anime.select_all", default="Select All"))
-        self._select_all_chk.stateChanged.connect(self._on_select_all)
-        layout.addWidget(self._select_all_chk)
+        self._tree, box = _check_tree(self, [""], (), False)
+        self._tree.setMinimumHeight(180)
+        self._tree.itemChanged.connect(self._sync)
+        lay.addWidget(box, 1)
 
-        scroll = SmoothScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setFixedHeight(280)
-        scroll.setFrameShape(QAbstractScrollArea.Shape.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-
-        self._ep_container = QWidget()
-        self._ep_layout = QVBoxLayout(self._ep_container)
-        self._ep_layout.setContentsMargins(4, 4, 4, 4)
-        self._ep_layout.setSpacing(6)
-        scroll.setWidget(self._ep_container)
-        layout.addWidget(scroll, 1)
-
-        self._error_lbl = CaptionLabel("")
+        self._error_lbl = CaptionLabel("", self)
         self._error_lbl.setStyleSheet(f"color: {palette()['state_error']};")
         self._error_lbl.hide()
-        layout.addWidget(self._error_lbl)
+        lay.addWidget(self._error_lbl)
 
         self.yesButton.setText(tr("anime.download", default="Download"))
         self.yesButton.setIcon(FluentIcon.DOWNLOAD)
         self.cancelButton.setText(tr("anime.cancel", default="Cancel"))
-        self.widget.setMinimumWidth(460)
+        self.widget.setMinimumWidth(520)
 
         self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         self._audio_combo.currentIndexChanged.connect(self._rebuild_episode_list)
@@ -7122,84 +7976,79 @@ class AnimeDownloadDialog(MessageBoxBase):
 
     def _on_provider_changed(self, _index: int = 0) -> None:
         provider = self._provider_combo.currentData()
-        provider_data = self._episodes_by_provider.get(provider) or {}
-        provider_episodes = provider_data.get("episodes") or {}
-
-        has_dub = bool(provider_episodes.get("dub"))
-        self._audio_container.setVisible(has_dub)
+        listing = (self._episodes_by_provider.get(provider) or {}).get("episodes") or {}
+        has_dub = bool(listing.get("dub"))
         if not has_dub:
             self._audio_combo.blockSignals(True)
             self._audio_combo.setCurrentIndex(0)
             self._audio_combo.blockSignals(False)
-
-        has_quality = provider in _QUALITY_CAPABLE_PROVIDERS
-        self._quality_container.setVisible(has_quality)
-        has_subs = provider in _SUBTITLE_CAPABLE_PROVIDERS
-        self._subtitle_container.setVisible(has_subs)
-        self._quality_row_widget.setVisible(has_quality or has_subs)
-
+        self._fields[self._audio_combo].setVisible(has_dub)
+        self._fields[self._quality_combo].setVisible(provider in _QUALITY_CAPABLE_PROVIDERS)
+        self._fields[self._subtitle_combo].setVisible(provider in _SUBTITLE_CAPABLE_PROVIDERS)
         self._rebuild_episode_list()
 
     def _on_select_all(self, _state) -> None:
-        checked = self._select_all_chk.isChecked()
-        for _, chk in self._checkboxes:
-            chk.setChecked(checked)
+        state = Qt.CheckState.Checked if self._all_chk.isChecked() else Qt.CheckState.Unchecked
+        self._tree.blockSignals(True)
+        for _ep, item in self._items:
+            item.setCheckState(0, state)
+        self._tree.blockSignals(False)
+        self._sync()
+
+    def _sync(self, *_args) -> None:
+        picked = sum(item.checkState(0) == Qt.CheckState.Checked for _ep, item in self._items)
+        self._all_chk.blockSignals(True)
+        self._all_chk.setChecked(bool(self._items) and picked == len(self._items))
+        self._all_chk.blockSignals(False)
+        self._count_lbl.setText(f"{picked} / {len(self._items)}")
+        self._error_lbl.hide()
 
     def validate(self) -> bool:
-        if any(chk.isChecked() for _ep, chk in self._checkboxes):
+        if any(item.checkState(0) == Qt.CheckState.Checked for _ep, item in self._items):
             return True
         self._error_lbl.setText(tr("anime.select_episode_error", default="Select an episode to download"))
         self._error_lbl.show()
         return False
 
     def _rebuild_episode_list(self) -> None:
-        while self._ep_layout.count():
-            item = self._ep_layout.takeAt(0)
-            w = item.widget() if hasattr(item, "widget") else None
-            if w:
-                w.deleteLater()
-        self._checkboxes.clear()
-        self._error_lbl.hide()
-
-        provider = self._provider_combo.currentData()
-        audio = self._audio_combo.currentData() or "sub"
-        provider_data = self._episodes_by_provider.get(provider) or {}
-        episodes = provider_data.get("episodes")
-        episodes = episodes.get(audio, []) if isinstance(episodes, dict) else []
-
-        for ep in episodes:
+        self._tree.blockSignals(True)
+        self._tree.clear()
+        self._items = []
+        listing = (self._episodes_by_provider.get(self._provider_combo.currentData()) or {}).get("episodes")
+        for ep in (listing.get(self._audio_combo.currentData() or "sub", []) if isinstance(listing, dict) else []):
             label = _episode_number_label(ep.get("number"))
-            if ep.get("title"):
-                label = f"{label} — {ep['title']}"
-            chk = CheckBox(label)
-            if self._preset_episode is not None and _episode_key_number(ep.get("number")) == self._preset_episode:
-                chk.setChecked(True)
-            self._ep_layout.addWidget(chk)
-            self._checkboxes.append((ep, chk))
-        self._ep_layout.addStretch(1)
+            title = (ep.get("title") or "").strip()
+            if title and not self._GENERIC_TITLE.fullmatch(title):
+                label = f"{label}  \u00b7  {title}"
+            item = QTreeWidgetItem(self._tree, [label])
+            item.setToolTip(0, label)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            preset = self._preset_episode is not None and _episode_key_number(ep.get("number")) == self._preset_episode
+            item.setCheckState(0, Qt.CheckState.Checked if preset else Qt.CheckState.Unchecked)
+            self._items.append((ep, item))
+        self._tree.blockSignals(False)
+        self._sync()
 
     def selected(self) -> tuple[Optional[str], str, list[dict], str, str]:
-        provider = self._provider_combo.currentData()
-        audio = self._audio_combo.currentData() or "sub"
-        episodes = [ep for ep, chk in self._checkboxes if chk.isChecked()]
-        quality = self._quality_combo.currentData() or "best"
-        subtitle_lang = self._subtitle_combo.currentData() or "none"
-        return provider, audio, episodes, quality, subtitle_lang
+        return (self._provider_combo.currentData(), self._audio_combo.currentData() or "sub",
+                [ep for ep, item in self._items if item.checkState(0) == Qt.CheckState.Checked],
+                self._quality_combo.currentData() or "best", self._subtitle_combo.currentData() or "none")
 
-class AnimeDetailView(QWidget):
+
+class AnimeDetailView(_DetailsChrome, QWidget):
     back_requested = Signal()
     download_requested = Signal(object, str, str, object, str, str)
     provider_requested = Signal(str)
     season_requested = Signal(object)
     banner_changed = Signal()
+    genre_requested = Signal(str)
 
     def _set_genre_pills(self, genres: list) -> None:
         for p in self._genre_pills:
             p.deleteLater()
         self._genre_pills = []
         for g in genres:
-            pill = PillPushButton(str(g), self._genres_box)
-            pill.setCheckable(False)
+            pill = _genre_pill(str(g), self._genres_box, self.genre_requested.emit)
             pill.setFixedHeight(28)
             self._genres_row.insertWidget(self._genres_row.count() - 1, pill)
             self._genre_pills.append(pill)
@@ -7234,7 +8083,6 @@ class AnimeDetailView(QWidget):
         self._back_btn.clicked.connect(self.back_requested.emit)
         top_row.addWidget(self._back_btn)
         top_row.addStretch(1)
-        outer.addLayout(top_row)
 
         scroll = SmoothScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -7250,6 +8098,9 @@ class AnimeDetailView(QWidget):
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 4, 20)
         content_layout.setSpacing(12)
+        self._content_layout = content_layout
+        self._content_margins = (0, 0, 4, 20)
+        content_layout.addLayout(top_row)
         scroll.setWidget(content)
 
         header = QHBoxLayout()
@@ -7707,6 +8558,12 @@ class AnimeDetailView(QWidget):
         if not self._media or not self._episodes_by_provider:
             self._download_pending = True
             return
+        listing = (self._episodes_by_provider.get(self._current_provider) or {}).get("episodes") or {}
+        only = listing.get(self._current_audio) or listing.get("sub") or []
+        if preset_episode is None and len(only) == 1 and self._current_provider:
+            audio = self._current_audio if listing.get(self._current_audio) else "sub"
+            self.download_requested.emit(self._media, self._current_provider, audio, list(only), "best", "none")
+            return
         dlg = AnimeDownloadDialog(self._episodes_by_provider, self._current_provider, self._current_audio,
                                   parent=self.window(), preset_episode=preset_episode)
         if not dlg.exec():
@@ -8024,6 +8881,21 @@ class AnimePage(_MediaTab):
     def _start_search(self, query: str, on_done, on_error):
         return _worker_module.submit_coro(_search_anime, args=(query,), on_done=on_done, on_error=on_error)
 
+    def _start_resolve_genres(self, names, on_done, on_error):
+        return _worker_module.submit_coro(_resolve_anime_genres, args=(names,), on_done=on_done, on_error=on_error)
+
+    def _start_genre_page(self, page: int, on_done, on_error):
+        return _worker_module.submit_coro(_browse_anime_genres, args=(list(self._genre_names), page),
+                                          on_done=on_done, on_error=on_error)
+
+    def _start_random(self, exclude, on_done, on_error):
+        return _worker_module.submit_coro(_random_anime, args=(exclude,),
+                                          on_done=lambda res: on_done(res[0] if res else None), on_error=on_error)
+
+    def _open_random(self, item) -> None:
+        self._last_random = _safe_int(item.id)
+        self._on_anime_clicked(item)
+
     def _open_details(self, item, media_type: str = "anime") -> None:
         self._on_anime_clicked(item)
 
@@ -8036,7 +8908,11 @@ class AnimePage(_MediaTab):
         self._download_manager = manager
 
     def _on_download_requested(self, media: dict, provider: str, audio: str, episodes: list, quality: str, subtitle_lang: str) -> None:
-        if self._download_manager is None:
+        manager = _resolve_manager(self)
+        if manager is None:
+            InfoBar.error(title=tr("anime.download_failed_title", default="Download failed"),
+                          content=tr("tv.download.no_manager", default="The download manager is not available."),
+                          parent=self.window(), duration=4000, isClosable=True)
             return
         anilist_id = media.get("id")
         title_obj = media.get("title") or {}
@@ -8045,23 +8921,23 @@ class AnimePage(_MediaTab):
 
         for ep in episodes:
             label = _episode_number_label(ep.get("number"))
-            item_id = self._download_manager.add_external(
+            item_id = manager.add_external(
                 game_name=f"{title} - {label}", console=title, source=provider, category="anime",
             )
 
             def _on_done(path: str, iid=item_id) -> None:
-                self._download_manager.complete_external(iid, path)
+                manager.complete_external(iid, path)
 
             def _on_err(msg: str, iid=item_id) -> None:
-                self._download_manager.fail_external(iid, msg)
+                manager.fail_external(iid, msg)
 
             task_id = _worker_module.submit(
                 _do_download_anime_episode,
-                args=(self._download_manager, item_id, anilist_id, provider, audio, ep, dest_dir),
+                args=(manager, item_id, anilist_id, provider, audio, ep, dest_dir),
                 kwargs={"quality": quality, "subtitle_lang": subtitle_lang},
                 on_done=_on_done, on_error=_on_err,
             )
-            self._download_manager.register_external_cancel(item_id, lambda tid=task_id: _worker_module.cancel(tid))
+            manager.register_external_cancel(item_id, lambda tid=task_id: _worker_module.cancel(tid))
 
         InfoBar.success(
             title=tr("anime.download_queued_title", default="Download queued"),
@@ -8097,9 +8973,8 @@ class AnimePage(_MediaTab):
         menu = RoundMenu(parent=self)
         menu.addAction(Action(FluentIcon.VIEW, tr('tv.watchlater_open', default='Open'),
                               triggered=lambda: self._open_details(card, 'anime')))
-        if self._download_manager is not None:
-            menu.addAction(Action(FluentIcon.DOWNLOAD, tr('tv.download.action', default='Download...'),
-                                  triggered=lambda: self._open_anime_and_download(card)))
+        menu.addAction(Action(FluentIcon.DOWNLOAD, tr('tv.download.action', default='Download...'),
+                              triggered=lambda: self._open_anime_and_download(card)))
         saved = watch_later_store().has('anime', media_id)
         menu.addAction(Action(themed_icon('tv.watchlater', FluentIcon.HEART),
                               tr('tv.watchlater_remove', default='Remove from watch later') if saved
@@ -8327,6 +9202,10 @@ class _WatchLaterView(QWidget):
         apply_label_theme(self._count_lbl, 'muted')
         header.addWidget(self._count_lbl, 0, Qt.AlignmentFlag.AlignBottom)
         header.addStretch(1)
+        self._dice_btn = _DiceButton(tr('tv.random', default='Surprise me'), self)
+        self._dice_btn.clicked.connect(self._surprise_me)
+        header.addWidget(self._dice_btn)
+        self._last_random: Optional[str] = None
         outer.addLayout(header)
 
         self._grid = PosterGrid(self, cover_attrs=('poster_url',), key_attr='key', show_caption=True,
@@ -8363,6 +9242,21 @@ class _WatchLaterView(QWidget):
         self._empty_lbl.setVisible(not entries)
         self._grid.setVisible(bool(entries))
 
+    def _surprise_me(self) -> None:
+        store = watch_later_store()
+        entries = [e for e in store.all() if e.get('raw')]
+        if not entries:
+            InfoBar.info(
+                title=tr('tv.watchlater_random_empty_title', default='Nothing to pick from'),
+                content=tr('tv.watchlater_random_empty', default='Save something to Watch later first.'),
+                parent=self.window(), duration=2500, isClosable=True,
+            )
+            return
+        pool = [e for e in entries if store.entry_key(e) != self._last_random] or entries
+        entry = _RNG.choice(pool)
+        self._last_random = store.entry_key(entry)
+        self.open_requested.emit(entry)
+
     def _show_menu(self, item, pos: QPoint) -> None:
         entry = getattr(item, 'entry', None)
         if not isinstance(entry, dict):
@@ -8381,6 +9275,7 @@ class _WatchLaterView(QWidget):
 
     def apply_locale(self) -> None:
         self._back_btn.setText(tr('tv.movies.back', default='Back'))
+        self._dice_btn.setToolTip(tr('tv.random', default='Surprise me'))
         self._title_lbl.setText(tr('tv.watchlater', default='Watch later'))
         self._empty_lbl.setText(tr('tv.watchlater_empty',
                                    default='Nothing saved yet. Use the watch later button on a movie, show, or anime.'))
@@ -8393,7 +9288,7 @@ class _WatchLaterView(QWidget):
             pass
 
 
-class TV_page(QWidget):
+class TV_page(MediaPageBase):
     _TABS = (
         ('movies', FluentIcon.MOVIE, 'tv.movies'),
         ('series', FluentIcon.VIDEO, 'tv.series'),
@@ -8401,17 +9296,26 @@ class TV_page(QWidget):
         ('channels', FluentIcon.TILES, 'tv.channels'),
     )
 
+    _TOP = 12
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName('tvPage')
         self.setStyleSheet('background: transparent;')
         self._download_manager: Any = None
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(24, 12, 24, 20)
+        outer.setContentsMargins(24, self._TOP, 24, 0)
         outer.setSpacing(12)
 
         self._pivot = Pivot()
-        outer.addWidget(self._pivot)
+        self._header = QWidget(self)
+        header_layout = QVBoxLayout(self._header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.addWidget(self._pivot)
+        outer.addWidget(self._header)
+        self._floating = False
+        self._pivot_shown = True
+        self._inset = -1
 
         self._stack = QStackedWidget()
         outer.addWidget(self._stack, 1)
@@ -8445,6 +9349,39 @@ class TV_page(QWidget):
         return _TVTabPlaceholder(themed_icon(f'tv.tab_{key}', self._tab_icons[key]),
                                  self._tab_text_keys[key], self)
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._sync_top()
+
+    def _sync_top(self) -> None:
+        tab = self._stack.currentWidget()
+        details = getattr(tab, '_details', None)
+        inner = getattr(tab, '_stack', None)
+        height = self._header.sizeHint().height() if self._pivot_shown else 0
+        active = (details is not None and inner is not None and height > 0
+                  and inner.currentWidget() is details and details.isVisible())
+        layout = self.layout()
+        margins = layout.contentsMargins()
+        if active != self._floating:
+            self._floating = active
+            layout.setContentsMargins(margins.left(), 0 if active else self._TOP, margins.right(), margins.bottom())
+            if active:
+                layout.removeWidget(self._header)
+            else:
+                layout.insertWidget(0, self._header)
+        if active:
+            self._header.setGeometry(margins.left(), self._TOP - details.banner_offset(),
+                                     self.width() - margins.left() - margins.right(), height)
+            self._header.raise_()
+        inset = height + self._TOP + layout.spacing() if height else 0
+        if inset != self._inset:
+            self._inset = inset
+            for child in self._tabs.values():
+                view = getattr(child, '_details', None)
+                if hasattr(view, 'set_top_inset'):
+                    view.set_top_inset(inset)
+        self.update()
+
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
         details = getattr(self._stack.currentWidget(), '_details', None)
@@ -8472,7 +9409,9 @@ class TV_page(QWidget):
         self._tabs[key] = tab
         details = getattr(tab, '_details', None)
         if details is not None and hasattr(details, 'banner_changed'):
-            details.banner_changed.connect(self.update)
+            details.banner_changed.connect(self._sync_top)
+            if hasattr(details, 'set_top_inset') and self._inset > 0:
+                details.set_top_inset(self._inset)
         if self._download_manager is not None and hasattr(tab, 'set_download_manager'):
             tab.set_download_manager(self._download_manager)
         return tab
@@ -8503,14 +9442,17 @@ class TV_page(QWidget):
         apply_pivot_theme(self._pivot)
         self._pivot.currentItemChanged.connect(self._on_tab_changed)
         self._tab_handler_connected = True
-        self._pivot.setVisible(len(enabled) > 1)
+        self._pivot_shown = len(enabled) > 1
+        self._header.setVisible(self._pivot_shown)
+        self._pivot.setVisible(self._pivot_shown)
         self._pivot.setCurrentItem(current)
         tab = self._ensure_tab(current)
         if tab is not None:
-            self._stack.setCurrentWidget(tab)
+            self._switch_stack_animated(tab)
         self._current_tab_key = current
         if tab is not None and hasattr(tab, 'activate'):
             tab.activate()
+        self._sync_top()
 
     def _on_tab_visibility_changed(self, scope: str) -> None:
         if scope == 'tv':
@@ -8521,9 +9463,10 @@ class TV_page(QWidget):
         tab = self._ensure_tab(key)
         if tab is None:
             return
-        self._stack.setCurrentWidget(tab)
+        self._switch_stack_animated(tab)
         if hasattr(tab, 'activate'):
             tab.activate()
+        self._sync_top()
 
     def open_detail(self, item: dict, media_kind: str = 'show') -> None:
         from src.core.config import is_tab_enabled
@@ -8534,10 +9477,11 @@ class TV_page(QWidget):
         if tab is None or not hasattr(tab, '_open_details'):
             return
         self._pivot.setCurrentItem(tab_key)
-        self._stack.setCurrentWidget(tab)
+        self._switch_stack_animated(tab)
         self._current_tab_key = tab_key
         tmdb_media_type = 'movie' if media_kind == 'movie' else 'tv'
         tab._open_details(item, tmdb_media_type)
+        self._sync_top()
 
     def open_watch_later_entry(self, entry: dict) -> None:
         raw = (entry or {}).get('raw') or {}
@@ -8566,10 +9510,11 @@ class TV_page(QWidget):
         if tab is None:
             return False
         self._pivot.setCurrentItem(key)
-        self._stack.setCurrentWidget(tab)
+        self._switch_stack_animated(tab)
         self._current_tab_key = key
         if hasattr(tab, 'activate'):
             tab.activate()
+        self._sync_top()
         return True
 
     def open_anime_detail(self, media: dict) -> None:

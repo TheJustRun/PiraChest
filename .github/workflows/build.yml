@@ -16,19 +16,30 @@ jobs:
       version: ${{ steps.ver.outputs.version }}
       tag: ${{ steps.ver.outputs.tag }}
       is_new: ${{ steps.ver.outputs.is_new }}
+      canary: ${{ steps.ver.outputs.canary }}
+      slug: ${{ steps.ver.outputs.slug }}
+      app_name: ${{ steps.ver.outputs.app_name }}
     steps:
       - uses: actions/checkout@v4
       - id: ver
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          V=$(tr -d '[:space:]' < VERSION)
+          V=$(sed -n '1p' VERSION | tr -d '[:space:]')
+          C=$(sed -n '2,$p' VERSION | tr -d '[:space:]')
           if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid VERSION: $V" >&2
             exit 1
           fi
+          case "$C" in
+            1|canary=1|is_canary=1) CANARY=1; SLUG=PiraChest-Canary; APP="PiraChest Canary" ;;
+            *) CANARY=0; SLUG=PiraChest; APP="PiraChest" ;;
+          esac
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "tag=v$V" >> "$GITHUB_OUTPUT"
+          echo "canary=$CANARY" >> "$GITHUB_OUTPUT"
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+          echo "app_name=$APP" >> "$GITHUB_OUTPUT"
           if gh release view "v$V" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "is_new=false" >> "$GITHUB_OUTPUT"
           else
@@ -50,7 +61,13 @@ jobs:
 
       - name: Write version file
         shell: pwsh
-        run: Set-Content -Path VERSION -Value "${{ needs.version.outputs.version }}" -NoNewline
+        run: |
+          $v = "${{ needs.version.outputs.version }}"
+          if ("${{ needs.version.outputs.canary }}" -eq "1") {
+            Set-Content -Path VERSION -Value @($v, "1")
+          } else {
+            Set-Content -Path VERSION -Value $v -NoNewline
+          }
 
       - name: Install WiX Toolset
         shell: pwsh
@@ -69,16 +86,21 @@ jobs:
       - name: Build MSI installer
         shell: pwsh
         run: |
-          if (-not (Test-Path dist/PiraChest/PiraChest.exe)) { Write-Error "Build output missing"; exit 1 }
-          if (Test-Path dist/PiraChest/data) { Remove-Item dist/PiraChest/data -Recurse -Force }
+          $slug = "${{ needs.version.outputs.slug }}"
+          $brand = "${{ needs.version.outputs.app_name }}"
+          $exeName = "$brand.exe"
+          $distDir = "dist/$slug"
+          if (-not (Test-Path "$distDir/$exeName")) { Write-Error "Build output missing"; exit 1 }
+          if (Test-Path "$distDir/data") { Remove-Item "$distDir/data" -Recurse -Force }
           New-Item -ItemType Directory -Force package | Out-Null
           $ver = ("${{ needs.version.outputs.version }}" -split '-')[0]
-          $exe = (Resolve-Path dist/PiraChest/PiraChest.exe).Path
-          $srcDir = (Resolve-Path dist/PiraChest).Path
-          $ico = Get-ChildItem -Recurse -File -Filter *.ico | Where-Object { $_.FullName -notmatch '[\\/](dist|build|package|\.venv|venv|node_modules|site-packages)[\\/]' } | Sort-Object Length -Descending | Select-Object -First 1 -ExpandProperty FullName
+          $exe = (Resolve-Path "$distDir/$exeName").Path
+          $srcDir = (Resolve-Path $distDir).Path
+          $canary = "${{ needs.version.outputs.canary }}" -eq "1"
+          $ico = if ($canary -and (Test-Path 'src/gui/photos/icon_c.ico')) { (Resolve-Path 'src/gui/photos/icon_c.ico').Path } else { Get-ChildItem -Recurse -File -Filter *.ico | Where-Object { $_.FullName -notmatch '[\\/](dist|build|package|\.venv|venv|node_modules|site-packages)[\\/]' } | Sort-Object Length -Descending | Select-Object -First 1 -ExpandProperty FullName }
           $iconSrc = if ($ico) { $ico } else { $exe }
           Add-Type -AssemblyName System.Drawing
-          $png = Join-Path $env:GITHUB_WORKSPACE 'package/PiraChest-icon.png'
+          $png = Join-Path $env:GITHUB_WORKSPACE "package/$slug-icon.png"
           try {
             $icon = if ($ico) { [System.Drawing.Icon]::new($ico, 256, 256) } else { [System.Drawing.Icon]::ExtractAssociatedIcon($exe) }
             $icon.ToBitmap().Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
@@ -111,9 +133,9 @@ jobs:
             $g.DrawImage($logo, 34, 64, 96, 96)
             $center = New-Object System.Drawing.StringFormat
             $center.Alignment = 'Center'
-            $title = New-Object System.Drawing.Font('Segoe UI Semibold', 17, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
+            $title = New-Object System.Drawing.Font('Segoe UI Semibold', $(if ($canary) { 14 } else { 17 }), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
             $sub = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
-            $g.DrawString('PiraChest', $title, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF(0, 172, 164, 34)), $center)
+            $g.DrawString($brand, $title, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF(0, 172, 164, 34)), $center)
             $g.FillRectangle((New-Object System.Drawing.SolidBrush((& $hex '#58B9FF'))), 70, 212, 24, 3)
             $g.DrawString("Games, movies, anime,`nbooks and more", $sub, (New-Object System.Drawing.SolidBrush((& $hex '#A9C3DD'))), (New-Object System.Drawing.RectangleF(0, 224, 164, 40)), $center)
           }
@@ -122,12 +144,14 @@ jobs:
             $g.DrawImage($logo, 493 - 52, 9, 40, 40)
           }
           $logo.Dispose()
-          $msiName = "PiraChest-${{ needs.version.outputs.tag }}-Windows-x64.msi"
+          $msiName = "$slug-${{ needs.version.outputs.tag }}-Windows-x64.msi"
           $msi = Join-Path $env:GITHUB_WORKSPACE "package/$msiName"
           wix extension add -g WixToolset.UI.wixext/5.0.2
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          $upgrade = if ($canary) { 'b7e0d3f2-9c41-4e8a-a6d5-2f7c1e9b4a68' } else { 'a3f6c2d1-7b4e-4c9a-8f2d-5e1b0c7a9d34' }
           wix build installer/PiraChest.wxs -arch x64 -pdbtype none -ext WixToolset.UI.wixext `
             -d Version=$ver -d SourceDir="$srcDir" -d IconFile="$iconSrc" -d DialogBmp="$dlgBmp" -d BannerBmp="$banBmp" `
+            -d Brand="$brand" -d ExeName="$exeName" -d UpgradeCode="$upgrade" `
             -d Manufacturer="${{ github.repository_owner }}" -d ProjectUrl="https://github.com/${{ github.repository }}" `
             -o "$msi"
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -136,9 +160,10 @@ jobs:
       - name: Zip + checksums
         shell: pwsh
         run: |
-          $name = "PiraChest-${{ needs.version.outputs.tag }}-Windows-x64.zip"
+          $slug = "${{ needs.version.outputs.slug }}"
+          $name = "$slug-${{ needs.version.outputs.tag }}-Windows-x64.zip"
           $out = Join-Path $env:GITHUB_WORKSPACE "package/$name"
-          Push-Location dist/PiraChest
+          Push-Location "dist/$slug"
           if (Get-Command 7z -ErrorAction SilentlyContinue) {
             7z a -tzip -mx=9 -mmt=on "$out" * | Out-Null
           } else {
@@ -149,7 +174,7 @@ jobs:
             $hash = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
             "$hash  $(Split-Path $f -Leaf)" | Set-Content "$f.sha256" -Encoding utf8NoBOM
           }
-          $mb = [math]::Round((Get-ChildItem dist/PiraChest -Recurse -File | Measure-Object Length -Sum).Sum / 1MB, 1)
+          $mb = [math]::Round((Get-ChildItem "dist/$slug" -Recurse -File | Measure-Object Length -Sum).Sum / 1MB, 1)
           "Onedir size: $mb MB" >> $env:GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@v4
@@ -172,14 +197,15 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
-          name: "PiraChest ${{ needs.version.outputs.tag }}"
+          name: "${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.tag }}"
           body: |
-            PiraChest ${{ needs.version.outputs.version }} (Windows x64).
+            ${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.version }} (Windows x64).
 
             **Install:** download the MSI and run it. Choose the install location in the setup wizard. It installs for the current user with a Start Menu shortcut, no admin prompt, and no forced file associations.
-            **Portable:** download the ZIP, extract it, and run `PiraChest.exe`. The ZIP `.sha256` file contains the checksum used by the built-in updater; the MSI `.sha256` verifies the installer.
+            **Portable:** download the ZIP, extract it, and run `${{ needs.version.outputs.app_name }}.exe`. The ZIP `.sha256` file contains the checksum used by the built-in updater; the MSI `.sha256` verifies the installer.
           generate_release_notes: true
-          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
+          prerelease: ${{ needs.version.outputs.canary == '1' }}
+          make_latest: ${{ needs.version.outputs.canary != '1' }}
           fail_on_unmatched_files: true
           files: release-files/*
 
@@ -208,21 +234,21 @@ jobs:
           URL=$(jq -r '.url' <<< "$JSON")
           MSI=$(jq -r '[.assets[].url | select(endswith(".msi"))][0] // empty' <<< "$JSON")
           ZIP=$(jq -r '[.assets[].url | select(endswith(".zip"))][0] // empty' <<< "$JSON")
-          jq -n --arg role "<@&1548027542353477743>" --arg title "PiraChest $TAG" --arg url "$URL" \
-                --arg body "$BODY" --arg msi "$MSI" --arg zip "$ZIP" --arg repo "$REPO" '
+          jq -n --arg role "<@&1548027542353477743>" --arg title "${{ needs.version.outputs.app_name }} $TAG" --arg url "$URL" \
+                --arg body "$BODY" --arg msi "$MSI" --arg zip "$ZIP" --arg repo "$REPO" --arg app "${{ needs.version.outputs.app_name }}" '
             {username: "GitHub",
              avatar_url: "https://github.com/\($repo | split("/")[0]).png",
              content: $role,
              allowed_mentions: {parse: [], roles: ["1548027542353477743"]},
              embeds: [{title: $title, url: $url, color: 5814783,
                        description: ($body + "\n\n[Installer (MSI)](\($msi)) | [Portable (ZIP)](\($zip))"),
-                       footer: {text: "PiraChest Changelog"}}]}' > payload.json
+                       footer: {text: "\($app) Changelog"}}]}' > payload.json
           curl -fsS -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL"
 
   chocolatey:
     name: Publish to Chocolatey
     needs: [ version, release ]
-    if: needs.version.outputs.is_new == 'true'
+    if: needs.version.outputs.is_new == 'true' && needs.version.outputs.canary != '1'
     runs-on: windows-latest
     env:
       CHOCO_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}

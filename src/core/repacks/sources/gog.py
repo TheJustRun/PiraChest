@@ -53,6 +53,10 @@ def _get_json(url: str):
 
 def _slug_matches_query(slug: str, query_tokens: list[str]) -> bool:
     haystack = slug.replace('_', ' ').lower()
+    packed = re.sub(r'[^0-9a-z\u0400-\u04ff]+', '', haystack)
+    packed_query = ''.join(query_tokens)
+    if packed_query and packed_query in packed:
+        return True
     return all(tok in haystack for tok in query_tokens)
 
 
@@ -403,3 +407,15 @@ class GogRevivedSource(RepackSource):
         if complete:
             save_page(self.key, cache_key, [e.to_dict() for e in entries], False)
         return entries
+
+    def random_entry(self, exclude: Optional[str] = None) -> Optional[RepackEntry]:
+        import random
+        slugs = self._load_slugs()
+        if not slugs:
+            return None
+        rng = random.SystemRandom()
+        for slug in (slugs[i] for i in rng.sample(range(len(slugs)), min(12, len(slugs)))):
+            entries, _complete = self._entries_for_slugs_ex([slug], True)
+            if entries and not (exclude and len(slugs) > 1 and entries[0].url == exclude):
+                return entries[0]
+        raise RuntimeError('Could not load a random GOG game, try again')

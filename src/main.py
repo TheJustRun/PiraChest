@@ -45,12 +45,8 @@ def _cleanup_stale_temp() -> None:
 
 def _log_startup_environment() -> None:
     import platform
-    from src.core.config import paths
-    try:
-        with open(os.path.join(_PROJECT_ROOT, 'VERSION'), encoding='utf-8') as fh:
-            version = fh.read().strip()
-    except OSError:
-        version = 'unknown'
+    from src.core.config import VERSION, paths
+    version = VERSION
     try:
         import PySide6
         pyside = PySide6.__version__
@@ -89,8 +85,9 @@ def main() -> int:
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
     from src.gui.main_window import MainWindow, create_application
+    from src.core.config import APP_NAME
     app = create_application(sys.argv)
-    app.setApplicationName('PiraChest')
+    app.setApplicationName(APP_NAME)
 
     from src.core.config import (SingleInstance, ensure_associations_repaired, extract_cli_targets)
     initial_targets = extract_cli_targets(sys.argv[1:])
@@ -130,7 +127,7 @@ def main() -> int:
                 ensure_associations_repaired()
             except Exception:
                 logger.warning('Association repair failed', exc_info=True)
-        QTimer.singleShot(2000, _deferred_assoc)
+        QTimer.singleShot(6000, _deferred_assoc)
 
     logger.info('GUI application started')
     return app.exec()

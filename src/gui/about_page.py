@@ -40,6 +40,7 @@ from src.core.theme import (
     to_color,
 )
 from src.core.translations import register_locale_refresh, tr
+from src.core.config import APP_NAME, ICON_FILE, LOGO_FILE, VERSION
 DISCORD_URL = 'https://discord.gg/j7dBxTZMDE'
 _GUI_DIR = Path(__file__).resolve().parent
 _PHOTO_ROOTS = tuple(dict.fromkeys(
@@ -51,7 +52,7 @@ PHOTO_DIR = str(next((r for r in _PHOTO_ROOTS if r.is_dir()), _PHOTO_ROOTS[0]))
 
 def find_logo_path() -> str | None:
     return next(
-        (str(p) for n in ('logo.png', 'icon.png', 'logo.ico', 'icon.ico')
+        (str(p) for n in (LOGO_FILE, ICON_FILE, 'logo.png', 'icon.png', 'logo.ico', 'icon.ico')
          for r in _PHOTO_ROOTS if (p := r / n).is_file()),
         None,
     )
@@ -68,9 +69,6 @@ _SERVICE_ROWS = (
     )),
     ('about.services_books', (
         ('MangaDex', 'https://mangadex.org'),
-        ('Gutendex', 'https://gutendex.com'),
-        ('Project Gutenberg', 'https://www.gutenberg.org'),
-        ('Library Genesis', 'https://libgen.li'),
     )),
     ('about.services_screen', (
         ('TMDB', 'https://www.themoviedb.org'),
@@ -111,7 +109,7 @@ _SERVICE_ROWS = (
 _PACKAGES = (
     'PySide6', 'PySide6-Fluent-Widgets', 'PySideSix-Frameless-Window',
     'libtorrent', 'yt-dlp', 'FFmpeg', 'requests', 'httpx', 'BeautifulSoup4',
-    'libgen-api-enhanced', 'musicdl', 'ytmusicapi', 'mutagen', 'tinytag',
+    'musicdl', 'ytmusicapi', 'mutagen', 'tinytag',
     'aigpy', 'm3u8', 'orjson', 'json-repair', 'puremagic', 'filetype',
     'pathvalidate', 'platformdirs', 'cryptography', 'pycryptodome',
     'pycryptodomex', 'pywidevine', 'rich', 'prettytable', 'tabulate',
@@ -546,8 +544,7 @@ class AboutPage(QWidget):
         layout.setContentsMargins(24, 20, 28, 24)
         layout.setSpacing(12)
 
-        from src.core.updater import __version__ as _about_version
-        self._about_version = _about_version
+        self._about_version = VERSION
 
         self._hero_card = self._build_hero_card()
         layout.addWidget(self._hero_card)
@@ -591,7 +588,7 @@ class AboutPage(QWidget):
         text_col.setContentsMargins(0, 0, 0, 0)
         title_row = QHBoxLayout()
         title_row.setSpacing(10)
-        self._hero_title_lbl = SubtitleLabel('PiraChest')
+        self._hero_title_lbl = SubtitleLabel(APP_NAME)
         title_row.addWidget(self._hero_title_lbl, 0)
         self._version_lbl = _ClickableLabel('')
         self._version_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)

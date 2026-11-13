@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import html
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -13,17 +15,19 @@ from functools import partial
 from ctypes import wintypes
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, QStandardPaths, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QIcon, QKeySequence
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QStandardPaths, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractItemView,
     QAbstractScrollArea,
     QApplication,
+    QButtonGroup,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -36,11 +40,13 @@ from qfluentwidgets import (
     CompactSpinBox,
     ExpandGroupSettingCard,
     FluentIcon,
+    FlowLayout,
     IndicatorPosition,
     InfoBar,
     InfoBarPosition,
     LineEdit,
     MessageBoxBase,
+    PillPushButton,
     PrimaryPushButton,
     ProgressBar,
     PushButton,
@@ -59,6 +65,10 @@ from qfluentwidgets import (
 from src.core.debrid import PROVIDER_INFO, PROVIDER_ORDER, PROVIDERS, token_store
 from src.core.config import (
     APP_ACCENT_COLOR,
+    APP_NAME,
+    IS_CANARY,
+    NAV_SOURCE_KEYS,
+    nav_order,
     apply_settings,
     apply_settings_backup,
     associations_need_repair,
@@ -77,7 +87,10 @@ from src.core.config import (
     set_launch_at_startup,
     set_tab_enabled,
     settings,
+    paths,
+    SLUG,
     ThemeMode,
+    VERSION,
     wipe_all_app_data,
     write_settings_backup,
 )
@@ -87,6 +100,12 @@ from src.core.theme import (
     active_preset_id,
     apply_tool_button_theme,
     branded_icon,
+    animations_enabled,
+    dialog_qss,
+    ensure_contrast,
+    fade_in,
+    manager,
+    to_color,
     notify_accent_changed,
     open_theme_maker,
     palette,
@@ -98,6 +117,7 @@ from src.core.theme import (
     theme_background_info,
     theme_sfx_path,
     themed_icon,
+    ThemedSlider,
 )
 from src.core.translations import (
     available_languages,
@@ -106,6 +126,11 @@ from src.core.translations import (
     set_language,
     tr,
 )
+from PySide6.QtCore import QEasingCurve, QPointF, QPropertyAnimation, QRectF
+from PySide6.QtGui import QBrush, QConicalGradient, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QVariantAnimation
+from PySide6.QtWidgets import QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QScrollArea
+from qfluentwidgets import isDarkTheme, themeColor
 
 
 logger = logging.getLogger(__name__)
@@ -113,7 +138,7 @@ logger = logging.getLogger(__name__)
 
 _GUI_DIR = os.path.dirname(os.path.abspath(__file__))
 _SOURCE_TAB_ICON_FILENAMES = {'fitgirl': 'fg.png', 'gog': 'gr.png'}
-_ASSOC_APP_REGISTRY_NAME = 'PiraChest'
+_ASSOC_APP_REGISTRY_NAME = SLUG
 
 
 def _repacks_tab_icon(source_key: str) -> QIcon | None:
@@ -168,10 +193,12 @@ class UpdateController(QObject):
     download_progress = Signal(int, int)
     download_finished = Signal(str)
     download_error = Signal(str)
+    download_stage = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._download_ticket = None
+        self.current_tag = ''
 
     def disconnect_listeners(self) -> None:
         with warnings.catch_warnings():
@@ -181,26 +208,31 @@ class UpdateController(QObject):
                 with suppress(RuntimeError, TypeError):
                     signal.disconnect()
 
-    def check(self, include_prereleases: bool = True) -> None:
+    def check(self, channel: str | None = None) -> None:
         from src.core import updater as _updater
         from src.core import worker as _worker
+        if channel is None:
+            channel = "auto" if (IS_CANARY or settings.canary_updates) else "stable"
 
         def _job():
             try:
-                return _updater.check_for_update(include_prereleases=include_prereleases)
+                return _updater.check_for_update(channel=channel)
             except Exception:
                 return None
         self.check_started.emit()
         _worker.submit(_job, on_done=self.check_finished.emit, on_error=lambda _m: self.check_finished.emit(None),
-                       owner=self, key=('update-check', include_prereleases), priority=_worker.Priority.NORMAL)
+                       owner=self, key=('update-check', channel), priority=_worker.Priority.NORMAL)
 
     def download(self, update_info: dict) -> None:
         from src.core import updater as _updater
         from src.core import worker as _worker
 
+        self.current_tag = str(update_info.get('tag') or '')
+
         def _job(is_cancelled=None):
             progress = _worker.wrap_callback(self.download_progress.emit, owner=self)
-            return _updater.download_and_verify_update(update_info, on_progress=progress, is_cancelled=is_cancelled)
+            stage = _worker.wrap_callback(self.download_stage.emit, owner=self)
+            return _updater.download_and_verify_update(update_info, on_progress=progress, is_cancelled=is_cancelled, on_stage=stage)
 
         def _error(message: str) -> None:
             self.download_error.emit(message)
@@ -273,6 +305,12 @@ def show_update_dialog(parent: QWidget, result: dict, allow_skip: bool = True) -
     box_layout = QVBoxLayout()
     box_layout.setContentsMargins(0, 0, 0, 0)
     box_layout.addWidget(StrongBodyLabel(tr('update.available_title', tag=result['tag'])))
+    if result.get('canary'):
+        notice = QLabel(tr('update.canary_notice',
+                           'Experimental PiraChest Canary build. It can be unstable, but stable releases are still offered when they are newer.'))
+        notice.setWordWrap(True)
+        notice.setStyleSheet(f'QLabel {{ background: transparent; color: {palette()["accent"]}; font-size: 12px; }}')
+        box_layout.addWidget(notice)
     notes = result.get('notes') or tr('update.no_notes')
     notes_lbl = QLabel(_changelog_markdown_to_html(notes[:4000]))
     notes_lbl.setTextFormat(Qt.TextFormat.RichText)
@@ -309,76 +347,458 @@ def show_update_dialog(parent: QWidget, result: dict, allow_skip: bool = True) -
     return 'update' if accepted else 'later'
 
 
+def _fmt_bytes(n: float) -> str:
+    n = float(max(0, n))
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024 or unit == 'GB':
+            return f'{n:.0f} {unit}' if unit == 'B' else f'{n:.1f} {unit}'
+        n /= 1024
+    return ''
+
+
+def _fmt_eta(seconds: float) -> str:
+    seconds = int(seconds + 0.5)
+    if seconds < 1:
+        return '<1s'
+    if seconds < 60:
+        return f'{seconds}s'
+    return f'{seconds // 60}m {seconds % 60:02d}s'
+
+
+def _pal(key: str, fallback: str) -> QColor:
+    return to_color(palette().get(key) or fallback, fallback)
+
+
+_UPDATE_WEIGHTS = (0.52, 0.16, 0.18, 0.14)
+
+
+def _css_rgba(c: QColor) -> str:
+    return f'rgba({c.red()}, {c.green()}, {c.blue()}, {c.alpha()})'
+
+
+def _tabular(font: QFont) -> QFont:
+    try:
+        font.setFeature(QFont.Tag('tnum'), 1)
+    except Exception:
+        pass
+    return font
+
+
+def _dialog_radius() -> float:
+    try:
+        return float(re.sub(r'[^0-9.]', '', str(manager.layout().get('dialog_radius', '12'))) or 12)
+    except Exception:
+        return 12.0
+
+
+class _UpdateRail(QWidget):
+    percent_changed = Signal(int)
+
+    def __init__(self, labels: list, parent=None):
+        super().__init__(parent)
+        self._labels = labels
+        self._stage = 0
+        self._shown = [0.0, 0.0, 0.0, 0.0]
+        self._from = list(self._shown)
+        self._to = list(self._shown)
+        self._pct = 0
+        self._sweep = 0.0
+        self.setFixedHeight(32)
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(240)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.valueChanged.connect(self._on_anim)
+        self._loop = QVariantAnimation(self)
+        self._loop.setDuration(1500)
+        self._loop.setStartValue(0.0)
+        self._loop.setEndValue(1.0)
+        self._loop.setLoopCount(-1)
+        self._loop.setEasingCurve(QEasingCurve.Type.InOutSine)
+        self._loop.valueChanged.connect(self._on_loop)
+
+    def _on_anim(self, t) -> None:
+        t = float(t)
+        self._shown = [a + (b - a) * t for a, b in zip(self._from, self._to)]
+        pct = int(self._shown[0] * 100 + 0.5)
+        if pct != self._pct:
+            self._pct = pct
+            self.percent_changed.emit(pct)
+        self.update()
+
+    def _on_loop(self, v) -> None:
+        self._sweep = float(v)
+        self.update()
+
+    def _retarget(self) -> None:
+        self._anim.stop()
+        self._from = list(self._shown)
+        if not animations_enabled():
+            self._shown = list(self._to)
+            self._on_anim(1.0)
+            return
+        self._anim.start()
+
+    def set_fraction(self, fraction: float) -> None:
+        fraction = max(0.0, min(1.0, fraction))
+        if self._stage == 0 and abs(self._to[0] - fraction) < 0.001:
+            return
+        self._to[0] = fraction
+        self._retarget()
+
+    def set_stage(self, stage: int) -> None:
+        self._stage = stage
+        self._to = [1.0 if i < stage else (self._to[0] if i == 0 else 0.0) for i in range(4)]
+        self._retarget()
+        self._sync_loop()
+
+    def _sync_loop(self) -> None:
+        if self._stage >= 1 and self.isVisible() and animations_enabled():
+            if self._loop.state() != QVariantAnimation.State.Running:
+                self._loop.start()
+        else:
+            self._loop.stop()
+
+    def start(self) -> None:
+        self._sync_loop()
+
+    def stop(self) -> None:
+        self._anim.stop()
+        self._loop.stop()
+
+    def reset(self) -> None:
+        self.stop()
+        self._stage = 0
+        self._shown = [0.0] * 4
+        self._from = [0.0] * 4
+        self._to = [0.0] * 4
+        self._pct = 0
+        self.update()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._sync_loop()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self._loop.stop()
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bg = to_color(palette().get('dialog_bg'), '#1a1a1a')
+        accent = ensure_contrast(_pal('accent', '#c9c9c9'), bg, 3.0)
+        track = to_color(palette().get('surface_border'), '#33ffffff')
+        done = to_color(palette().get('body_text'), '#dddddd')
+        live = to_color(palette().get('primary_text'), '#ffffff')
+        faint = to_color(palette().get('faint_text'), '#777777')
+        gap, thick, top = 4.0, 4.0, 2.0
+        usable = self.width() - gap * 3
+        radius = min(thick / 2, _dialog_radius())
+        font = p.font()
+        font.setPixelSize(11)
+        p.setFont(font)
+        fm = QFontMetrics(font)
+        x = 0.0
+        for i, label in enumerate(self._labels):
+            w = usable * _UPDATE_WEIGHTS[i]
+            seg = QRectF(x, top, w, thick)
+            clip = QPainterPath()
+            clip.addRoundedRect(seg, radius, radius)
+            p.fillPath(clip, track)
+            fill = self._shown[i]
+            active = i == self._stage
+            if active and self._stage >= 1 and fill < 1.0:
+                if animations_enabled():
+                    span = w * 0.5
+                    start = seg.left() - span + (w + span) * self._sweep
+                    grad = QLinearGradient(start, 0, start + span, 0)
+                    clear = QColor(accent)
+                    clear.setAlpha(0)
+                    grad.setColorAt(0.0, clear)
+                    grad.setColorAt(0.5, accent)
+                    grad.setColorAt(1.0, clear)
+                    p.save()
+                    p.setClipPath(clip)
+                    p.fillRect(seg, QBrush(grad))
+                    p.restore()
+                else:
+                    soft = QColor(accent)
+                    soft.setAlpha(110)
+                    p.fillPath(clip, soft)
+            if fill > 0.001:
+                p.save()
+                p.setClipPath(clip)
+                p.fillRect(QRectF(seg.left(), seg.top(), w * min(1.0, fill), thick), accent)
+                p.restore()
+            complete = i < self._stage
+            p.setPen(live if active else (done if complete else faint))
+            tx = x
+            if complete:
+                cy = top + thick + 14.0
+                p.setPen(QPen(accent, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                p.drawPolyline([QPointF(x + 0.5, cy), QPointF(x + 2.7, cy + 2.4), QPointF(x + 6.5, cy - 2.4)])
+                p.setPen(done)
+                tx = x + 11
+            text = fm.elidedText(label, Qt.TextElideMode.ElideRight, int(max(10, w + gap - (tx - x))))
+            p.drawText(QRectF(tx, top + thick + 6, w + gap, 16), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
+            x += w + gap
+
+
 class UpdateOverlay(QWidget):
+    _STAGE_KEYS = {'download': 0, 'verify': 1, 'extract': 2}
+    _RISE = 10
+
     def __init__(self, parent: QWidget):
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet('UpdateOverlay { background-color: rgba(0, 0, 0, 160); }')
         self.setVisible(False)
-
-        card = QFrame(self)
-        card.setObjectName('updateOverlayCard')
-        card.setFixedWidth(360)
-        card.setStyleSheet(
-            '#updateOverlayCard { background-color: rgba(32, 32, 32, 235); border-radius: 8px; }'
-        )
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(28, 24, 28, 24)
-        card_layout.setSpacing(12)
-
-        self._title_lbl = StrongBodyLabel(tr('update.downloading'), card)
-        self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        self._title_lbl.setStyleSheet('color: white; background: transparent;')
-        card_layout.addWidget(self._title_lbl)
-
-        self._progress_bar = ProgressBar(card)
-        self._progress_bar.setRange(0, 100)
-        self._progress_bar.setValue(0)
-        card_layout.addWidget(self._progress_bar)
-
-        self._pct_lbl = CaptionLabel('0%', card)
-        self._pct_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        self._pct_lbl.setStyleSheet('color: rgba(255, 255, 255, 200); background: transparent;')
-        card_layout.addWidget(self._pct_lbl)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addStretch(1)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._dim = 0
+        self._stage = 0
+        self._last = (0.0, 0)
+        self._speed = 0.0
+        self._stats_at = 0.0
+        self._closing = False
+        self._fx = None
+        self._texts = [
+            tr('update.stage_download', 'Downloading update'),
+            tr('update.stage_verify', 'Verifying download'),
+            tr('update.stage_prepare', 'Preparing files'),
+            tr('update.stage_restart', 'Restarting PiraChest'),
+        ]
+        self._card = QFrame(self)
+        self._card.setObjectName('pirachestUpdateCard')
+        self._card.setFixedWidth(460)
+        layout = QVBoxLayout(self._card)
+        layout.setContentsMargins(32, 28, 32, 24)
+        layout.setSpacing(0)
+        head = QHBoxLayout()
+        head.setSpacing(16)
+        titles = QVBoxLayout()
+        titles.setSpacing(3)
+        self._title_lbl = QLabel(self._texts[0], self._card)
+        self._version_lbl = QLabel('', self._card)
+        titles.addWidget(self._title_lbl)
+        titles.addWidget(self._version_lbl)
+        head.addLayout(titles, 1)
+        self._pct_lbl = QLabel('0%', self._card)
+        self._pct_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        pct_font = _tabular(QFont(self._pct_lbl.font()))
+        pct_font.setPixelSize(24)
+        pct_font.setWeight(QFont.Weight.DemiBold)
+        self._pct_lbl.setFont(pct_font)
+        self._pct_lbl.setFixedWidth(QFontMetrics(pct_font).horizontalAdvance('100%') + 4)
+        head.addWidget(self._pct_lbl, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(head)
+        layout.addSpacing(22)
+        self._rail = _UpdateRail([
+            tr('update.step_download', 'Download'), tr('update.step_verify', 'Verify'),
+            tr('update.step_prepare', 'Prepare'), tr('update.step_restart', 'Restart')], self._card)
+        self._rail.percent_changed.connect(self._on_percent)
+        layout.addWidget(self._rail)
+        layout.addSpacing(10)
+        stats = QHBoxLayout()
+        stats.setSpacing(12)
+        self._bytes_lbl = QLabel('', self._card)
+        self._rate_lbl = QLabel('', self._card)
+        self._rate_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        for lbl in (self._bytes_lbl, self._rate_lbl):
+            f = _tabular(QFont(lbl.font()))
+            f.setPixelSize(12)
+            lbl.setFont(f)
+            lbl.setMinimumHeight(16)
+        stats.addWidget(self._bytes_lbl, 1)
+        stats.addWidget(self._rate_lbl, 0)
+        layout.addLayout(stats)
+        layout.addSpacing(20)
+        foot = QHBoxLayout()
+        foot.addStretch(1)
+        self._cancel_btn = PushButton(tr('update.cancel', 'Cancel'), self._card)
+        self._cancel_btn.setMinimumWidth(96)
+        policy = self._cancel_btn.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        self._cancel_btn.setSizePolicy(policy)
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        foot.addWidget(self._cancel_btn)
+        layout.addLayout(foot)
+        self._outer = QVBoxLayout(self)
+        self._outer.setContentsMargins(0, 0, 0, 0)
+        self._outer.addStretch(1)
         row = QHBoxLayout()
         row.addStretch(1)
-        row.addWidget(card)
+        row.addWidget(self._card)
         row.addStretch(1)
-        outer.addLayout(row)
-        outer.addStretch(1)
+        self._outer.addLayout(row)
+        self._outer.addStretch(1)
+        self._fade = QVariantAnimation(self)
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self._fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade.valueChanged.connect(self._on_fade)
+        self._fade.finished.connect(self._on_fade_done)
+        parent.installEventFilter(self)
+        update_controller.download_stage.connect(self._on_stage)
+        register_theme_refresh(self, self._restyle)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.Resize and obj is self.parentWidget() and self.isVisible():
+            self.setGeometry(obj.rect())
+        return False
+
+    def _restyle(self) -> None:
+        pal = palette()
+        self._card.setStyleSheet(dialog_qss(('#pirachestUpdateCard',)))
+        primary = _css_rgba(to_color(pal.get('dialog_title_text') or pal.get('primary_text'), '#ffffff'))
+        body = _css_rgba(to_color(pal.get('dialog_body_text') or pal.get('body_text'), '#dddddd'))
+        muted = _css_rgba(to_color(pal.get('muted'), '#999999'))
+        self._title_lbl.setStyleSheet(f'color: {primary}; background: transparent; font-size: 15px; font-weight: 600;')
+        self._version_lbl.setStyleSheet(f'color: {muted}; background: transparent; font-size: 12px;')
+        self._pct_lbl.setStyleSheet(f'color: {primary}; background: transparent;')
+        self._bytes_lbl.setStyleSheet(f'color: {body}; background: transparent;')
+        self._rate_lbl.setStyleSheet(f'color: {muted}; background: transparent;')
+        self._rail.update()
+        self.update()
+
+    def _scrim_alpha(self) -> int:
+        return 135 if isDarkTheme() else 85
+
+    def _attach_fx(self, opacity: float) -> None:
+        self._fx = QGraphicsOpacityEffect(self._card)
+        self._fx.setOpacity(opacity)
+        self._card.setGraphicsEffect(self._fx)
+
+    def _drop_fx(self) -> None:
+        if self._fx is None:
+            return
+        self._fx = None
+        with suppress(RuntimeError):
+            self._card.setGraphicsEffect(None)
+
+    def _on_fade(self, value) -> None:
+        value = float(value)
+        self._dim = int(self._scrim_alpha() * value)
+        if self._fx is not None:
+            with suppress(RuntimeError):
+                self._fx.setOpacity(value)
+        self._outer.setContentsMargins(0, int(round((1.0 - value) * self._RISE * 2)), 0, 0)
+        self.update()
+
+    def _on_fade_done(self) -> None:
+        self._drop_fx()
+        if self._closing:
+            self._closing = False
+            self.setVisible(False)
+            self._rail.reset()
+
+    def _on_percent(self, pct: int) -> None:
+        self._pct_lbl.setText(f'{pct}%')
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, self._dim))
+
+    def mousePressEvent(self, event) -> None:
+        event.accept()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self._cancel_btn.isVisible():
+            self._on_cancel()
+        event.accept()
+
+    def _on_cancel(self) -> None:
+        update_controller.cancel_download()
+        self.hide_overlay()
+
+    def _set_stage(self, stage: int) -> None:
+        stage = max(0, min(3, stage))
+        if stage < self._stage:
+            return
+        self._stage = stage
+        self._title_lbl.setText(self._texts[stage])
+        self.setAccessibleName(self._texts[stage])
+        self._rail.set_stage(stage)
+        self._cancel_btn.setVisible(stage < 2)
+        if stage >= 1:
+            self._bytes_lbl.setText('')
+            self._rate_lbl.setText('')
+
+    def _on_stage(self, key: str) -> None:
+        stage = self._STAGE_KEYS.get(key)
+        if stage is not None and self.isVisible():
+            self._set_stage(stage)
 
     def set_title(self, text: str) -> None:
-        self._title_lbl.setText(text)
+        return
 
     def set_indeterminate(self) -> None:
-        self._progress_bar.setRange(0, 0)
-        self._pct_lbl.setText('')
+        self._set_stage(3)
 
     def set_progress(self, downloaded: int, total: int) -> None:
-        if total > 0:
-            pct = max(0, min(100, int(downloaded / total * 100)))
-            self._progress_bar.setRange(0, 100)
-            self._progress_bar.setValue(pct)
-            self._pct_lbl.setText(f'{pct}%')
-        else:
-            self.set_indeterminate()
+        if self._stage > 0:
+            return
+        if total <= 0:
+            self._bytes_lbl.setText(_fmt_bytes(downloaded))
+            return
+        self._rail.set_fraction(downloaded / total)
+        now = time.monotonic()
+        last_t, last_b = self._last
+        if last_t and now > last_t:
+            inst = (downloaded - last_b) / (now - last_t)
+            self._speed = inst if not self._speed else self._speed * 0.8 + inst * 0.2
+        self._last = (now, downloaded)
+        if now - self._stats_at >= 0.25 or downloaded >= total:
+            self._stats_at = now
+            self._bytes_lbl.setText(f'{_fmt_bytes(downloaded)} of {_fmt_bytes(total)}')
+            rate = []
+            if self._speed > 1024:
+                rate.append(f'{_fmt_bytes(self._speed)}/s')
+                if downloaded < total:
+                    rate.append(tr('update.eta', '{time} left', time=_fmt_eta((total - downloaded) / self._speed)))
+            self._rate_lbl.setText('  \u00b7  '.join(rate))
 
     def show_overlay(self, title: str | None = None) -> None:
-        if title is not None:
-            self.set_title(title)
-        self._progress_bar.setRange(0, 100)
-        self._progress_bar.setValue(0)
+        self._fade.stop()
+        self._closing = False
+        self._drop_fx()
+        self._stage = 0
+        self._last = (0.0, 0)
+        self._speed = 0.0
+        self._rail.reset()
         self._pct_lbl.setText('0%')
+        self._set_stage(0)
+        self._cancel_btn.setVisible(True)
+        self._bytes_lbl.setText('')
+        self._rate_lbl.setText('')
+        tag = getattr(update_controller, 'current_tag', '')
+        self._version_lbl.setText(f'{APP_NAME} {tag}' if tag else '')
         self.setGeometry(self.parentWidget().rect())
         self.raise_()
         self.setVisible(True)
+        self.setFocus(Qt.FocusReason.PopupFocusReason)
+        self._rail.start()
+        if animations_enabled():
+            self._attach_fx(0.0)
+            self._on_fade(0.0)
+            self._fade.setDirection(QVariantAnimation.Direction.Forward)
+            self._fade.setDuration(220)
+            self._fade.start()
+        else:
+            self._on_fade(1.0)
 
     def hide_overlay(self) -> None:
-        self.setVisible(False)
+        self._fade.stop()
+        self._rail.stop()
+        if not self.isVisible() or not animations_enabled():
+            self._drop_fx()
+            self.setVisible(False)
+            self._rail.reset()
+            return
+        self._closing = True
+        self._attach_fx(1.0)
+        self._fade.setDirection(QVariantAnimation.Direction.Backward)
+        self._fade.setDuration(140)
+        self._fade.start()
 
 
 def make_smooth_scroll_area(parent=None):
@@ -455,10 +875,142 @@ _AMBIANCE_START_TIMEOUT = 5.0
 
 
 _HOVER_MIN_GAP = 0.04
+_SFX_VOICES = {
+    'hover': 4, 'click': 4, 'navigate': 3,
+    'popout_info': 3, 'popout_success': 3, 'popout_warning': 3, 'popout_error': 3,
+}
+_SFX_TARGET_RMS = 0.14
+_NORM_CACHE: dict = {}
+_PITCH_SPAN = 0.006
+_PITCH_OFFSETS = (-1.0, 1.0, -0.5, 0.5, -0.75, 0.75)
+_PITCH_CACHE: dict = {}
+_PITCH_MAX_FILES = 128
 
 
 def _gain(volume: int) -> float:
     return (volume / 100.0) ** 2
+
+
+def _norm_gain(path: str) -> float:
+    try:
+        stamp = (path, os.path.getmtime(path))
+    except OSError:
+        return 1.0
+    cached = _NORM_CACHE.get(stamp)
+    if cached is not None:
+        return cached
+    gain = 1.0
+    try:
+        import wave
+        from array import array
+        with wave.open(path, 'rb') as wav:
+            if wav.getsampwidth() == 2:
+                samples = array('h')
+                samples.frombytes(wav.readframes(wav.getnframes()))
+                if sys.byteorder == 'big':
+                    samples.byteswap()
+                if samples:
+                    rms = (sum(s * s for s in samples) / len(samples)) ** 0.5 / 32768.0
+                    if rms > 1e-4:
+                        gain = max(0.2, min(4.0, _SFX_TARGET_RMS / rms))
+    except Exception:
+        gain = 1.0
+    _NORM_CACHE[stamp] = gain
+    return gain
+
+
+def _pitch_offsets(count: int) -> tuple[float, ...]:
+    shifts = []
+    for index in range(max(0, count - 1)):
+        shifts.append(_PITCH_SPAN * _PITCH_OFFSETS[index % len(_PITCH_OFFSETS)])
+    return tuple(shifts)
+
+
+def _prune_pitch_cache(directory: str) -> None:
+    try:
+        files = sorted(
+            (os.path.join(directory, name) for name in os.listdir(directory) if name.endswith('.wav')),
+            key=os.path.getmtime,
+        )
+        for old in files[:-_PITCH_MAX_FILES]:
+            os.remove(old)
+    except OSError:
+        pass
+
+
+def _pitch_variant(path: str, ratio: float) -> str:
+    if not path or abs(ratio - 1.0) < 1e-4 or not path.lower().endswith('.wav'):
+        return path
+    try:
+        stat = os.stat(path)
+        key = (os.path.abspath(path), stat.st_mtime_ns, stat.st_size, round(ratio, 6))
+    except OSError:
+        return path
+    cached = _PITCH_CACHE.get(key)
+    if cached and os.path.isfile(cached):
+        return cached
+    try:
+        import wave
+        from array import array
+        with wave.open(path, 'rb') as wav:
+            channels = wav.getnchannels()
+            width = wav.getsampwidth()
+            rate = wav.getframerate()
+            frames = wav.getnframes()
+            if width != 2 or channels not in (1, 2) or frames < 2:
+                return path
+            data = wav.readframes(frames)
+        samples = array('h')
+        samples.frombytes(data)
+        if sys.byteorder == 'big':
+            samples.byteswap()
+        out_frames = max(1, int(frames / ratio))
+        out = array('h', bytes(2 * out_frames * channels))
+        limit = frames - 1
+        pos = 0.0
+        if channels == 2:
+            for i in range(out_frames):
+                j = int(pos)
+                if j >= limit:
+                    j = limit
+                    frac = 0.0
+                else:
+                    frac = pos - j
+                k = j * 2
+                a = samples[k]
+                b = samples[k + 2]
+                out[2 * i] = int(a + (b - a) * frac)
+                a = samples[k + 1]
+                b = samples[k + 3]
+                out[2 * i + 1] = int(a + (b - a) * frac)
+                pos += ratio
+        else:
+            for i in range(out_frames):
+                j = int(pos)
+                if j >= limit:
+                    j = limit
+                    frac = 0.0
+                else:
+                    frac = pos - j
+                a = samples[j]
+                b = samples[j + 1]
+                out[i] = int(a + (b - a) * frac)
+                pos += ratio
+        directory = os.path.join(paths.cache_dir, 'sfx')
+        os.makedirs(directory, exist_ok=True)
+        digest = hashlib.sha1(repr(key).encode('utf-8')).hexdigest()[:20]
+        target = os.path.join(directory, f'{digest}.wav')
+        if not os.path.isfile(target):
+            with wave.open(target, 'wb') as wav:
+                wav.setnchannels(channels)
+                wav.setsampwidth(2)
+                wav.setframerate(rate)
+                wav.writeframes(out.tobytes())
+            _prune_pitch_cache(directory)
+        _PITCH_CACHE[key] = target
+        return target
+    except Exception:
+        return path
 
 
 class SoundManager(QObject):
@@ -472,8 +1024,12 @@ class SoundManager(QObject):
         self._media_owners: dict[str, Any] = {}
         self._suspended = False
         self._devices = None
-        self._effects: dict[str, Any] = {}
+        self._effects: dict[str, list] = {}
+        self._voice_index: dict[str, int] = {}
+        self._norms: dict[str, float] = {}
         self._effect_paths: dict[str, str] = {}
+        self._variant_key: dict[str, str] = {}
+        self._active_variants: dict[str, tuple[str, ...]] = {}
         self._ambiance_loaded = ''
         self._last_hover = 0.0
         self._ambiance_player = None
@@ -517,7 +1073,7 @@ class SoundManager(QObject):
         self._available = True
         if self._suspended:
             self._stop_ambiance()
-        else:
+        elif self._ambiance_volume > 0:
             self._ambiance_tick.start()
             self._sync_ambiance()
         return True
@@ -525,9 +1081,11 @@ class SoundManager(QObject):
     def _setup(self) -> None:
         from PySide6.QtMultimedia import QSoundEffect, QMediaPlayer, QAudioOutput, QMediaDevices
         for name, filename in _SFX_FILENAMES.items():
-            effect = QSoundEffect(self)
-            effect.setVolume(_gain(self._sfx_volume))
-            self._effects[name] = effect
+            if name.startswith('popout_'):
+                continue
+            count = _SFX_VOICES.get(name, 3)
+            self._effects[name] = [QSoundEffect(self) for _ in range(count)]
+            self._voice_index[name] = 0
             self._apply_effect_source(name, filename)
         self._ambiance_player = QMediaPlayer(self)
         self._ambiance_output = QAudioOutput(self)
@@ -543,9 +1101,9 @@ class SoundManager(QObject):
     def _on_audio_outputs_changed(self) -> None:
         from PySide6.QtMultimedia import QMediaDevices
         device = QMediaDevices.defaultAudioOutput()
-        for effect in self._effects.values():
-            effect.setAudioDevice(device)
-
+        for voices in self._effects.values():
+            for effect in voices:
+                effect.setAudioDevice(device)
 
         if self._ambiance_output is not None and not device.isNull() and self._ambiance_output.device() != device:
             self._ambiance_output.setDevice(device)
@@ -559,16 +1117,45 @@ class SoundManager(QObject):
         return theme_sfx_path(active_preset_id(), 'ambiance') or os.path.join(_SFX_DIR, _AMBIANCE_FILENAME)
 
     def _apply_effect_source(self, name: str, filename: str) -> None:
-        effect = self._effects.get(name)
-        if effect is None:
+        voices = self._effects.get(name)
+        if not voices:
             return
         path = self._sfx_path(name, filename) if self._sfx_volume > 0 else ''
         if path and not os.path.isfile(path):
             path = ''
         if self._effect_paths.get(name) == path:
+            self._apply_effect_volume(name)
             return
         self._effect_paths[name] = path
-        effect.setSource(QUrl.fromLocalFile(path) if path else QUrl())
+        self._norms[name] = _norm_gain(path) if path else 1.0
+        self._variant_key.pop(name, None)
+        self._active_variants.pop(name, None)
+        url = QUrl.fromLocalFile(path) if path else QUrl()
+        for effect in voices:
+            effect.stop()
+            effect.setSource(url)
+        self._apply_effect_volume(name)
+
+    def _prepare_variants(self, name: str) -> None:
+        voices = self._effects.get(name)
+        path = self._effect_paths.get(name) or ''
+        if not voices or not path or self._variant_key.get(name) == path:
+            return
+        self._variant_key[name] = path
+        variants = [path]
+        variants.extend(_pitch_variant(path, 1.0 + shift) for shift in _pitch_offsets(len(voices)))
+        self._active_variants[name] = tuple(variants)
+        for effect, variant in zip(voices, variants):
+            if effect.source().toLocalFile() == variant:
+                continue
+            effect.stop()
+            effect.setSource(QUrl.fromLocalFile(variant))
+        self._apply_effect_volume(name)
+
+    def _apply_effect_volume(self, name: str) -> None:
+        volume = min(1.0, _gain(self._sfx_volume) * self._norms.get(name, 1.0))
+        for effect in self._effects.get(name, ()):
+            effect.setVolume(volume)
 
     def _apply_ambiance_source(self) -> None:
         path = self._ambiance_path() if self._ambiance_volume > 0 else ''
@@ -587,6 +1174,8 @@ class SoundManager(QObject):
     def _do_reload_sources(self) -> None:
         for name, filename in _SFX_FILENAMES.items():
             self._apply_effect_source(name, filename)
+        for name in ('hover', 'click', 'navigate'):
+            self._prepare_variants(name)
         self._apply_ambiance_source()
         self._sync_ambiance()
 
@@ -596,11 +1185,11 @@ class SoundManager(QObject):
         self._sfx_volume = value
         if not self._available:
             return
-        for effect in self._effects.values():
-            effect.setVolume(_gain(value))
-        if value <= 0 or was_off:
-            for name, filename in _SFX_FILENAMES.items():
+        for name, filename in _SFX_FILENAMES.items():
+            if value <= 0 or was_off:
                 self._apply_effect_source(name, filename)
+            else:
+                self._apply_effect_volume(name)
 
     def set_ambiance_volume(self, value: int) -> None:
         value = max(0, min(100, int(value)))
@@ -609,10 +1198,13 @@ class SoundManager(QObject):
         if not self._available:
             return
         if value <= 0:
+            self._ambiance_tick.stop()
             self._stop_ambiance()
             self._apply_ambiance_source()
         elif was_off:
             self._apply_ambiance_source()
+            if not self._suspended:
+                self._ambiance_tick.start()
         self._apply_ambiance_gain()
         self._sync_ambiance()
 
@@ -641,7 +1233,8 @@ class SoundManager(QObject):
             self._ambiance_tick.stop()
             self._stop_ambiance()
             return
-        self._ambiance_tick.start()
+        if self._ambiance_volume > 0:
+            self._ambiance_tick.start()
         self._sync_ambiance()
 
     def _release_media_source(self, source: str, owner=None) -> None:
@@ -744,20 +1337,78 @@ class SoundManager(QObject):
         self._stop_ambiance()
         logger.warning('Ambiance track stopped (%s); retrying in %.0fs', reason, delay)
 
+    def warm(self) -> None:
+        if self._sfx_volume <= 0 and self._ambiance_volume <= 0:
+            return
+        if not self._available and not self._setup_failed:
+            self._ensure_ready()
+        if self._available and self._sfx_volume > 0:
+            for name in ('hover', 'click', 'navigate'):
+                self._prepare_variants(name)
+
+    def _retry_play(self, name: str, attempt: int) -> None:
+        if self._sfx_volume <= 0 or not self._available:
+            return
+        voices = self._effects.get(name)
+        if not voices:
+            return
+        if any(v.isLoaded() for v in voices):
+            self.play(name)
+        elif attempt < 4:
+            QTimer.singleShot(40, lambda: self._retry_play(name, attempt + 1))
+
+    def _ensure_effect(self, name: str):
+        voices = self._effects.get(name)
+        if voices is not None:
+            return voices
+        filename = _SFX_FILENAMES.get(name)
+        if filename is None:
+            return None
+        from PySide6.QtMultimedia import QSoundEffect
+        count = _SFX_VOICES.get(name, 3)
+        voices = [QSoundEffect(self) for _ in range(count)]
+        self._effects[name] = voices
+        self._voice_index[name] = 0
+        self._apply_effect_source(name, filename)
+        return voices
+
     def play(self, name: str) -> None:
         if self._sfx_volume <= 0:
             return
         if not self._ensure_ready():
             return
-        effect = self._effects.get(name)
-        if effect is None or not effect.isLoaded():
+        voices = self._effects.get(name) or self._ensure_effect(name)
+        if not voices:
             return
         if name == 'hover':
             now = time.monotonic()
             if now - self._last_hover < _HOVER_MIN_GAP:
                 return
             self._last_hover = now
-        effect.play()
+        self._prepare_variants(name)
+        count = len(voices)
+        start = random.randrange(count)
+        index = -1
+        for step in range(count):
+            probe = (start + step) % count
+            effect = voices[probe]
+            if effect.isLoaded() and not effect.isPlaying():
+                index = probe
+                break
+        if index < 0:
+            index = start
+            effect = voices[index]
+            if not effect.isLoaded():
+                if name != 'hover':
+                    QTimer.singleShot(40, lambda: self._retry_play(name, 1))
+                return
+            effect.stop()
+        if not name.startswith('popout'):
+            for other_index, other in enumerate(voices):
+                if other_index != index and other.isPlaying():
+                    other.stop()
+        self._voice_index[name] = (index + 1) % count
+        voices[index].play()
 
     def play_popout(self, kind: str = 'info') -> None:
         key = f'popout_{kind}' if kind in ('info', 'success', 'warning', 'error') else 'popout_info'
@@ -775,46 +1426,148 @@ def play_popout_sfx(kind: str = 'info') -> None:
         logger.exception('Failed to play popout sfx (kind=%r)', kind)
 
 
+def _root_owner(widget):
+    node = widget
+    for _ in range(8):
+        parent = node.parentWidget()
+        if parent is None or getattr(parent, 'itemWidget', None) is not node:
+            break
+        node = parent
+    return node
+
+
 class _UiSoundEventFilter(QObject):
+    _INTERESTING = frozenset((
+        QEvent.Type.Enter, QEvent.Type.Leave, QEvent.Type.MouseButtonPress,
+        QEvent.Type.MouseButtonRelease, QEvent.Type.KeyPress,
+    ))
+    _ACTIVATE_KEYS = frozenset((Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter))
+    _HOVER_GAP = 0.05
+
     def __init__(self):
         super().__init__()
-        self._last_click_id = None
-        self._primed = False
-
-    _INTERESTING = frozenset((QEvent.Type.Enter, QEvent.Type.MouseButtonRelease))
+        self._hover_owner = None
+        self._hover_at = 0.0
+        self._pending_owner = None
+        self._hover_timer = None
+        self._press_owner = None
+        self._click_stamp = None
+        self._click_at = 0.0
 
     @staticmethod
-    def _muted(widget) -> bool:
+    def _owner(widget):
         current = widget
-        for _ in range(32):
+        for _ in range(24):
             if current is None:
-                return False
+                return None
             if getattr(current, '_pirachest_no_sfx', False):
-                return True
+                return None
+            if getattr(current, '_pirachest_menu_sfx', None) is not None:
+                return None
+            if isinstance(current, QAbstractItemView):
+                return None
+            if isinstance(current, QAbstractButton) or getattr(current, '_pirachest_sfx', False):
+                return _root_owner(current)
+            if getattr(type(current), 'clicked', None) is not None:
+                return _root_owner(current)
             current = current.parentWidget()
-        return False
+        return None
+
+    @staticmethod
+    def _pointer_over(owner) -> bool:
+        try:
+            return owner.isVisible() and owner.rect().contains(owner.mapFromGlobal(QCursor.pos()))
+        except Exception:
+            return False
+
+    def _release_hover(self, owner) -> None:
+        if self._pointer_over(owner):
+            return
+        if owner is self._pending_owner:
+            self._cancel_pending_hover()
+        if owner is self._hover_owner:
+            self._hover_owner = None
+
+    def _request_hover(self, owner) -> None:
+        now = time.monotonic()
+        if now - self._click_at < 0.12:
+            return
+        if owner is self._hover_owner and self._pointer_over(owner):
+            return
+        self._hover_owner = owner
+        timer = self._hover_timer
+        if timer is None:
+            timer = self._hover_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._flush_hover)
+        wait = self._hover_at + self._HOVER_GAP - now
+        if wait <= 0.001:
+            if timer.isActive():
+                timer.stop()
+            self._pending_owner = None
+            self._hover_at = now
+            get_sound_manager().play('hover')
+        else:
+            self._pending_owner = owner
+            timer.start(max(1, round(wait * 1000)))
+
+    def _flush_hover(self) -> None:
+        owner = self._pending_owner
+        self._pending_owner = None
+        if owner is None or not self._pointer_over(owner):
+            return
+        self._hover_at = time.monotonic()
+        get_sound_manager().play('hover')
+
+    def _cancel_pending_hover(self) -> None:
+        self._pending_owner = None
+        timer = self._hover_timer
+        if timer is not None:
+            timer.stop()
 
     def eventFilter(self, obj, event) -> bool:
         et = event.type()
-        if et not in self._INTERESTING or not isinstance(obj, QWidget) or isinstance(obj, QAbstractItemView):
+        if et not in self._INTERESTING or not isinstance(obj, QWidget):
             return False
-        with suppress(Exception):
-            if self._muted(obj):
+        try:
+            if et in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease):
+                self._cancel_pending_hover()
+            owner = self._owner(obj)
+            if et == QEvent.Type.Leave:
+                if owner is not None:
+                    self._release_hover(owner)
                 return False
-            if not (isinstance(obj, QAbstractButton) or getattr(obj, '_pirachest_sfx', False) or hasattr(obj, 'clicked')):
+            if owner is None:
+                if et == QEvent.Type.Enter:
+                    self._cancel_pending_hover()
+                if et == QEvent.Type.MouseButtonRelease:
+                    self._press_owner = None
                 return False
-            if not obj.isEnabled():
+            if not owner.isEnabled():
                 return False
             if et == QEvent.Type.Enter:
-                if (self._primed and QApplication.mouseButtons() == Qt.MouseButton.NoButton
-                        and QApplication.applicationState() == Qt.ApplicationState.ApplicationActive):
-                    get_sound_manager().play('hover')
-            elif event.button() == Qt.MouseButton.LeftButton and obj.rect().contains(event.position().toPoint()):
-                click_id = (event.timestamp(), event.button())
-                if click_id != self._last_click_id:
-                    self._last_click_id = click_id
-                    self._primed = True
+                if (QApplication.mouseButtons() != Qt.MouseButton.NoButton
+                        or QApplication.applicationState() != Qt.ApplicationState.ApplicationActive):
+                    return False
+                self._request_hover(owner)
+            elif et == QEvent.Type.MouseButtonPress:
+                self._press_owner = owner if event.button() == Qt.MouseButton.LeftButton else None
+            elif et == QEvent.Type.MouseButtonRelease:
+                pressed = self._press_owner
+                self._press_owner = None
+                if (event.button() == Qt.MouseButton.LeftButton and pressed is owner
+                        and owner.rect().contains(owner.mapFromGlobal(event.globalPosition().toPoint()))):
+                    stamp = event.timestamp()
+                    if stamp != self._click_stamp:
+                        self._click_stamp = stamp
+                        self._click_at = time.monotonic()
+                        get_sound_manager().play('click')
+            elif et == QEvent.Type.KeyPress:
+                if obj is owner and not event.isAutoRepeat() and event.key() in self._ACTIVATE_KEYS:
+                    self._click_at = time.monotonic()
                     get_sound_manager().play('click')
+        except Exception:
+            pass
         return False
 
 
@@ -915,16 +1668,436 @@ def tr_or(key: str, fallback: str, **kwargs) -> str:
     return value
 
 
+class _DragHandle(QWidget):
+    grabbed = Signal(QPoint)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(16)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._hover = False
+        self._down = False
+
+    def reset(self) -> None:
+        self._down = False
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._down = True
+            self.update()
+            self.grabbed.emit(event.globalPosition().toPoint())
+            event.accept()
+        else:
+            event.ignore()
+
+    def mouseReleaseEvent(self, event) -> None:
+        self.reset()
+        event.accept()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        base = 255 if isDarkTheme() else 0
+        if self._hover or self._down:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(base, base, base, 26 if self._down else 14))
+            painter.drawRoundedRect(QRectF(1, self.height() / 2 - 20, self.width() - 2, 40), 4, 4)
+        alpha = 190 if self._down else (140 if self._hover else 70)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(base, base, base, alpha))
+        cx, cy = self.width() / 2, self.height() / 2
+        for dx in (-2.5, 2.5):
+            for dy in (-5, 0, 5):
+                painter.drawEllipse(QPointF(cx + dx, cy + dy), 1.3, 1.3)
+
+
+class _DragGhost(QWidget):
+
+    def __init__(self, pixmap, parent):
+        super().__init__(parent)
+        self._pixmap = pixmap
+        self._valid = True
+        self.setFixedSize(pixmap.size() / pixmap.devicePixelRatio())
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(22)
+        shadow.setOffset(0, 5)
+        shadow.setColor(QColor(0, 0, 0, 110))
+        self.setGraphicsEffect(shadow)
+
+    def set_valid(self, valid: bool) -> None:
+        if valid != self._valid:
+            self._valid = valid
+            self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setOpacity(0.93 if self._valid else 0.5)
+        painter.drawPixmap(0, 0, self._pixmap)
+        painter.setOpacity(1.0 if self._valid else 0.5)
+        accent = QColor(themeColor())
+        accent.setAlpha(150)
+        painter.setPen(accent)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 5, 5)
+
+
+class _SectionReorder(QObject):
+
+    def __init__(self, group, on_commit, parent=None):
+        super().__init__(parent)
+        self._group = group
+        self._layout = group.cardLayout
+        self._cards = []
+        self._orig = []
+        self._targets = {}
+        self._anims = {}
+        self._settling = None
+        self._top = 0
+        self._gap = 0
+        self._on_commit = on_commit
+        self._card = None
+        self._ghost = None
+        self._scroll = None
+        self._last = QPoint()
+        self._index = 0
+        self._grab_dy = 0
+        self._valid = True
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._autoscroll)
+
+    def register(self, card) -> None:
+        if card not in self._cards:
+            self._cards.append(card)
+
+    def cards(self) -> list:
+        return list(self._cards)
+
+    def arrange(self, order: list) -> None:
+        if self._card is not None:
+            return
+        rank = {key: i for i, key in enumerate(order)}
+        wanted = sorted(self._cards, key=lambda c: rank.get(c.nav_key, len(rank)))
+        if wanted != self._cards:
+            self._place(wanted, animate=False)
+
+    def _glide(self, cards: list) -> None:
+        for card in cards:
+            end = QPoint(card.x(), self._targets[card])
+            start = card.pos()
+            if start == end:
+                continue
+            if not animations_enabled():
+                card.move(end)
+                continue
+            anim = QPropertyAnimation(card, b'pos', self)
+            anim.setDuration(170)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.setStartValue(start)
+            anim.setEndValue(end)
+            anim.finished.connect(partial(self._anims.pop, card, None))
+            self._anims[card] = anim
+            anim.start()
+
+    def _reorder_list(self, wanted: list) -> None:
+        owned = getattr(self._layout, '_ExpandLayout__widgets', None)
+        if isinstance(owned, list) and all(c in owned for c in wanted):
+            slots = sorted(owned.index(c) for c in wanted)
+            for slot, card in zip(slots, wanted):
+                owned[slot] = card
+            return
+        for card in self._cards:
+            self._layout.removeWidget(card)
+        for card in wanted:
+            self._layout.addWidget(card)
+
+    def _place(self, wanted: list, animate: bool = True) -> None:
+        for anim in list(self._anims.values()):
+            anim.stop()
+        self._anims.clear()
+        self._reorder_list(wanted)
+        self._cards = list(wanted)
+        if not animate:
+            self._layout.invalidate()
+            return
+        y = self._top
+        for card in self._cards:
+            self._targets[card] = y
+            y += card.height() + self._gap
+        self._glide(self._cards)
+
+    def _settle(self) -> None:
+        pending, self._settling = self._settling, None
+        if pending is None:
+            return
+        card, ghost, anim = pending
+        anim.stop()
+        ghost.hide()
+        ghost.deleteLater()
+        card.setGraphicsEffect(None)
+        card.handle_reset()
+
+    def begin(self, card, gpos: QPoint) -> None:
+        self._settle()
+        if self._card is not None:
+            return
+        if len(self._cards) < 2 or card not in self._cards:
+            card.handle_reset()
+            return
+        ordered = sorted(self._cards, key=lambda c: c.y())
+        self._top = ordered[0].y()
+        self._gap = max(0, ordered[1].y() - (ordered[0].y() + ordered[0].height()))
+        self._targets = {c: c.y() for c in self._cards}
+        self._card = card
+        self._orig = list(self._cards)
+        self._index = self._cards.index(card)
+        self._grab_dy = self._group.mapFromGlobal(gpos).y() - card.y()
+        self._ghost = _DragGhost(card.card.grab(), self._group)
+        self._ghost.move(card.x(), card.y())
+        self._ghost.show()
+        effect = QGraphicsOpacityEffect(card)
+        effect.setOpacity(0.35)
+        card.setGraphicsEffect(effect)
+        parent = self._group.parentWidget()
+        while parent is not None and not isinstance(parent, QScrollArea):
+            parent = parent.parentWidget()
+        self._scroll = parent
+        if parent is not None:
+            parent.verticalScrollBar().valueChanged.connect(self._refresh)
+        QApplication.instance().installEventFilter(self)
+        QApplication.setOverrideCursor(Qt.CursorShape.ClosedHandCursor)
+        self._timer.start()
+        self._update(gpos)
+
+    def eventFilter(self, obj, event) -> bool:
+        if self._card is None:
+            return False
+        kind = event.type()
+        if kind == QEvent.Type.MouseMove:
+            self._update(event.globalPosition().toPoint())
+            return True
+        if kind == QEvent.Type.MouseButtonRelease:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._end(commit=True)
+            return True
+        if kind == QEvent.Type.MouseButtonPress:
+            self._end(commit=False)
+            return True
+        if kind == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Escape:
+                self._end(commit=False)
+            return True
+        if kind in (QEvent.Type.ApplicationDeactivate, QEvent.Type.WindowBlocked):
+            self._end(commit=False)
+        return False
+
+    def _refresh(self, *_args) -> None:
+        if self._card is not None:
+            self._update(self._last)
+
+    def _region(self):
+        widget = self._scroll.viewport() if self._scroll is not None else self._group
+        return QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
+
+    def _update(self, gpos: QPoint) -> None:
+        self._last = gpos
+        card = self._card
+        slots = self._targets
+        top = min(slots.values())
+        bottom = max(slots[c] + c.height() for c in self._cards)
+        local_y = self._group.mapFromGlobal(gpos).y()
+        raw = local_y - self._grab_dy
+        y = max(top, min(raw, bottom - self._ghost.height()))
+        self._ghost.move(card.x(), y)
+        center = raw + self._ghost.height() / 2
+        others = [c for c in self._cards if c is not card]
+        index = sum(1 for c in others if slots[c] + c.height() / 2 < center)
+        if index != self._index:
+            self._index = index
+            self._place(others[:index] + [card] + others[index:])
+        region = self._region()
+        valid = region.adjusted(0, -24, 0, 24).contains(gpos) and region.left() <= gpos.x() <= region.right()
+        if valid != self._valid:
+            self._valid = valid
+            self._ghost.set_valid(valid)
+            QApplication.changeOverrideCursor(
+                Qt.CursorShape.ClosedHandCursor if valid else Qt.CursorShape.ForbiddenCursor)
+
+    def _autoscroll(self) -> None:
+        if self._card is None or self._scroll is None or not self._valid:
+            return
+        region = self._region()
+        edge = 56
+        y = self._last.y()
+        delta = 0
+        if y < region.top() + edge:
+            delta = -int(max(1, (region.top() + edge - y) / 4))
+        elif y > region.bottom() - edge:
+            delta = int(max(1, (y - (region.bottom() - edge)) / 4))
+        if delta:
+            bar = self._scroll.verticalScrollBar()
+            bar.setValue(bar.value() + max(-24, min(24, delta)))
+
+    def _end(self, commit: bool) -> None:
+        card, ghost = self._card, self._ghost
+        changed = self._cards != self._orig
+        keep = commit and self._valid
+        if changed and not keep:
+            self._place(list(self._orig))
+        target = self._targets[card]
+        self._card = None
+        self._ghost = None
+        self._timer.stop()
+        QApplication.instance().removeEventFilter(self)
+        while QApplication.overrideCursor() is not None:
+            QApplication.restoreOverrideCursor()
+        if self._scroll is not None:
+            with suppress(Exception):
+                self._scroll.verticalScrollBar().valueChanged.disconnect(self._refresh)
+        self._scroll = None
+        self._valid = True
+        if not animations_enabled():
+            ghost.move(card.x(), target)
+            ghost.hide()
+            ghost.deleteLater()
+            card.setGraphicsEffect(None)
+            card.handle_reset()
+            if changed and keep:
+                self._on_commit()
+            return
+        anim = QPropertyAnimation(ghost, b'pos', self)
+        anim.setDuration(140)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(ghost.pos())
+        anim.setEndValue(QPoint(card.x(), target))
+        anim.finished.connect(self._settle)
+        self._settling = (card, ghost, anim)
+        ghost.set_valid(True)
+        anim.start()
+        if changed and keep:
+            self._on_commit()
+
+
+def _contrast_text(color: QColor) -> QColor:
+    def lin(v: float) -> float:
+        v /= 255
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    lum = 0.2126 * lin(color.red()) + 0.7152 * lin(color.green()) + 0.0722 * lin(color.blue())
+    white = 1.05 / (lum + 0.05)
+    dark = (lum + 0.05) / 0.0556
+    return QColor('#ffffff') if white >= dark else QColor('#111111')
+
+
+class _PillButton(PillPushButton):
+
+    def paintEvent(self, event) -> None:
+        if not self.isChecked():
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        accent = QColor(themeColor())
+        if self.isDown():
+            accent.setAlphaF(0.8)
+        elif self.underMouse():
+            accent.setAlphaF(0.92)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(accent)
+        painter.drawRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+        painter.setPen(_contrast_text(QColor(themeColor())))
+        painter.setFont(self.font())
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.text())
+
+
+class _AccentButton(PrimaryPushButton):
+
+    def paintEvent(self, event) -> None:
+        if not self.isEnabled() or not self.icon().isNull():
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        accent = QColor(themeColor())
+        if self.isDown():
+            accent.setAlphaF(0.8)
+        elif self.underMouse():
+            accent.setAlphaF(0.92)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(accent)
+        painter.drawRoundedRect(rect, 5, 5)
+        painter.setPen(_contrast_text(QColor(themeColor())))
+        painter.setFont(self.font())
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.text())
+
+
+class _ClickShield(QObject):
+
+    _BLOCKED = (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease,
+                QEvent.Type.MouseButtonDblClick)
+
+    def eventFilter(self, obj, event) -> bool:
+        return event.type() in self._BLOCKED
+
+
+class _HandleAnchor(QObject):
+
+    def __init__(self, header, handle) -> None:
+        super().__init__(header)
+        self._header = header
+        self._handle = handle
+        header.installEventFilter(self)
+        self._sync()
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            self._sync()
+        return False
+
+    def _sync(self) -> None:
+        self._handle.setGeometry(0, 0, 16, self._header.height())
+        self._handle.raise_()
+
+
 class _SectionCard(ExpandGroupSettingCard):
 
     def __init__(self, icon, title: str, content: str = '', parent=None):
         super().__init__(icon, title, content, parent)
+        self.nav_key = ''
+        self._handle = None
+        self._shield = _ClickShield(self)
+        self.card.installEventFilter(self._shield)
         self.switch = SwitchButton('', self, IndicatorPosition.RIGHT)
         self.addWidget(self.switch)
         self.switch.checkedChanged.connect(self._sync_switch_text)
 
     def _sync_switch_text(self, checked: bool) -> None:
         self.switch.setText(_on_off(checked))
+
+    def enable_reorder(self, key: str, begin) -> None:
+        self.nav_key = key
+        self._handle = _DragHandle(self.card)
+        self._anchor = _HandleAnchor(self.card, self._handle)
+        self._handle.grabbed.connect(lambda pos: begin(self, pos))
+        self._handle.show()
+
+    def handle_reset(self) -> None:
+        if self._handle is not None:
+            self._handle.reset()
 
     def setChecked(self, checked: bool) -> None:
         self.switch.setChecked(bool(checked))
@@ -1050,6 +2223,18 @@ class SettingsPage(QWidget):
     settings_changed = Signal()
     _cache_size_ready = Signal(int)
     _cache_clear_finished = Signal(str)
+    _vyla_update_finished = Signal(str, str)
+
+    _CATEGORIES = (
+        ('appearance', 'settings.tab_appearance', 'Appearance'),
+        ('sections', 'settings.tab_sections', 'Sections'),
+        ('sailseek', 'settings.tab_sailseek', 'SailSeek'),
+        ('downloads', 'settings.tab_downloads', 'Downloads'),
+        ('network', 'settings.tab_network', 'Network'),
+        ('integrations', 'settings.tab_integrations', 'Integrations'),
+        ('shortcuts', 'settings.tab_shortcuts', 'Shortcuts'),
+        ('advanced', 'settings.tab_advanced', 'Advanced'),
+    )
 
     _NET_ICONS = {
         'proxy_address': FluentIcon.WIFI,
@@ -1097,6 +2282,11 @@ class SettingsPage(QWidget):
         self.setStyleSheet('background: transparent;')
         self._build_steps = None
         self._pending_group_adjust: set = set()
+        self._active_category = self._CATEGORIES[0][0]
+        self._selected_category = self._CATEGORIES[0][0]
+        self._category_buttons: dict = {}
+        self._category_layouts: dict = {}
+        self._category_pages: dict = {}
         self._prebuild_timer = QTimer(self)
         self._prebuild_timer.setSingleShot(True)
         self._prebuild_timer.setInterval(0)
@@ -1181,6 +2371,7 @@ class SettingsPage(QWidget):
         self._build_steps = None
         self._building = False
         self._built = True
+        self._last_cache_probe = 0.0
         self._populate()
         self._flush_group_adjust()
         register_locale_refresh(self, self._apply_locale)
@@ -1196,39 +2387,110 @@ class SettingsPage(QWidget):
     def _build_slices(self):
         self._make_shell()
         yield
+        self._active_category = 'appearance'
         yield from self._build_general()
+        self._active_category = 'downloads'
         yield from self._build_downloads()
+        self._active_category = 'network'
         yield from self._build_privacy()
+        self._active_category = 'sections'
         yield from self._build_sections_start()
         yield from self._build_sections_books()
         yield from self._build_sections_tv()
         yield from self._build_sections_end()
+        self._active_category = 'appearance'
         yield from self._build_sound()
+        self._active_category = 'sailseek'
         yield from self._build_sailseek()
-        yield from self._build_shortcuts()
+        self._active_category = 'integrations'
         yield from self._build_integrations()
         yield from self._build_debrid()
+        self._active_category = 'advanced'
         yield from self._build_advanced()
         yield from self._build_experimental()
-        self._page_layout.addStretch()
+        self._active_category = 'shortcuts'
+        yield from self._build_shortcuts()
+        for layout in self._category_layouts.values():
+            groups = [
+                layout.itemAt(i).widget()
+                for i in range(layout.count())
+                if isinstance(layout.itemAt(i).widget(), SettingCardGroup)
+            ]
+            if len(groups) == 1:
+                groups[0].titleLabel.hide()
+            layout.addStretch(1)
+        self._active_category = self._selected_category
 
     def _make_shell(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        scroll = make_smooth_scroll_area(self)
+
+        self._category_bar = QWidget(self)
+        self._category_bar.setObjectName('settingsCategoryBar')
+        self._category_bar.setStyleSheet('background: transparent;')
+        self._category_flow = FlowLayout(self._category_bar)
+        self._category_flow.setContentsMargins(24, 10, 28, 4)
+        self._category_flow.setHorizontalSpacing(6)
+        self._category_flow.setVerticalSpacing(6)
+        outer.addWidget(self._category_bar)
+
+        self._category_group = QButtonGroup(self)
+        self._category_group.setExclusive(True)
+
+        self._stack = QStackedWidget(self)
+        self._stack.setStyleSheet('QStackedWidget { background: transparent; border: none; }')
+        outer.addWidget(self._stack, 1)
+
+        for key, text_key, fallback in self._CATEGORIES:
+            self._make_category_page(key)
+            self._make_category_button(key, text_key, fallback)
+
+        self._active_category = self._CATEGORIES[0][0]
+        self._scroll = self._category_pages[self._active_category]
+        self._show_category(self._active_category, animate=False)
+
+    def _make_category_page(self, key: str) -> None:
+        scroll = make_smooth_scroll_area(self._stack)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setStyleSheet('QScrollArea { background: transparent; border: none; }')
         scroll.viewport().setStyleSheet('background: transparent;')
-        outer.addWidget(scroll)
         container = QWidget()
         container.setStyleSheet('background: transparent;')
         scroll.setWidget(container)
-        self._scroll = scroll
-        self._page_layout = QVBoxLayout(container)
-        self._page_layout.setContentsMargins(24, 10, 28, 26)
-        self._page_layout.setSpacing(6)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(24, 4, 28, 24)
+        layout.setSpacing(4)
+        self._stack.addWidget(scroll)
+        self._category_pages[key] = scroll
+        self._category_layouts[key] = layout
+
+    def _make_category_button(self, key: str, text_key: str, fallback: str) -> None:
+        button = _PillButton(self._t(text_key, fallback), self._category_bar)
+        button.setCheckable(True)
+        button.setFixedHeight(30)
+        button.clicked.connect(lambda _checked=False, k=key: self._show_category(k))
+        self._bind(button.setText, text_key, fallback)
+        self._category_group.addButton(button)
+        self._category_buttons[key] = button
+        self._category_flow.addWidget(button)
+
+    def _show_category(self, key: str, animate: bool = True) -> None:
+        page = self._category_pages.get(key)
+        if page is None:
+            return
+        button = self._category_buttons.get(key)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+        self._active_category = key
+        self._selected_category = key
+        self._scroll = page
+        if self._stack.currentWidget() is page:
+            return
+        self._stack.setCurrentWidget(page)
+        if animate:
+            fade_in(page, 110)
 
     def scroll_to_group(self, key: str) -> None:
         if not self._built:
@@ -1236,26 +2498,44 @@ class SettingsPage(QWidget):
         if not self._built:
             return
         attrs = {
+            'settings.group_appearance': '_general_group',
             'settings.group_general': '_general_group',
+            'settings.group_downloads': '_dl_group',
             'settings.group_downloads_network': '_dl_group',
+            'settings.group_network': '_privacy_group',
             'settings.privacy_group': '_privacy_group',
+            'settings.group_features': '_feature_group',
             'settings.group_sections': '_feature_group',
             'settings.group_sound': '_sound_group',
-            'settings.group_shortcuts': '_shortcuts_card',
+            'settings.group_shortcuts': '_shortcuts_group',
             'settings.group_sailseek': '_sailseek_group',
             'settings.group_integrations': '_integrations_group',
             'settings.group_debrid': '_debrid_group',
             'settings.group_advanced': '_adv_group',
             'settings.group_experimental': '_experimental_group',
         }
+        pages = {
+            'settings.group_appearance': 'appearance',
+            'settings.group_general': 'appearance',
+            'settings.group_downloads': 'downloads',
+            'settings.group_downloads_network': 'downloads',
+            'settings.group_network': 'network',
+            'settings.privacy_group': 'network',
+            'settings.group_features': 'sections',
+            'settings.group_sections': 'sections',
+            'settings.group_sound': 'appearance',
+            'settings.group_shortcuts': 'shortcuts',
+            'settings.group_sailseek': 'sailseek',
+            'settings.group_integrations': 'integrations',
+            'settings.group_debrid': 'integrations',
+            'settings.group_advanced': 'advanced',
+            'settings.group_experimental': 'advanced',
+        }
         widget = getattr(self, attrs.get(key, ''), None)
         if widget is None:
             return
-        if key == 'settings.group_shortcuts':
-            with suppress(Exception):
-                if not getattr(widget, 'isExpand', False):
-                    widget.setExpand(True)
-        self._scroll_to_widget(widget)
+        self._show_category(pages.get(key, 'appearance'), animate=False)
+        QTimer.singleShot(0, lambda: self._scroll_to_widget(widget))
 
     def _scroll_to_widget(self, widget) -> None:
         def _apply() -> None:
@@ -1372,9 +2652,17 @@ class SettingsPage(QWidget):
         return group
 
     def _add_group(self, group: SettingCardGroup) -> None:
-        self._page_layout.addWidget(group)
+        layout = self._category_layouts.get(self._active_category)
+        if layout is None:
+            layout = self._category_layouts[self._CATEGORIES[0][0]]
+        first = not any(
+            isinstance(layout.itemAt(i).widget(), SettingCardGroup) for i in range(layout.count()))
+        if first and self._active_category in ('appearance', 'integrations', 'advanced'):
+            group.titleLabel.hide()
+            group.titleLabel.setFixedHeight(0)
+        layout.addWidget(group)
         group.show()
-        self._page_layout.addSpacing(18)
+        layout.addSpacing(12)
 
     def _add_card(self, group: SettingCardGroup, card: QWidget) -> None:
         if card.parentWidget() is not group:
@@ -1484,7 +2772,7 @@ class SettingsPage(QWidget):
 
 
     def _build_general(self):
-        group = self._general_group = self._group('settings.group_general', 'General')
+        group = self._general_group = self._group('settings.group_appearance', 'Appearance')
         self._add_group(group)
         yield
 
@@ -1517,6 +2805,13 @@ class SettingsPage(QWidget):
         )
         yield
 
+        self._animations_card = self._switch_card(
+            group, 'settings.animations', FluentIcon.SPEED_HIGH,
+            'settings.animations_title', 'Animations',
+            'settings.animations_content', 'Animate navigation, cards, panels and transitions. Turn off for instant, motion-free interactions.',
+            attr='animations_enabled')
+        yield
+
         self._accent_color_btn = ColorPickerButton(
             QColor(palette()['accent']), self._t('settings.accent_color_title'), self, enableAlpha=False)
         self._bind(lambda text: setattr(self._accent_color_btn, 'title', text), 'settings.accent_color_title')
@@ -1535,13 +2830,6 @@ class SettingsPage(QWidget):
         yield
 
         yield from self._build_background(group)
-
-        self._chk_launch_startup = self._switch_card(
-            group, 'settings.launch_at_startup', FluentIcon.SPEED_HIGH,
-            'settings.launch_at_startup_title', None, 'settings.launch_at_startup_content', None,
-            on_change=self._on_launch_at_startup_toggled,
-        )
-        yield
 
     def _build_background(self, group):
         self._bg_card = _SectionCard(
@@ -1599,7 +2887,7 @@ class SettingsPage(QWidget):
         yield
 
     def _make_slider_row(self, minimum: int, maximum: int, value: int, suffix: str):
-        slider = Slider(Qt.Orientation.Horizontal)
+        slider = ThemedSlider(Qt.Orientation.Horizontal)
         slider.setRange(minimum, maximum)
         slider.setValue(value)
         label = CaptionLabel(f'{value}{suffix}')
@@ -1646,6 +2934,11 @@ class SettingsPage(QWidget):
             group, 'settings.seed_time', FluentIcon.HISTORY,
             'settings.seed_time_title', None, 'settings.seed_time_content', None,
             'seed_time', 0, 9999, 'settings.suffix_min')
+        self._reserve_card, self._spin_reserve = self._spin_card(
+            group, 'settings.min_free_space', FluentIcon.FOLDER,
+            'settings.min_free_space_title', 'Keep free disk space',
+            'settings.min_free_space_content', 'Refuse or stop downloads that would leave less than this free',
+            'min_free_space_mb', 0, 10000000, 'settings.suffix_mb', 'MB')
         yield
 
         self._finish_combo = ComboBox()
@@ -1670,6 +2963,14 @@ class SettingsPage(QWidget):
             group, 'settings.close_to_tray', FluentIcon.MINIMIZE,
             'settings.close_to_tray_title', None, 'settings.close_to_tray_content', None,
             attr='close_to_tray')
+        yield
+
+        self._chk_notify_download = self._switch_card(
+            group, 'settings.notify_download', FluentIcon.RINGER,
+            'settings.notify_download_title', 'Download complete notifications',
+            'settings.notify_download_content',
+            'Show a Windows notification whenever a download finishes.',
+            attr='notify_on_download_complete')
         yield
 
 
@@ -1764,7 +3065,19 @@ class SettingsPage(QWidget):
             on_change or (lambda checked, a=attr: self._save_switch(a, checked)))
         self._sections.append((card, attr))
         self._add_card(group, card)
+        key = attr[:-8] if attr.endswith('_enabled') else ''
+        if key in NAV_SOURCE_KEYS:
+            reorder = getattr(self, '_section_reorder', None)
+            if reorder is None:
+                reorder = self._section_reorder = _SectionReorder(group, self._commit_section_order, self)
+            card.enable_reorder(key, reorder.begin)
+            reorder.register(card)
         return card
+
+    def _commit_section_order(self) -> None:
+        reorder = getattr(self, '_section_reorder', None)
+        if reorder is not None:
+            self._apply_setting('nav_order', [c.nav_key for c in reorder.cards()])
 
     def _add_download_folder(self, card: _SectionCard, slot: str, icon,
                              title_key: str, content_key: str, attr: str) -> None:
@@ -1927,16 +3240,9 @@ class SettingsPage(QWidget):
             group, 'nav.books', FluentIcon.BOOK_SHELF,
             'settings.books_title', 'settings.books_content', 'books_enabled')
         self._add_download_folder(
-            self._chk_books, 'settings.folder_books', FluentIcon.FOLDER,
-            'settings.download_folder_books_title', 'settings.download_folder_books_content',
-            'download_dir_books')
-        self._add_download_folder(
             self._chk_books, 'settings.folder_manga', FluentIcon.DOCUMENT,
             'settings.download_folder_manga_title', 'settings.download_folder_manga_content',
             'download_dir_manga')
-        self._add_tab_switch(
-            self._chk_books, 'books', 'books', 'settings.tab_books', FluentIcon.BOOK_SHELF,
-            'settings.tab_books_title', 'settings.tab_books_content')
         self._add_tab_switch(
             self._chk_books, 'books', 'manga', 'settings.tab_manga', FluentIcon.DICTIONARY,
             'settings.tab_manga_title', 'settings.tab_manga_content')
@@ -2084,6 +3390,10 @@ class SettingsPage(QWidget):
         self._btn_external_setup = PushButton(self._t('settings.external_setup', 'Set up runtime'))
         self._bind(self._btn_external_setup.setText, 'settings.external_setup', 'Set up runtime')
         self._btn_external_setup.clicked.connect(self._on_external_setup)
+        self._btn_vyla_update = PushButton(self._t('settings.vyla_update', 'Update Vyla SDK'))
+        self._bind(self._btn_vyla_update.setText, 'settings.vyla_update', 'Update Vyla SDK')
+        self._btn_vyla_update.clicked.connect(self._on_vyla_update)
+        self._vyla_update_finished.connect(self._on_vyla_update_finished)
         status_box = QWidget()
         status_layout = QVBoxLayout(status_box)
         status_layout.setContentsMargins(0, 0, 0, 0)
@@ -2093,6 +3403,7 @@ class SettingsPage(QWidget):
         button_row.setContentsMargins(0, 0, 0, 0)
         button_row.setSpacing(8)
         button_row.addWidget(self._btn_external_setup, 0, Qt.AlignmentFlag.AlignVCenter)
+        button_row.addWidget(self._btn_vyla_update, 0, Qt.AlignmentFlag.AlignVCenter)
         button_row.addStretch(1)
         status_layout.addLayout(button_row)
         self._external_status_card = self._tv_row(
@@ -2176,7 +3487,7 @@ class SettingsPage(QWidget):
 
     def _build_sections_end(self):
         self._chk_tbhb = self._section(
-            self._feature_group, 'nav.tbhb', FluentIcon.SEARCH,
+            self._feature_group, 'nav.tbhb', FluentIcon.GLOBE,
             'settings.tbhb_title', 'settings.tbhb_content', 'tbhb_enabled')
         self._add_download_folder(
             self._chk_tbhb, 'settings.folder_tbhb', FluentIcon.FOLDER,
@@ -2190,15 +3501,7 @@ class SettingsPage(QWidget):
         self._add_group(group)
         yield
 
-        self._chk_notify_download = self._switch_card(
-            group, 'settings.notify_download', FluentIcon.RINGER,
-            'settings.notify_download_title', 'Download complete notifications',
-            'settings.notify_download_content',
-            'Show a Windows notification whenever a download finishes.',
-            attr='notify_on_download_complete')
-        yield
-
-        self._sfx_slider = Slider(Qt.Orientation.Horizontal)
+        self._sfx_slider = ThemedSlider(Qt.Orientation.Horizontal)
         self._sfx_slider.setRange(0, 100)
         self._sfx_slider.setValue(_SFX_DEFAULT_VOLUME)
         self._sfx_value_lbl = CaptionLabel(str(_SFX_DEFAULT_VOLUME))
@@ -2212,7 +3515,7 @@ class SettingsPage(QWidget):
             self._sfx_slider, self._sfx_value_lbl)
         yield
 
-        self._ambiance_slider = Slider(Qt.Orientation.Horizontal)
+        self._ambiance_slider = ThemedSlider(Qt.Orientation.Horizontal)
         self._ambiance_slider.setRange(0, 100)
         self._ambiance_slider.setValue(_AMBIANCE_DEFAULT_VOLUME)
         self._ambiance_value_lbl = CaptionLabel(str(_AMBIANCE_DEFAULT_VOLUME))
@@ -2237,7 +3540,6 @@ class SettingsPage(QWidget):
         ('tv', FluentIcon.PROJECTOR, 'TV', 'Series results from TMDB.'),
         ('anime', FluentIcon.PLAY, 'Anime', 'Anime results from AniList.'),
         ('manga', FluentIcon.DICTIONARY, 'Manga', 'Manga results from MangaDex.'),
-        ('books', FluentIcon.BOOK_SHELF, 'Books', 'Results from your book providers.'),
     )
 
     def _build_sailseek(self):
@@ -2420,11 +3722,18 @@ class SettingsPage(QWidget):
             attr='external_torrent_client')
         yield
 
+        self._chk_launch_startup = self._switch_card(
+            group, 'settings.launch_at_startup', FluentIcon.SPEED_HIGH,
+            'settings.launch_at_startup_title', None, 'settings.launch_at_startup_content', None,
+            on_change=self._on_launch_at_startup_toggled,
+        )
+        yield
+
         if os.name != 'nt':
             return
         yield
 
-        self._btn_make_default = PrimaryPushButton(self._t('settings.make_default_button'))
+        self._btn_make_default = _AccentButton(self._t('settings.make_default_button'))
         self._bind(self._btn_make_default.setText, 'settings.make_default_button')
         self._btn_make_default.clicked.connect(self._on_make_default_torrent_client)
         self._make_default_card = self._plain_card(
@@ -2465,6 +3774,34 @@ class SettingsPage(QWidget):
             timer.setInterval(1000)
             timer.timeout.connect(self._refresh_external_status)
         timer.start()
+
+    def _on_vyla_update(self) -> None:
+        from src.core import worker as _worker
+        from src.core.tv import external as external_backend
+        self._btn_vyla_update.setEnabled(False)
+        self._external_status_lbl.setText(
+            self._t('settings.vyla_update_running', 'Updating Vyla SDK...'))
+        _worker.submit(
+            external_backend.update_vyla_sdk,
+            on_done=lambda version: self._vyla_update_finished.emit(str(version or ''), ''),
+            on_error=lambda message: self._vyla_update_finished.emit(
+                '', str(message) or 'unknown error'),
+            owner=self, key='vyla-update', priority=_worker.Priority.NORMAL)
+
+    def _on_vyla_update_finished(self, version: str, error: str) -> None:
+        self._btn_vyla_update.setEnabled(True)
+        self._refresh_external_status()
+        if error:
+            logger.error('Vyla SDK update failed: %s', error)
+            InfoBar.error(
+                title=self._t('settings.vyla_update_failed', 'Vyla SDK update failed'),
+                content=error, duration=6000, parent=self.window())
+            return
+        InfoBar.success(
+            title=self._t('settings.vyla_update_done', 'Vyla SDK updated'),
+            content=self._t('settings.vyla_update_done_content',
+                            'Now running version {version}.', version=version),
+            duration=3500, parent=self.window())
 
     def _refresh_external_status(self) -> None:
         from src.core.tv import external as external_backend
@@ -2808,8 +4145,19 @@ class SettingsPage(QWidget):
             self._btn_export_settings, self._btn_import_settings)
         yield
 
-        from src.core.updater import __version__ as app_version
-        self._app_version = app_version
+        self._chk_auto_update = self._switch_card(
+            group, 'settings.auto_update_check', FluentIcon.SYNC,
+            'settings.auto_update_check_title', 'Check for updates automatically',
+            'settings.auto_update_check_content', 'Look for newer releases in the background when PiraChest starts. On by default.',
+            attr='auto_check_updates')
+        self._chk_canary_update = self._switch_card(
+            group, 'settings.canary_updates', FluentIcon.UPDATE,
+            'settings.canary_updates_title', 'PiraChest Canary',
+            'settings.canary_updates_content', 'Experimental cutting-edge builds that update faster and may be unstable. Canary builds also receive stable update notices.',
+            attr='canary_updates')
+        yield
+
+        self._app_version = VERSION
         self._update_status_lbl = CaptionLabel('')
         self._btn_check_update = PushButton(self._t('settings.check_for_updates'))
         self._bind(self._btn_check_update.setText, 'settings.check_for_updates')
@@ -2828,6 +4176,8 @@ class SettingsPage(QWidget):
         self._btn_clear_cache.clicked.connect(self._on_clear_cache)
         self._cache_ready_slot = lambda size: self._cache_status_lbl.setText(
             format_size(size) if size >= 0 else '')
+        self._cache_status_lbl.setMinimumWidth(64)
+        self._cache_status_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._cache_size_ready.connect(self._cache_ready_slot)
         self._cache_clear_finished.connect(self._on_cache_cleared)
         self._cache_card = self._plain_card(
@@ -2890,8 +4240,14 @@ class SettingsPage(QWidget):
                     self._quiet_switch(card, checked)
                 else:
                     self._quiet(card, card.setChecked, checked)
+            if IS_CANARY and getattr(self, '_chk_canary_update', None) is not None:
+                self._quiet_switch(self._chk_canary_update.switchButton, True)
+                self._chk_canary_update.setEnabled(False)
             for card, attr in self._sections:
                 self._quiet_switch(card.switch, bool(getattr(settings, attr, False)))
+            reorder = getattr(self, '_section_reorder', None)
+            if reorder is not None:
+                reorder.arrange(nav_order())
             for combo, attr in self._combos:
                 value = getattr(settings, attr, None)
                 index = combo.findData(value)
@@ -3001,7 +4357,6 @@ class SettingsPage(QWidget):
             apply_settings(theme_preset=option)
             save_settings(settings)
         self._sync_theme_lock_state()
-        self.settings_changed.emit()
 
     def _on_theme_reload_clicked(self) -> None:
         reload_custom_themes()
@@ -3016,7 +4371,13 @@ class SettingsPage(QWidget):
 
 
     def _on_accent_color_changed(self, color: QColor) -> None:
+        for pill in getattr(self, '_category_buttons', {}).values():
+            pill.update()
         self._pending_accent = QColor(color)
+        if not accent_locked(active_preset_id()):
+            shader = getattr(self.window(), '_shader_bg', None)
+            if shader is not None:
+                shader.set_accent_color(color)
         timer = getattr(self, '_accent_timer', None)
         if timer is None:
             timer = self._accent_timer = QTimer(self)
@@ -3038,12 +4399,8 @@ class SettingsPage(QWidget):
         save_settings(settings)
         if not accent_locked(active_preset_id()):
             notify_accent_changed()
-            shader = getattr(self.window(), '_shader_bg', None)
-            if shader is not None:
-                shader.set_accent_color(palette()['accent'])
         else:
             self._sync_accent_button()
-        self.settings_changed.emit()
 
     def _on_default_accent_color(self) -> None:
         color = QColor(APP_ACCENT_COLOR)
@@ -3207,55 +4564,39 @@ class SettingsPage(QWidget):
 
 
     def _build_shortcuts(self):
-        card = ExpandGroupSettingCard(
-            themed_icon('settings.keyboard_shortcut', FluentIcon.SETTING),
-            self._t('settings.group_shortcuts', 'Keyboard shortcuts'),
-            self._t('settings.group_shortcuts_content', 'Expand to view and remap every shortcut'),
-            self._general_group,
-        )
-        self._shortcuts_card = card
-        self._track_icon(card, 'settings.keyboard_shortcut', FluentIcon.SETTING)
-        self._bind(card.card.setTitle, 'settings.group_shortcuts', 'Keyboard shortcuts')
-        self._bind(card.card.setContent, 'settings.group_shortcuts_content',
-                   'Expand to view and remap every shortcut')
+        group = self._shortcuts_group = self._group(
+            'settings.group_shortcuts', 'Keyboard shortcuts')
+        self._shortcuts_card = group
+        self._add_group(group)
         yield
 
         for action_id, _default_key, label, _attr in SHORTCUT_DEFAULTS:
-            button = PushButton('', self)
+            button = PushButton('', group)
             button.setMinimumWidth(150)
             button.clicked.connect(
                 lambda _checked=False, a=action_id: self._begin_shortcut_capture(a))
             button.installEventFilter(self)
             slot, fluent = SHORTCUT_ICONS.get(action_id, (None, FluentIcon.SETTING))
-            group = card.addGroup(
-                themed_icon(slot, fluent),
-                self._t(f'settings.shortcut_{action_id}', label),
-                '',
-                button,
-            )
-            if slot is not None:
-                self._track_group_icon(group, slot, fluent)
-            self._bind(group.setTitle, f'settings.shortcut_{action_id}', label)
-            self._shortcut_rows[action_id] = (group, button)
+            key = f'settings.shortcut_{action_id}'
+            card = SettingCard(themed_icon(slot, fluent), self._t(key, label), '', group)
+            card.setFixedHeight(50)
+            self._track_icon(card, slot, fluent)
+            self._bind(card.setTitle, key, label)
+            self._tail(card, button)
+            self._add_card(group, card)
+            self._shortcut_rows[action_id] = (card, button)
             yield
 
-        self._btn_shortcuts_reset = PushButton(self._t('settings.shortcuts_reset', 'Reset to defaults'))
+        self._btn_shortcuts_reset = PushButton(
+            self._t('settings.shortcuts_reset', 'Reset to defaults'), group)
         self._bind(self._btn_shortcuts_reset.setText, 'settings.shortcuts_reset', 'Reset to defaults')
         self._btn_shortcuts_reset.clicked.connect(self._on_shortcuts_reset)
-        self._shortcuts_reset_group = card.addGroup(
-            themed_icon('settings.keyboard_shortcut', FluentIcon.SETTING),
-            self._t('settings.shortcuts_reset_title', 'Reset shortcuts'),
-            self._t('settings.shortcuts_reset_content',
-                    'Restore all keyboard shortcuts to their defaults'),
-            self._btn_shortcuts_reset,
-        )
-        self._track_group_icon(self._shortcuts_reset_group, 'settings.keyboard_shortcut',
-                               FluentIcon.SETTING)
-        self._bind(self._shortcuts_reset_group.setTitle, 'settings.shortcuts_reset_title',
-                   'Reset shortcuts')
-        self._bind(self._shortcuts_reset_group.setContent, 'settings.shortcuts_reset_content',
-                   'Restore all keyboard shortcuts to their defaults')
-        self._add_card(self._general_group, card)
+        self._plain_card(
+            group, 'settings.keyboard_shortcut', FluentIcon.SYNC,
+            'settings.shortcuts_reset_title', 'Reset shortcuts',
+            'settings.shortcuts_reset_content',
+            'Restore all keyboard shortcuts to their defaults',
+            self._btn_shortcuts_reset)
         self._refresh_shortcut_buttons()
         yield
 
@@ -3572,6 +4913,8 @@ class SettingsPage(QWidget):
 
 
     def _refresh_cache_size(self) -> None:
+        if not self._built:
+            return
         now = time.monotonic()
         if now - self._last_cache_probe < 20.0:
             return
@@ -3600,6 +4943,7 @@ class SettingsPage(QWidget):
             clear_app_cache()
             from src.core.repacks.enrichment import clear_steam_cache
             clear_steam_cache()
+            return 0
 
         _worker.submit(
             clear_all,
@@ -3611,6 +4955,8 @@ class SettingsPage(QWidget):
         self._btn_clear_cache.setEnabled(True)
         self._last_cache_probe = 0.0
         self._refresh_cache_size()
+        if not error:
+            self._cache_status_lbl.setText(format_size(0))
         if error:
             logger.error('Failed to clear cache: %s', error)
             return
@@ -3942,7 +5288,7 @@ SHORTCUT_ICONS = {
     'books': ('nav.books', FluentIcon.BOOK_SHELF),
     'youtube': ('nav.youtube', FluentIcon.PLAY),
     'tv': ('nav.tv', FluentIcon.PROJECTOR),
-    'tbhb': ('nav.tbhb', FluentIcon.SEARCH),
+    'tbhb': ('nav.tbhb', FluentIcon.GLOBE),
     'sailseek': ('sailseek.search', FluentIcon.SEARCH),
     'settings': ('nav.settings', FluentIcon.SETTING),
     'back': (None, FluentIcon.LEFT_ARROW),

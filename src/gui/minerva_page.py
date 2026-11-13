@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -25,6 +26,11 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 30
 SEARCH_DEBOUNCE_MS = 350
 DETAILS_WIDTH = 340
+
+
+def _clean_query(text: str) -> str:
+    value = re.sub(r'\s+', ' ', str(text or '')).strip()
+    return value.strip('"\'.,;:!?()[]{}<>')
 
 
 def get_all_consoles() -> list[str]:
@@ -386,6 +392,7 @@ class MinervaPage(QWidget):
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
         self._status_timer.setInterval(6000)
+        self._status_timer.timeout.connect(lambda: self._status_lbl.setText(''))
 
 
     def _ensure_ui(self) -> None:
@@ -689,7 +696,7 @@ class MinervaPage(QWidget):
         combo.blockSignals(False)
 
     def _apply_filter_state(self) -> None:
-        self._current_query = self._search_input.text().strip()
+        self._current_query = _clean_query(self._search_input.text())
         self._current_console = self._console_filter.currentData()
         self._current_variant = self._variant_filter.currentData() if self._variant_filter.isVisible() else None
         self._sort_field, self._sort_dir = self._sort_combo.currentData() or ('title', 'ASC')
@@ -953,11 +960,18 @@ class MinervaPage(QWidget):
     def _get_download_panel(self):
         return getattr(self.window(), 'download_page', None)
 
+    @staticmethod
+    def _call_download_panel(panel, method: str, *args) -> None:
+        if hasattr(panel, 'call_when_ready'):
+            panel.call_when_ready(method, *args)
+        else:
+            getattr(panel, method)(*args)
+
     def _on_download(self, rom: dict) -> None:
         try:
             panel = self._get_download_panel()
             if panel is not None:
-                panel.add_from_rom(rom)
+                self._call_download_panel(panel, 'add_from_rom', rom)
         except Exception:
             logger.exception('Download handler error')
 
@@ -968,7 +982,7 @@ class MinervaPage(QWidget):
         try:
             panel = self._get_download_panel()
             if panel is not None:
-                panel.add_many_from_roms(roms)
+                self._call_download_panel(panel, 'add_many_from_roms', roms)
         except Exception:
             logger.exception('Bulk download handler error')
             return
@@ -999,11 +1013,6 @@ class MinervaPage(QWidget):
         self._status_lbl.setText(text)
         self._status_timer.stop()
         if transient and text:
-            try:
-                self._status_timer.timeout.disconnect()
-            except (RuntimeError, TypeError):
-                pass
-            self._status_timer.timeout.connect(lambda: self._status_lbl.setText(''))
             self._status_timer.start()
 
     def _end_sync_ui(self) -> None:

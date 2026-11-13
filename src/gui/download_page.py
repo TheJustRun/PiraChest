@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -9,7 +10,7 @@ from contextlib import suppress
 from functools import lru_cache
 
 from PySide6.QtCore import QAbstractItemModel, QByteArray, QEvent, QModelIndex, QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QFontMetrics, QGuiApplication, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QFontMetrics, QGuiApplication, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractButton, QAbstractItemView, QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QScrollArea,
@@ -21,7 +22,7 @@ from qfluentwidgets import (
 )
 
 from src.core.downloader import (
-    DLState, DownloadItem, DownloadManager, human_bytes, human_duration, human_speed, is_risky_file,
+    DLState, DownloadItem, DownloadManager, human_bytes, human_duration, human_speed, is_risky_file, parse_checksum,
 )
 from src.core.theme import palette, scroll_area_qss
 from src.core.translations import register_locale_refresh, tr
@@ -57,6 +58,33 @@ def _qc(value: str, alpha: float | None = None) -> QColor:
 
 def _pal(key: str, alpha: float | None = None) -> QColor:
     return _qc(palette()[key], alpha)
+
+
+_FALLBACK = {
+    "files.tab_graphs": "Graphs", "files.gr_speed": "Transfer speed", "files.gr_conn": "Connections",
+    "files.gr_down": "Download", "files.gr_up": "Upload", "files.gr_peers": "Peers", "files.gr_seeds": "Seeds",
+    "files.gr_1m": "1m", "files.gr_5m": "5m", "files.gr_15m": "15m", "files.gr_1h": "1h", "files.gr_now": "now",
+    "files.gr_avg": "Avg", "files.gr_peak": "Peak", "files.gr_avail": "Availability", "files.gr_pieces": "Pieces",
+    "files.gen_avg_down": "Avg. download", "files.gen_avg_up": "Avg. upload", "files.gen_peak_down": "Peak download",
+    "files.gen_peak_up": "Peak upload", "files.gen_seed_time": "Seeding time", "files.gen_uploads": "Upload slots",
+    "files.gen_availability": "Availability", "files.gen_tracker": "Current tracker", "files.gen_hashfails": "Hash failures",
+    "files.pe_flags": "Flags", "files.tr_downloaded": "Downloaded",
+}
+
+
+def _t(key: str) -> str:
+    try:
+        v = tr(key)
+    except Exception:
+        v = ""
+    return v if v and v != key else _FALLBACK.get(key, key)
+
+
+def _nice(v: float) -> float:
+    if v <= 0:
+        return 1.0
+    mag = 10 ** math.floor(math.log10(v))
+    return next((m * mag for m in (1, 2, 2.5, 5, 10) if v <= m * mag), 10 * mag)
 
 
 def _download_title(item) -> str:
@@ -719,6 +747,7 @@ class _DropZone(QWidget):
 class AddTorrentDialog(MessageBoxBase):
     torrent_file_chosen = Signal(str)
     magnet_submitted = Signal(str)
+    url_submitted = Signal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -742,6 +771,11 @@ class AddTorrentDialog(MessageBoxBase):
         self._link.setPlaceholderText(tr("download.link_placeholder"))
         self._link.setClearButtonEnabled(True)
         self.viewLayout.addWidget(self._link)
+        self._checksum = LineEdit(self)
+        self._checksum.setPlaceholderText(tr("download.checksum_placeholder"))
+        self._checksum.setClearButtonEnabled(True)
+        self._checksum.textChanged.connect(lambda _t: self._checksum.setStyleSheet(""))
+        self.viewLayout.addWidget(self._checksum)
         self.yesButton.setText(tr("download.add"))
         self.cancelButton.setText(tr("download.cancel"))
         self.widget.setMinimumWidth(460)
@@ -760,8 +794,16 @@ class AddTorrentDialog(MessageBoxBase):
         link = self._link.text().strip()
         if self._chosen:
             self.torrent_file_chosen.emit(self._chosen)
-        elif link.lower().startswith("magnet:"):
+        elif link.lower().startswith("magnet:") or (link.lower().startswith(("http://", "https://")) and link.lower().split("?")[0].split("#")[0].endswith(".torrent")):
             self.magnet_submitted.emit(link)
+        elif link.lower().startswith(("http://", "https://")):
+            raw = self._checksum.text().strip()
+            digest = parse_checksum(raw)
+            if raw and not digest:
+                self._checksum.setStyleSheet("border: 1px solid #d13438;")
+                self._checksum.setToolTip(tr("download.checksum_invalid"))
+                return
+            self.url_submitted.emit(link, digest)
         else:
             return
         super().accept()
@@ -1022,6 +1064,7 @@ class _PanelHeader(QWidget):
         self.setFixedHeight(30)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.title = self.info = ""
+        self.frac = 0.0
         self._f = _font(self.font(), 12, QFont.Weight.DemiBold)
         self._fs = _font(self.font(), 12)
 
@@ -1031,6 +1074,8 @@ class _PanelHeader(QWidget):
         dpr = self.devicePixelRatioF()
         p.setPen(_pal("card_border"))
         p.drawLine(0, 0, w, 0)
+        if self.frac > 0:
+            p.fillRect(QRectF(0, 0, w * min(1.0, self.frac), 2), _pal("accent"))
         _blit(p, "chev_d", 2, 9, 12, _pal("muted"), dpr, 2)
         info_w = min(w * .6, QFontMetrics(self._fs).horizontalAdvance(self.info) + 8)
         _text(p, QRectF(20, 0, w - info_w - 28, 30), self.title, self._f, _pal("primary_text"))
@@ -1062,7 +1107,7 @@ class _Table(QTreeWidget):
         self.retranslate()
 
     def retranslate(self) -> None:
-        self.setHeaderLabels([tr(c) for c in self._cols])
+        self.setHeaderLabels([_t(c) for c in self._cols])
 
     def set_rows(self, rows: list) -> None:
         self.setUpdatesEnabled(False)
@@ -1079,6 +1124,216 @@ class _Table(QTreeWidget):
         while self.topLevelItemCount() > len(rows):
             self.takeTopLevelItem(self.topLevelItemCount() - 1)
         self.setUpdatesEnabled(True)
+
+
+class _Graph(QWidget):
+    _GAP = 3.0
+
+    def __init__(self, title: str, series: tuple, fmt, floor: float):
+        super().__init__()
+        self._title, self._series, self._fmt, self._floor = title, series, fmt, floor
+        self._rows: list = []
+        self._window, self._now, self._hx = 300.0, time.monotonic(), None
+        self._f, self._fs = _font(self.font(), 11), _font(self.font(), 11, QFont.Weight.DemiBold)
+        self.setMinimumHeight(110)
+        self.setMouseTracking(True)
+
+    def set_data(self, rows: list, window: float) -> None:
+        self._rows, self._window, self._now = rows, float(window), time.monotonic()
+        self.update()
+
+    def _plot(self) -> QRectF:
+        return QRectF(54, 24, max(10, self.width() - 64), max(10, self.height() - 44))
+
+    def _x(self, t: float, plot: QRectF) -> float:
+        return plot.left() + (1 - (self._now - t) / self._window) * plot.width()
+
+    def mouseMoveEvent(self, e):
+        self._hx = e.position().x()
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hx = None
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        plot, rows, fm = self._plot(), self._rows, QFontMetrics(self._f)
+        muted, text = _pal("muted"), _pal("primary_text")
+        top = _nice(max(max((r[c] for r in rows for c, *_ in self._series), default=0.0) * 1.1, self._floor))
+        for i in range(5):
+            y = plot.bottom() - plot.height() * i / 4
+            p.setPen(QPen(_pal("primary_text", .08), 1))
+            p.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
+            _text(p, QRectF(0, y - 8, plot.left() - 6, 16), self._fmt(top * i / 4), self._f, muted, _RIGHT)
+        w = int(self._window)
+        span = f"-{w // 3600}h" if w >= 3600 else f"-{w // 60}m"
+        _text(p, QRectF(plot.left(), plot.bottom() + 4, 80, 14), span, self._f, muted)
+        _text(p, QRectF(plot.right() - 80, plot.bottom() + 4, 80, 14), _t("files.gr_now"), self._f, muted, _RIGHT)
+        p.save()
+        p.setClipRect(plot.adjusted(-1, -2, 1, 2))
+        for col, role, _lbl, fill in self._series:
+            segs, cur, last = [], [], None
+            for r in rows:
+                if last is not None and r[0] - last > self._GAP:
+                    segs.append(cur)
+                    cur = []
+                cur.append(QPointF(self._x(r[0], plot), plot.bottom() - plot.height() * min(r[col] / top, 1.0)))
+                last = r[0]
+            if cur:
+                segs.append(cur)
+            for seg in segs:
+                if len(seg) < 2:
+                    continue
+                line = QPainterPath(seg[0])
+                for pt in seg[1:]:
+                    line.lineTo(pt)
+                if fill:
+                    area = QPainterPath(line)
+                    area.lineTo(seg[-1].x(), plot.bottom())
+                    area.lineTo(seg[0].x(), plot.bottom())
+                    area.closeSubpath()
+                    grad = QLinearGradient(0, plot.top(), 0, plot.bottom())
+                    grad.setColorAt(0, _pal(role, .32))
+                    grad.setColorAt(1, _pal(role, .02))
+                    p.fillPath(area, grad)
+                p.setPen(QPen(_pal(role), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPath(line)
+        p.restore()
+        x = self.width() - 8
+        for col, role, lbl, _fill in reversed(self._series):
+            label = f"{_t(lbl)} {self._fmt(rows[-1][col] if rows else 0)}"
+            lw = fm.horizontalAdvance(label) + 18
+            x -= lw
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(_pal(role))
+            p.drawEllipse(QPointF(x + 5, 11), 3.5, 3.5)
+            _text(p, QRectF(x + 14, 0, lw - 14, 22), label, self._f, text)
+            x -= 8
+        _text(p, QRectF(plot.left(), 0, max(0.0, x - plot.left()), 22), _t(self._title), self._fs, text)
+        if self._hx is None or not rows or not plot.left() <= self._hx <= plot.right():
+            return
+        t = self._now - self._window * (1 - (self._hx - plot.left()) / plot.width())
+        r = min(rows, key=lambda row: abs(row[0] - t))
+        if abs(r[0] - t) > self._GAP * 2:
+            return
+        hx = self._x(r[0], plot)
+        p.setPen(QPen(_pal("primary_text", .25), 1, Qt.PenStyle.DashLine))
+        p.drawLine(QPointF(hx, plot.top()), QPointF(hx, plot.bottom()))
+        for col, role, _lbl, _fill in self._series:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(_pal(role))
+            p.drawEllipse(QPointF(hx, plot.bottom() - plot.height() * min(r[col] / top, 1.0)), 3, 3)
+        lines = [f"-{human_duration(self._now - r[0])}"] + [f"{_t(lbl)}: {self._fmt(r[c])}" for c, _role, lbl, _fill in self._series]
+        bw, bh = max(fm.horizontalAdvance(s) for s in lines) + 16, len(lines) * 16 + 8
+        bx = hx + 10 if hx + 10 + bw < plot.right() else hx - 10 - bw
+        bg = _pal("primary_text", .92)
+        p.setBrush(bg)
+        p.drawRoundedRect(QRectF(bx, plot.top() + 4, bw, bh), 5, 5)
+        fg = QColor(20, 20, 20) if bg.lightness() > 128 else QColor(245, 245, 245)
+        for i, s in enumerate(lines):
+            _text(p, QRectF(bx + 8, plot.top() + 8 + i * 16, bw - 12, 16), s, self._f, fg)
+
+
+class _PieceBar(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(34)
+        self._data = None
+        self._f = _font(self.font(), 11)
+
+    def set_data(self, data) -> None:
+        self._data = data
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        d, info = self._data, _t("files.gr_pieces")
+        if d:
+            info += f"   {d['have']} / {d['total']}  ({d['have'] / max(d['total'], 1) * 100:.1f}%)"
+        _text(p, QRectF(0, 0, self.width(), 16), info, self._f, _pal("muted"))
+        bar = QRectF(0, 19, self.width(), 12)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(_pal("primary_text", .08))
+        p.drawRoundedRect(bar, 3, 3)
+        if not d or not d["buckets"]:
+            return
+        clip = QPainterPath()
+        clip.addRoundedRect(bar, 3, 3)
+        p.setClipPath(clip)
+        step = bar.width() / len(d["buckets"])
+        for i, (have, skip) in enumerate(d["buckets"]):
+            if skip >= .5:
+                color = _pal("muted", .22)
+            elif have > 0:
+                color = _pal("state_completed", .3 + .7 * have)
+            else:
+                continue
+            p.fillRect(QRectF(bar.left() + i * step, bar.top(), step + .6, bar.height()), color)
+
+
+class _Graphs(QWidget):
+    window_changed = Signal()
+    _RANGES = (("60", "files.gr_1m", 60), ("300", "files.gr_5m", 300), ("900", "files.gr_15m", 900), ("3600", "files.gr_1h", 3600))
+
+    def __init__(self):
+        super().__init__()
+        self.window = 300
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 2, 8, 4)
+        root.setSpacing(4)
+        top = QHBoxLayout()
+        self._range = Pivot()
+        for key, label, secs in self._RANGES:
+            self._range.addItem(routeKey=key, text=_t(label), onClick=lambda *_, s=secs: self._set(s))
+        self._range.setCurrentItem("300")
+        top.addWidget(self._range)
+        top.addStretch(1)
+        self._summary = CaptionLabel("")
+        top.addWidget(self._summary)
+        root.addLayout(top)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self._speed = _Graph("files.gr_speed", ((1, "state_downloading", "files.gr_down", True), (2, "state_seeding", "files.gr_up", True)),
+                             human_speed, 16.0)
+        self._conn = _Graph("files.gr_conn", ((3, "accent", "files.gr_peers", True), (4, "state_completed", "files.gr_seeds", False)),
+                            lambda v: f"{v:.0f}", 4.0)
+        row.addWidget(self._speed, 3)
+        row.addWidget(self._conn, 2)
+        root.addLayout(row, 1)
+        self._pieces = _PieceBar()
+        root.addWidget(self._pieces)
+
+    def _set(self, secs: int) -> None:
+        self.window = secs
+        self.window_changed.emit()
+
+    def retranslate(self) -> None:
+        for key, label, _ in self._RANGES:
+            with suppress(Exception):
+                self._range.widget(key).setText(_t(label))
+        self.update()
+
+    def update_from(self, data: dict) -> None:
+        rows = data["rows"]
+        self._speed.set_data(rows, self.window)
+        self._conn.set_data(rows, self.window)
+        self._pieces.set_data(data["pieces"])
+        self._pieces.setVisible(data["pieces"] is not None)
+        if not rows:
+            self._summary.setText("")
+            return
+        n = len(rows)
+        parts = [f"{_t('files.gr_avg')} \u2193 {human_speed(sum(r[1] for r in rows) / n)}  \u2191 {human_speed(sum(r[2] for r in rows) / n)}",
+                 f"{_t('files.gr_peak')} \u2193 {human_speed(max(r[1] for r in rows))}  \u2191 {human_speed(max(r[2] for r in rows))}"]
+        d = data["d"]
+        if d and d["availability"] >= 0:
+            parts.append(f"{_t('files.gr_avail')} {d['availability']:.2f}")
+        self._summary.setText("   \u00b7   ".join(parts))
 
 
 class _Bar(QWidget):
@@ -1105,17 +1360,21 @@ class _Bar(QWidget):
 
 _GENERAL = (
     ("files.gen_transfer", (
-        (("active", "files.gen_active"), ("down", "files.gen_downloaded"), ("down_rate", "files.gen_down_speed"),
-         ("down_limit", "files.gen_down_limit"), ("ratio", "files.gen_ratio")),
-        (("eta", "files.col_eta"), ("up", "files.gen_uploaded"), ("up_rate", "files.gen_up_speed"),
-         ("up_limit", "files.gen_up_limit"), ("reannounce", "files.gen_reannounce")),
-        (("conns", "files.gen_connections"), ("seeds", "files.gen_seeds"), ("peers", "files.gen_peers"),
-         ("wasted", "files.gen_wasted"), ("seen", "files.gen_seen")))),
+        ((("active", "files.gen_active"), ("down", "files.gen_downloaded"), ("down_rate", "files.gen_down_speed"),
+          ("peak_down", "files.gen_peak_down"), ("down_limit", "files.gen_down_limit"), ("avg_down", "files.gen_avg_down"),
+          ("ratio", "files.gen_ratio"))),
+        ((("eta", "files.col_eta"), ("up", "files.gen_uploaded"), ("up_rate", "files.gen_up_speed"),
+          ("peak_up", "files.gen_peak_up"), ("up_limit", "files.gen_up_limit"), ("avg_up", "files.gen_avg_up"),
+          ("seed_time", "files.gen_seed_time"))),
+        ((("conns", "files.gen_connections"), ("seeds", "files.gen_seeds"), ("peers", "files.gen_peers"),
+          ("uploads", "files.gen_uploads"), ("availability", "files.gen_availability"), ("wasted", "files.gen_wasted"),
+          ("seen", "files.gen_seen"))))),
     ("files.gen_information", (
-        (("size", "files.gen_total_size"), ("added", "files.gen_added"), ("private", "files.gen_private"),
-         ("hash", "files.gen_hash"), ("save_path", "files.gen_save_path"), ("comment", "files.gen_comment")),
-        (("pieces", "files.gen_pieces"), ("completed", "files.gen_completed")),
-        (("creator", "files.gen_created_by"), ("created", "files.gen_created_on")))),
+        ((("size", "files.gen_total_size"), ("added", "files.gen_added"), ("private", "files.gen_private"),
+          ("hash", "files.gen_hash"), ("save_path", "files.gen_save_path"), ("comment", "files.gen_comment"))),
+        ((("pieces", "files.gen_pieces"), ("completed", "files.gen_completed"), ("tracker", "files.gen_tracker"),
+          ("reannounce", "files.gen_reannounce"), ("hashfails", "files.gen_hashfails"))),
+        ((("creator", "files.gen_created_by"), ("created", "files.gen_created_on"))))),
 )
 
 
@@ -1134,6 +1393,10 @@ def _general_values(d: dict) -> dict[str, str]:
         "private": tr("files.gen_yes" if d["private"] else "files.gen_no"), "hash": d["hash"], "save_path": d["save_path"],
         "comment": d["comment"], "pieces": f"{d['pieces']} x {B(d['piece_len'])} ({tr('files.gen_have', n=d['have'])})",
         "completed": ts(d["completed"]), "creator": d["creator"], "created": ts(d["created"]),
+        "avg_down": S(d["avg_down"]), "avg_up": S(d["avg_up"]), "peak_down": S(d["peak_down"]), "peak_up": S(d["peak_up"]),
+        "seed_time": human_duration(d["seed_time"]), "uploads": str(d["uploads"]),
+        "availability": f"{d['availability']:.2f}" if d["availability"] >= 0 else "-",
+        "tracker": d["tracker"] or "-", "hashfails": B(d["hashfails"]),
     }
 
 
@@ -1149,7 +1412,7 @@ class _General(QWidget):
         self._vals: dict[str, CaptionLabel] = {}
         self._names: list[tuple[CaptionLabel, str]] = []
         for head, groups in _GENERAL:
-            title = StrongBodyLabel(tr(head))
+            title = StrongBodyLabel(_t(head))
             self._names.append((title, head))
             root.addWidget(title)
             grid = QGridLayout()
@@ -1158,7 +1421,7 @@ class _General(QWidget):
             for g, rows in enumerate(groups):
                 grid.setColumnStretch(g * 2 + 1, 1)
                 for r, (key, label) in enumerate(rows):
-                    name, val = CaptionLabel(tr(label)), CaptionLabel("")
+                    name, val = CaptionLabel(_t(label)), CaptionLabel("")
                     name.setAlignment(_RIGHT | _VCENTER)
                     val.setTextFormat(Qt.TextFormat.PlainText)
                     val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1174,7 +1437,7 @@ class _General(QWidget):
 
     def retranslate(self) -> None:
         for w, key in self._names:
-            w.setText(tr(key))
+            w.setText(_t(key))
         self._bar.update()
 
     def update_from(self, d: dict, item) -> None:
@@ -1187,7 +1450,7 @@ class _General(QWidget):
 
 class FilesPanel(QWidget):
     _MIN_OPEN = 170
-    _TABS = ("general", "content", "trackers", "peers")
+    _TABS = ("general", "graphs", "content", "trackers", "peers")
 
     def __init__(self, manager: DownloadManager, parent=None):
         super().__init__(parent)
@@ -1204,7 +1467,7 @@ class FilesPanel(QWidget):
         bl.setSpacing(2)
         self._tabs = Pivot()
         for key in self._TABS:
-            self._tabs.addItem(routeKey=key, text=tr(f"files.tab_{key}"), onClick=lambda *_, k=key: self._switch(k))
+            self._tabs.addItem(routeKey=key, text=_t(f"files.tab_{key}"), onClick=lambda *_, k=key: self._switch(k))
         bl.addWidget(self._tabs, 0, Qt.AlignmentFlag.AlignLeft)
         self._note = CaptionLabel("")
         self._note.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1217,16 +1480,19 @@ class FilesPanel(QWidget):
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setWidget(self._general)
         self._stack.addWidget(self._scroll)
+        self._graphs = _Graphs()
+        self._graphs.window_changed.connect(self.refresh)
+        self._stack.addWidget(self._graphs)
         self._stack.addWidget(self._build_content())
-        self._trackers = _Table(("files.tr_url", "files.tr_tier", "files.tr_status", "files.tr_seeds", "files.tr_peers"),
-                                (0, 50, 260, 70, 70), (1, 3, 4))
-        self._peers = _Table(("files.pe_addr", "files.pe_client", "files.pe_progress", "files.pe_down", "files.pe_up",
-                              "files.pe_downloaded", "files.pe_uploaded"), (0, 130, 80, 80, 80, 90, 90), (2, 3, 4, 5, 6))
+        self._trackers = _Table(("files.tr_url", "files.tr_tier", "files.tr_status", "files.tr_seeds", "files.tr_peers", "files.tr_downloaded"),
+                                (0, 50, 260, 70, 70, 80), (1, 3, 4, 5))
+        self._peers = _Table(("files.pe_addr", "files.pe_client", "files.pe_flags", "files.pe_progress", "files.pe_down", "files.pe_up",
+                              "files.pe_downloaded", "files.pe_uploaded"), (0, 130, 64, 80, 80, 80, 90, 90), (3, 4, 5, 6, 7))
         self._stack.addWidget(self._trackers)
         self._stack.addWidget(self._peers)
         lay.addWidget(self._body, 1)
         self._tabs.setCurrentItem("content")
-        self._stack.setCurrentIndex(1)
+        self._stack.setCurrentIndex(2)
         self._timer = QTimer(self, interval=500)
         self._timer.timeout.connect(self.refresh)
         self._apply_theme()
@@ -1300,12 +1566,13 @@ class FilesPanel(QWidget):
     def _retranslate(self) -> None:
         for key in self._TABS:
             with suppress(Exception):
-                self._tabs.widget(key).setText(tr(f"files.tab_{key}"))
+                self._tabs.widget(key).setText(_t(f"files.tab_{key}"))
         for key, b in self._btns.items():
             b.setText(tr(key))
         self._trackers.retranslate()
         self._peers.retranslate()
         self._general.retranslate()
+        self._graphs.retranslate()
         self._model.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, len(_FCOLS) - 1)
         self.on_item(self._m.get(self._iid))
         self.refresh()
@@ -1324,8 +1591,11 @@ class FilesPanel(QWidget):
     def on_item(self, item) -> None:
         h = self._head
         h.title = tr("files.title") + (f"  ·  {_download_title(item)}" if item is not None else "")
-        h.info = "" if item is None else (f"\u2193 {human_speed(item.speed_down_kbps)}  ·  {item.progress:.1f}%  ·  "
-                                          f"{human_bytes(item.downloaded_bytes)} / {human_bytes(item.total_bytes)}")
+        h.frac = 0.0 if item is None else item.progress / 100.0
+        h.info = "" if item is None else "  \u00b7  ".join(x for x in (
+            f"\u2193 {human_speed(item.speed_down_kbps)}", f"\u2191 {human_speed(item.speed_up_kbps)}", f"{item.progress:.1f}%",
+            f"{human_bytes(item.downloaded_bytes)} / {human_bytes(item.total_bytes)}",
+            f"{_t('files.col_eta')} {human_duration(item.eta)}" if item.eta >= 0 else "") if x)
         h.update()
 
     def showEvent(self, e) -> None:
@@ -1359,7 +1629,7 @@ class FilesPanel(QWidget):
         if not (self._iid and self.isVisible()):
             return
         m, tab = self._m, self._stack.currentIndex()
-        data = (m.details, m.file_state, m.trackers, m.peers)[tab](self._iid)
+        data = (m.details, self._graph_data, m.file_state, m.trackers, m.peers)[tab](self._iid)
         if data is None:
             if self._shape is not None:
                 self._shape = None
@@ -1371,14 +1641,22 @@ class FilesPanel(QWidget):
         if tab == 0:
             self._general.update_from(data, m.get(self._iid))
         elif tab == 1:
-            self._refresh_content(data)
+            self._graphs.update_from(data)
         elif tab == 2:
-            self._trackers.set_rows([[host, str(tier), msg or "-", str(s) if s >= 0 else "-", str(p) if p >= 0 else "-"]
-                                     for host, tier, msg, s, p in data])
+            self._refresh_content(data)
+        elif tab == 3:
+            self._trackers.set_rows([[host, str(tier), msg or "-", str(s) if s >= 0 else "-", str(p) if p >= 0 else "-", str(c) if c >= 0 else "-"]
+                                     for host, tier, msg, s, p, c in data])
         else:
-            self._peers.set_rows([[addr, client, f"{prog * 100:.0f}%", human_speed(dn / 1024) if dn else "",
+            self._peers.set_rows([[addr, client, flags, f"{prog * 100:.0f}%", human_speed(dn / 1024) if dn else "",
                                    human_speed(up / 1024) if up else "", human_bytes(dl), human_bytes(ul)]
-                                  for addr, client, prog, dn, up, dl, ul in data])
+                                  for addr, client, prog, dn, up, dl, ul, flags in data])
+
+    def _graph_data(self, iid: str):
+        rows = self._m.history(iid, self._graphs.window)
+        if rows is None:
+            return None
+        return {"rows": rows, "pieces": self._m.piece_map(iid), "d": self._m.details(iid)}
 
     def _refresh_content(self, st: dict) -> None:
         n = len(st["prios"])
@@ -1723,7 +2001,13 @@ class DownloadManagerPage(QWidget):
         dialog = AddTorrentDialog(self.window())
         dialog.torrent_file_chosen.connect(self._start_selective_add)
         dialog.magnet_submitted.connect(self._start_selective_add)
+        dialog.url_submitted.connect(self._add_url)
         dialog.exec()
+
+    def _add_url(self, url: str, checksum: str) -> None:
+        self._manager.add_http(url, source="Manual", checksum=checksum)
+        _toast(self.window(), "success", tr("download.added_to_queue_title"),
+               tr("download.added_to_queue_single", title=os.path.basename(url.split("?")[0].split("#")[0].rstrip("/")) or url))
 
     @staticmethod
     def _display_name(source: str) -> str:
@@ -1761,7 +2045,8 @@ class DownloadManagerPage(QWidget):
         )
         names = [p for p, _ in files]
         entries = build_selective_entries_from_torrent(names, [s for _, s in files])
-        dialog = SelectiveDownloadDialog(entries, parent=self.window(), subtitle=name)
+        dialog = SelectiveDownloadDialog(entries, parent=self.window(), subtitle=name,
+                                         space=lambda: self._manager.usable_space("repacks", tr("download.unknown")))
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._queue(source, resolve_selective_file_indices(entries, dialog.selected_labels(), names) or None, name, label)

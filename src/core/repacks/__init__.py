@@ -63,7 +63,9 @@ def default_install_dir() -> str:
         pass
     try:
         from src.core.config import settings as s, paths
-        return getattr(s, 'download_dir_repacks', '') or paths.download_root
+        base = getattr(s, 'download_dir_repacks', '') or paths.download_root
+        parent = os.path.dirname(os.path.normpath(base))
+        return os.path.join(parent, 'Installed Games') if parent else os.path.join(base, 'Installed Games')
     except Exception:
         return os.path.expanduser('~')
 

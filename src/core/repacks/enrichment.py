@@ -57,7 +57,7 @@ _MAX_ABOUT = 30_000
 _MAX_IMAGES = 8
 _MAX_SEARCH = 10
 _MAX_VALIDATE = 4
-_YEAR_GRACE = 8          # PC ports/remasters may arrive years after the console release
+_YEAR_GRACE = 8
 _ART_MEMO_TTL = 3600
 
 MAPPING_NS, APP_NS, SEARCH_NS, ART_NS, NOMATCH_NS = (
@@ -65,7 +65,6 @@ MAPPING_NS, APP_NS, SEARCH_NS, ART_NS, NOMATCH_NS = (
 
 _APP_URL = "https://store.steampowered.com/api/appdetails"
 _SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
-# Key-backed artwork only; Steam metadata stays on its public endpoints.
 _ART_PROXY = "https://tmdb-proxy.justrun.workers.dev"
 _CDN = "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps"
 _CDN_OLD = "https://steamcdn-a.akamaihd.net/steam/apps"
@@ -82,7 +81,7 @@ _session = LazyHttpClient(
     limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
     transport_factory=lambda: httpx.HTTPTransport(retries=0, verify=shared_ssl_context()),
 )
-_net_slots = threading.BoundedSemaphore(3)   # caps concurrent Steam requests (CPU, 429s)
+_net_slots = threading.BoundedSemaphore(3)
 
 _IMAGE_HOSTS = {"cdn.steamgriddb.com", "cdn2.steamgriddb.com", "images.steamgriddb.com", "steamgriddb.com",
                 "shared.akamai.steamstatic.com", "steamcdn-a.akamaihd.net", "cdn.cloudflare.steamstatic.com",
@@ -100,7 +99,6 @@ _ALLOWED_TAGS = {"p", "br", "hr", "ul", "ol", "li", "strong", "b", "em", "i", "u
 
 
 class _LRU:
-    """Tiny thread-safe LRU so grid cards/search never hit the disk cache twice."""
     _MISS = object()
 
     def __init__(self, size: int):
@@ -220,7 +218,6 @@ def safe_web_url(value) -> str:
     return value
 
 
-# --- HTTP ----------------------------------------------------------------
 def _retry_after(value) -> float:
     try:
         return min(3.0, max(0.2, float(str(value or "1"))))
@@ -229,7 +226,6 @@ def _retry_after(value) -> float:
 
 
 def _get_json(url: str, params: dict | None = None):
-    """Fetch JSON with a hard size cap.  Raises SteamError on transport failure."""
     last_error: Exception | None = None
     for attempt in range(2):
         delay = 0.0
@@ -267,7 +263,6 @@ def _get_json(url: str, params: dict | None = None):
     raise SteamError("Steam request failed") from last_error
 
 
-# --- Payload shaping -----------------------------------------------------
 def _year(value: str) -> int | None:
     m = re.search(r"\b((?:19|20)\d{2})\b", value or "")
     return int(m.group(1)) if m else None
@@ -331,7 +326,6 @@ def normalize_appdetails(appid: int, data: dict) -> dict | None:
 
 
 def _slim(p: dict) -> dict:
-    """Compact what we persist: no derivable URLs, sanitised description only when it will be shown."""
     art = {}
     for key, value in (p.get("artwork") or {}).items():
         if key == "poster_fallback" or not isinstance(value, str) or not value.startswith(("http://", "https://")):
@@ -382,7 +376,7 @@ def _steam_search(query: str) -> list[dict] | None:
     except SteamError:
         return None
     if not isinstance(raw, dict):
-        return None                       # malformed provider response, not "no hits"
+        return None
     items = raw.get("items")
     if items is None and isinstance(raw.get("data"), dict):
         items = raw["data"].get("items")
@@ -434,11 +428,11 @@ def _provider_art(appid: int, *, allow_network: bool) -> dict:
             _art_memo.put(key, {"at": time.time(), "art": art})
             return art
     if not allow_network:
-        return art          # stale artwork still beats an empty card
+        return art
     try:
         data = _get_json(f"{base}/steamgriddb/artwork", {"appid": int(appid)})
     except SteamError:
-        return art          # provider outage keeps the previous artwork
+        return art
     if not isinstance(data, dict):
         return art
     fresh = {}
@@ -459,7 +453,7 @@ def sanitize_html(html: str, max_chars: int = _MAX_ABOUT) -> str:
     text = str(html or "")[:max_chars]
     if not text:
         return ""
-    from bs4 import BeautifulSoup, Comment      # bs4 only; no bleach/html5lib import cost
+    from bs4 import BeautifulSoup, Comment
 
     try:
         soup = BeautifulSoup(text, "html.parser")
@@ -503,12 +497,9 @@ def plain_text(html: str, limit: int = 2000) -> str:
     return " ".join(_html.unescape(re.sub(r"<[^>]+>", " ", str(html))).split())[:limit]
 
 
-# --- Cache layer ---------------------------------------------------------
 def _identity_key(parsed: ParsedTitle, url: str = "") -> str:
     if not parsed.key:
         return hashlib.sha1((url or parsed.raw).strip().casefold().encode("utf-8", "ignore")).hexdigest()
-    # Same-name remakes must not share a mapping ("Resident Evil 4 (2005)"
-    # vs "(2023)"), while editions/versions of one release still do.
     return f"{parsed.key}:{parsed.year}" if parsed.year else parsed.key
 
 
@@ -534,7 +525,7 @@ def _save_mapping(parsed: ParsedTitle, mapping: dict, *, manual: bool = False, u
     if appid is None:
         return
     data = dict(mapping, appid=appid, manual=bool(manual or mapping.get("manual")), updated=time.time())
-    if payload:      # compact blob so grid search never needs the full app payload
+    if payload:
         data["search"] = " ".join(filter(None, [payload.get("name"), *(payload.get("developers") or ()),
                                                  *(payload.get("publishers") or ()), *(payload.get("genres") or ())]))
     cache.set_entry(MAPPING_NS, key, data)
@@ -571,7 +562,6 @@ def _save_nomatch(parsed: ParsedTitle, url: str = "") -> None:
     cache.save(NOMATCH_NS, _identity_key(parsed, url), {"query": parsed.clean, "updated": time.time()})
 
 
-# --- Model ---------------------------------------------------------------
 @dataclass
 class GameEnrichment:
     parsed: ParsedTitle
@@ -674,7 +664,6 @@ def needs_refresh(obj) -> bool:
         return False
 
 
-# --- Matching ------------------------------------------------------------
 _app_locks: dict[int, threading.Lock] = {}
 _app_locks_guard = threading.Lock()
 
@@ -701,7 +690,6 @@ def _fetch_and_store(appid: int, *, force: bool = False) -> dict | None:
 
 
 def _rank_candidates(parsed: ParsedTitle, candidates: list[dict]) -> list[dict]:
-    """Score and order Steam search hits, demoting DLC and add-on entries."""
     ranked: list[dict] = []
     seen: set[int] = set()
     for raw in candidates:
@@ -719,9 +707,6 @@ def _rank_candidates(parsed: ParsedTitle, candidates: list[dict]) -> list[dict]:
             if cand_key.startswith(key + " "):
                 suffix = cand_key[len(key) + 1:]
                 break
-        # A release suffix may legitimately trail the name ('Reloaded
-        # Edition'), but a DLC/add-on suffix ('Chicken Bundle', 'Developer
-        # Tools') must not win just because Steam indexed it under the game.
         if method != "exact" and suffix and _ADDON_RE.search(suffix):
             score = max(0.0, score - 0.30)
             if score < _MIN_AUTO_SCORE:
@@ -732,15 +717,11 @@ def _rank_candidates(parsed: ParsedTitle, candidates: list[dict]) -> list[dict]:
 
 
 def _validate_candidate(parsed: ParsedTitle, candidate: dict) -> dict | None:
-    """Load appdetails and reject non-games and contradicted release years."""
     payload = _fetch_and_store(int(candidate["appid"]))
     if not isinstance(payload, dict):
-        return None                       # DLC, soundtrack, bundle, or fetch failure
+        return None
     name_year = title_year(str(payload.get("name") or candidate.get("name") or ""))
     if parsed.year:
-        # Trust an explicit year in Steam's own title (Resident Evil 4 (2005)
-        # lists a 2014 PC release date).  Otherwise allow PC-port delays but
-        # reject a remake/reboot from another era.
         if name_year != parsed.year:
             year = payload.get("year")
             if isinstance(year, int) and abs(year - parsed.year) > _YEAR_GRACE:
@@ -758,7 +739,7 @@ def _match_candidates(parsed: ParsedTitle, candidates: list[dict]) -> dict | Non
             peers = [c for c in ranked if c is not candidate
                      and abs(c["score"] - candidate["score"]) < _MIN_FUZZY_MARGIN]
             if peers:
-                continue                  # ambiguous fuzzy hits are not a match
+                continue
         payload = _validate_candidate(parsed, candidate)
         if payload is not None:
             return {**candidate, "payload": payload}
@@ -767,7 +748,6 @@ def _match_candidates(parsed: ParsedTitle, candidates: list[dict]) -> dict | Non
 
 
 def _search_cached(query: str) -> list[dict] | None:
-    """Cached Steam search.  ``None`` means a transport failure, not "no hits"."""
     query = " ".join(str(query or "").split())
     if len(query) < 2:
         return []
@@ -782,7 +762,6 @@ def _search_cached(query: str) -> list[dict] | None:
 
 
 def _queries(parsed: ParsedTitle) -> list[str]:
-    """Year-first query order keeps remakes and originals apart."""
     out: list[str] = []
     if parsed.year:
         out.append(f"{parsed.clean} {parsed.year}")
@@ -802,7 +781,6 @@ def _queries(parsed: ParsedTitle) -> list[str]:
 
 
 def _find_match(parsed: ParsedTitle) -> tuple[dict | None, bool]:
-    """Return ``(match, failed)``; a failed query must not become no-match cache."""
     failed = False
     for query in _queries(parsed):
         items = _search_cached(query)
@@ -865,7 +843,6 @@ def request_enrichment(obj, owner, on_done, on_error=None):
 
 
 def request_artwork(appid: int, owner, on_done, on_error=None):
-    """Fetch key-backed artwork without delaying the Steam metadata result."""
     if not enrichment_enabled():
         return None
     resolved = resolve_appid(appid)
@@ -900,7 +877,7 @@ def set_manual_match(obj, appid: int) -> GameEnrichment | None:
         return None
     url = _entry_url(obj)
     payload = _fetch_and_store(appid)
-    if not payload:                    # DLC, non-game, or failed fetch: keep the old mapping
+    if not payload:
         return None
     mapping = {"appid": appid, "title": str(payload.get("name") or ""), "confidence": 1.0,
                "method": "manual", "manual": True}
@@ -919,7 +896,6 @@ def clear_match(obj) -> None:
 
 
 def clear_steam_cache() -> int:
-    """Drop Steam mappings/payloads; image files and FitGirl data are untouched."""
     removed = cache.count_namespace("steam")
     cache.clear_namespace("steam")
     for memo in (_map_memo, _app_memo, _art_memo):
@@ -927,7 +903,6 @@ def clear_steam_cache() -> int:
     return removed
 
 
-# --- Cheap helpers for grid cards / search (mapping memo only, no payload loads) ----
 def search_text_for(obj) -> str:
     parsed = _identity(obj)
     parts = [search_text(parsed), str(getattr(obj, "title", "") or "")]

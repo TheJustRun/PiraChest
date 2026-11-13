@@ -2,6 +2,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 import time
 from collections import deque
 import httpx
@@ -15,10 +16,32 @@ _CHUNK_SIZE = 1 << 18
 _MAX_CONCURRENT_DOWNLOADS = 4
 _MAX_VIDEO_BYTES = 128 * 1024 * 1024
 _DISK_BUDGET = 768 * 1024 * 1024
+_TRIM_EVERY = 64 * 1024 * 1024
 _HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36', 'Accept-Encoding': 'gzip, deflate, br'}
 _session = LazyHttpClient(headers=_HEADERS, trust_env=False, follow_redirects=True, limits=httpx.Limits(max_connections=_MAX_CONCURRENT_DOWNLOADS, max_keepalive_connections=_MAX_CONCURRENT_DOWNLOADS), transport_factory=lambda: httpx.HTTPTransport(retries=0, verify=shared_ssl_context()))
 
 _video_dir_ready = False
+_trim_growth = 0
+_trim_scheduled = False
+_trim_lock = threading.Lock()
+
+
+def _request_trim() -> None:
+    global _trim_scheduled
+    with _trim_lock:
+        if _trim_scheduled:
+            return
+        _trim_scheduled = True
+    engine().submit(_trim_videos, priority=Priority.LOW, pool=IO)
+
+
+def _note_growth(size: int) -> None:
+    global _trim_growth
+    with _trim_lock:
+        _trim_growth += max(0, int(size))
+        due = _trim_growth >= _TRIM_EVERY
+    if due:
+        _request_trim()
 
 def video_cache_path(url: str) -> str:
     global _video_dir_ready
@@ -40,34 +63,40 @@ def _touch(path: str) -> None:
 
 
 def _trim_videos() -> None:
-    files, total = [], 0
+    global _trim_growth, _trim_scheduled
     try:
-        entries = list(os.scandir(_VIDEO_DIR))
-    except OSError:
-        return
-    for entry in entries:
+        files, total = [], 0
         try:
-            st = entry.stat()
+            entries = list(os.scandir(_VIDEO_DIR))
         except OSError:
-            continue
-        if entry.name.endswith('.part') and time.time() - st.st_mtime > 3600:
+            return
+        for entry in entries:
             try:
-                os.remove(entry.path)
+                st = entry.stat()
             except OSError:
-                pass
-            continue
-        files.append((st.st_mtime, st.st_size, entry.path))
-        total += st.st_size
-    if total <= _DISK_BUDGET:
-        return
-    for _mtime, size, path in sorted(files):
-        try:
-            os.remove(path)
-        except OSError:
-            continue
-        total -= size
-        if total <= _DISK_BUDGET * 0.8:
-            break
+                continue
+            if entry.name.endswith('.part') and time.time() - st.st_mtime > 3600:
+                try:
+                    os.remove(entry.path)
+                except OSError:
+                    pass
+                continue
+            files.append((st.st_mtime, st.st_size, entry.path))
+            total += st.st_size
+        if total <= _DISK_BUDGET:
+            return
+        for _mtime, size, path in sorted(files):
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+            total -= size
+            if total <= _DISK_BUDGET * 0.8:
+                break
+    finally:
+        with _trim_lock:
+            _trim_growth = 0
+            _trim_scheduled = False
 
 def _do_download_video(url: str, is_cancelled=None) -> str:
     dest_path = video_cache_path(url)
@@ -93,6 +122,7 @@ def _do_download_video(url: str, is_cancelled=None) -> str:
                     if is_cancelled is not None and is_cancelled():
                         raise RuntimeError('download cancelled')
         os.replace(tmp_path, dest_path)
+        _note_growth(written)
         return dest_path
     except Exception:
         try:
@@ -139,7 +169,7 @@ class VideoDownloader(QObject):
             return
         if not self._trimmed:
             self._trimmed = True
-            engine().submit(_trim_videos, priority=Priority.LOW, pool=IO)
+            _request_trim()
         if len(self._active) < self._max_concurrent:
             self._start(url)
         else:

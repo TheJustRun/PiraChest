@@ -9,21 +9,28 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 import zipfile
 import zlib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+
+from src.core.config import APP_NAME, IS_CANARY, VERSION
 
 logger = logging.getLogger(__name__)
 
 _REPO = "TheJustRun/PiraChest"
 _API_URL = f"https://api.github.com/repos/{_REPO}/releases/latest"
 _API_URL_ALL = f"https://api.github.com/repos/{_REPO}/releases?per_page=100"
-_HEADERS = {"Accept": "application/vnd.github+json", "User-Agent": "PiraChest-Updater"}
+_HEADERS = {"Accept": "application/vnd.github+json", "User-Agent": f"{APP_NAME}-Updater"}
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _ZIP_RE = re.compile(r"^pirachest.*windows.*x64\.zip$", re.I)
+_EXE_RE = re.compile(r"^pirachest(?:[ -]canary)?\.exe$", re.I)
+_CANARY_RE = re.compile(r"canary|nightly|unstable|experimental", re.I)
+_CACHE: dict[str, tuple[float, object]] = {}
+_CACHE_TTL = 300.0
 
 
 def _app_dir() -> str:
@@ -32,36 +39,7 @@ def _app_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def _load_version() -> str:
-    bases = [getattr(sys, "_MEIPASS", ""), _app_dir(), os.path.dirname(os.path.abspath(__file__))]
-    seen: set[str] = set()
-    for base in bases:
-        if not base:
-            continue
-        current = os.path.abspath(base)
-        for _ in range(3):
-            if current in seen:
-                break
-            seen.add(current)
-            try:
-                with open(os.path.join(current, "VERSION"), "r", encoding="utf-8") as fh:
-                    value = fh.read().strip()
-                if value:
-                    return value
-            except OSError:
-                pass
-            parent = os.path.dirname(current)
-            if parent == current:
-                break
-            current = parent
-    return "0.0.0-dev"
-
-
-__version__ = _load_version()
-
-
-class UpdateCancelled(Exception):
-    pass
+class UpdateCancelled(Exception):    pass
 
 
 class ChecksumMismatch(RuntimeError):
@@ -80,14 +58,39 @@ def _parse_version(tag: str) -> tuple:
     if not pre:
         return (numbers[0], numbers[1], numbers[2], 4, 0)
     label = re.split(r"[.\-+_]", pre)[0]
-    stage = {"dev": 0, "alpha": 1, "a": 1, "beta": 2, "b": 2, "pre": 2, "preview": 2, "rc": 3}.get(label, 2)
+    stage = {"dev": 0, "canary": 0, "nightly": 0, "alpha": 1, "a": 1,
+             "beta": 2, "b": 2, "pre": 2, "preview": 2, "rc": 3,
+             "stable": 4, "release": 4, "ga": 4}.get(label, 2)
     match = re.search(r"(\d+)", pre)
     return (numbers[0], numbers[1], numbers[2], stage, int(match.group(1)) if match else 0)
 
 
 def _get_json(url: str):
-    with urllib.request.urlopen(urllib.request.Request(url, headers=_HEADERS), timeout=8) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    now = time.monotonic()
+    hit = _CACHE.get(url)
+    if hit is not None and now - hit[0] < _CACHE_TTL:
+        return hit[1]
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=_HEADERS), timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code in (403, 404, 429) or attempt == 2:
+                raise
+            time.sleep(0.6 * (attempt + 1))
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            if attempt == 2:
+                raise
+            time.sleep(0.6 * (attempt + 1))
+    _CACHE[url] = (now, data)
+    return data
+
+
+def _release_is_canary(data: dict) -> bool:
+    if _CANARY_RE.search(str(data.get("tag_name") or "")):
+        return True
+    return any(_CANARY_RE.search(str(a.get("name") or "")) for a in (data.get("assets") or []) if isinstance(a, dict))
 
 
 def _fetch_releases(include_prereleases: bool) -> list[dict]:
@@ -105,12 +108,19 @@ def _fetch_releases(include_prereleases: bool) -> list[dict]:
     return releases
 
 
-def _pick_zip(assets: list) -> dict | None:
+def _pick_zip(assets: list, canary: bool) -> dict | None:
     zips = [
         a for a in assets
         if isinstance(a, dict) and a.get("name", "").lower().endswith(".zip")
         and "sha256" not in a.get("name", "").lower()
     ]
+    if canary:
+        zips = [a for a in zips if _CANARY_RE.search(a.get("name", ""))]
+        if not zips:
+            return None
+    else:
+        plain = [a for a in zips if not _CANARY_RE.search(a.get("name", ""))]
+        zips = plain or zips
     preferred = [a for a in zips if _ZIP_RE.match(a.get("name", ""))]
     if preferred:
         return preferred[0]
@@ -138,19 +148,31 @@ def _is_choco_install() -> bool:
     return "\\chocolatey\\lib\\" in app.lower()
 
 
-def check_for_update(include_prereleases: bool = True) -> dict | None:
+def check_for_update(include_prereleases: bool = True, channel: str | None = None) -> dict | None:
     if _is_choco_install():
         return None
+    channel = (channel or ("auto" if IS_CANARY else "stable")).lower()
+    if channel not in ("auto", "stable", "canary"):
+        channel = "stable"
     try:
         for data in _fetch_releases(include_prereleases):
             tag = str(data.get("tag_name") or "")
-            if not tag or _parse_version(tag) <= _parse_version(__version__):
+            if not tag:
+                continue
+            canary = _release_is_canary(data)
+            if channel == "canary" and not canary:
+                continue
+            if channel == "stable" and canary:
+                continue
+            if _parse_version(tag) <= _parse_version(VERSION):
                 break
-            asset = _pick_zip(data.get("assets") or [])
+            asset = _pick_zip(data.get("assets") or [], canary)
             if asset is None:
                 continue
+            digest = str(asset.get("digest") or "")
+            digest = digest.split(":", 1)[1].lower() if digest.lower().startswith("sha256:") else ""
             checksum = _checksum_asset(data.get("assets") or [], asset["name"])
-            if checksum is None:
+            if not digest and checksum is None:
                 logger.warning("Release %s has no SHA-256 checksum; skipping", tag)
                 continue
             return {
@@ -159,9 +181,12 @@ def check_for_update(include_prereleases: bool = True) -> dict | None:
                 "download_url": asset["browser_download_url"],
                 "asset_name": asset["name"],
                 "asset_size": int(asset.get("size") or 0),
-                "checksum_url": checksum["browser_download_url"],
+                "checksum_url": checksum["browser_download_url"] if checksum else "",
+                "checksum_sha256": digest,
                 "notes": data.get("body", ""),
                 "prerelease": bool(data.get("prerelease")),
+                "canary": canary,
+                "channel": "canary" if canary else "stable",
             }
     except Exception as exc:
         logger.warning("Update check failed: %s", exc)
@@ -214,7 +239,7 @@ def _download(url: str, dest: str, expected_sha256: str | None, on_progress, is_
     req = urllib.request.Request(url, headers={"User-Agent": "PiraChest-Updater", "Accept-Encoding": "identity"})
     hasher = hashlib.sha256() if expected_sha256 else None
     downloaded = 0
-    last_pct = -1
+    last_emit = 0.0
     view = memoryview(bytearray(4 << 20))
     try:
         with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb", buffering=8 << 20) as fh:
@@ -231,9 +256,9 @@ def _download(url: str, dest: str, expected_sha256: str | None, on_progress, is_
                     hasher.update(chunk)
                 downloaded += n
                 if on_progress and total > 0:
-                    pct = downloaded * 100 // total
-                    if pct != last_pct:
-                        last_pct = pct
+                    now = time.monotonic()
+                    if now - last_emit >= 0.05 or downloaded == total:
+                        last_emit = now
                         try:
                             on_progress(downloaded, total)
                         except Exception:
@@ -248,6 +273,138 @@ def _download(url: str, dest: str, expected_sha256: str | None, on_progress, is_
         except OSError:
             pass
         raise
+
+
+_SEG_MIN = 8 << 20
+_BASE_HEADERS = {"User-Agent": "PiraChest-Updater", "Accept-Encoding": "identity"}
+
+
+def _probe_ranges(url: str) -> tuple[int, bool]:
+    req = urllib.request.Request(url, headers={**_BASE_HEADERS, "Range": "bytes=0-0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        resp.read(1)
+        content_range = resp.headers.get("Content-Range", "")
+        if getattr(resp, "status", 200) == 206 and "/" in content_range:
+            return int(content_range.rsplit("/", 1)[1]), True
+        return int(resp.headers.get("Content-Length", 0) or 0), False
+
+
+def _sha256_file(path: str, is_cancelled) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb", buffering=0) as fh:
+        buf = bytearray(4 << 20)
+        view = memoryview(buf)
+        while True:
+            if is_cancelled is not None and is_cancelled():
+                raise UpdateCancelled()
+            n = fh.readinto(buf)
+            if not n:
+                break
+            hasher.update(view[:n])
+    return hasher.hexdigest()
+
+
+def _download_parallel(url: str, dest: str, total: int, expected: str | None, on_progress, is_cancelled, on_stage) -> None:
+    part = dest + ".part"
+    streams = max(3, min(8, (os.cpu_count() or 4)))
+    size = -(-total // streams)
+    ranges = [(i * size, min(total, (i + 1) * size) - 1) for i in range(streams) if i * size < total]
+    lock = threading.Lock()
+    abort = threading.Event()
+    state = {"done": 0, "emit": 0.0}
+
+    def cancelled() -> bool:
+        return abort.is_set() or (is_cancelled is not None and is_cancelled())
+
+    def tick(n: int) -> None:
+        with lock:
+            state["done"] += n
+            now = time.monotonic()
+            if now - state["emit"] < 0.05 and state["done"] < total:
+                return
+            state["emit"] = now
+            done = state["done"]
+            if on_progress:
+                try:
+                    on_progress(done, total)
+                except Exception:
+                    logger.exception("Update progress callback raised")
+
+    def segment(start: int, end: int) -> None:
+        pos = start
+        attempts = 0
+        with open(part, "r+b", buffering=0) as fh:
+            while pos <= end:
+                if cancelled():
+                    raise UpdateCancelled()
+                try:
+                    req = urllib.request.Request(url, headers={**_BASE_HEADERS, "Range": f"bytes={pos}-{end}"})
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        if getattr(resp, "status", 206) != 206:
+                            raise RuntimeError("Server ignored the range request")
+                        fh.seek(pos)
+                        while pos <= end:
+                            if cancelled():
+                                raise UpdateCancelled()
+                            chunk = resp.read(min(1 << 20, end - pos + 1))
+                            if not chunk:
+                                break
+                            fh.write(chunk)
+                            pos += len(chunk)
+                            tick(len(chunk))
+                    if pos <= end:
+                        raise RuntimeError("Connection closed early")
+                except UpdateCancelled:
+                    raise
+                except Exception:
+                    attempts += 1
+                    if attempts >= 4:
+                        raise
+                    time.sleep(min(2.0, 0.5 * attempts))
+
+    try:
+        with open(part, "wb") as fh:
+            fh.truncate(total)
+        with ThreadPoolExecutor(len(ranges)) as pool:
+            futures = [pool.submit(segment, a, b) for a, b in ranges]
+            done, _pending = wait(futures, return_when=FIRST_EXCEPTION)
+            if any(f.exception() for f in done):
+                abort.set()
+            for f in futures:
+                f.result()
+        if on_progress:
+            on_progress(total, total)
+        if expected:
+            if on_stage:
+                on_stage("verify")
+            if _sha256_file(part, is_cancelled).lower() != expected.lower():
+                raise ChecksumMismatch("Downloaded file failed checksum verification")
+        os.replace(part, dest)
+    except BaseException:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        raise
+
+
+def _fetch_archive(url: str, dest: str, expected: str | None, on_progress, is_cancelled, on_stage) -> None:
+    total, ranged = 0, False
+    try:
+        total, ranged = _probe_ranges(url)
+    except Exception as exc:
+        logger.info("Range probe failed, using single stream: %s", exc)
+    if ranged and total >= _SEG_MIN:
+        try:
+            _download_parallel(url, dest, total, expected, on_progress, is_cancelled, on_stage)
+            return
+        except (UpdateCancelled, ChecksumMismatch):
+            raise
+        except Exception as exc:
+            logger.warning("Parallel download failed (%s); falling back to single stream", exc)
+    _download_with_retries(url, dest, expected, on_progress, is_cancelled)
+    if on_stage:
+        on_stage("verify")
 
 
 def _download_with_retries(url: str, dest: str, expected: str | None, on_progress, is_cancelled) -> None:
@@ -323,10 +480,11 @@ def _stage_delta(zip_path: str, out_dir: str, exe_name: str, install_dir: str | 
         if (info.external_attr >> 16) & 0o170000 == 0o120000:
             raise RuntimeError("Update archive contains a symbolic link")
         names.append(name)
-    roots = [n for n in names if not n.endswith("/") and n.rsplit("/", 1)[-1].lower() == exe_lower]
+    roots = [n for n in names if not n.endswith("/") and _EXE_RE.match(n.rsplit("/", 1)[-1])]
     if not roots:
         raise RuntimeError(f"{exe_name} not found in update archive")
-    prefix = min(roots, key=len)[: -len(exe_name)]
+    root = min(roots, key=len)
+    prefix = root[: -len(root.rsplit("/", 1)[-1])]
     files = []
     for info, name in zip(infos, names):
         if info.is_dir() or name.endswith("/") or not name.startswith(prefix):
@@ -334,6 +492,8 @@ def _stage_delta(zip_path: str, out_dir: str, exe_name: str, install_dir: str | 
         rel = name[len(prefix):]
         if rel.split("/", 1)[0].lower() == "data":
             continue
+        if _EXE_RE.match(rel.rsplit("/", 1)[-1]):
+            rel = exe_name
         files.append((info, rel))
     if install_dir is None:
         changed = files
@@ -361,21 +521,33 @@ def _stage_delta(zip_path: str, out_dir: str, exe_name: str, install_dir: str | 
             fh.write("".join(f"{p}\n" for p in _stale_files(install_dir, keep)))
 
 
-def download_and_verify_update(update_info: dict, on_progress=None, is_cancelled=None) -> str:
-    checksum_url = update_info.get("checksum_url")
-    if not checksum_url:
-        raise RuntimeError("Release is missing its SHA-256 checksum")
-    expected = fetch_expected_checksum(checksum_url, update_info.get("asset_name", ""))
+def download_and_verify_update(update_info: dict, on_progress=None, is_cancelled=None, on_stage=None) -> str:
+    expected = str(update_info.get("checksum_sha256") or "").strip().lower()
+    if not _HASH_RE.match(expected):
+        checksum_url = update_info.get("checksum_url")
+        if not checksum_url:
+            raise RuntimeError("Release is missing its SHA-256 checksum")
+        expected = fetch_expected_checksum(checksum_url, update_info.get("asset_name", ""))
     if not expected:
         raise RuntimeError("Could not verify the update checksum")
     staging = _update_staging_dir()
+    need = int(update_info.get("asset_size") or 0) * 3
+    try:
+        if need and shutil.disk_usage(staging).free < need:
+            raise RuntimeError("Not enough free disk space to download the update")
+    except OSError:
+        pass
     zip_path = os.path.join(staging, "update.zip")
     out_dir = os.path.join(staging, "new")
     shutil.rmtree(out_dir, ignore_errors=True)
     frozen = bool(getattr(sys, "frozen", False))
     exe_name = os.path.basename(sys.executable) if frozen else "PiraChest.exe"
     try:
-        _download_with_retries(update_info["download_url"], zip_path, expected, on_progress, is_cancelled)
+        if on_stage:
+            on_stage("download")
+        _fetch_archive(update_info["download_url"], zip_path, expected, on_progress, is_cancelled, on_stage)
+        if on_stage:
+            on_stage("extract")
         _stage_delta(zip_path, out_dir, exe_name, _app_dir() if frozen else None, is_cancelled)
     finally:
         try:

@@ -12,9 +12,9 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import (
     BodyLabel, CaptionLabel, CardWidget, ComboBox, FlowLayout, FluentIcon, IconWidget,
-    IndeterminateProgressBar, InfoBar, InfoBarPosition, PillPushButton, PushButton,
-    SearchLineEdit, SmoothScrollArea, StrongBodyLabel, SubtitleLabel, TableWidget,
-    TransparentToolButton,
+    IndeterminateProgressBar, InfoBar, InfoBarPosition, MessageBoxBase, PillPushButton,
+    PushButton, SearchLineEdit, SmoothScrollArea, StrongBodyLabel, SubtitleLabel,
+    TableWidget, TransparentToolButton,
 )
 
 from src.core.models import assess_source_files, assess_title, classify_file
@@ -24,9 +24,10 @@ from src.core.tbhb.models import (
     format_date,
 )
 from src.core.worker import Priority as TaskPriority, cancel as cancel_task, submit as submit_task
+from src.core.config import save_settings, settings
 from src.core.downloader import DownloadManager
 from src.core.translations import tr, register_locale_refresh
-from src.core.theme import palette, themed_icon, ScrollingTextDelegate
+from src.core.theme import palette, pop_in, themed_icon, ScrollingTextDelegate
 from .repacks_page import DownloadActionWidget
 
 logger = logging.getLogger(__name__)
@@ -187,7 +188,7 @@ class ResultsList(QWidget):
         super().__init__(parent)
         self._on_row_click = on_row_click
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(4, 4, 4, 4)
+        self._layout.setContentsMargins(4, 4, 4, 0)
         self._layout.setSpacing(10)
         self._layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._rows: list[ResultRow] = []
@@ -285,7 +286,7 @@ class DetailsView(QWidget):
         body = QWidget()
         body.setStyleSheet("background: transparent;")
         body_l = QVBoxLayout(body)
-        body_l.setContentsMargins(0, 0, 8, 8)
+        body_l.setContentsMargins(0, 0, 8, 0)
         body_l.setSpacing(14)
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
@@ -525,6 +526,41 @@ class DetailsView(QWidget):
         self._download_action.shutdown()
 
 
+class TBHBDisclaimer(MessageBoxBase):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.widget.setMinimumWidth(500)
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        icon = IconWidget(FluentIcon.INFO, self.widget)
+        icon.setFixedSize(22, 22)
+        head.addWidget(icon)
+        head.addWidget(SubtitleLabel(tr('tbhb.disclaimer_title', default='Before you use TBHB'), self.widget), 1)
+        self.viewLayout.addLayout(head)
+        self.viewLayout.setSpacing(10)
+        warning = StrongBodyLabel(
+            tr('tbhb.disclaimer_warning',
+               default='TBHB is a torrent search aggregator. It does not host or check any files.'),
+            self.widget)
+        warning.setWordWrap(True)
+        self.viewLayout.addWidget(warning)
+        body = BodyLabel(
+            tr('tbhb.disclaimer_text',
+               default='Torrents are uploaded by strangers and are often mislabeled or infected. '
+                       'A file that claims to be a movie, game or crack can be malware, and an '
+                       'installer can bundle miners, ransomware or steal your accounts. '
+                       'Never trust a name, size or thumbnail. Open the file list and look for '
+                       '.exe, .scr, .bat, .cmd, .ps1, .lnk or password-protected archives, scan '
+                       'everything with your antivirus, keep Windows Defender on, use a sandbox or '
+                       'VM for unknown files, avoid "cracks" from untrusted uploaders, and prefer '
+                       'VIP or trusted sources. Even then, continue at your own risk.'),
+            self.widget)
+        body.setWordWrap(True)
+        self.viewLayout.addWidget(body)
+        self.yesButton.setText(tr('tbhb.disclaimer_confirm', default='I understand'))
+        self.cancelButton.hide()
+
+
 class TBHBPage(QWidget):
     def __init__(self, manager: DownloadManager, parent=None):
         super().__init__(parent)
@@ -549,8 +585,18 @@ class TBHBPage(QWidget):
         self._search_watchdog.timeout.connect(self._on_search_timeout)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(24, 16, 24, 0)
+        root.setSpacing(8)
+
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.addStretch(1)
+        self._info_btn = TransparentToolButton(FluentIcon.INFO, self)
+        self._info_btn.setFixedSize(32, 32)
+        self._info_btn.setToolTip(tr('tbhb.info_tooltip', default='About TBHB'))
+        self._info_btn.clicked.connect(self._show_disclaimer)
+        header_row.addWidget(self._info_btn)
+        root.addLayout(header_row)
 
         self._search_section = QWidget()
         search_layout = QVBoxLayout(self._search_section)
@@ -678,6 +724,7 @@ class TBHBPage(QWidget):
             bar.setPlaceholderText(tr('tbhb.search_placeholder'))
         self._hint_lbl.setText(tr('tbhb.browse_hint', default='Press Enter on an empty search to browse the latest uploads'))
         self._new_search_btn.setText(tr('tbhb.new_search'))
+        self._info_btn.setToolTip(tr('tbhb.info_tooltip', default='About TBHB'))
         self._sort_lbl.setText(tr('tbhb.sort_by', default='Sort by'))
         for i, text in enumerate(_sort_labels()):
             self._sort_combo.setItemText(i, text)
@@ -690,6 +737,19 @@ class TBHBPage(QWidget):
             self._status_lbl.setText(tr('tbhb.loading'))
         elif self._all_entries or self._query or self._results_section.isVisible():
             self._render_page()
+
+    def _show_disclaimer(self) -> None:
+        dialog = TBHBDisclaimer(self.window())
+        QTimer.singleShot(0, lambda: pop_in(dialog))
+        dialog.exec()
+        if not settings.tbhb_disclaimer_seen:
+            settings.tbhb_disclaimer_seen = True
+            save_settings(settings)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not settings.tbhb_disclaimer_seen:
+            QTimer.singleShot(0, self._show_disclaimer)
 
     def _on_escape(self) -> None:
         if self._details_view.isVisible():

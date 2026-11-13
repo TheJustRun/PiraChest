@@ -21,9 +21,11 @@ from typing import Callable, Optional
 
 import shiboken6
 from PySide6.QtCore import (
+    QEasingCurve,
     QEvent,
     QFileSystemWatcher,
     QObject,
+    QPropertyAnimation,
     QPoint,
     QPointF,
     QRect,
@@ -62,6 +64,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -75,12 +78,124 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qfluentwidgets import FluentIcon, isDarkTheme, qconfig, Theme
-from qfluentwidgets.common.style_sheet import setStyleSheet, styleSheetManager
+from qfluentwidgets import FluentIcon, isDarkTheme, qconfig, Slider, Theme
+from qfluentwidgets.common.style_sheet import styleSheetManager
 from qfluentwidgets.window.fluent_window import FluentTitleBar
 from qframelesswindow import TitleBarButton
 from qframelesswindow.titlebar.title_bar_buttons import TitleBarButtonState
 from qframelesswindow.utils import toggleMaxState
+
+from src.core.config import IS_CANARY
+
+
+_REDUCE_MOTION_SPI = 0x1042
+_OS_MOTION_TTL = 1.0
+_os_motion_cache: tuple[float, bool] = (0.0, True)
+
+
+def _os_animations_allowed() -> bool:
+    global _os_motion_cache
+    now = time.monotonic()
+    stamp, value = _os_motion_cache
+    if now - stamp < _OS_MOTION_TTL:
+        return value
+    value = True
+    if sys.platform == 'win32':
+        try:
+            flag = c_int(1)
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    _REDUCE_MOTION_SPI, 0, byref(flag), 0):
+                value = bool(flag.value)
+        except Exception:
+            pass
+    _os_motion_cache = (now, value)
+    return value
+
+
+def animations_enabled() -> bool:
+    try:
+        from src.core.config import settings
+        if not getattr(settings, 'animations_enabled', True):
+            return False
+    except Exception:
+        pass
+    return _os_animations_allowed()
+
+
+def fade_in(widget: QWidget, duration: int = 140) -> None:
+    if widget is None:
+        return
+    if not animations_enabled():
+        previous = getattr(widget, '_pirachest_fade', None)
+        if previous is not None:
+            with suppress(Exception):
+                previous.stop()
+            try:
+                if widget.graphicsEffect() is getattr(previous, '_pirachest_effect', None):
+                    widget.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+            widget._pirachest_fade = None
+        return
+    try:
+        previous = getattr(widget, '_pirachest_fade', None)
+        if previous is not None:
+            previous.stop()
+            if widget.graphicsEffect() is getattr(previous, '_pirachest_effect', None):
+                widget.setGraphicsEffect(None)
+        effect = QGraphicsOpacityEffect(widget)
+        effect.setOpacity(0.0)
+        widget.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b'opacity', widget)
+        anim.setDuration(max(60, int(duration)))
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim._pirachest_effect = effect
+
+        def _done() -> None:
+            if getattr(widget, '_pirachest_fade', None) is anim:
+                try:
+                    if widget.graphicsEffect() is effect:
+                        widget.setGraphicsEffect(None)
+                except RuntimeError:
+                    pass
+                widget._pirachest_fade = None
+
+        anim.finished.connect(_done)
+        widget._pirachest_fade = anim
+        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+    except (RuntimeError, TypeError):
+        pass
+
+
+def pop_in(widget: QWidget, duration: int = 220) -> None:
+    if widget is None or not animations_enabled():
+        return
+    try:
+        if not widget.isWindow():
+            fade_in(widget, max(120, duration - 40))
+            return
+        final = widget.geometry()
+        start = final.adjusted(
+            final.width() // 40, final.height() // 40,
+            -final.width() // 40, -final.height() // 40)
+        widget.setWindowOpacity(0.0)
+        widget.setGeometry(start)
+        fade = QPropertyAnimation(widget, b'windowOpacity', widget)
+        fade.setDuration(max(120, int(duration)))
+        fade.setStartValue(0.0)
+        fade.setEndValue(1.0)
+        fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        grow = QPropertyAnimation(widget, b'geometry', widget)
+        grow.setDuration(max(140, int(duration)))
+        grow.setStartValue(start)
+        grow.setEndValue(final)
+        grow.setEasingCurve(QEasingCurve.Type.OutQuint)
+        fade.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+        grow.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+    except (RuntimeError, TypeError):
+        pass
 
 
 def _widget_global_pos(widget, point):
@@ -479,127 +594,109 @@ _SRC: dict = {
         "list_bg": "rgba(0, 0, 0, 0.035)", "dialog_bg": "@card_bg",
     },
     "amoled": {
-        "page_bg": "#000000", "card_bg": "#0A0A0A", "primary_text": "#F2F2F2",
-        "muted": "#8A8F98", "accent": "#FFFFFF", "state_queued": "#7A7F87",
-        "state_downloading": "#00B8D4", "state_verifying": "#E08838", "state_seeding": "#00E676",
-        "state_error": "#FF5252", "card_hover": "#141414", "card_border": "rgba(255, 255, 255, 0.08)",
-        "input_bg": "#0D0D0D", "input_border": "rgba(255, 255, 255, 0.12)", "input_border_hover": "rgba(255, 255, 255, 0.20)",
+        "page_bg": "#000000", "card_bg": "#0A0A0A", "primary_text": "#F2F2F2", "muted": "#8A8F98",
+        "accent": "#22D3EE", "state_queued": "#7A7F87", "state_downloading": "#5B8CFF", "state_verifying": "#FFB020",
+        "state_seeding": "#2EE59D", "state_error": "#FF5D6C", "card_hover": "#141414",
+        "card_border": "rgba(255, 255, 255, 0.08)", "input_bg": "#0D0D0D",
+        "input_border": "rgba(255, 255, 255, 0.12)", "input_border_hover": "rgba(255, 255, 255, 0.20)",
         "btn_bg": "#0D0D0D", "btn_border": "rgba(255, 255, 255, 0.12)", "btn_hover": "#161616",
         "detail_box_border": "rgba(255, 255, 255, 0.08)", "faint_text": "#6E7178", "body_text": "#D0D2D6",
-        "surface_tint": "rgba(255, 255, 255, 0.05)", "surface_tint_strong": "rgba(255, 255, 255, 0.09)", "surface_border": "rgba(255, 255, 255, 0.10)",
-        "hover_tint": "rgba(255, 255, 255, 0.06)", "inactive_dot": "rgba(255, 255, 255, 0.22)", "section_card_bg": "#0D0D0D",
-        "section_card_border": "rgba(255, 255, 255, 0.10)", "scrollbar_handle": "rgba(255, 255, 255, 0.16)", "scrollbar_handle_hover": "rgba(255, 255, 255, 0.26)",
-        "list_bg": "rgba(0, 0, 0, 0.35)", "nav_selected_bg": "#141414", "nav_hover_bg": "#0D0D0D",
-        "dialog_bg": "#0A0A0A", "dialog_border": "rgba(255, 255, 255, 0.10)", "dialog_body_text": "#D0D2D6",
-        "icon_color": "#FFFFFF",
+        "surface_tint": "rgba(255, 255, 255, 0.05)", "surface_tint_strong": "rgba(255, 255, 255, 0.09)",
+        "surface_border": "rgba(255, 255, 255, 0.10)", "hover_tint": "rgba(255, 255, 255, 0.06)",
+        "inactive_dot": "rgba(255, 255, 255, 0.22)", "section_card_bg": "#0D0D0D",
+        "section_card_border": "rgba(255, 255, 255, 0.10)", "scrollbar_handle": "rgba(255, 255, 255, 0.16)",
+        "scrollbar_handle_hover": "rgba(255, 255, 255, 0.26)", "list_bg": "rgba(0, 0, 0, 0.35)",
+        "nav_selected_bg": "#141414", "nav_hover_bg": "#0D0D0D", "dialog_bg": "#0A0A0A",
+        "dialog_border": "rgba(255, 255, 255, 0.10)", "dialog_body_text": "#D0D2D6", "icon_color": "@primary_text",
+        "nav_icon": "@icon_color",
     },
     "catppuccin_rose": {
-        "page_bg": "#f2e6e8", "card_bg": "#f8f0f1", "primary_text": "#4a3238",
-        "muted": "#8a6f76", "accent": "#ea76cb", "state_queued": "#a68d93",
-        "state_downloading": "#ea76cb", "state_verifying": "#fe640b", "state_seeding": "#40a02b",
-        "state_error": "#e64553", "card_hover": "#efe0e2", "card_border": "rgba(76, 44, 58, 0.12)",
-        "input_border": "#e0c9cd", "input_border_hover": "#d0b0b6", "btn_bg": "#f8f0f1",
-        "btn_border": "#e0c9cd", "btn_hover": "#efe0e2", "detail_subtitle": "#dd7878",
-        "detail_box_bg": "#efe0e2", "detail_box_border": "#e0c9cd", "faint_text": "#a68d93",
-        "body_text": "#5c4249", "surface_tint": "rgba(76, 44, 58, 0.05)", "surface_tint_strong": "rgba(76, 44, 58, 0.09)",
-        "surface_border": "rgba(76, 44, 58, 0.12)", "hover_tint": "rgba(76, 44, 58, 0.06)", "inactive_dot": "rgba(76, 44, 58, 0.22)",
-        "poster_fallback_bg": "#efe0e2", "section_card_bg": "#efe0e2", "section_card_border": "rgba(76, 44, 58, 0.12)",
-        "scrollbar_handle": "rgba(76, 44, 58, 0.20)", "scrollbar_handle_hover": "rgba(76, 44, 58, 0.32)", "list_bg": "rgba(76, 44, 58, 0.04)",
-        "nav_bg": "#f8f0f1", "nav_selected_bg": "#efe0e2", "nav_selected_icon": "#dd7878",
-        "nav_hover_bg": "#f2e6e8", "dialog_bg": "#f8f0f1", "dialog_border": "#e0c9cd",
-        "dialog_body_text": "#5c4249", "dialog_accent_text": "#dd7878", "icon_color": "#c98fae",
+        "page_bg": "#FEEAEE", "card_bg": "#FFF8F9", "primary_text": "#361E27", "muted": "#70545F",
+        "accent": "#A70D61", "state_queued": "#8B7B81", "state_downloading": "#0068A5", "state_verifying": "#9F5000",
+        "state_seeding": "#21763C", "state_error": "#B7191C", "card_hover": "#F9EFF1", "card_border": "#E3CCD0",
+        "input_border": "#DCC5CA", "input_border_hover": "#C7A0AD", "btn_bg": "#FFF8F9", "btn_border": "#DCC5CA",
+        "btn_hover": "#F9EFF1", "detail_box_bg": "#F9EFF1", "detail_box_border": "#E3CCD0", "faint_text": "#917981",
+        "body_text": "#442E36", "poster_fallback_bg": "#F9EFF1", "section_card_bg": "#F9EFF1",
+        "section_card_border": "#E3CCD0", "scrollbar_handle_hover": "#AA8A90", "list_bg": "rgba(54, 30, 39, 0.05)",
+        "nav_bg": "#FFF8F9", "nav_selected_bg": "#F9EFF1", "nav_hover_bg": "#FEEAEE", "dialog_bg": "#FFF8F9",
+        "dialog_border": "#E3CCD0", "dialog_body_text": "#442E36", "icon_color": "#6B3078", "nav_icon": "@icon_color",
     },
     "dracula": {
-        "page_bg": "#282a36", "card_bg": "#21222c", "primary_text": "#f8f8f2",
-        "muted": "#6272a4", "accent": "#bd93f9", "state_queued": "#6272a4",
-        "state_downloading": "#8be9fd", "state_verifying": "#ffb86c", "state_seeding": "#50fa7b",
-        "state_error": "#ff5555", "card_hover": "#343746", "input_border": "#44475a",
-        "input_border_hover": "#6272a4", "btn_bg": "#343746", "btn_border": "#44475a",
-        "btn_hover": "#44475a", "detail_subtitle": "#ff79c6", "detail_box_border": "#44475a",
-        "faint_text": "#6272a4", "body_text": "#d6d6e0", "section_card_bg": "#343746",
-        "section_card_border": "#44475a", "list_bg": "rgba(33, 34, 44, 0.5)", "nav_bg": "#21222c",
-        "nav_selected_bg": "#343746", "nav_selected_text": "#ff79c6", "nav_hover_bg": "#2b2d3a",
-        "dialog_bg": "#21222c", "dialog_border": "#44475a", "dialog_body_text": "#d6d6e0",
-        "dialog_accent_text": "#ff79c6",
+        "page_bg": "#1E0D21", "card_bg": "#28162B", "primary_text": "#F6ECF7", "muted": "#AC96AF",
+        "accent": "#C0F447", "state_queued": "#9D86A0", "state_downloading": "#61C3F9", "state_verifying": "#FEB354",
+        "state_seeding": "#43DAB0", "state_error": "#FD6178", "card_hover": "#311E34", "card_border": "#3E2B41",
+        "input_border": "#402E43", "input_border_hover": "#614D64", "btn_bg": "#311E34", "btn_border": "#402E43",
+        "btn_hover": "#3D2940", "detail_box_border": "#3E2B41", "faint_text": "#7D6A80", "body_text": "#CCBFCE",
+        "section_card_bg": "#311E34", "section_card_border": "#3E2B41", "scrollbar_handle_hover": "#614D64",
+        "list_bg": "rgba(30, 13, 33, 0.55)", "nav_bg": "#19091C", "nav_selected_bg": "#311E34",
+        "nav_hover_bg": "#28162B", "dialog_bg": "#28162B", "dialog_border": "#3E2B41", "dialog_body_text": "#CCBFCE",
+        "icon_color": "#CE94F8", "nav_icon": "@icon_color",
     },
     "nord": {
-        "page_bg": "#2e3440", "card_bg": "#3b4252", "primary_text": "#eceff4",
-        "muted": "#7b88a1", "accent": "#88c0d0", "state_queued": "#4c566a",
-        "state_downloading": "#81a1c1", "state_verifying": "#d08770", "state_seeding": "#a3be8c",
-        "state_error": "#bf616a", "card_hover": "#434c5e", "card_border": "rgba(216, 222, 233, 0.08)",
-        "input_border": "#434c5e", "input_border_hover": "#4c566a", "btn_bg": "#434c5e",
-        "btn_border": "#4c566a", "btn_hover": "#4c566a", "detail_subtitle": "#81a1c1",
-        "detail_box_border": "#434c5e", "faint_text": "#7b88a1", "body_text": "#d8dee9",
-        "surface_tint": "rgba(216, 222, 233, 0.05)", "surface_tint_strong": "rgba(216, 222, 233, 0.09)", "surface_border": "rgba(216, 222, 233, 0.10)",
-        "hover_tint": "rgba(216, 222, 233, 0.06)", "inactive_dot": "rgba(216, 222, 233, 0.22)", "section_card_bg": "#434c5e",
-        "section_card_border": "#4c566a", "scrollbar_handle": "rgba(216, 222, 233, 0.16)", "scrollbar_handle_hover": "rgba(216, 222, 233, 0.26)",
-        "nav_selected_bg": "#3b4252", "nav_selected_icon": "#81a1c1", "nav_hover_bg": "#333947",
-        "dialog_border": "#4c566a", "dialog_body_text": "#d8dee9", "dialog_accent_text": "#81a1c1",
-        "icon_color": "#8fbcbb",
+        "page_bg": "#3C362A", "card_bg": "#474033", "primary_text": "#F5EFE6", "muted": "#C3B8A4",
+        "accent": "#B6AAFF", "state_queued": "#A0947D", "state_downloading": "#6DBBE8", "state_verifying": "#F3AE58",
+        "state_seeding": "#83D494", "state_error": "#F98D91", "card_hover": "#51493C", "card_border": "#5E574A",
+        "input_border": "#615A4D", "input_border_hover": "#897B62", "btn_bg": "#51493C", "btn_border": "#615A4D",
+        "btn_hover": "#5D5648", "detail_box_border": "#5E574A", "faint_text": "#8A7F6B", "body_text": "#CBC3B6",
+        "section_card_bg": "#51493C", "section_card_border": "#5E574A", "scrollbar_handle_hover": "#897B62",
+        "list_bg": "rgba(60, 54, 42, 0.55)", "nav_bg": "#373125", "nav_selected_bg": "#51493C",
+        "nav_hover_bg": "#474033", "dialog_bg": "#474033", "dialog_border": "#5E574A", "dialog_body_text": "#CBC3B6",
+        "icon_color": "#CFBC8A", "nav_icon": "@icon_color",
     },
     "gruvbox_dark": {
-        "page_bg": "#282828", "card_bg": "#32302f", "primary_text": "#ebdbb2",
-        "muted": "#928374", "accent": "#fe8019", "state_queued": "#928374",
-        "state_downloading": "#83a598", "state_verifying": "#fabd2f", "state_seeding": "#b8bb26",
-        "state_error": "#fb4934", "card_hover": "#3c3836", "input_border": "#504945",
-        "input_border_hover": "#665c54", "btn_bg": "#3c3836", "btn_border": "#504945",
-        "btn_hover": "#504945", "detail_subtitle": "#d3869b", "detail_box_border": "#504945",
-        "faint_text": "#7c6f64", "body_text": "#d5c4a1", "section_card_bg": "#3c3836",
-        "section_card_border": "#504945", "nav_selected_bg": "#3c3836", "nav_selected_icon": "#fabd2f",
-        "dialog_border": "#504945", "dialog_body_text": "#d5c4a1", "dialog_accent_text": "#d3869b",
-        "icon_color": "#d3869b",
+        "page_bg": "#2C1006", "card_bg": "#391A0E", "primary_text": "#FFEEE7", "muted": "#BE9C8F",
+        "accent": "#FF8346", "state_queued": "#AE8D80", "state_downloading": "#6DBDDC", "state_verifying": "#EACC56",
+        "state_seeding": "#86D489", "state_error": "#F9557C", "card_hover": "#422317", "card_border": "#4F3024",
+        "input_border": "#523327", "input_border_hover": "#755345", "btn_bg": "#422317", "btn_border": "#523327",
+        "btn_hover": "#4F2E22", "detail_box_border": "#4F3024", "faint_text": "#876A5F", "body_text": "#D7BEB5",
+        "section_card_bg": "#422317", "section_card_border": "#4F3024", "scrollbar_handle_hover": "#755346",
+        "list_bg": "rgba(44, 16, 6, 0.55)", "nav_bg": "#270C03", "nav_selected_bg": "#422317",
+        "nav_hover_bg": "#391A0E", "dialog_bg": "#391A0E", "dialog_border": "#4F3024", "dialog_body_text": "#D7BEB5",
+        "icon_color": "#EDC47D", "nav_icon": "@icon_color",
     },
     "tokyo_night": {
-        "page_bg": "#1a1b26", "card_bg": "#16161e", "primary_text": "#c0caf5",
-        "muted": "#565f89", "accent": "#7aa2f7", "state_queued": "#565f89",
-        "state_downloading": "#7dcfff", "state_verifying": "#ff9e64", "state_seeding": "#9ece6a",
-        "state_error": "#f7768e", "card_hover": "#232433", "input_border": "#292e42",
-        "input_border_hover": "#414868", "btn_bg": "#292e42", "btn_border": "#414868",
-        "btn_hover": "#414868", "detail_subtitle": "#bb9af7", "detail_box_border": "#292e42",
-        "faint_text": "#565f89", "body_text": "#a9b1d6", "section_card_bg": "#292e42",
-        "section_card_border": "#414868", "list_bg": "rgba(22, 22, 30, 0.5)", "nav_bg": "#16161e",
-        "nav_selected_bg": "#292e42", "nav_selected_text": "#bb9af7", "nav_hover_bg": "#1e1f2c",
-        "dialog_bg": "#16161e", "dialog_border": "#292e42", "dialog_body_text": "#a9b1d6",
-        "dialog_accent_text": "#bb9af7",
+        "page_bg": "#F0E1C4", "card_bg": "#FDF6E6", "primary_text": "#2D2114", "muted": "#665849",
+        "accent": "#006965", "state_queued": "#887E74", "state_downloading": "#0F68A2", "state_verifying": "#A35900",
+        "state_seeding": "#277539", "state_error": "#B3241F", "card_hover": "#F6EEDC", "card_border": "#D5C4A1",
+        "input_border": "#CEBD9B", "input_border_hover": "#91A889", "btn_bg": "#FDF6E6", "btn_border": "#CEBD9B",
+        "btn_hover": "#F6EEDC", "detail_box_bg": "#F6EEDC", "detail_box_border": "#D5C4A1", "faint_text": "#8A7E71",
+        "body_text": "#3C3124", "poster_fallback_bg": "#F6EEDC", "section_card_bg": "#F6EEDC",
+        "section_card_border": "#D5C4A1", "scrollbar_handle_hover": "#93866B", "list_bg": "rgba(45, 33, 20, 0.05)",
+        "nav_bg": "#FDF6E6", "nav_selected_bg": "#F6EEDC", "nav_hover_bg": "#F0E1C4", "dialog_bg": "#FDF6E6",
+        "dialog_border": "#D5C4A1", "dialog_body_text": "#3C3124", "icon_color": "#A44C1D", "nav_icon": "@icon_color",
     },
     "rose_pine": {
-        "page_bg": "#191724", "card_bg": "#1f1d2e", "primary_text": "#e0def4",
-        "muted": "#6e6a86", "accent": "#ebbcba", "state_queued": "#6e6a86",
-        "state_downloading": "#9ccfd8", "state_verifying": "#f6c177", "state_seeding": "#31748f",
-        "state_error": "#eb6f92", "card_hover": "#26233a", "input_border": "#403d52",
-        "input_border_hover": "#524f67", "btn_bg": "#26233a", "btn_border": "#403d52",
-        "btn_hover": "#403d52", "detail_subtitle": "#c4a7e7", "detail_meta": "#908caa",
-        "detail_box_border": "#403d52", "faint_text": "#6e6a86", "body_text": "#908caa",
-        "section_card_bg": "#26233a", "section_card_border": "#403d52", "nav_selected_bg": "#26233a",
-        "nav_selected_icon": "#c4a7e7", "dialog_border": "#403d52", "dialog_body_text": "#908caa",
-        "dialog_accent_text": "#c4a7e7",
+        "page_bg": "#4B2C39", "card_bg": "#573544", "primary_text": "#FDEFF4", "muted": "#CEAFBB",
+        "accent": "#7FE3CE", "state_queued": "#B99BA7", "state_downloading": "#7FBEF3", "state_verifying": "#EEC469",
+        "state_seeding": "#99DC8A", "state_error": "#FF877A", "card_hover": "#613E4D", "card_border": "#6E4D5B",
+        "input_border": "#714F5E", "input_border_hover": "#6F7D9C", "btn_bg": "#613E4D", "btn_border": "#714F5E",
+        "btn_hover": "#6E4B5A", "detail_box_border": "#6E4D5B", "faint_text": "#9E848E", "body_text": "#D0BEC5",
+        "section_card_bg": "#613E4D", "section_card_border": "#6E4D5B", "scrollbar_handle_hover": "#957180",
+        "list_bg": "rgba(75, 44, 57, 0.55)", "nav_bg": "#452734", "nav_selected_bg": "#613E4D",
+        "nav_hover_bg": "#573544", "dialog_bg": "#573544", "dialog_border": "#6E4D5B", "dialog_body_text": "#D0BEC5",
+        "icon_color": "#FFBCCA", "nav_icon": "@icon_color",
     },
     "solarized_dark": {
-        "page_bg": "#002b36", "card_bg": "#073642", "primary_text": "#eee8d5",
-        "muted": "#93a1a1", "accent": "#2aa198", "state_queued": "#657b83",
-        "state_downloading": "#268bd2", "state_verifying": "#b58900", "state_seeding": "#859900",
-        "state_error": "#dc322f", "card_hover": "#0a4351", "card_border": "rgba(147, 161, 161, 0.10)",
-        "input_border": "#0a4351", "input_border_hover": "#586e75", "btn_bg": "#0a4351",
-        "btn_border": "#586e75", "btn_hover": "#0e5162", "detail_subtitle": "#268bd2",
-        "detail_box_border": "#0a4351", "faint_text": "#657b83", "body_text": "#c3cfd1",
-        "surface_tint": "rgba(147, 161, 161, 0.06)", "surface_tint_strong": "rgba(147, 161, 161, 0.10)", "surface_border": "rgba(147, 161, 161, 0.12)",
-        "hover_tint": "rgba(147, 161, 161, 0.07)", "inactive_dot": "rgba(147, 161, 161, 0.24)", "section_card_bg": "#0a4351",
-        "section_card_border": "#586e75", "scrollbar_handle": "rgba(147, 161, 161, 0.18)", "scrollbar_handle_hover": "rgba(147, 161, 161, 0.28)",
-        "nav_selected_bg": "#073642", "nav_selected_icon": "#268bd2", "nav_hover_bg": "#04404e",
-        "dialog_border": "#0a4351", "dialog_body_text": "#c3cfd1", "dialog_accent_text": "#268bd2",
-        "icon_color": "#b58900",
+        "page_bg": "#003631", "card_bg": "#00423C", "primary_text": "#E8F7F5", "muted": "#95BEB8",
+        "accent": "#FBE6AF", "state_queued": "#85AEA8", "state_downloading": "#87BAFD", "state_verifying": "#E6D271",
+        "state_seeding": "#8DDC7C", "state_error": "#F97B96", "card_hover": "#004C46", "card_border": "#135A53",
+        "input_border": "#175D56", "input_border_hover": "#607D55", "btn_bg": "#004C46", "btn_border": "#175D56",
+        "btn_hover": "#085952", "detail_box_border": "#135A53", "faint_text": "#71958F", "body_text": "#B5C9C6",
+        "section_card_bg": "#004C46", "section_card_border": "#135A53", "scrollbar_handle_hover": "#3F8078",
+        "list_bg": "rgba(0, 54, 49, 0.55)", "nav_bg": "#00312C", "nav_selected_bg": "#004C46",
+        "nav_hover_bg": "#00423C", "dialog_bg": "#00423C", "dialog_border": "#135A53", "dialog_body_text": "#B5C9C6",
+        "icon_color": "#FF917F", "nav_icon": "@icon_color",
     },
     "everforest": {
-        "page_bg": "#2b3339", "card_bg": "#323c41", "primary_text": "#d3c6aa",
-        "muted": "#9da9a0", "accent": "#a7c080", "state_queued": "#7a8478",
-        "state_downloading": "#7fbbb3", "state_verifying": "#dbbc7f", "state_seeding": "#a7c080",
-        "state_error": "#e67e80", "card_hover": "#3a454a", "card_border": "rgba(211, 198, 170, 0.09)",
-        "input_border": "#4a555b", "input_border_hover": "#5c6a63", "btn_bg": "#3a454a",
-        "btn_border": "#4a555b", "btn_hover": "#4a555b", "detail_subtitle": "#83c092",
-        "detail_box_border": "#4a555b", "faint_text": "#7a8478", "body_text": "#c6d1b8",
-        "section_card_bg": "#3a454a", "section_card_border": "#4a555b", "nav_selected_bg": "#3a454a",
-        "nav_selected_icon": "#83c092", "nav_hover_bg": "#333e43", "dialog_border": "#4a555b",
-        "dialog_body_text": "#c6d1b8", "dialog_accent_text": "#83c092",
+        "page_bg": "#343D47", "card_bg": "#3E4753", "primary_text": "#EFF4FA", "muted": "#B6C3D1",
+        "accent": "#F3B7A4", "state_queued": "#94A3B4", "state_downloading": "#6EBDF3", "state_verifying": "#EDBB64",
+        "state_seeding": "#7FD994", "state_error": "#FB9A9A", "card_hover": "#47515C", "card_border": "#555F6A",
+        "input_border": "#58616D", "input_border_hover": "#72859B", "btn_bg": "#47515C", "btn_border": "#58616D",
+        "btn_hover": "#535D69", "detail_box_border": "#555F6A", "faint_text": "#818E9D", "body_text": "#BBC5D1",
+        "section_card_bg": "#47515C", "section_card_border": "#555F6A", "scrollbar_handle_hover": "#72859B",
+        "list_bg": "rgba(52, 61, 71, 0.55)", "nav_bg": "#2F3842", "nav_selected_bg": "#47515C",
+        "nav_hover_bg": "#3E4753", "dialog_bg": "#3E4753", "dialog_border": "#555F6A", "dialog_body_text": "#BBC5D1",
+        "icon_color": "#92C6E5", "nav_icon": "@icon_color",
     },
     "cyberpunk": {
         "page_bg": "#0d0221", "card_bg": "#170a33", "primary_text": "#f5f0ff",
@@ -607,14 +704,13 @@ _SRC: dict = {
         "state_downloading": "#00f0ff", "state_verifying": "#ffb800", "state_seeding": "#39ff88",
         "state_error": "#ff2e6e", "card_hover": "#231143", "card_border": "rgba(255, 0, 122, 0.14)",
         "input_border": "#3a1d63", "input_border_hover": "#5a2a8f", "input_border_focus": "#00f0ff",
-        "btn_bg": "#231143", "btn_border": "#3a1d63", "btn_hover": "#331759",
-        "detail_subtitle": "#00f0ff", "detail_box_border": "#3a1d63", "faint_text": "#7a6ba0",
+        "btn_bg": "#231143", "btn_border": "#3a1d63", "btn_hover": "#331759", "detail_box_border": "#3a1d63", "faint_text": "#7a6ba0",
         "body_text": "#d6c9ff", "surface_tint": "rgba(255, 46, 136, 0.06)", "surface_tint_strong": "rgba(255, 46, 136, 0.11)",
         "surface_border": "rgba(0, 240, 255, 0.14)", "hover_tint": "rgba(0, 240, 255, 0.07)", "inactive_dot": "rgba(245, 240, 255, 0.24)",
         "section_card_bg": "#231143", "section_card_border": "#3a1d63", "scrollbar_handle": "rgba(255, 46, 136, 0.22)",
-        "scrollbar_handle_hover": "rgba(0, 240, 255, 0.32)", "list_bg": "rgba(13, 2, 33, 0.55)", "nav_selected_bg": "#231143",
-        "nav_selected_text": "#00f0ff", "dialog_bg": "#170a33", "dialog_border": "#3a1d63",
-        "dialog_body_text": "#d6c9ff", "dialog_accent_text": "#00f0ff",
+        "scrollbar_handle_hover": "rgba(0, 240, 255, 0.32)", "list_bg": "rgba(13, 2, 33, 0.55)", "nav_selected_bg": "#231143", "dialog_bg": "#170a33", "dialog_border": "#3a1d63",
+        "dialog_body_text": "#d6c9ff",
+        "icon_color": "#00f0ff", "detail_subtitle": "#00f0ff", "dialog_accent_text": "#00f0ff", "nav_icon": "@icon_color", "nav_selected_icon": "@accent", "nav_selected_text": "@accent",
     },
     "vgui": {
         "page_bg": "#333d2e", "card_bg": "#3f4a38", "primary_text": "#eef0e2",
@@ -622,15 +718,38 @@ _SRC: dict = {
         "state_downloading": "#66c0f4", "state_verifying": "#d9a441", "state_seeding": "#7a9c34",
         "state_error": "#c15c4a", "card_hover": "#4a5641", "card_border": "rgba(140, 168, 88, 0.18)",
         "input_border": "#5a6b4e", "input_border_hover": "#6d8058", "input_border_focus": "#8db83c",
-        "btn_bg": "#4a5641", "btn_border": "#5a6b4e", "btn_hover": "#56643f",
-        "detail_subtitle": "#a8cf4a", "detail_box_border": "#5a6b4e", "faint_text": "#828c6f",
+        "btn_bg": "#4a5641", "btn_border": "#5a6b4e", "btn_hover": "#56643f", "detail_box_border": "#5a6b4e", "faint_text": "#828c6f",
         "body_text": "#d3d8c3", "surface_tint": "rgba(140, 168, 88, 0.07)", "surface_tint_strong": "rgba(140, 168, 88, 0.13)",
         "surface_border": "rgba(140, 168, 88, 0.16)", "hover_tint": "rgba(140, 168, 88, 0.09)", "inactive_dot": "rgba(238, 240, 226, 0.24)",
         "section_card_bg": "#4a5641", "section_card_border": "#5a6b4e", "scrollbar_handle": "rgba(140, 168, 88, 0.22)",
         "scrollbar_handle_hover": "rgba(140, 168, 88, 0.34)", "list_bg": "rgba(51, 61, 46, 0.55)", "nav_bg": "#2b3327",
-        "nav_selected_bg": "#4a5641", "nav_selected_text": "#a8cf4a", "nav_hover_bg": "#3a4534",
+        "nav_selected_bg": "#4a5641", "nav_hover_bg": "#3a4534",
         "dialog_bg": "#3a4534", "dialog_border": "#5a6b4e", "dialog_body_text": "#d3d8c3",
-        "dialog_accent_text": "#a8cf4a", "icon_color": "#d3d8c3",
+        "icon_color": "#a8cf4a", "detail_subtitle": "#a8cf4a", "dialog_accent_text": "#a8cf4a", "nav_icon": "@icon_color", "nav_selected_icon": "@accent", "nav_selected_text": "@accent",
+    },
+    "bloodstone": {
+        "page_bg": "#130B0D", "nav_bg": "#0E0809", "card_bg": "#1D1114",
+        "primary_text": "#F2E7E6", "body_text": "#CDBBBA", "muted": "#AA9093", "faint_text": "#836D71",
+        "accent": "#C73A4E", "accent_text": "#F0707F", "on_accent": "#FFF4F4",
+        "input_bg": "mix(@card_bg,@page_bg,.45)", "input_border_focus": "@accent_text",
+        "nav_selected_bg": "mix(@card_bg,@accent,.22)", "nav_selected_text": "@accent_text",
+        "nav_selected_icon": "@accent_text", "detail_subtitle": "@accent_text",
+        "dialog_bg": "@card_bg", "dialog_accent_text": "@accent_text",
+        "icon_color": "#D9A5A8", "nav_icon": "@icon_color",
+        "state_queued": "#A08588", "state_downloading": "#6BA9DE", "state_verifying": "#E2A94C",
+        "state_seeding": "#74BE8D", "state_error": "#F27777",
+    },
+    "golden_wind": {
+        "page_bg": "#16100A", "nav_bg": "#110B07", "card_bg": "#201810",
+        "primary_text": "#F5EAD2", "body_text": "#D2C2A0", "muted": "#AE9C77", "faint_text": "#85764F",
+        "accent": "#C99A3E", "accent_text": "#E4C072", "on_accent": "#1B1209",
+        "input_bg": "mix(@card_bg,@page_bg,.45)", "input_border_focus": "@accent_text",
+        "nav_selected_bg": "mix(@card_bg,@accent,.2)", "nav_selected_text": "@accent_text",
+        "nav_selected_icon": "@accent_text", "detail_subtitle": "@accent_text",
+        "dialog_bg": "@card_bg", "dialog_accent_text": "@accent_text",
+        "icon_color": "#D2B07A", "nav_icon": "@icon_color",
+        "state_queued": "#A3936F", "state_downloading": "#6FB4D2", "state_verifying": "#E58F52",
+        "state_seeding": "#8DC47B", "state_error": "#E86F66",
     },
 }
 
@@ -816,12 +935,13 @@ _BASE = {True: _SRC["dark"], False: _SRC["light"]}
 _DARK = resolve_palette(_SRC["dark"])
 _LIGHT = resolve_palette(_SRC["light"])
 _BUILTIN_META = (
-    ("amoled", "AMOLED", True, False), ("catppuccin_rose", "Catppuccin Rosé", False, True),
-    ("dracula", "Dracula", True, True), ("nord", "Nord", True, True),
-    ("gruvbox_dark", "Gruvbox Dark", True, True), ("tokyo_night", "Tokyo Night", True, True),
-    ("rose_pine", "Rosé Pine", True, True), ("solarized_dark", "Solarized Dark", True, True),
-    ("everforest", "Everforest", True, True), ("cyberpunk", "Cyberpunk", True, True),
-    ("vgui", "VGUI", True, True),
+    ("amoled", "AMOLED", True, False), ("gruvbox_dark", "Ember", True, True),
+    ("bloodstone", "Bloodstone", True, True), ("golden_wind", "Golden Wind", True, True),
+    ("dracula", "Nightshade", True, True), ("cyberpunk", "Cyberpunk", True, True),
+    ("rose_pine", "Rosewood", True, True), ("solarized_dark", "Tidepool", True, True),
+    ("everforest", "Slate", True, True), ("nord", "Dune", True, True),
+    ("vgui", "VGUI", True, True), ("tokyo_night", "Linen", False, True),
+    ("catppuccin_rose", "Sorbet", False, True),
 )
 _log = logging.getLogger(__name__)
 _POPOUT_SFX_HOOK: list = [None]
@@ -832,7 +952,8 @@ def set_popout_sfx_hook(fn) -> None:
 
 
 def _accent_src(accent: str) -> dict:
-    return {"accent": accent, **dict.fromkeys(_ACCENT_ROLES, "@accent")}
+    return {"accent": accent, "nav_selected_bg": "mix(@card_bg,@accent,.24)",
+            **dict.fromkeys(_ACCENT_ROLES, "@accent")}
 
 
 def _int(value, lo, hi, default):
@@ -889,7 +1010,9 @@ class ThemePreset:
     def with_accent(self, accent: Optional[str]) -> "ThemePreset":
         if not accent:
             return self
-        return replace(self, palette=resolve_palette({**self.src, **_accent_src(accent)}))
+        src = dict(self.src)
+        src.pop("on_accent", None)
+        return replace(self, palette=resolve_palette({**src, **_accent_src(accent)}))
 
 
 BUILTIN_PRESETS: dict = {
@@ -955,6 +1078,20 @@ def _resolve_asset(theme_dir, value) -> Optional[str]:
     if not os.path.isabs(value) and not path.startswith(os.path.normpath(theme_dir) + os.sep):
         return None
     return path if os.path.isfile(path) else None
+
+
+def _resolve_sfx(theme_dir, key, value) -> Optional[str]:
+    path = _resolve_asset(theme_dir, value)
+    if path or key != 'ambiance' or not isinstance(value, str) or not value.strip():
+        return path
+    raw = value.strip().replace('\\', '/')
+    folder = os.path.dirname(raw)
+    stem = os.path.splitext(os.path.basename(raw))[0] or 'ambiance'
+    for ext in ('.mp3', '.ogg', '.opus', '.wav', '.flac', '.m4a'):
+        found = _resolve_asset(theme_dir, os.path.join(folder, stem + ext) if folder else stem + ext)
+        if found:
+            return found
+    return None
 
 
 def _resolve_icon_image(theme_dir, value) -> Optional[str]:
@@ -1086,7 +1223,7 @@ class PresetRegistry:
         fonts = tuple(x if os.path.isabs(x) else os.path.join(theme_dir, x)
                       for x in fp if isinstance(x, str)) if isinstance(fp, list) else None
         sfx_raw = data.get("sfx") if isinstance(data.get("sfx"), dict) else {}
-        sfx = {k: p for k in _SFX_KEYS if (p := _resolve_asset(theme_dir, sfx_raw.get(k))) is not None} or None
+        sfx = {k: p for k in _SFX_KEYS if (p := _resolve_sfx(theme_dir, k, sfx_raw.get(k))) is not None} or None
         icons_raw = data.get("icons") if isinstance(data.get("icons"), dict) else {}
         icons = {k: s for k, v in icons_raw.items()
                  if isinstance(k, str) and (s := _parse_icon_spec(theme_dir, v)) is not None}
@@ -1304,7 +1441,6 @@ ICON_SLOTS: dict[str, tuple[str, str]] = {
     "home.category_music": ("MUSIC", "settings.icon_slot_home_category_music"),
     "home.category_anime": ("VIDEO", "settings.icon_slot_home_category_anime"),
     "home.category_youtube": ("PLAY", "settings.icon_slot_home_category_youtube"),
-    "home.category_books": ("BOOK_SHELF", "settings.icon_slot_home_category_books"),
     "home.category_manga": ("BOOK_SHELF", "settings.icon_slot_home_category_manga"),
     "home.category_tbhb": ("SEARCH", "settings.icon_slot_home_category_tbhb"),
     "home.poster_placeholder": ("PHOTO", "settings.icon_slot_home_poster_placeholder"),
@@ -1357,6 +1493,11 @@ ICON_SLOTS: dict[str, tuple[str, str]] = {
     "repacks.tab_gog": ("GAME", "settings.tab_gog_title"),
     "repacks.tab_tbhb": ("SEARCH", "nav.tbhb"),
     "repacks.browse_folder": ("FOLDER", "settings.icon_slot_repacks_browse_folder"),
+    "badge.pink_paw": ("HEART", "settings.icon_slot_badge_pink_paw"),
+    "badge.hypervisor": ("IOT", "settings.icon_slot_badge_hypervisor"),
+    "badge.switch": ("GAME", "settings.icon_slot_badge_switch"),
+    "badge.ns2": ("GAME", "settings.icon_slot_badge_ns2"),
+    "badge.ps3": ("GAME", "settings.icon_slot_badge_ps3"),
 
 
     "music.lyrics_back": ("RETURN", "settings.icon_slot_music_lyrics_back"),
@@ -1393,9 +1534,7 @@ ICON_SLOTS: dict[str, tuple[str, str]] = {
 
 
     "books.detail_back": ("RETURN", "settings.icon_slot_books_detail_back"),
-    "books.site_link": ("LINK", "settings.icon_slot_books_site_link"),
     "books.chapter_download": ("DOWNLOAD", "settings.icon_slot_books_chapter_download"),
-    "books.filter_sources": ("FILTER", "settings.icon_slot_books_filter_sources"),
 
 
     "tbhb.results_prev_page": ("LEFT_ARROW", "settings.icon_slot_tbhb_results_prev_page"),
@@ -1456,12 +1595,10 @@ ICON_SLOTS: dict[str, tuple[str, str]] = {
     "settings.folder_minerva": ("FOLDER", "settings.icon_slot_settings_folder_minerva"),
     "settings.folder_repacks": ("FOLDER", "settings.icon_slot_settings_folder_repacks"),
     "settings.folder_music": ("FOLDER", "settings.icon_slot_settings_folder_music"),
-    "settings.folder_books": ("FOLDER", "settings.icon_slot_settings_folder_books"),
     "settings.folder_manga": ("DOCUMENT", "settings.icon_slot_settings_folder_manga"),
     "settings.folder_youtube": ("FOLDER", "settings.icon_slot_settings_folder_youtube"),
     "settings.folder_anime": ("VIDEO", "settings.icon_slot_settings_folder_anime"),
     "settings.folder_tbhb": ("FOLDER", "settings.icon_slot_settings_folder_tbhb"),
-    "settings.tab_books": ("BOOK_SHELF", "settings.icon_slot_settings_tab_books"),
     "settings.tab_manga": ("DICTIONARY", "settings.icon_slot_settings_tab_manga"),
     "settings.notify_download": ("RINGER", "settings.icon_slot_settings_notify_download"),
     "settings.sfx_volume": ("VOLUME", "settings.icon_slot_settings_sfx_volume"),
@@ -1878,6 +2015,8 @@ class ThemeManager:
         self._live = False
         self._applying = False
         self._reapply = False
+        self._freeze_depth = 0
+        self._frozen: list = []
         self._applied_version = -1
         self._watcher = None
         self._debounce = None
@@ -1922,7 +2061,8 @@ class ThemeManager:
     _pal_meta: Optional[ThemePreset] = None
 
     def _on_external_change(self, *_args) -> None:
-        self._rebuild()
+        if not self._applying:
+            self._rebuild()
 
     def go_live(self) -> None:
         self._live = True
@@ -1945,16 +2085,7 @@ class ThemeManager:
     def _apply_loop(self) -> None:
         self._notify_pending = False
         self._applying = True
-        app = QApplication.instance()
-        frozen = []
-        if app is not None:
-            for window in app.topLevelWidgets():
-                try:
-                    if window.isVisible() and window.updatesEnabled():
-                        window.setUpdatesEnabled(False)
-                        frozen.append(window)
-                except RuntimeError:
-                    pass
+        self._freeze()
         try:
             while True:
                 self._emit()
@@ -1963,12 +2094,7 @@ class ThemeManager:
                 self._reapply = False
         finally:
             self._applying = False
-            # Paint once with the finished palette instead of showing every
-            # intermediate restyle pass.
-            for window in frozen:
-                with suppress(RuntimeError):
-                    window.setUpdatesEnabled(True)
-                    window.update()
+            self._thaw()
 
     def _emit(self) -> None:
         if self._applied_version == self.version:
@@ -1980,16 +2106,25 @@ class ThemeManager:
         if accent:
             color = QColor(accent)
             if qconfig.themeColor.value != color:
+                quiet = qconfig.blockSignals(True)
                 qconfig.themeColor.value = color
+                qconfig.blockSignals(quiet)
                 color_changed = True
+        t = [time.perf_counter()]
         apply_app_palette()
+        t.append(time.perf_counter())
         _restyle_qfluent_widgets()
+        t.append(time.perf_counter())
         apply_widget_rules()
+        t.append(time.perf_counter())
         qconfig.themeChanged.emit(qconfig.theme)
         if color_changed:
             qconfig.themeColorChanged.emit(qconfig.themeColor.value)
         qconfig.themeChangedFinished.emit()
-        _repaint_now()
+        t.append(time.perf_counter())
+        if os.environ.get('PIRACHEST_PROFILE_THEME'):
+            names = ('palette', 'qfluent_restyle', 'widget_rules', 'themeChanged_slots')
+            _log.warning('theme apply: %s', ', '.join(f'{n} {(b - a) * 1000:.0f}ms' for n, a, b in zip(names, t, t[1:])))
 
     def all_presets(self) -> dict: return self.presets.all()
     def preset(self, preset_id): return self.presets.get(preset_id)
@@ -2027,37 +2162,34 @@ class ThemeManager:
         self._meta, self._active = meta, (meta.id if meta else None)
         self._watch(meta)
 
-    def activate(self, preset_id: Optional[str] = None, dark: Optional[bool] = None) -> None:
-        # Hold painting for the whole switch. Setting qconfig.theme / themeColor
-        # below restyles widgets and fires themeChanged *before* _notify() runs,
-        # so without this the window can paint a half-switched frame (old and new
-        # scrollbars / backgrounds on top of each other) for a few milliseconds.
-        frozen = self._freeze_windows()
-        try:
-            self._activate_unfrozen(preset_id, dark)
-        finally:
-            self._thaw_windows(frozen)
-
-    @staticmethod
-    def _freeze_windows() -> list:
-        frozen = []
-        app = QApplication.instance()
-        if app is not None:
-            for window in app.topLevelWidgets():
+    def _freeze(self) -> None:
+        if self._freeze_depth == 0:
+            app = QApplication.instance()
+            for window in (app.topLevelWidgets() if app is not None else ()):
                 try:
                     if window.isVisible() and window.updatesEnabled():
                         window.setUpdatesEnabled(False)
-                        frozen.append(window)
+                        self._frozen.append(window)
                 except RuntimeError:
                     pass
-        return frozen
+        self._freeze_depth += 1
 
-    @staticmethod
-    def _thaw_windows(frozen: list) -> None:
+    def _thaw(self) -> None:
+        self._freeze_depth -= 1
+        if self._freeze_depth:
+            return
+        frozen, self._frozen = self._frozen, []
         for window in frozen:
             with suppress(RuntimeError):
                 window.setUpdatesEnabled(True)
                 window.update()
+
+    def activate(self, preset_id: Optional[str] = None, dark: Optional[bool] = None) -> None:
+        self._freeze()
+        try:
+            self._activate_unfrozen(preset_id, dark)
+        finally:
+            self._thaw()
 
     def _activate_unfrozen(self, preset_id: Optional[str] = None, dark: Optional[bool] = None) -> None:
         meta = self.presets.get(preset_id)
@@ -2070,14 +2202,18 @@ class ThemeManager:
             dark = isDarkTheme() if dark is None else dark
         self._rebuild()
         target = Theme.DARK if dark else Theme.LIGHT
-        if qconfig.theme != target:
-            qconfig.theme = target
-        if qconfig.themeMode.value != target:
-            qconfig.themeMode.value = target
-        if accent:
-            color = QColor(accent)
-            if qconfig.themeColor.value != color:
-                qconfig.themeColor.value = color
+        quiet = qconfig.blockSignals(True)
+        try:
+            if qconfig.theme != target:
+                qconfig.theme = target
+            if qconfig.themeMode.value != target:
+                qconfig.themeMode.value = target
+            if accent:
+                color = QColor(accent)
+                if qconfig.themeColor.value != color:
+                    qconfig.themeColor.value = color
+        finally:
+            qconfig.blockSignals(quiet)
         self._notify()
 
     def preview(self, data: dict, theme_dir: str) -> list:
@@ -2377,7 +2513,17 @@ _QSS_ROLE_BY_TOKEN = {
     "input_bg": "base",
     "input_border": "midlight",
     "input_border_hover": "mid",
-    "input_border_focus": "shadow",
+    "input_border_focus": "highlight",
+    "body_text": "window-text",
+    "faint_text": "placeholder-text",
+    "accent_text": "highlight",
+    "on_accent": "highlighted-text",
+    "nav_text": "text",
+    "nav_selected_text": "shadow",
+    "detail_title": "text",
+    "detail_subtitle": "accent",
+    "detail_meta": "placeholder-text",
+    "dialog_accent_text": "accent",
 }
 
 _QPALETTE_ROLE_BY_NAME = {
@@ -2401,6 +2547,7 @@ _QPALETTE_ROLE_BY_NAME = {
     "shadow": QPalette.ColorRole.Shadow,
     "highlight": QPalette.ColorRole.Highlight,
     "highlighted-text": QPalette.ColorRole.HighlightedText,
+    "accent": getattr(QPalette.ColorRole, "Accent", QPalette.ColorRole.Highlight),
 }
 
 
@@ -2424,8 +2571,9 @@ def _palette_color(pal: dict, token: str) -> Optional[QColor]:
 
 
 def _on_accent_text(accent: QColor) -> QColor:
-    lum = 0.299 * accent.red() + 0.587 * accent.green() + 0.114 * accent.blue()
-    return QColor(0, 0, 0) if lum > 165 else QColor(255, 255, 255)
+    rgb = (accent.red(), accent.green(), accent.blue())
+    dark, light = (17, 17, 17), (255, 255, 255)
+    return QColor(*dark) if _ratio(dark, rgb) >= _ratio(light, rgb) else QColor(*light)
 
 
 def _build_app_palette() -> QPalette:
@@ -2437,9 +2585,12 @@ def _build_app_palette() -> QPalette:
         if color is not None and role is not None:
             qp.setColor(QPalette.ColorGroup.All, role, color)
 
-    text = _palette_color(pal, "primary_text")
+    text = _palette_color(pal, "body_text")
     if text is not None:
         qp.setColor(QPalette.ColorGroup.All, QPalette.ColorRole.WindowText, text)
+    muted = _palette_color(pal, "muted")
+    if muted is not None:
+        qp.setColor(QPalette.ColorGroup.All, QPalette.ColorRole.PlaceholderText, muted)
     accent = _palette_color(pal, "accent")
     if accent is not None:
         qp.setColor(QPalette.ColorGroup.All, QPalette.ColorRole.Highlight, accent)
@@ -2453,34 +2604,29 @@ def apply_app_palette() -> None:
     app = QApplication.instance()
     if app is None:
         return
-    app.setPalette(_build_app_palette())
+    qp = _build_app_palette()
+    if app.palette() != qp:
+        app.setPalette(qp)
 
 
 def _restyle_qfluent_widgets() -> None:
-    # Setting a style sheet on every visible widget costs hundreds of
-    # milliseconds. qfluentwidgets already ships a paint-time watcher for the
-    # ``dirty-qss`` property, so mark every managed widget and let the next
-    # paint restyle it. Painting is frozen by the caller, which coalesces all
-    # of those style recalculations into one pass.
-    removes = []
-    for widget, _source in list(styleSheetManager.items()):
+    from qfluentwidgets.common.style_sheet import getStyleSheet
+    removes, sheets = [], {}
+    for widget, source in list(styleSheetManager.items()):
         try:
-            widget.setProperty('dirty-qss', True)
             if widget.isVisible():
-                widget.update()
+                sheet = sheets.get(source)
+                if sheet is None:
+                    sheet = sheets[source] = getStyleSheet(source)
+                if widget.styleSheet() != sheet:
+                    widget.setStyleSheet(sheet)
+                widget.setProperty('dirty-qss', False)
+            else:
+                widget.setProperty('dirty-qss', True)
         except RuntimeError:
             removes.append(widget)
     for widget in removes:
         styleSheetManager.deregister(widget)
-
-
-def _repaint_now() -> None:
-    app = QApplication.instance()
-    if app is None:
-        return
-    for w in app.topLevelWidgets():
-        if w.isVisible():
-            w.update()
 
 
 def _sels(prefixes, widgets, suffix="") -> str:
@@ -2499,14 +2645,129 @@ PivotItem[isSelected=false]:pressed { color: @muted; }
 """
 _BASE_TEXT_TPL = """
 QWidget { color: @primary_text; }
-MutedLabel, CaptionLabel, BodyLabel, ItalicBodyLabel { color: @muted; }
+MutedLabel, CaptionLabel { color: @muted; }
+BodyLabel, ItalicBodyLabel { color: @body_text; }
 StrongBodyLabel, SubtitleLabel, TitleLabel, LargeTitleLabel, DisplayLabel { color: @primary_text; }
 PushButton, PrimaryPushButton, TransparentPushButton, ToolButton, TransparentToolButton { color: @btn_text; }
 PrimaryPushButton, PrimaryToolButton, PrimaryDropDownPushButton, PrimarySplitPushButton { color: @on_accent; }
+QLabel { color: @primary_text; }
+QLabel:disabled { color: @muted; }
+QAbstractItemView, QListView, QTreeView, QTableView, QColumnView { color: @primary_text; }
+QAbstractItemView:disabled, QListView:disabled, QTreeView:disabled, QTableView:disabled { color: @muted; }
+QHeaderView::section, QTableCornerButton::section { color: @body_text; }
+QMenu, QMenuBar { color: @primary_text; }
+QMenu::item:disabled, QMenuBar::item:disabled { color: @faint_text; }
+QToolTip { color: @primary_text; }
+QGroupBox { color: @primary_text; }
+QTabBar::tab { color: @muted; }
+QTabBar::tab:selected, QTabBar::tab:hover { color: @primary_text; }
+QStatusBar { color: @muted; }
+QLineEdit, QTextEdit, QPlainTextEdit, QTextBrowser, QComboBox,
+QSpinBox, QDoubleSpinBox, QCheckBox, QRadioButton { color: @primary_text; }
+QLineEdit:disabled, QTextEdit:disabled, QPlainTextEdit:disabled, QTextBrowser:disabled,
+QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
+QCheckBox:disabled, QRadioButton:disabled { color: @muted; }
 """ + _PIVOT_TPL + """
 SegmentedItem[isSelected=true], SegmentedToolItem[isSelected=true] { color: @primary_text; }
 SegmentedItem[isSelected=false], SegmentedToolItem[isSelected=false] { color: @muted; }
+QDialog QPushButton:default, QMessageBox QPushButton:default,
+QDialogButtonBox QPushButton:default {
+    background-color: @accent; color: @on_accent;
+    border: 1px solid @accent; }
+QDialog QPushButton:default:hover, QMessageBox QPushButton:default:hover,
+QDialogButtonBox QPushButton:default:hover {
+    background-color: mix(@accent,@primary_text,.12); border-color: mix(@accent,@primary_text,.12); }
 """
+
+_TEXT_TINT_TPL = """
+PushButton, ToolButton, ToggleButton, ToggleToolButton,
+DropDownPushButton, DropDownToolButton, SplitDropButton,
+TransparentPushButton, TransparentToolButton, TransparentTogglePushButton,
+TransparentDropDownPushButton, TransparentToggleToolButton, TransparentDropDownToolButton,
+PillPushButton, PillToolButton, CommandButton { color: @btn_text; }
+PushButton[isPlaceholderText=true] { color: @muted; }
+PushButton:pressed, ToolButton:pressed, ToggleButton:pressed, ToggleToolButton:pressed,
+DropDownPushButton:pressed, DropDownToolButton:pressed, SplitDropButton:pressed { color: @btn_text; }
+PushButton:disabled, ToolButton:disabled, ToggleButton:disabled, ToggleToolButton:disabled,
+DropDownPushButton:disabled, DropDownToolButton:disabled, SplitDropButton:disabled { color: @muted; }
+PrimaryPushButton, PrimaryToolButton, PrimaryDropDownPushButton, PrimaryDropDownToolButton,
+PrimarySplitPushButton, PrimarySplitToolButton, ToggleButton:checked, ToggleToolButton:checked,
+PillPushButton:checked, PillToolButton:checked { color: @on_accent; }
+PrimaryPushButton:pressed, PrimaryToolButton:pressed, PrimaryDropDownPushButton:pressed,
+PrimaryDropDownToolButton:pressed, PrimarySplitPushButton:pressed, PrimarySplitToolButton:pressed,
+ToggleButton:checked:pressed, ToggleToolButton:checked:pressed { color: @on_accent; }
+PrimaryPushButton:disabled, PrimaryToolButton:disabled, PrimaryDropDownPushButton:disabled,
+PrimaryDropDownToolButton:disabled, PrimarySplitPushButton:disabled, PrimarySplitToolButton:disabled,
+ToggleButton:checked:disabled, ToggleToolButton:checked:disabled { color: @on_accent; }
+HyperlinkButton, HyperlinkLabel { color: @accent_text; }
+HyperlinkButton:hover, HyperlinkLabel:hover, HyperlinkButton:pressed, HyperlinkLabel:pressed { color: @accent_text; }
+HyperlinkButton:disabled, HyperlinkLabel:disabled { color: @muted; }
+RadioButton, CheckBox { color: @primary_text; }
+RadioButton:disabled, CheckBox:disabled { color: @muted; }
+ComboBox, ModelComboBox, LineEdit, TextEdit, PlainTextEdit, TextBrowser,
+SpinBox, DoubleSpinBox, DateEdit, DateTimeEdit, TimeEdit,
+CompactSpinBox, CompactDoubleSpinBox, CompactDateEdit, CompactDateTimeEdit, CompactTimeEdit,
+CalendarPicker, PickerBase { color: @primary_text; }
+ComboBox[isPlaceholderText=true], ModelComboBox[isPlaceholderText=true] { color: @muted; }
+ComboBox:pressed, ModelComboBox:pressed { color: @primary_text; }
+ComboBox:disabled, ModelComboBox:disabled, LineEdit:disabled, TextEdit:disabled,
+PlainTextEdit:disabled, TextBrowser:disabled, SpinBox:disabled, DoubleSpinBox:disabled,
+DateEdit:disabled, DateTimeEdit:disabled, TimeEdit:disabled, CompactSpinBox:disabled,
+CompactDoubleSpinBox:disabled, CompactDateEdit:disabled, CompactDateTimeEdit:disabled,
+CompactTimeEdit:disabled, CalendarPicker:disabled { color: @muted; }
+SwitchButton>QLabel { color: @primary_text; }
+SwitchButton>QLabel:disabled { color: @muted; }
+MenuActionListWidget::item { color: @primary_text; }
+MenuActionListWidget::item:disabled { color: @faint_text; }
+MenuActionListWidget::item:selected, MenuActionListWidget::item:selected:active { color: @primary_text; }
+PivotItem { color: @muted; }
+PivotItem[isSelected=true], PivotItem[isSelected=true]:hover, PivotItem[isSelected=true]:pressed,
+PivotItem[isSelected=false]:hover { color: @primary_text; }
+PivotItem[isSelected=false]:pressed { color: @muted; }
+SegmentedItem[isSelected=true], SegmentedToolItem[isSelected=true] { color: @primary_text; }
+SegmentedItem[isSelected=false], SegmentedToolItem[isSelected=false] { color: @muted; }
+SettingCardGroup>QLabel, HeaderCardWidget #headerLabel { color: @primary_text; }
+QLabel#titleLabel, ExpandSettingCard QLabel#titleLabel { color: @primary_text; }
+QLabel#contentLabel, ExpandSettingCard QLabel#contentLabel, RangeSettingCard>QLabel#valueLabel { color: @muted; }
+QLabel:disabled, ExpandSettingCard QLabel#titleLabel:disabled,
+ExpandSettingCard QLabel#contentLabel:disabled, RangeSettingCard>QLabel#valueLabel:disabled { color: @faint_text; }
+SettingCard QPushButton, ExpandSettingCard QPushButton { color: @btn_text; }
+SettingCard PrimaryPushButton, ExpandSettingCard PrimaryPushButton,
+SettingCard PrimaryToolButton, ExpandSettingCard PrimaryToolButton { color: @on_accent; }
+SettingCard #primaryButton { color: @on_accent; }
+QHeaderView::section { color: @body_text; }
+QTreeView:disabled { color: @muted; }
+FluentTitleBar>QLabel#titleLabel, SplitTitleBar>QLabel#titleLabel { color: @primary_text; }
+InfoBar #titleLabel { color: @primary_text; }
+InfoBar #contentLabel { color: @body_text; }
+TeachingTip #titleLabel { color: @primary_text; }
+TeachingTip #contentLabel { color: @body_text; }
+InfoBadge, StateToolTip QLabel, ToastToolTip QLabel { color: @on_accent; }
+ToolTip QLabel { color: @primary_text; }
+QDialog QLabel, MessageBoxBase QLabel, Dialog QLabel, MessageDialog QLabel { color: @dialog_body_text; }
+QDialog QLabel#titleLabel, MessageBoxBase QLabel#titleLabel, Dialog QLabel#titleLabel,
+MessageDialog QLabel#titleLabel { color: @dialog_title_text; }
+QDialog QLabel#windowTitleLabel { color: @muted; }
+QDialog QPushButton, MessageBoxBase QPushButton, Dialog QPushButton, MessageDialog QPushButton,
+ColorDialog QPushButton, FolderListDialog QPushButton { color: @btn_text; }
+QDialog QPushButton:disabled, MessageBoxBase QPushButton:disabled, Dialog QPushButton:disabled,
+MessageDialog QPushButton:disabled, ColorDialog QPushButton:disabled,
+FolderListDialog QPushButton:disabled { color: @muted; }
+QDialog PrimaryPushButton:!disabled, MessageBoxBase PrimaryPushButton:!disabled, Dialog PrimaryPushButton:!disabled,
+MessageDialog PrimaryPushButton:!disabled, ColorDialog PrimaryPushButton:!disabled,
+FolderListDialog PrimaryPushButton:!disabled { color: @on_accent; }
+ColorDialog QLabel, FolderListDialog QLabel { color: @dialog_body_text; }
+FluentLabelBase { color: @primary_text; }
+MutedLabel, CaptionLabel { color: @muted; }
+BodyLabel, ItalicBodyLabel { color: @body_text; }
+StrongBodyLabel, SubtitleLabel, TitleLabel, LargeTitleLabel, DisplayLabel { color: @primary_text; }
+HyperlinkLabel { color: @accent_text; }
+""" + "\n".join(
+    f'FluentLabelBase[pirachestRole="{role}"] {{ color: @{role}; }}'
+    for _group, _roles in TEXT_COLOR_ROLE_GROUPS
+    for role, _label in _roles
+)
+_QSS_COLOR_DECL = re.compile(r"(?<![-\w])color\s*:\s*[^;{}]+;")
 _SCROLL_TPL = """
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: @scrollbar_handle; border-radius: 5px; min-height: 24px; }
@@ -2545,6 +2806,7 @@ _DIALOG_TPL = """
 %btns% { border-radius: $btn_radius; padding: $btn_padding; }
 %btn% { background-color: @btn_bg; border: $input_border_width solid @btn_border; color: @btn_text; }
 %btn_hover% { background-color: @btn_hover; }
+%primary% { color: @on_accent; }
 %inputs% { background-color: @input_bg; border: $input_border_width solid @input_border;
            border-radius: $input_radius; color: @primary_text; padding: $input_padding; }
 %cardw% { background-color: @card_bg; border: none; border-radius: $card_radius; }
@@ -2556,6 +2818,10 @@ _DIALOG_TPL = """
 
 def base_text_qss() -> str:
     return manager.qss(("base_text",), _BASE_TEXT_TPL)
+
+
+def qfluent_text_tint_qss() -> str:
+    return manager.qss(("qfluent_text",), _TEXT_TINT_TPL)
 
 
 def scroll_area_qss() -> str:
@@ -2587,7 +2853,7 @@ def dialog_qss(selectors: tuple = ("MessageBoxBase", "QDialog", "Ui_MessageBox")
         "root": ", ".join(sel), "label": _sels(sel, ("QLabel",)),
         "titles": _sels(sel, ("SubtitleLabel", "TitleLabel", "StrongBodyLabel")),
         "caption": _sels(sel, ("CaptionLabel",)), "btns": _sels(sel, ("PushButton", "PrimaryPushButton")),
-        "btn": _sels(sel, ("PushButton",)), "btn_hover": _sels(sel, ("PushButton",), ":hover"),
+        "primary": _sels(sel, ("PrimaryPushButton",), ":!disabled"), "btn": _sels(sel, ("PushButton",)), "btn_hover": _sels(sel, ("PushButton",), ":hover"),
         "inputs": _sels(sel, ("LineEdit", "ComboBox")), "cardw": _sels(sel, ("CardWidget",)),
         "bar": _sels(sel, ("#pirachestButtonBar",)),
     }))
@@ -2607,7 +2873,9 @@ def _install_integration() -> None:
         return
     _INTEGRATED = True
     for step in (_patch_qfluent_combo_menu_exec, _patch_message_box_theming,
-                 _patch_infobar_theming, _patch_label_theming, _patch_spin_box_layout):
+                 _patch_infobar_theming, _patch_label_theming, _patch_spin_box_layout,
+                 _patch_qfluent_text_tint, _patch_qfluent_tm_rules,
+                 _patch_qfluent_theme_color, _patch_nav_indicator):
         try:
             step()
         except Exception:
@@ -2616,7 +2884,8 @@ def _install_integration() -> None:
 
 def global_app_qss() -> str:
     _install_integration()
-    return "\n".join(s for s in (base_text_qss(), dialog_qss(), custom_theme_qss()) if s)
+    return "\n".join(s for s in (base_text_qss(), qfluent_text_tint_qss(),
+                                 dialog_qss(), custom_theme_qss()) if s)
 
 
 def _qhex(c: QColor) -> str:
@@ -2708,6 +2977,110 @@ def _patch_qfluent_combo_menu_exec() -> None:
 
     QMenu.exec = _compatible_exec
     QMenu._pirachest_exec_patched = True
+
+
+def _patch_qfluent_text_tint() -> None:
+    from qfluentwidgets.common import style_sheet as _ss
+    cls = _ss.FluentStyleSheet
+    if getattr(cls, "_pirachest_text_tint", False):
+        return
+    original = cls.content
+
+    def _content(self, theme=_ss.Theme.AUTO):
+        return _QSS_COLOR_DECL.sub("", original(self, theme))
+
+    cls.content = _content
+    cls._pirachest_text_tint = True
+
+
+def _patch_qfluent_tm_rules() -> None:
+    from qfluentwidgets.common import style_sheet as _ss
+    if getattr(_ss, "_pirachest_tm_rules", False):
+        return
+
+    original_set = _ss.setStyleSheet
+
+    def _set(widget, source, *args, **kwargs):
+        original_set(widget, source, *args, **kwargs)
+        with suppress(Exception):
+            _restore_tm_rules(widget)
+
+    original_add = _ss.addStyleSheet
+
+    def _add(widget, source, *args, **kwargs):
+        original_add(widget, source, *args, **kwargs)
+        with suppress(Exception):
+            _restore_tm_rules(widget)
+
+    original_event = _ss.DirtyStyleSheetWatcher.eventFilter
+
+    def _event(self, obj, event):
+        dirty = event.type() == QEvent.Type.Paint and bool(obj.property("dirty-qss"))
+        result = original_event(self, obj, event)
+        if dirty:
+            with suppress(Exception):
+                _restore_tm_rules(obj)
+        return result
+
+    _ss.setStyleSheet = _set
+    _ss.addStyleSheet = _add
+    _ss.DirtyStyleSheetWatcher.eventFilter = _event
+    _ss._pirachest_tm_rules = True
+
+
+def _patch_qfluent_theme_color() -> None:
+    from qfluentwidgets.common import style_sheet as _ss
+    cls = _ss.ThemeColor
+    if getattr(cls, "_pirachest_exact_accent", False):
+        return
+    original = cls.color
+
+    def _color(self):
+        color = qconfig.get(qconfig._cfg.themeColor)
+        if self == cls.PRIMARY:
+            return QColor(color)
+        if not isDarkTheme():
+            return original(self)
+        h, s, v, _ = color.getHsvF()
+        v = max(0.0, min(1.0, v))
+        if self == cls.DARK_1:
+            v = min(1.0, v * 1.16)
+        elif self == cls.DARK_2:
+            s *= 0.977
+            v *= 0.84
+        elif self == cls.DARK_3:
+            s *= 0.95
+            v *= 0.7
+        elif self == cls.LIGHT_1:
+            s *= 0.92
+            v = min(1.0, v * 1.2)
+        elif self == cls.LIGHT_2:
+            s *= 0.78
+            v = min(1.0, v * 1.3)
+        elif self == cls.LIGHT_3:
+            s *= 0.65
+            v = min(1.0, v * 1.45)
+        return QColor.fromHsvF(h, max(0.0, min(s, 1.0)), v)
+
+    cls.color = _color
+    cls._pirachest_exact_accent = True
+
+
+def _patch_nav_indicator() -> None:
+    from qfluentwidgets.components.navigation.navigation_widget import NavigationIndicator
+    if getattr(NavigationIndicator, "_pirachest_top", False):
+        return
+    start = NavigationIndicator.startAnimation
+
+    def _start(self, *args, **kwargs):
+        self.raise_()
+        start(self, *args, **kwargs)
+        self.raise_()
+
+    NavigationIndicator.startAnimation = _start
+    from qfluentwidgets.components.navigation.navigation_panel import NavigationPanel
+    NavigationPanel.isIndicatorAnimationEnabled = lambda self: animations_enabled()
+    NavigationIndicator._pirachest_top = True
 
 
 def apply_tool_button_theme(button) -> None:
@@ -2866,10 +3239,18 @@ def _patch_label_theming() -> None:
         return "primary_text"
 
     def _patched_apply_theme_color(self) -> None:
-        color = palette().get(_role_for(self), palette()["primary_text"])
-        self.setTextColor(color, color)
+        try:
+            self.setProperty("pirachestRole", _role_for(self))
+        except RuntimeError:
+            pass
 
     FluentLabelBase._applyThemeColor = _patched_apply_theme_color
+
+    def _set_text_color(self, light=QColor(0, 0, 0), dark=QColor(255, 255, 255)) -> None:
+        self._lightColor = QColor(light)
+        self._darkColor = QColor(dark)
+
+    FluentLabelBase.setTextColor = _set_text_color
     FluentLabelBase._pirachest_patched = True
 
 
@@ -2887,8 +3268,7 @@ def _patch_label_theming() -> None:
 def apply_label_theme(label, role: str = "muted") -> None:
     _patch_label_theming()
     label._pirachest_role = role
-    color = palette().get(role, palette()["primary_text"])
-    label.setTextColor(color, color)
+    label.setProperty("pirachestRole", role)
 
 
 def themed_icon(slot_id: Optional[str], default_icon=None, size: int = 20, color: Optional[str] = None) -> QIcon:
@@ -2911,6 +3291,28 @@ def themed_icon(slot_id: Optional[str], default_icon=None, size: int = 20, color
         with suppress(Exception):
             return default_icon.icon(color=QColor(tint_color))
     return tinted_icon(default_icon, tint_color, size)
+
+
+def icon_override_pixmap(slot_id: str, size: int, hd: bool = False):
+    spec = manager.resolve_icon_spec(slot_id)
+    if not spec:
+        return None
+    px = size * (2 if hd else 1)
+    if spec.get("type") == "image":
+        icon = image_icon(spec["value"], px, crop=bool(spec.get("crop", True)))
+    elif spec.get("type") == "fluent":
+        fluent = _fluent_icon_by_name(spec["value"])
+        icon = themed_icon(None, fluent, size=px) if fluent is not None else QIcon()
+    else:
+        return None
+    if icon.isNull():
+        return None
+    pix = icon.pixmap(px, px)
+    if pix.isNull():
+        return None
+    if hd:
+        pix.setDevicePixelRatio(2.0)
+    return pix
 
 
 def accent_icon(slot_id: Optional[str], default_icon=None, size: int = 20) -> QIcon:
@@ -2957,6 +3359,58 @@ def apply_slot_icon_theme(widget, slot_id: str, default_icon, size: int = 16) ->
         widget.setIcon(themed_icon(slot_id, default_icon, size))
     register_theme_refresh(widget, _apply)
 
+
+class ThemedSlider(Slider):
+
+    def __init__(self, *args, groove_length: int = 180, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._len = groove_length
+        self._track = self._fill = QColor()
+        horizontal = self.orientation() == Qt.Orientation.Horizontal
+        (self.setMinimumWidth if horizontal else self.setMinimumHeight)(groove_length)
+        register_theme_refresh(self, self._apply_theme)
+
+    def _apply_theme(self) -> None:
+        pal = palette()
+        self._fill = _palette_color(pal, "accent") or QColor()
+        self._track = _palette_color(pal, "primary_text") or QColor()
+        self._track.setAlpha(80)
+        self.setThemeColor(self._fill, self._fill)
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._len, 22) if self.orientation() == Qt.Orientation.Horizontal else QSize(22, self._len)
+
+    def setValue(self, value: int) -> None:
+        super().setValue(value)
+        self._adjustHandlePos()
+
+    def _span(self) -> int:
+        return max(self.maximum() - self.minimum(), 1)
+
+    def _adjustHandlePos(self) -> None:
+        delta = round((self.value() - self.minimum()) / self._span() * self.grooveLength)
+        self.handle.move(*((delta, 0) if self.orientation() == Qt.Orientation.Horizontal else (0, delta)))
+
+    def _posToValue(self, pos) -> int:
+        raw = pos.x() if self.orientation() == Qt.Orientation.Horizontal else pos.y()
+        frac = min(1.0, max(0.0, (raw - self.handle.width() / 2) / max(self.grooveLength, 1)))
+        return round(self.minimum() + frac * self._span())
+
+    def paintEvent(self, event) -> None:
+        self._adjustHandlePos()
+        r = self.handle.width() / 2
+        horizontal = self.orientation() == Qt.Orientation.Horizontal
+        length = (self.width() if horizontal else self.height()) - 2 * r
+        filled = (self.value() - self.minimum()) / self._span() * length
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        for color, size in ((self._track, length), (self._fill, filled)):
+            if size > 0:
+                p.setBrush(color)
+                p.drawRoundedRect(QRectF(r, r - 2, size, 4) if horizontal else QRectF(r - 2, r, 4, size), 2, 2)
+        p.end()
 
 
 try:
@@ -3202,11 +3656,16 @@ def _patch_nav_paint() -> None:
                 if fill is None:
                     fill = hover_fill
                 if fill is not None and fill.isValid():
-                    if pressed and not selected:
-                        fill = QColor(fill)
-                        fill.setAlpha(min(255, fill.alpha() + 28))
+                    fill = QColor(fill)
+                    if selected:
+                        tint = _nav_indicator_color(self)
+                        if tint is not None and QColor(tint).isValid():
+                            fill = QColor(tint)
+                        fill.setAlpha(52 if hovered else 40)
+                    else:
+                        fill.setAlpha(min(fill.alpha(), 34 if pressed else 22))
                     p.setBrush(fill)
-                    p.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), nav_radius, nav_radius)
+                    p.drawRoundedRect(QRectF(self.rect()).adjusted(3, 3, -3, -3), max(nav_radius, 8.0), max(nav_radius, 8.0))
             with suppress(Exception):
 
 
@@ -3386,9 +3845,6 @@ class DwmBackdrop:
         h = int(hwnd)
         kind_changed = kind != self._last_kind
 
-        # Only clear the backdrop when no new one replaces it below. Clearing
-        # first and re-applying right after lets DWM composite one frame with
-        # no backdrop, which shows up as a flash while switching themes.
         replaced = (kind == "acrylic" and build >= 17134) or (kind == "blur" and build >= 6000)
         if kind_changed and not replaced:
             self._accent(h, 0)
@@ -3472,6 +3928,17 @@ def _draw_text(p: QPainter, font: QFont, rect: QRectF, text: str, color: QColor,
     p.restore()
 
 
+_CANARY_SUFFIX = " Canary"
+_CANARY_BADGE = QColor("#F0D068")
+_CANARY_BADGE_TEXT = QColor("#231A08")
+
+
+def _title_parts(text: str) -> tuple[str, str]:
+    if IS_CANARY and text.endswith(_CANARY_SUFFIX):
+        return text[: -len(_CANARY_SUFFIX)], "Canary"
+    return text, ""
+
+
 class ChromeTitleLabel(QLabel):
 
     def __init__(self, parent=None) -> None:
@@ -3496,10 +3963,24 @@ class ChromeTitleLabel(QLabel):
     def _padding(self) -> int:
         return self._pad + self._glow_radius
 
+    def _badge_font(self) -> QFont:
+        font = QFont(self._font)
+        font.setBold(True)
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(max(7.0, font.pointSizeF() * 0.74))
+        else:
+            font.setPixelSize(max(9, int(font.pixelSize() * 0.74)))
+        return font
+
     def sizeHint(self) -> QSize:
         metrics = QFontMetrics(self._font)
         pad = self._padding()
-        return QSize(metrics.horizontalAdvance(self.text()) + pad * 2, metrics.height() + pad)
+        name, badge = _title_parts(self.text())
+        if not badge:
+            return QSize(metrics.horizontalAdvance(name) + pad * 2, metrics.height() + pad)
+        badge_metrics = QFontMetrics(self._badge_font())
+        width = metrics.horizontalAdvance(name) + 7 + badge_metrics.horizontalAdvance(badge) + 16 + pad * 2
+        return QSize(width, max(metrics.height(), badge_metrics.height() + 6) + pad)
 
     def minimumSizeHint(self) -> QSize:
         return self.sizeHint()
@@ -3516,8 +3997,26 @@ class ChromeTitleLabel(QLabel):
         p = QPainter(self)
         p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
         pad = self._padding()
-        _draw_text(p, self._font, QRectF(pad, 0, self.width() - pad, self.height()), text,
+        name, badge = _title_parts(text)
+        metrics = QFontMetrics(self._font)
+        name_width = metrics.horizontalAdvance(name)
+        _draw_text(p, self._font, QRectF(pad, 0, name_width + 1, self.height()), name,
                    self._color, self._glow, self._glow_radius, elide=False)
+        if badge:
+            badge_font = self._badge_font()
+            badge_metrics = QFontMetrics(badge_font)
+            x = pad + name_width + 7
+            width = min(badge_metrics.horizontalAdvance(badge) + 16, max(0, self.width() - x - 2))
+            height = min(self.height() - 4, badge_metrics.height() + 6)
+            if width > 0 and height > 0:
+                rect = QRectF(x, (self.height() - height) / 2.0, width, height)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(_CANARY_BADGE)
+                p.drawRoundedRect(rect, height / 2.0, height / 2.0)
+                p.setFont(badge_font)
+                p.setPen(_CANARY_BADGE_TEXT)
+                p.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), badge)
+
 
 
 class ChromeButton(TitleBarButton):
@@ -4356,6 +4855,12 @@ class WindowChrome(QObject):
 
     def apply(self) -> None:
         window = self._window
+        title = window.windowTitle()
+        title_bar = getattr(window, "titleBar", None)
+        title_label = getattr(title_bar, "titleLabel", None)
+        if title_label is not None and title_label.text() != title:
+            with suppress(Exception):
+                title_label.setText(title)
         spec = self.spec()
         pal = palette()
         try:
@@ -4404,10 +4909,6 @@ class WindowChrome(QObject):
                 key = (self._kind, dark, tint_key, spec.corner, frame)
                 if key != self._backdrop_last:
                     last = self._backdrop_last
-                    # Dark-mode and tint-only changes need no frame
-                    # invalidation: re-applying SetWindowPos/RedrawWindow here
-                    # makes DWM composite an extra frame, which shows up as a
-                    # duplicated window flash on dark <-> light switches.
                     structural = not last or (last[0], last[3], last[4]) != (key[0], key[3], key[4])
                     self._backdrop.apply(int(window.winId()), self._kind, dark, tint=tint, corner=spec.corner, frame=frame)
                     if structural:
@@ -4822,12 +5323,6 @@ def _spec_icon(spec, size: int = 20) -> QIcon:
 
 
 class ScrollingTextDelegate(QStyledItemDelegate):
-    """Scroll an overflowing cell's text while the pointer rests on it.
-
-    The column keeps its normal width and ellipsis, so neighbouring columns do
-    not get pushed off-screen. After a short hover delay the full text slides
-    left until the end is visible, then loops.
-    """
 
     def __init__(self, view, column: int = 0, padding: int = 16):
         super().__init__(view)
@@ -4946,27 +5441,76 @@ class ScrollingTextDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+def _tm_hits(w) -> list:
+    meta = manager._meta
+    rules = meta.rules if meta is not None else ()
+    return [r for r in rules if _match(w, r["selector"])]
+
+
+def _tm_css(w, tag: str, hits: list) -> str:
+    selectors = [f'*[tmRule="{tag}"]']
+    name = w.objectName()
+    if name and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        selectors.append(f'#{name}[tmRule="{tag}"]')
+    lines = []
+    for rule in hits:
+        state = rule.get("state", "")
+        for sel in selectors:
+            lines.append(f'{sel}{state} {{ {rule["css"]} }}')
+        color = _css_to_dict(rule["css"]).get("color")
+        if color and not state:
+            for pseudo in (":hover", ":pressed", ":checked", ":focus", ":selected"):
+                for sel in selectors:
+                    lines.append(f"{sel}{pseudo} {{ color: {color}; }}")
+    return "\n".join(lines)
+
+
+def _apply_tm_rules(w) -> None:
+    if not shiboken6.isValid(w):
+        return
+    ss = w.styleSheet()
+    base = ss.split(_TM_MARK)[0] if _TM_MARK in ss else ss
+    hits = _tm_hits(w)
+    new = base
+    if hits:
+        tag = w.property("tmRule") or f"w{next(_tm_seq)}"
+        w.setProperty("tmRule", tag)
+        new = base + _TM_MARK + "\n" + _tm_css(w, tag, hits)
+        _tm_touched.add(w)
+    if new != ss:
+        w.setStyleSheet(new)
+
+
+def _restore_tm_rules(w) -> None:
+    if shiboken6.isValid(w) and w.property("tmRule"):
+        _apply_tm_rules(w)
+
+
+_WIDGET_RULES_KEY = None
+
+
 def apply_widget_rules() -> None:
+    global _WIDGET_RULES_KEY
     meta = manager._meta
     rules, icons = (meta.rules, meta.widget_icons) if meta is not None else ((), ())
     app = QApplication.instance()
     if app is None or not (rules or icons or _tm_touched):
         return
-    targets = app.allWidgets() if (rules or icons) else list(_tm_touched)
+    if rules or icons:
+        key = (id(meta), isDarkTheme())
+        if key == _WIDGET_RULES_KEY:
+            if not _tm_touched:
+                return
+            targets = list(_tm_touched)
+        else:
+            _WIDGET_RULES_KEY = key
+            targets = app.allWidgets()
+    else:
+        targets = list(_tm_touched)
     for w in targets:
         if not shiboken6.isValid(w):
             continue
-        ss = w.styleSheet()
-        base = ss.split(_TM_MARK)[0] if _TM_MARK in ss else ss
-        hits = [r for r in rules if _match(w, r["selector"])]
-        new = base
-        if hits:
-            tag = w.property("tmRule") or f"w{next(_tm_seq)}"
-            w.setProperty("tmRule", tag)
-            new = base + _TM_MARK + "\n" + "\n".join(f'*[tmRule="{tag}"]{r["state"]} {{ {r["css"]} }}' for r in hits)
-            _tm_touched.add(w)
-        if new != ss:
-            w.setStyleSheet(new)
+        _apply_tm_rules(w)
         if icons and hasattr(w, "setIcon"):
             for ic in icons:
                 if _match(w, ic["match"]):

@@ -1,16 +1,3 @@
-"""Shared HTTP plumbing.
-
-`httpx.Client(...)` loads and parses every CA certificate (~150 ms) the moment it
-is constructed. Several pages build their clients at module import time, which
-put that cost on the UI thread the first time the page was opened.
-
-Two small helpers fix both halves of that:
-
-* `shared_ssl_context()` builds one context per process and reuses it, so the
-  certificate bundle is parsed once instead of once per client.
-* `LazyHttpClient` only constructs the real `httpx.Client` when a request is
-  actually made, which normally happens on a worker thread.
-"""
 
 from __future__ import annotations
 
@@ -23,7 +10,6 @@ _context: ssl.SSLContext | None = None
 
 
 def shared_ssl_context() -> ssl.SSLContext:
-    """One verified TLS context for every client in the process."""
     global _context
     ctx = _context
     if ctx is not None:
@@ -38,13 +24,6 @@ def shared_ssl_context() -> ssl.SSLContext:
 
 
 class LazyHttpClient:
-    """`httpx.Client` built on first use, with a shared TLS context.
-
-    The module-level clients in the page backends are only touched from worker
-    threads, so deferring construction keeps the certificate-store load off the
-    UI thread. Attribute access forwards to the real client, which covers get,
-    stream, close and anything else callers already use.
-    """
 
     __slots__ = ('_kwargs', '_transport_factory', '_client', '_lock')
 

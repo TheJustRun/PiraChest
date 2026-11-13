@@ -17,7 +17,6 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _normalize(name: str) -> str:
-    """Return an archive path relative to the extraction root, or raise."""
     name = name.replace("\\", "/")
     if not name or "\x00" in name:
         raise ValueError("archive contains an empty path")
@@ -144,7 +143,6 @@ def _commit(temp: Path, final: Path) -> None:
 
 
 def extract_archive(archive: Path) -> bool:
-    """Extract one archive beside itself. The archive itself is kept."""
     if not archive.is_file() or not archive.name.lower().endswith(ARCHIVE_SUFFIXES):
         return False
     stem = archive.stem
@@ -172,7 +170,6 @@ def extract_archive(archive: Path) -> bool:
 
 
 def extract_rom_archives(paths: Iterable[str]) -> int:
-    """Extract any archive files in *paths*. Failures are logged, never raised."""
     extracted = 0
     for raw in dict.fromkeys(str(path) for path in paths if path):
         archive = Path(raw)

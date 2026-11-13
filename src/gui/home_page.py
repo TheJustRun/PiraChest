@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QPushBu
 from qfluentwidgets import BodyLabel, CardWidget, CaptionLabel, FluentIcon, ProgressBar, SmoothScrollArea, StrongBodyLabel, SubtitleLabel, TitleLabel, TransparentToolButton
 from .grid import PosterStrip, _LIFT, images
 from src.core.config import paths as app_paths, settings as app_settings, is_tab_enabled, tab_visibility_bus
-from src.core.theme import palette, register_theme_refresh, apply_tool_button_theme, themed_icon, to_color
+from src.core.theme import palette, register_theme_refresh, apply_tool_button_theme, themed_icon, to_color, fade_in, animations_enabled
 from src.core.translations import current_language, register_locale_refresh, tr
 logger = logging.getLogger(__name__)
 _ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'photos')
@@ -139,7 +139,7 @@ class _SplashLabel(QLabel):
         self._base = self._BASE_ANGLE
         self._started_at = 0.0
         self._clock = QTimer(self)
-        self._clock.setInterval(33)
+        self._clock.setInterval(50)
         self._clock.setTimerType(Qt.TimerType.CoarseTimer)
         self._clock.timeout.connect(self._advance)
 
@@ -782,6 +782,12 @@ class _FeaturedCard(QFrame):
 
     def _restart(self, anim: QVariantAnimation, attr: str) -> None:
         anim.stop()
+        if not animations_enabled():
+            setattr(self, attr, 1.0)
+            if attr == '_pt':
+                self._drop_old_poster()
+            self.update()
+            return
         setattr(self, attr, 0.0)
         anim.start()
 
@@ -935,6 +941,10 @@ class HomePage(QWidget):
         self._animation_active = True
         self._gen = 0
         self._booting = True
+        self._last_refresh = 0.0
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self.refresh)
         self._rot_timer = QTimer(self)
         self._rot_timer.setInterval(9000)
 
@@ -972,7 +982,6 @@ class HomePage(QWidget):
         add('_trending_anime_row', 'home.dashboard_trending_anime', lambda: self._goto('tv_page', 'show_tab', 'anime'), gate='tv_enabled')
         add('_new_anime_row', 'home.dashboard_new_anime', lambda: self._goto('tv_page', 'show_tab', 'anime'), gate='tv_enabled')
         add('_new_manga_row', 'home.dashboard_new_manga', lambda: self._goto('books_page'), gate='books_enabled')
-        add('_new_books_row', 'home.dashboard_new_books', lambda: self._goto('books_page'), gate='books_enabled')
         add('_playlists_row', 'home.dashboard_playlists_title', lambda: self._goto('music_page'), gate='music_enabled')
         layout.addStretch(1)
         self._empty_notice = TitleLabel('')
@@ -1010,8 +1019,7 @@ class HomePage(QWidget):
         super().showEvent(event)
         self._rot_timer.start()
         if self._features_timer.isActive():
-            self._features_timer.start(250)
-        self._refresh_playlists()
+            self._features_timer.start(300)
         self.refresh()
         self._splash_timer.start()
 
@@ -1038,7 +1046,8 @@ class HomePage(QWidget):
     def _sync_splash_animation(self, *_a) -> None:
         app = QApplication.instance()
         focused = app is None or app.applicationState() == Qt.ApplicationState.ApplicationActive
-        active = (self._animation_active and focused and not self.window().isMinimized()
+        active = (self._animation_active and animations_enabled() and focused
+                  and not self.window().isMinimized()
                   and self.isVisible() and self._splash.isVisible()
                   and self._splash.geometry().bottom() > self._vbar.value())
         if active:
@@ -1115,16 +1124,17 @@ class HomePage(QWidget):
             self._rot_idx += 1
             self.refresh()
 
-    _UPDATES = ('_fetch_repacks', '_fetch_tv', '_fetch_anime', '_fetch_manga', '_fetch_books', '_refresh_playlists', 'refresh')
+    _UPDATES = ('_fetch_repacks', '_fetch_tv', '_fetch_anime', '_fetch_manga', '_refresh_playlists', 'refresh')
+    _STAGGER_MS = (0, 260, 520, 780, 180, 120)
 
     def on_features_changed(self, *_args) -> None:
         self._gen += 1
-        self._features_timer.start(0 if self.isVisible() else 700)
+        self._features_timer.start(350 if self.isVisible() else 900)
 
     def _apply_features_update(self) -> None:
         gen = self._gen
-        for i, name in enumerate(self._UPDATES):
-            QTimer.singleShot(i * 30, partial(self._run_update, name, gen))
+        for name, delay in zip(self._UPDATES, self._STAGGER_MS):
+            QTimer.singleShot(delay, partial(self._run_update, name, gen))
 
     def _run_update(self, name: str, gen: int) -> None:
         if gen != self._gen:
@@ -1149,6 +1159,13 @@ class HomePage(QWidget):
         self._splash.set_color(c.get('accent', '#ffd166'))
 
     def refresh(self) -> None:
+        now = time.perf_counter()
+        elapsed = now - self._last_refresh
+        if elapsed < 0.12:
+            if not self._refresh_timer.isActive():
+                self._refresh_timer.start(max(1, int((0.12 - elapsed) * 1000)))
+            return
+        self._last_refresh = now
         for row, _, gate in self._rows:
             if gate:
                 row.set_enabled(_on(gate))
@@ -1385,11 +1402,7 @@ class HomePage(QWidget):
             self._cands.pop('manga', None)
         self.refresh()
 
-    def _fetch_books(self) -> None:
-        if not _on('books_enabled') or not is_tab_enabled('books', 'books'):
-            self._new_books_row.set_cards([])
-            return
-        self._fetch_browse(self._new_books_row, 'books', _lazy('src.core.books', 'manager'), lambda r: self._new_books_row.set_cards(self._entry_cards(r, 'artwork_url', lambda e: self._goto('books_page', 'open_detail', e), True)), sources=['gutenberg'])
+
 
 
 def _single_shot_timer(parent, interval_ms: int, slot):
@@ -1438,21 +1451,5 @@ class MediaPageBase(QWidget):
     def _switch_stack_animated(self, widget) -> None:
         if self._stack.currentWidget() is widget:
             return
-        old_group = getattr(self, '_stack_fade_anim', None)
-        if old_group is not None:
-            try:
-                old_group.stop()
-                try:
-                    old_group.finished.disconnect()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            for i in range(self._stack.count()):
-                try:
-                    page = self._stack.widget(i)
-                    page.setGraphicsEffect(None)
-                except Exception:
-                    pass
-            self._stack_fade_anim = None
         self._stack.setCurrentWidget(widget)
+        fade_in(widget, 130)

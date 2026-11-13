@@ -48,8 +48,6 @@ _HTTP_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML
        'Chrome/124.0 Safari/537.36')
 
 
-# Built on first use: constructing the client parses the CA bundle, and module
-# import must not pay that on the UI thread.
 http_client = LazyHttpClient(
     headers={'User-Agent': _HTTP_UA, 'Accept': 'application/json, text/html;q=0.9,*/*;q=0.8'},
     timeout=10,
@@ -173,10 +171,6 @@ class RepackEntry:
 
     @property
     def display_title(self) -> str:
-        # Always re-parse the raw title. Cached/clean_title values can come from
-        # an older build with a different cleaning policy, and trusting them
-        # made long names (for example "Call of Duty: Black Ops Cold War")
-        # collapse to whatever a stale cache contained.
         raw = self.title or ""
         if raw:
             parsed = parse_title(raw)
@@ -283,9 +277,27 @@ class RepackDetails:
             self.extra.pop("screenshot_urls", None)
 
 
+REPACK_LIST_MENUS: dict = {
+    "fitgirl": (
+        ("collections", "Collections", (
+            ("pink_paw", "Games with my personal Pink Paw Award"),
+            ("hypervisor", "All Hypervisor Bypassed repacks, A-Z"),
+            ("switch", "Switch emulated repacks"),
+            ("ns2", "Switch 2 emulated repacks"),
+            ("ps3", "PlayStation 3 emulated repacks"),
+        )),
+        ("popular", "Popular repacks", (
+            ("top50", "Top 50 repacks of the month"),
+            ("top150", "Top 150 repacks of the year"),
+        )),
+    ),
+}
+
+
 class RepackSource:
     key: str = ""
     display_name: str = ""
+    supports_tag_exclude = False
 
     def fetch_page(self, page: int) -> RepackPage:
         raise NotImplementedError
@@ -302,11 +314,81 @@ class RepackSource:
     def fetch_popular_repacks(self, use_cache: bool = True) -> list["RepackEntry"]:
         return []
 
+    def badge_slugs(self, use_cache: bool = True) -> dict[str, set[str]]:
+        return {}
+
+    def fetch_tag(self, tag: str, page: int = 1, use_cache: bool = True, exclude=None) -> RepackPage:
+        raise NotImplementedError
+
+    def all_tag_names(self) -> list[str]:
+        return []
+
+    def resolve_tags(self, names: list[str]) -> dict:
+        return {"tags": list(names), "missing": [], "suggestions": {}}
+
+    def random_entry(self, exclude: Optional[str] = None) -> Optional["RepackEntry"]:
+        import random
+        import time
+        rng = random.SystemRandom()
+        now = time.monotonic()
+        stats = getattr(self, "_random_stats", None)
+        if stats is None or now - stats[0] > 900:
+            sizes: dict[int, tuple[int, bool]] = {}
+
+            def probe(p: int) -> tuple[int, bool]:
+                if p not in sizes:
+                    try:
+                        page = self.fetch_page(p)
+                        sizes[p] = (len(page.entries), bool(page.has_more))
+                    except Exception:
+                        if p == 1:
+                            raise
+                        sizes[p] = (0, False)
+                return sizes[p]
+
+            per_page, more = probe(1)
+            if not per_page:
+                self._random_stats = None
+                return None
+            last = 1
+            if more:
+                lo, hi = 1, 2
+                while hi <= 8192 and probe(hi)[0]:
+                    lo = hi
+                    if not probe(hi)[1]:
+                        hi = 0
+                        break
+                    hi *= 2
+                if hi:
+                    while hi - lo > 1:
+                        mid = (lo + hi) // 2
+                        if probe(mid)[0]:
+                            lo = mid
+                        else:
+                            hi = mid
+                last = lo
+            stats = (now, per_page, last, (last - 1) * per_page + probe(last)[0])
+            self._random_stats = stats
+        _, per_page, _last, total = stats
+        pick = None
+        for _ in range(4):
+            number, offset = divmod(rng.randrange(total), per_page)
+            entries = self.fetch_page(number + 1).entries
+            if not entries:
+                self._random_stats = None
+                continue
+            pick = entries[offset] if offset < len(entries) else rng.choice(entries)
+            if not (exclude and total > 1 and getattr(pick, "url", None) == exclude):
+                return pick
+        return pick
+
     def fetch_latest_repacks(self, use_cache: bool = True) -> list["RepackEntry"]:
         return []
 
+    def fetch_list(self, list_key: str, page: int = 1, use_cache: bool = True) -> RepackPage:
+        raise NotImplementedError
 
-# --- Title cleaning: clean game name + faded extras (edition, version, repack tags) ---
+
 __all__ = ["ParsedTitle", "parse_title", "normalize_title", "matching_keys", "title_score", "title_year", "display_meta", "display_title", "search_text"]
 
 _WS_RE = re.compile(r"\s+")
@@ -391,11 +473,6 @@ def _strip_seps(text: str) -> str:
 
 @lru_cache(maxsize=4096)
 def normalize_title(value: str) -> str:
-    """Return a comparison key for a title.
-
-    Accents, punctuation, ``&``/``and`` and apostrophes are normalised, but
-    every meaningful word (including sequel numbers and subtitles) remains.
-    """
     text = unicodedata.normalize("NFKD", str(value or ""))
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
     text = text.casefold().replace("&", " and ")
@@ -406,11 +483,6 @@ def normalize_title(value: str) -> str:
 
 
 def matching_keys(value: str) -> tuple[str, ...]:
-    """Normalised keys used by exact/alias matching.
-
-    A trailing Roman numeral gets a digit twin (and vice versa) so ``GTA V``
-    and ``GTA 5`` compare equal without rewriting the displayed title.
-    """
     key = normalize_title(value)
     if not key:
         return ()
@@ -435,7 +507,6 @@ def _has_meta(text: str) -> bool:
 
 
 def _take_meta_groups(raw: str) -> tuple[str, list[str], str | None, int | None]:
-    """Remove recognised metadata brackets and gather what they contained."""
     notes: list[str] = []
     version: str | None = None
     year: int | None = None
@@ -492,8 +563,6 @@ def _extract_version(text: str) -> tuple[str, str | None]:
     if match is None:
         return text, None
     version = _version_text(match)
-    # Only remove a version token that looks like metadata, never a number
-    # in the title itself (e.g. "Cyberpunk 2077").
     start, end = match.span()
     before = text[:start]
     after = text[end:]
@@ -533,7 +602,6 @@ _EDITION_NOUNS = frozenset(("edition", "cut", "goty"))
 
 
 def _release_parts(text: str, notes: list[str]) -> tuple[str | None, int | None]:
-    """Everything after the title proper is release info: pull version/year, keep the rest as notes."""
     version: str | None = None
     year: int | None = None
 
@@ -583,19 +651,12 @@ _PREFIX_RELEASE_WORDS = frozenset(
 
 
 def _release_only_suffix(segment: str) -> bool:
-    """True when a suffix consists only of release/edition words.
-
-    ``Reloaded Edition`` and ``Game of the Year`` qualify; ``GO: Definitive
-    Edition`` or ``Chicken Bundle`` do not, because their leading words are
-    part of a different product name.
-    """
     words = normalize_title(segment).split()
     return bool(words) and len(words) <= 8 and all(
         word in _PREFIX_RELEASE_WORDS or word.isdigit() for word in words)
 
 
 def _peel_release_tail(text: str, notes: list[str]) -> tuple[str, str]:
-    """Strip trailing '(…)' groups and ': / , ' segments that read like release info, not name."""
     edition = ""
     for _ in range(4):
         group = _TRAIL_GROUP_RE.search(text)
@@ -698,7 +759,6 @@ def parse_title(raw: str) -> ParsedTitle:
     version: str | None = None
     year: int | None = None
 
-    # A spaced en/em dash separates the game name from release info.
     dash = _DASH_SPLIT_RE.search(text)
     if dash:
         version, year = _release_parts(text[dash.end():], notes)
@@ -736,11 +796,9 @@ def parse_title(raw: str) -> ParsedTitle:
                 notes.pop(index)
             break
 
-    # A year left as bare trailing metadata ("Game 2015") is unusual; keep it
-    # in the title rather than risk cutting a number from the name.
 
     clean = _strip_seps(text) or original
-    for opener, closer in ("()", "[]"):          # never leave a dangling bracket in the name
+    for opener, closer in ("()", "[]"):
         if clean.count(opener) > clean.count(closer):
             clean = _strip_seps(clean[:clean.rindex(opener)]) or clean
     if not clean:
@@ -821,11 +879,6 @@ _YEAR_SUFFIX_RE = re.compile(r"[\(\[]\s*((?:19|20)\d{2})\s*[\)\]]\s*$")
 
 
 def title_year(value: str) -> int | None:
-    """Return a parenthesised/bracketed release year.
-
-    Only a structured year counts, so names such as ``Cyberpunk 2077`` or
-    ``Battlefield 1942`` keep their number as part of the title.
-    """
     text = _clean_spaces(value)
     match = _YEAR_SUFFIX_RE.search(text)
     return int(match.group(1)) if match else None
@@ -836,13 +889,6 @@ def _without_year(value: str) -> str:
 
 
 def title_score(title: ParsedTitle, candidate: str, *, year: int | None = None) -> tuple[float, str]:
-    """Score one Steam candidate against a parsed title.
-
-    Priority: exact, exact + year, alias, edition, a release suffix on an
-    otherwise exact name (``Reloaded Edition``, ``Remastered``), then fuzzy.
-    A candidate that names a different year than the parsed title is never a
-    match, which keeps remakes and originals apart.
-    """
     cand_key = normalize_title(candidate)
     if not cand_key:
         return 0.0, "none"
@@ -876,11 +922,6 @@ def title_score(title: ParsedTitle, candidate: str, *, year: int | None = None) 
             if base_key and _ratio(base_key, title.key) >= 0.92:
                 return 0.93, "edition"
 
-    # Steam frequently appends release wording ('Remastered', 'Reloaded
-    # Edition', 'Game of the Year') to an otherwise exact name.  Only accept
-    # that when the remainder really reads like release information; a real
-    # subtitle ('Separate Ways', 'Underworld') must not collapse into the base
-    # game.
     for key in title.keys:
         if cand_key.startswith(key + " "):
             suffix = cand_key[len(key) + 1:]

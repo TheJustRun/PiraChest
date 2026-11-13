@@ -6,6 +6,7 @@ import ctypes
 import html as _html
 import logging
 import math
+import random
 import re
 import time
 from collections import OrderedDict
@@ -1136,6 +1137,79 @@ async def browse_category(cat: str) -> list[dict]:
     return _browse_mem.get(cat) or []
 
 
+_genre_cache = (0.0, [])
+
+
+async def _genre_collection() -> list[str]:
+    global _genre_cache
+    stamp, names = _genre_cache
+    if names and time.monotonic() - stamp < DAY / 1000:
+        return names
+    data = await _al_post("query{GenreCollection}")
+    names = [g for g in (data.get("GenreCollection") or []) if isinstance(g, str) and g != "Hentai"]
+    if names:
+        _genre_cache = (time.monotonic(), names)
+    return names
+
+
+async def resolve_genres(names) -> dict:
+    pool = await _genre_collection()
+    by_norm = {re.sub(r"[^a-z0-9]+", "", g.lower()): g for g in pool}
+    tags, missing = [], []
+    for name in names:
+        found = by_norm.get(re.sub(r"[^a-z0-9]+", "", str(name).lower()))
+        if found is None:
+            missing.append(name)
+        elif found not in tags:
+            tags.append(found)
+    return {"tags": tags, "ids": [], "missing": missing, "pool": list(pool)}
+
+
+async def browse_genres(tags, page: int = 1) -> tuple[list[dict], bool]:
+    query = ("query($p:Int,$g:[String]){Page(page:$p,perPage:" + str(_BROWSE_LIMIT) + "){pageInfo{hasNextPage} "
+             "media(type:ANIME,isAdult:false,genre_in:$g,sort:POPULARITY_DESC){...F}}}"
+             "fragment F on Media{" + _MEDIA_FIELDS + "}")
+    data = await _al_post(query, {"p": page, "g": list(tags)})
+    if not data:
+        raise RuntimeError("AniList request failed")
+    block = data.get("Page") or {}
+    items = [_media_dict(m) for m in (block.get("media") or [])]
+    more = bool((block.get("pageInfo") or {}).get("hasNextPage"))
+    return await collapse_to_franchises(items), more
+
+
+_rng = random.SystemRandom()
+_RANDOM_FILTER = "type:ANIME,isAdult:false,format_not_in:[MUSIC],status_not:NOT_YET_RELEASED,sort:ID"
+_RANDOM_TTL = 6 * 3600
+_random_total = (0.0, 0)
+
+
+async def random_anime(exclude: Any = None) -> Optional[dict]:
+    global _random_total
+    query = ("query($p:Int){Page(page:$p,perPage:1){pageInfo{total} media(" + _RANDOM_FILTER + "){...F}}}"
+             "fragment F on Media{" + _MEDIA_FIELDS + "}")
+    stamp, total = _random_total
+    if time.monotonic() - stamp > _RANDOM_TTL:
+        total = 0
+    for _ in range(4):
+        if total <= 0:
+            data = await _al_post(query, {"p": 1})
+            total = int(((data.get("Page") or {}).get("pageInfo") or {}).get("total") or 0)
+            if total <= 0:
+                return None
+            _random_total = (time.monotonic(), total)
+        data = await _al_post(query, {"p": _rng.randint(1, total)})
+        media = (data.get("Page") or {}).get("media") or []
+        if not media:
+            total = 0
+            continue
+        items = await collapse_to_franchises([_media_dict(media[0])])
+        item = items[0] if items else None
+        if item and (exclude is None or item.get("id") != exclude or total <= 1):
+            return item
+    return None
+
+
 def forget_media(anilist_id: Any) -> None:
     _al_resolved.pop(int(anilist_id))
 
@@ -1967,7 +2041,6 @@ async def _resolve_shared(anilist_id: Any, fresh_media: bool = False) -> tuple[O
     return await asyncio.gather(_safe_media(), _safe_anizip())
 
 async def invalidate_provider_caches() -> None:
-    """Drop cached provider episode lists after extensions are (re)discovered."""
     await delete_prefix_async("episodes:")
     await delete_prefix_async("epv:")
 

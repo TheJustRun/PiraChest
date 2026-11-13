@@ -1,13 +1,181 @@
 from __future__ import annotations
 
-from functools import partial
+from functools import lru_cache, partial
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QRect, QRectF, Qt, QTimer, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QPainter, QPainterPath
+from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QPointF, QRect, QRectF, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import QAbstractScrollArea, QToolTip
 from qfluentwidgets import FluentIcon, TransparentToolButton, isDarkTheme, qconfig
 
-from src.core.theme import palette
+from src.core.theme import palette, animations_enabled
+
+import re as _gs_re
+import unicodedata as _gs_ud
+
+_GS_ROMAN = {'ii': '2', 'iii': '3', 'iv': '4', 'v': '5', 'vi': '6', 'vii': '7', 'viii': '8', 'ix': '9', 'x': '10', 'xi': '11', 'xii': '12'}
+_GS_NUMBERS = {'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10'}
+_GS_ALIASES = {'gta': 'grand theft auto', 'rdr': 'red dead redemption', 'lotr': 'lord of the rings', 'nfs': 'need for speed', 'cod': 'call of duty', 'dbz': 'dragon ball z', 'aot': 'attack on titan', 'got': 'game of thrones'}
+_GS_STOP = frozenset({'the', 'a', 'an', 'of', 'and', 'to', 'in', 'on', 'for'})
+_GS_CACHE: dict[str, str] = {}
+
+
+def _fold(text: str) -> str:
+    text = str(text or '')
+    hit = _GS_CACHE.get(text)
+    if hit is not None:
+        return hit
+    plain = _gs_ud.normalize('NFKD', _gs_ud.normalize('NFKC', text).casefold())
+    plain = ''.join(c for c in plain if not _gs_ud.combining(c))
+    plain = plain.replace('&', ' and ').replace('+', ' and ').replace("'", '').replace('\u2019', '').replace('`', '')
+    plain = _gs_re.sub(r'[^0-9a-z\u0400-\u04ff\u3040-\u30ff\u4e00-\u9fff]+', ' ', plain)
+    out = ' '.join(_GS_ROMAN.get(w, _GS_NUMBERS.get(w, w)) for w in plain.split())
+    if len(_GS_CACHE) > 6000:
+        _GS_CACHE.clear()
+    _GS_CACHE[text] = out
+    return out
+
+
+def _gs_stem(word: str) -> str:
+    if len(word) > 3:
+        if word.endswith('ies'):
+            return word[:-3] + 'y'
+        if word.endswith(('sses', 'shes', 'ches', 'xes')):
+            return word[:-2]
+        if word.endswith('s') and not word.endswith('ss'):
+            return word[:-1]
+    return word
+
+
+def _gs_close(a: str, b: str) -> bool:
+    if len(a) < 4 or len(b) < 4:
+        return False
+    limit = 2 if max(len(a), len(b)) >= 12 else 1
+    if abs(len(a) - len(b)) > limit:
+        return False
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i]
+        best = i
+        for j, cb in enumerate(b, 1):
+            value = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb))
+            current.append(value)
+            best = min(best, value)
+        if best > limit:
+            return False
+        previous = current
+    return previous[-1] <= limit
+
+
+def _gs_word_hit(term: str, words: list[str], fuzzy: bool = True) -> bool:
+    stem = _gs_stem(term)
+    for word in words:
+        if word == term or _gs_stem(word) == stem or (len(term) >= 2 and word.startswith(term)):
+            return True
+    alias = (_GS_ALIASES.get(term) or '').split()
+    if alias and any(words[i:i + len(alias)] == alias for i in range(max(1, len(words) - len(alias) + 1))):
+        return True
+    return fuzzy and any(_gs_close(term, word) for word in words)
+
+
+@lru_cache(maxsize=8192)
+def _score(query: str, title: str, extra: str = ''):
+    q, t = _fold(query), _fold(title)
+    if not q:
+        return 0
+    if not t:
+        return None
+    if t == q:
+        return 0
+    qc, tc = q.replace(' ', ''), t.replace(' ', '')
+    if t.startswith(q) or tc.startswith(qc):
+        return 1
+    if q in t or (len(qc) >= 3 and qc in tc):
+        return 2
+    words = [_gs_stem(w) for w in q.split()]
+    terms = [w for w in words if w not in _GS_STOP] or words
+    hay = t.split()
+    if all(_gs_word_hit(term, hay, False) for term in terms):
+        return 3
+    extra_words = f'{t} {_fold(extra)}'.split()
+    if extra and all(_gs_word_hit(term, extra_words, False) for term in terms):
+        return 4
+    if all(_gs_word_hit(term, hay) for term in terms):
+        return 5
+    if extra and all(_gs_word_hit(term, extra_words) for term in terms):
+        return 6
+    if 4 <= len(qc) <= 40 and 4 <= len(tc) <= 68:
+        limit = 1 if max(len(qc), len(tc)) < 12 else 2
+        if abs(len(qc) - len(tc)) <= limit:
+            previous = list(range(len(tc) + 1))
+            for i, ca in enumerate(qc, 1):
+                current = [i]
+                best = i
+                for j, cb in enumerate(tc, 1):
+                    value = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb))
+                    current.append(value)
+                    best = min(best, value)
+                if best > limit:
+                    break
+                previous = current
+            else:
+                if previous[-1] <= limit:
+                    return 5
+    return None
+
+
+def _matches(query: str, text: str) -> bool:
+    return not _fold(query) or _score(query, text) is not None
+
+
+@lru_cache(maxsize=4096)
+def _highlight_spans(text: str, query: str) -> list[tuple[int, int]]:
+    source = _gs_ud.normalize('NFKD', str(text or '').casefold())
+    chars: list[str] = []
+    positions: list[int] = []
+    for index, ch in enumerate(source):
+        if _gs_ud.combining(ch):
+            continue
+        if ch == '&':
+            for part in ' and ':
+                chars.append(part)
+                positions.append(index)
+        elif ch.isalnum() or ch.isspace() or '\u0400' <= ch <= '\u04ff' or '\u3040' <= ch <= '\u9fff':
+            chars.append(' ' if ch.isspace() else ch)
+            positions.append(index)
+        else:
+            chars.append(' ')
+            positions.append(index)
+    folded: list[str] = []
+    kept: list[int] = []
+    for ch, pos in zip(chars, positions):
+        if ch == ' ' and (not folded or folded[-1] == ' '):
+            continue
+        folded.append(ch)
+        kept.append(pos)
+    packed = ''.join(ch for ch in folded if ch != ' ')
+    packed_positions = [pos for ch, pos in zip(folded, kept) if ch != ' ']
+    spans: list[tuple[int, int]] = []
+    for needle in _fold(query).split():
+        if needle in _GS_STOP:
+            continue
+        for needle_text, mapping in ((''.join(folded), kept), (packed, packed_positions)):
+            start = 0
+            while needle:
+                found = needle_text.find(needle, start)
+                if found < 0:
+                    break
+                left = mapping[found]
+                right = mapping[found + len(needle) - 1] + 1
+                spans.append((left, max(left + 1, right)))
+                start = found + len(needle)
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for left, right in spans:
+        if merged and left <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], right))
+        else:
+            merged.append((left, right))
+    return merged
 
 
 class _LazyImages:
@@ -99,6 +267,10 @@ def grid_colors() -> tuple[QColor, QColor, QColor]:
     return strong, muted_color, QColor(base, base, base, 36)
 
 
+_SHADOWS: dict = {}
+_HOVER_RESET_EVENTS = frozenset({QEvent.Type.Leave, QEvent.Type.Hide, QEvent.Type.WindowDeactivate})
+
+
 class _PosterView(QAbstractScrollArea):
     poster_clicked = Signal(object)
     context_requested = Signal(object, QPoint)
@@ -106,13 +278,14 @@ class _PosterView(QAbstractScrollArea):
     visible_changed = Signal(list)
 
     _MARGIN_PX = 600
-    _SNAP = True
+    _SNAP = False
     _HOVER_CURSOR = Qt.CursorShape.PointingHandCursor
 
     def __init__(self, parent, *, vertical, cell_w, poster_h, cover_attrs, key_attr, title_attr,
                  tooltip_fn, subtitle_fn, show_caption, fallback_icon_fn, colors_fn,
-                 img_size=None, cell_h=None, meta_fn=None, search_fn=None):
+                 img_size=None, cell_h=None, meta_fn=None, search_fn=None, badge_fn=None):
         super().__init__(parent)
+        self._badge_fn = badge_fn
         self._vertical = vertical
         self._cw, self._ph, self._caption = cell_w, poster_h, show_caption
         self._fixed_cell_h = cell_h is not None
@@ -148,6 +321,8 @@ class _PosterView(QAbstractScrollArea):
         self._f_title.setPixelSize(13)
         self._f_title.setWeight(QFont.Weight.DemiBold)
         self._f_small.setPixelSize(12)
+        self._fm_title = QFontMetrics(self._f_title)
+        self._fm_small = QFontMetrics(self._f_small)
         self._text, self._muted, self._tint = self._colors_fn()
 
         self.setFrameShape(QAbstractScrollArea.Shape.NoFrame)
@@ -181,13 +356,61 @@ class _PosterView(QAbstractScrollArea):
             self._keys.add(key)
             self._entries.append(entry)
             self._lower.append(self._entry_search_text(entry))
-            if self._query in self._lower[-1]:
+            if _matches(self._query, self._lower[-1]):
                 self._rows.append(len(self._entries) - 1)
             added = True
         if added:
             self._layout()
 
+    def append_entries_ready(self, entries, on_done=None, preload: int = 24, timeout_ms: int = 2500) -> None:
+        entries = list(entries)
+        size = self._img_size()
+        gen = self._ready_gen = getattr(self, '_ready_gen', 0) + 1
+        ready = [True] * len(entries)
+        waiting: dict = {}
+        for i, entry in enumerate(entries[:preload]):
+            src = next((str(v) for v in (getattr(entry, a, None) for a in self._cover_attrs) if v), '')
+            if src and images.peek(src, size) is None:
+                ready[i] = False
+                waiting.setdefault(src, []).append(i)
+        state = {'ptr': 0, 'done': False}
+
+        def flush() -> None:
+            if gen != getattr(self, '_ready_gen', 0):
+                return
+            end = state['ptr']
+            while end < len(entries) and ready[end]:
+                end += 1
+            if end > state['ptr']:
+                self.append_entries(entries[state['ptr']:end])
+                state['ptr'] = end
+            if state['ptr'] >= len(entries) and not state['done']:
+                state['done'] = True
+                if on_done is not None:
+                    on_done()
+
+        def arrived(src, _pixmap=None) -> None:
+            for i in waiting.get(src, ()):
+                ready[i] = True
+            flush()
+
+        def expire() -> None:
+            ready[:] = [True] * len(ready)
+            flush()
+
+        for src in waiting:
+            images.get(src, size, partial(arrived, src), owner=self)
+        if waiting:
+            QTimer.singleShot(timeout_ms, expire)
+        flush()
+
+    def refresh_covers(self) -> None:
+        self._failed.clear()
+        self._sync(True)
+        self.viewport().update()
+
     def clear(self) -> None:
+        self._ready_gen = getattr(self, '_ready_gen', 0) + 1
         self._entries, self._lower, self._keys, self._query = [], [], set(), ''
         self._rebuild_rows()
 
@@ -195,8 +418,12 @@ class _PosterView(QAbstractScrollArea):
         return len(self._entries)
 
     def filter_by_title(self, query: str) -> None:
-        self._query = query.strip().lower()
+        self._query = str(query or '').strip()
         self._rebuild_rows()
+
+    def set_highlight(self, query: str) -> None:
+        self._query = str(query or '').strip()
+        self.viewport().update()
 
     def refresh(self) -> None:
         self._layout()
@@ -234,7 +461,16 @@ class _PosterView(QAbstractScrollArea):
 
     def _rebuild_rows(self) -> None:
         q = self._query
-        self._rows = [i for i, t in enumerate(self._lower) if q in t] if q else list(range(len(self._entries)))
+        if q:
+            scored = []
+            for index, text in enumerate(self._lower):
+                value = _score(q, text)
+                if value is not None:
+                    scored.append((value, index))
+            scored.sort(key=lambda row: (row[0], row[1]))
+            self._rows = [index for _value, index in scored]
+        else:
+            self._rows = list(range(len(self._entries)))
         self._reset_requests()
         self._layout()
 
@@ -254,10 +490,10 @@ class _PosterView(QAbstractScrollArea):
             try:
                 value = self._search_fn(entry)
                 if value:
-                    return str(value).casefold()
+                    return _fold(value)
             except Exception:
                 pass
-        return str(getattr(entry, self._title_attr, '') or '').casefold()
+        return _fold(getattr(entry, self._title_attr, '') or '')
 
     def _title(self, pos: int) -> str:
         return getattr(self._entry(pos), self._title_attr, '') or ''
@@ -310,6 +546,10 @@ class _PosterView(QAbstractScrollArea):
             return
         if pixmap.isNull():
             self._failed.add(pos)
+            retries = self.__dict__.setdefault('_img_retries', {})
+            if retries.get(src, 0) < 3:
+                retries[src] = retries.get(src, 0) + 1
+                QTimer.singleShot(2000 * retries[src], self.refresh_covers)
         lo, hi = self._span(0)
         if lo <= pos <= hi:
             self.viewport().update(self._cell_rect(pos))
@@ -322,12 +562,23 @@ class _PosterView(QAbstractScrollArea):
         self._sync(force=False)
         self.viewport().update()
 
+    def _hit_under_cursor(self) -> int | None:
+        vp = self.viewport()
+        if not vp.underMouse():
+            return None
+        point = vp.mapFromGlobal(QCursor.pos())
+        return self._hit(point) if vp.rect().contains(point) else None
+
     def _on_settled(self) -> None:
         self.is_scrolling = False
-        self._set_hover(self._hit(self.viewport().mapFromGlobal(QCursor.pos())))
+        self._set_hover(self._hit_under_cursor())
 
     def _smooth_scroll(self, delta: float) -> None:
         bar = self._bar()
+        if not animations_enabled():
+            self._wheel.stop()
+            bar.setValue(round(max(0, min(bar.maximum(), bar.value() + delta))))
+            return
         running = self._wheel.state() == QVariantAnimation.State.Running
         base = self._wheel.endValue() if running else bar.value()
         self._wheel.stop()
@@ -356,14 +607,15 @@ class _PosterView(QAbstractScrollArea):
             for p in (old, pos):
                 if p is not None and p < len(self._rows):
                     goal = self._target(p)
-                    if not self._SNAP:
-                        pass
-                    elif goal:
-                        self._lift[p] = goal
-                    else:
-                        self._lift.pop(p, None)
+                    if not animations_enabled() or self._SNAP:
+                        if goal:
+                            self._lift[p] = goal
+                        else:
+                            self._lift.pop(p, None)
                     self.viewport().update(self._cell_rect(p))
             self.hovered.emit(self._entry(pos) if pos is not None and pos < len(self._rows) else None)
+        if not animations_enabled():
+            return
         if not self._ticker.isActive():
             self._ticker.start()
 
@@ -385,7 +637,8 @@ class _PosterView(QAbstractScrollArea):
             self._ticker.stop()
 
     def mouseMoveEvent(self, event) -> None:
-        pos = None if self.is_scrolling else self._hit(event.position().toPoint())
+        point = event.position().toPoint()
+        pos = None if self.is_scrolling or not self.viewport().rect().contains(point) else self._hit(point)
         if pos is not None and pos != self._hover:
             play_sfx('hover')
         self._set_hover(pos)
@@ -414,7 +667,11 @@ class _PosterView(QAbstractScrollArea):
         self._set_hover(self._hover)
 
     def viewportEvent(self, event) -> bool:
-        if event.type() == QEvent.Type.ToolTip:
+        kind = event.type()
+        if kind in _HOVER_RESET_EVENTS:
+            self._pressed = None
+            self._set_hover(None)
+        if kind == QEvent.Type.ToolTip:
             pos = self._hit(event.pos())
             if pos is None:
                 QToolTip.hideText()
@@ -448,6 +705,9 @@ class _PosterView(QAbstractScrollArea):
         poster = QRectF(cell.x(), cell.y() + _LIFT - self._lift.get(pos, 0.0), self._cw, self._ph)
         titled = not self._caption
         self._paint_cover(p, pos, poster, 36 if titled else 48, titled)
+        badge = self._badge(pos)
+        if badge is not None:
+            self._paint_badge(p, badge, poster)
         if self._caption:
             box = QRect(cell.x(), cell.y() + _LIFT + self._ph + _CAPTION_GAP, self._cw, _CAPTION_H)
             p.save()
@@ -457,16 +717,40 @@ class _PosterView(QAbstractScrollArea):
             title_h = 18 if meta else _CAPTION_H
             p.setFont(self._f_title if meta else self._f_small)
             p.setPen(self._text if meta else self._muted)
-            fm = QFontMetrics(self._f_title if meta else self._f_small)
-            p.drawText(
-                QRect(box.x(), box.y(), box.width(), title_h),
-                int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
-                fm.elidedText(title, Qt.TextElideMode.ElideRight, box.width()),
-            )
+            fm = self._fm_title if meta else self._fm_small
+            elided = fm.elidedText(title, Qt.TextElideMode.ElideRight, box.width())
+            spans = _highlight_spans(elided, self._query) if self._query else []
+            if spans:
+                hot = QColor(palette().get('accent', '#4f7cff'))
+                cursor = box.x() + max(0, (box.width() - fm.horizontalAdvance(elided)) // 2)
+                position = 0
+                for left, right in spans:
+                    if left > position:
+                        part = elided[position:left]
+                        p.setPen(self._text if meta else self._muted)
+                        p.drawText(QRect(cursor, box.y(), box.width(), title_h),
+                                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop), part)
+                        cursor += fm.horizontalAdvance(part)
+                    part = elided[left:right]
+                    p.setPen(hot)
+                    p.drawText(QRect(cursor, box.y(), box.width(), title_h),
+                               int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop), part)
+                    cursor += fm.horizontalAdvance(part)
+                    position = right
+                if position < len(elided):
+                    p.setPen(self._text if meta else self._muted)
+                    p.drawText(QRect(cursor, box.y(), box.width(), title_h),
+                               int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop), elided[position:])
+            else:
+                p.drawText(
+                    QRect(box.x(), box.y(), box.width(), title_h),
+                    int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
+                    elided,
+                )
             if meta:
                 p.setFont(self._f_small)
                 p.setPen(self._muted)
-                fm_small = QFontMetrics(self._f_small)
+                fm_small = self._fm_small
                 p.drawText(
                     QRect(box.x(), box.y() + 18, box.width(), _CAPTION_H - 18),
                     int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
@@ -490,13 +774,47 @@ class _PosterView(QAbstractScrollArea):
         top = cell.y() + (cell.height() - 42) // 2 if sub else cell.y()
         p.setFont(self._f_title)
         p.setPen(self._text)
-        title = QFontMetrics(self._f_title).elidedText(self._title(pos), Qt.TextElideMode.ElideRight, width)
-        p.drawText(QRect(x, top, width, 20 if sub else cell.height()),
-                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), title)
+        badge = self._badge(pos)
+        title_w = max(0, width - 24 * len(badge)) if badge else width
+        title = self._fm_title.elidedText(self._title(pos), Qt.TextElideMode.ElideRight, title_w)
+        line_h = 20 if sub else cell.height()
+        spans = _highlight_spans(title, self._query) if self._query else []
+        if spans:
+            hot = QColor(palette().get('accent', '#4f7cff'))
+            cursor = x
+            position = 0
+            for left, right in spans:
+                if left > position:
+                    part = title[position:left]
+                    p.setPen(self._text)
+                    p.drawText(QRect(cursor, top, width, line_h),
+                               int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), part)
+                    cursor += self._fm_title.horizontalAdvance(part)
+                part = title[left:right]
+                p.setPen(hot)
+                p.drawText(QRect(cursor, top, width, line_h),
+                           int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), part)
+                cursor += self._fm_title.horizontalAdvance(part)
+                position = right
+            if position < len(title):
+                p.setPen(self._text)
+                p.drawText(QRect(cursor, top, width, line_h),
+                           int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), title[position:])
+        else:
+            p.drawText(QRect(x, top, width, line_h),
+                       int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), title)
+        if badge:
+            bx = x + self._fm_title.horizontalAdvance(title) + 6
+            for pix in badge:
+                d = pix.devicePixelRatio() or 1.0
+                w, h = pix.width() / d, pix.height() / d
+                k = min(1.0, 16 / max(w, h))
+                p.drawPixmap(QRectF(bx, top + line_h / 2 - h * k / 2, w * k, h * k), pix, QRectF(pix.rect()))
+                bx += w * k + 4
         if sub:
             p.setFont(self._f_small)
             p.setPen(self._muted)
-            sub = QFontMetrics(self._f_small).elidedText(sub, Qt.TextElideMode.ElideRight, width)
+            sub = self._fm_small.elidedText(sub, Qt.TextElideMode.ElideRight, width)
             p.drawText(QRect(x, top + 24, width, 18), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), sub)
 
     def _paint_cover(self, p: QPainter, pos: int, rect: QRectF, icon_px: int, titled: bool) -> None:
@@ -522,6 +840,42 @@ class _PosterView(QAbstractScrollArea):
                            self._title(pos))
         p.restore()
 
+    def _badge(self, pos: int):
+        fn = self._badge_fn
+        if fn is None:
+            return None
+        try:
+            pixes = fn(self._entry(pos))
+        except Exception:
+            return None
+        return [p for p in (pixes or ()) if p is not None and not p.isNull()] or None
+
+    def _badge_shadow(self, pix):
+        key = pix.cacheKey()
+        sh = _SHADOWS.get(key)
+        if sh is None:
+            sh = QPixmap(pix)
+            q = QPainter(sh)
+            q.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+            q.fillRect(sh.rect(), QColor(0, 0, 0, 150))
+            q.end()
+            _SHADOWS[key] = sh
+        return sh
+
+    def _paint_badge(self, p: QPainter, pixes, rect: QRectF) -> None:
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        x = rect.right() - 8
+        for pix in pixes:
+            d = pix.devicePixelRatio() or 1.0
+            w, h = pix.width() / d, pix.height() / d
+            x -= w
+            pt = QPointF(x, rect.top() + 8)
+            p.drawPixmap(pt + QPointF(0, 1), self._badge_shadow(pix))
+            p.drawPixmap(pt, pix)
+            x -= 6
+        p.restore()
+
     def _icon(self, size: int):
         if self._icon_fn is None:
             return None
@@ -540,7 +894,7 @@ class PosterGrid(_PosterView):
     def __init__(self, parent=None, *, header=None, cell_w=150, poster_h=210,
                  cover_attrs=('poster_path', 'poster_url'), key_attr='url', title_attr='title',
                  tooltip_fn=None, subtitle_fn=None, show_caption=False, fallback_icon_fn=None, colors_fn=None,
-                 img_size=None, cell_h=None, side=_SIDE, top=_TOP, meta_fn=None, search_fn=None):
+                 img_size=None, cell_h=None, side=_SIDE, top=_TOP, meta_fn=None, search_fn=None, badge_fn=None):
         self._header = header
         self._header_state = (True, 0)
         self._side, self._pad_top = side, top
@@ -549,7 +903,7 @@ class PosterGrid(_PosterView):
         super().__init__(parent, vertical=True, cell_w=cell_w, poster_h=poster_h, cover_attrs=cover_attrs,
                          key_attr=key_attr, title_attr=title_attr, tooltip_fn=tooltip_fn, subtitle_fn=subtitle_fn,
                          show_caption=show_caption, fallback_icon_fn=fallback_icon_fn, colors_fn=colors_fn,
-                         img_size=img_size, cell_h=cell_h, meta_fn=meta_fn, search_fn=search_fn)
+                         img_size=img_size, cell_h=cell_h, meta_fn=meta_fn, search_fn=search_fn, badge_fn=badge_fn)
         if header is not None:
             header.setParent(self.viewport())
             header.installEventFilter(self)

@@ -5,18 +5,179 @@ import re
 import threading
 import time
 from contextlib import suppress
-from functools import wraps
+from functools import lru_cache, wraps
 from PySide6.QtCore import Qt, QSize, QSizeF, QRect, QThread, QObject, Signal, Property, QPropertyAnimation, QEasingCurve, QTimer, QVariantAnimation, QAbstractAnimation, QEvent
 from shiboken6 import isValid as _qt_is_valid
 from PySide6.QtGui import QBrush, QColor, QIcon, QImage, QFontMetrics, QMovie, QTextDocument
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLayout, QLayoutItem, QScrollArea, QDialog, QTreeWidgetItem, QHeaderView, QGridLayout, QLabel, QSizePolicy, QFileDialog, QGraphicsOpacityEffect, QTextBrowser, QListWidget, QListWidgetItem
-from qfluentwidgets import CardWidget, FluentIcon, Pivot, TitleLabel, SubtitleLabel, BodyLabel, StrongBodyLabel, CaptionLabel, TransparentToolButton, PushButton, PrimaryPushButton, ImageLabel, PillPushButton, FlowLayout as QFlowLayout, themeColor, SearchLineEdit, LineEdit, CheckBox, TreeWidget, MessageBoxBase, SmoothScrollArea, HyperlinkButton, qconfig, isDarkTheme
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLayout, QLayoutItem, QScrollArea, QDialog, QTreeWidgetItem, QHeaderView, QGridLayout, QLabel, QSizePolicy, QFileDialog, QGraphicsOpacityEffect, QGraphicsDropShadowEffect, QTextBrowser, QListWidget, QListWidgetItem
+from qfluentwidgets import CardWidget, FluentIcon, Pivot, TitleLabel, SubtitleLabel, BodyLabel, StrongBodyLabel, CaptionLabel, TransparentToolButton, PushButton, PrimaryPushButton, ImageLabel, PillPushButton, FlowLayout as QFlowLayout, themeColor, SearchLineEdit, LineEdit, CheckBox, ComboBox, TreeWidget, MessageBoxBase, IndeterminateProgressRing, SmoothScrollArea, HyperlinkButton, qconfig, isDarkTheme
 from .home_page import AccentColorMixin, DetailsViewMixin, MediaPageBase
 from PySide6.QtGui import QAction, QDesktopServices, QPainter, QPainterPath, QPen, QPixmap, QRegion
-from PySide6.QtWidgets import QApplication, QGraphicsScene, QGraphicsView, QMenu, QPushButton as _QPB, QStackedWidget, QStyle, QSystemTrayIcon, QWidgetItem
-from PySide6.QtCore import QCoreApplication, QRectF, QUrl
+from PySide6.QtWidgets import QApplication, QGraphicsScene, QGraphicsView, QMenu, QPushButton as _QPB, QStackedWidget, QStyle, QSystemTrayIcon, QWidgetItem, QToolButton
+from PySide6.QtCore import QCoreApplication, QRectF, QUrl, QPoint
 from qfluentwidgets import InfoBar, InfoBarPosition, RoundMenu
 _bookmark_icon_cache: dict[str, QIcon] = {}
+
+import re as _tm_re
+import unicodedata as _tm_ud
+
+_TM_ROMAN = {'ii': '2', 'iii': '3', 'iv': '4', 'v': '5', 'vi': '6', 'vii': '7', 'viii': '8', 'ix': '9', 'x': '10', 'xi': '11', 'xii': '12'}
+_TM_NUMBERS = {'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10'}
+_TM_ALIASES = {'gta': 'grand theft auto', 'rdr': 'red dead redemption', 'lotr': 'lord of the rings', 'nfs': 'need for speed', 'cod': 'call of duty', 'dbz': 'dragon ball z', 'aot': 'attack on titan', 'got': 'game of thrones'}
+_TM_STOP = frozenset({'the', 'a', 'an', 'of', 'and', 'to', 'in', 'on', 'for'})
+_TM_CACHE: dict[str, str] = {}
+
+
+def _tm_fold(text: str) -> str:
+    text = str(text or '')
+    hit = _TM_CACHE.get(text)
+    if hit is not None:
+        return hit
+    plain = _tm_ud.normalize('NFKD', _tm_ud.normalize('NFKC', text).casefold())
+    plain = ''.join(c for c in plain if not _tm_ud.combining(c))
+    plain = plain.replace('&', ' and ').replace('+', ' and ').replace("'", '').replace('\u2019', '').replace('`', '')
+    plain = _tm_re.sub(r'[^0-9a-z\u0400-\u04ff\u3040-\u30ff\u4e00-\u9fff]+', ' ', plain)
+    out = ' '.join(_TM_ROMAN.get(w, _TM_NUMBERS.get(w, w)) for w in plain.split())
+    if len(_TM_CACHE) > 6000:
+        _TM_CACHE.clear()
+    _TM_CACHE[text] = out
+    return out
+
+
+def _tm_stem(word: str) -> str:
+    if len(word) > 3:
+        if word.endswith('ies'):
+            return word[:-3] + 'y'
+        if word.endswith(('sses', 'shes', 'ches', 'xes')):
+            return word[:-2]
+        if word.endswith('s') and not word.endswith('ss'):
+            return word[:-1]
+    return word
+
+
+def _tm_close(a: str, b: str) -> bool:
+    if len(a) < 4 or len(b) < 4:
+        return False
+    span = max(len(a), len(b))
+    limit = 2 if span >= 12 else 1
+    if abs(len(a) - len(b)) > limit:
+        return False
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i]
+        best = i
+        for j, cb in enumerate(b, 1):
+            value = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb))
+            current.append(value)
+            best = min(best, value)
+        if best > limit:
+            return False
+        previous = current
+    return previous[-1] <= limit
+
+
+def _tm_terms(query: str) -> list[str]:
+    words = [_tm_stem(w) for w in _tm_fold(query).split()]
+    kept = [w for w in words if w not in _TM_STOP]
+    return kept or words
+
+
+def _tm_word_hit(term: str, words: list[str], fuzzy: bool = True) -> bool:
+    stem = _tm_stem(term)
+    for word in words:
+        if word == term or _tm_stem(word) == stem or (len(term) >= 2 and word.startswith(term)):
+            return True
+    alias = (_TM_ALIASES.get(term) or '').split()
+    if alias and any(words[i:i + len(alias)] == alias for i in range(max(1, len(words) - len(alias) + 1))):
+        return True
+    return fuzzy and any(_tm_close(term, word) for word in words)
+
+
+@lru_cache(maxsize=8192)
+def _tm_score(query: str, title: str, extra: str = ''):
+    q, t = _tm_fold(query), _tm_fold(title)
+    if not q:
+        return 0
+    if not t:
+        return None
+    if t == q:
+        return 0
+    qc, tc = q.replace(' ', ''), t.replace(' ', '')
+    if t.startswith(q) or tc.startswith(qc):
+        return 1
+    if q in t or (len(qc) >= 3 and qc in tc):
+        return 2
+    terms, words = _tm_terms(q), t.split()
+    if all(_tm_word_hit(term, words, False) for term in terms):
+        return 3
+    hay = f'{t} {_tm_fold(extra)}'.split()
+    if extra and all(_tm_word_hit(term, hay, False) for term in terms):
+        return 4
+    if all(_tm_word_hit(term, words) for term in terms):
+        return 5
+    if extra and all(_tm_word_hit(term, hay) for term in terms):
+        return 6
+    if 4 <= len(qc) <= 40 and 4 <= len(tc) <= 68:
+        limit = 1 if max(len(qc), len(tc)) < 12 else 2
+        if abs(len(qc) - len(tc)) <= limit:
+            previous = list(range(len(tc) + 1))
+            for i, ca in enumerate(qc, 1):
+                current = [i]
+                best = i
+                for j, cb in enumerate(tc, 1):
+                    value = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb))
+                    current.append(value)
+                    best = min(best, value)
+                if best > limit:
+                    break
+                previous = current
+            else:
+                if previous[-1] <= limit:
+                    return 5
+    return None
+
+
+def _tm_contains(query: str, text: str) -> bool:
+    q = _tm_fold(query)
+    return not q or _tm_score(q, text) is not None
+
+
+def _tm_fallback_query(query: str) -> str:
+    words = _tm_fold(query).split()
+    if not words:
+        return ''
+    first = words[0]
+    if len(words) > 1:
+        return first if len(first) >= 3 else ''
+    if len(first) <= 5:
+        return ''
+    return first[:max(4, len(first) - 3)]
+
+
+def _tm_variants(query: str) -> list[str]:
+    q = ' '.join(str(query or '').split())
+    out: list[str] = []
+    expanded = []
+    for word in q.split():
+        alias = _TM_ALIASES.get(_tm_fold(word))
+        expanded.extend(alias.split() if alias else [word])
+    candidates = [q]
+    if _tm_re.search(r'[&+]', q):
+        candidates.append(' '.join(_tm_re.sub(r'\s*[&+]\s*', ' and ', q).split()))
+    if _tm_re.search(r'\band\b', q, _tm_re.I):
+        candidates.append(_tm_re.sub(r'\band\b', '&', q, flags=_tm_re.I))
+    candidates.append(' '.join(expanded))
+    plain = _tm_fold(q)
+    candidates.append(plain)
+    candidates.append(' '.join(w for w in plain.split() if w not in _TM_STOP))
+    seen: set[str] = set()
+    for value in candidates:
+        key = value.casefold()
+        if value and key not in seen:
+            seen.add(key)
+            out.append(value)
+    return out
+
 
 def _bookmark_icon(filled: bool=False) -> QIcon:
     key = 'filled' if filled else 'outline'
@@ -52,10 +213,12 @@ def _bookmark_icon(filled: bool=False) -> QIcon:
     icon = _bookmark_icon_cache[key] = QIcon(pm)
     return icon
 from src.core.models import assess_source_files, classify_file
-from src.core.repacks.base import RepackEntry, RepackDetails, display_title, magnet_display_name
-from src.core.worker import fetch_page_async, fetch_details_async, fetch_upcoming_repacks_async, fetch_search_async, fetch_popular_repacks_async, cancel as cancel_task, Priority
-from src.core.downloader import DownloadManager, DLState
-from src.core.theme import palette, to_color, register_theme_refresh, apply_pivot_theme, apply_tool_button_theme, branded_icon, count_badge_qss, themed_icon, apply_slot_icon_theme, ScrollingTextDelegate
+from src.core.repacks.base import RepackEntry, RepackDetails, display_title, magnet_display_name, REPACK_LIST_MENUS
+from PySide6.QtWidgets import QAbstractItemView, QListWidgetItem
+from qfluentwidgets import MessageBox, Flyout, FlyoutAnimationType, FlyoutViewBase, ListWidget, SearchLineEdit
+from src.core.worker import fetch_all_tags_async, random_entry_async, resolve_tags_async, fetch_tag_async, fetch_pink_paw_async, fetch_list_async, fetch_page_async, fetch_details_async, fetch_upcoming_repacks_async, fetch_search_async, fetch_popular_repacks_async, cancel as cancel_task, Priority
+from src.core.downloader import DownloadManager, DLState, category_dir
+from src.core.theme import palette, to_color, register_theme_refresh, apply_pivot_theme, apply_tool_button_theme, branded_icon, count_badge_qss, icon_override_pixmap, themed_icon, apply_slot_icon_theme, ScrollingTextDelegate, animations_enabled
 from .grid import PosterGrid, ViewModeButton, attrs_subtitle, play_sfx
 _source_subtitle = attrs_subtitle('source', labels={'fitgirl': 'FitGirl Repacks', 'gog': 'GOG Revived'})
 
@@ -71,6 +234,251 @@ def _entry_title(entry) -> str:
         return raw
 
 
+_BADGE_KEYS = ('pink_paw', 'hypervisor', 'switch', 'ns2', 'ps3')
+_BADGE_FILES = {'pink_paw': 'pinkpaw.png', 'hypervisor': 'hv_icon.png', 'switch': 'ns.png', 'ns2': 'ns2.png', 'ps3': 'ps3.png'}
+_badge_cache: dict = {}
+_EXCL_CACHE: dict = {}
+_TAG_EXCLUDE_SOURCES = frozenset({'fitgirl'})
+_EXCL_LANES = 4
+_EXCL_MAX_PAGES = 120
+BADGE_SLOT_PREFIX = 'badge.'
+
+
+def _badge_text(key: str) -> tuple:
+    return tr(f'repacks.badge_{key}_title'), tr(f'repacks.badge_{key}_text')
+
+
+def _badge_pixmap(key: str, size: int, hd: bool = False):
+    cache_key = (key, size, hd)
+    pix = _badge_cache.get(cache_key)
+    if pix is None:
+        pix = icon_override_pixmap(BADGE_SLOT_PREFIX + key, size, hd)
+        if pix is not None:
+            _badge_cache[cache_key] = pix
+            return pix
+        from PySide6.QtGui import QPixmap as _Pix
+        pix = _Pix(os.path.join(_PHOTO_DIR, _BADGE_FILES[key] if key != 'banner' else 'hv_banner.png'))
+        if not pix.isNull():
+            scale = 2 if hd else 1
+            pix = pix.scaled(size * scale, size * scale, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            if hd:
+                pix.setDevicePixelRatio(2.0)
+        _badge_cache[cache_key] = pix
+    return pix
+
+
+def _banner_pixmap(height: int):
+    cache_key = ('banner', height)
+    pix = _badge_cache.get(cache_key)
+    if pix is None:
+        pix = icon_override_pixmap(BADGE_SLOT_PREFIX + 'hypervisor', height, True)
+        if pix is not None:
+            _badge_cache[cache_key] = pix
+            return pix
+        from PySide6.QtGui import QPixmap as _Pix
+        pix = _Pix(os.path.join(_PHOTO_DIR, 'hv_banner.png'))
+        if not pix.isNull():
+            pix = pix.scaledToHeight(height * 2, Qt.TransformationMode.SmoothTransformation)
+            out = QPixmap(pix.size())
+            out.fill(Qt.GlobalColor.transparent)
+            p = QPainter(out)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            clip = QPainterPath()
+            clip.addRoundedRect(0, 0, pix.width(), pix.height(), 12, 12)
+            p.setClipPath(clip)
+            p.drawPixmap(0, 0, pix)
+            p.end()
+            out.setDevicePixelRatio(2.0)
+            pix = out
+        _badge_cache[cache_key] = pix
+    return pix
+
+
+def _entry_badges(entry) -> list:
+    return [p for p in (_badge_pixmap(k, 24, True) for k in badges_for(entry) if k != 'hypervisor') if not p.isNull()]
+
+
+class BadgeInfoDialog(MessageBoxBase):
+    def __init__(self, key: str, parent=None):
+        super().__init__(parent)
+        title, text = _badge_text(key)
+        self.viewLayout.addWidget(SubtitleLabel(title, self))
+        body = BodyLabel(text, self)
+        body.setWordWrap(True)
+        body.setStyleSheet(f'color: {_muted_text_color()}; font-size: 14px;')
+        self.viewLayout.addWidget(body)
+        self.yesButton.setText(tr('repacks.badge_ok'))
+        self.cancelButton.hide()
+        self.widget.setFixedWidth(420)
+
+
+def show_badge_info(key: str, parent) -> None:
+    BadgeInfoDialog(key, parent).exec()
+
+
+class _BadgeLabel(QLabel):
+    clicked = Signal(str)
+
+    def __init__(self, key: str, parent=None):
+        super().__init__(parent)
+        self._key = key
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet('background: transparent;')
+        self.setToolTip(_badge_text(key)[0])
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._key)
+        super().mousePressEvent(event)
+
+
+def _entry_slug(entry) -> str:
+    slug = str(getattr(entry, 'slug', '') or '')
+    if slug:
+        return slug
+    url = str(getattr(entry, 'url', '') or '').rstrip('/')
+    return url.rsplit('/', 1)[-1] if url else ''
+
+
+class _PinkPawStore(QObject):
+    changed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self._slugs: dict[str, dict] = {}
+        self._pending: set = set()
+
+    def request(self, source: str) -> None:
+        if source in self._slugs or source in self._pending:
+            return
+        self._pending.add(source)
+        fetch_pink_paw_async(source, on_done=lambda slugs, s=source: self._loaded(s, slugs),
+                             on_error=lambda _m, s=source: self._pending.discard(s))
+
+    def _loaded(self, source: str, data) -> None:
+        self._pending.discard(source)
+        self._slugs[source] = {k: {str(x).lower() for x in v} for k, v in (data or {}).items()}
+        self.changed.emit()
+
+    def badges(self, entry) -> list:
+        lists = self._slugs.get(str(getattr(entry, 'source', '') or ''))
+        slug = _entry_slug(entry).lower()
+        if not lists or not slug:
+            return []
+        return [k for k in _BADGE_KEYS if slug in lists.get(k, ())]
+
+
+_pink_paw_store_obj = None
+
+
+def pink_paw_store() -> _PinkPawStore:
+    global _pink_paw_store_obj
+    if _pink_paw_store_obj is None:
+        _pink_paw_store_obj = _PinkPawStore()
+    return _pink_paw_store_obj
+
+
+def badges_for(entry) -> list:
+    return pink_paw_store().badges(entry)
+
+
+def is_pink_paw(entry) -> bool:
+    return 'pink_paw' in badges_for(entry)
+
+
+def _fluent_icon(*names):
+    for name in names:
+        icon = getattr(FluentIcon, name, None)
+        if icon is not None:
+            return icon
+    return FluentIcon.GAME
+
+
+class _DiceButton(QToolButton):
+
+    def __init__(self, tip: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(32, 32)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setToolTip(tip)
+        self.setAccessibleName(tip)
+        self._hover = 0.0
+        self._angle = 0.0
+        self._hover_anim = QVariantAnimation(self)
+        self._hover_anim.setDuration(160)
+        self._hover_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._hover_anim.valueChanged.connect(self._set_hover)
+        self._spin_anim = QVariantAnimation(self)
+        self._spin_anim.setStartValue(0.0)
+        self._spin_anim.setEndValue(360.0)
+        self._spin_anim.setDuration(520)
+        self._spin_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._spin_anim.valueChanged.connect(self._set_angle)
+        self._spin_anim.finished.connect(lambda: self._set_angle(0.0))
+        self.pressed.connect(self._roll)
+
+    def set_busy(self, busy: bool) -> None:
+        self._spin_anim.setLoopCount(-1 if busy else 1)
+        if busy:
+            self._roll()
+
+    def _roll(self) -> None:
+        if self._spin_anim.state() != QVariantAnimation.State.Running:
+            self._spin_anim.start()
+
+    def _set_hover(self, value) -> None:
+        self._hover = float(value)
+        self.update()
+
+    def _set_angle(self, value) -> None:
+        self._angle = float(value)
+        self.update()
+
+    def _fade_to(self, target: float) -> None:
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self._hover)
+        self._hover_anim.setEndValue(target)
+        self._hover_anim.start()
+
+    def enterEvent(self, event) -> None:
+        self._fade_to(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._fade_to(0.0)
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        ink = to_color(palette().get('primary_text', '#ffffff'), '#ffffff')
+        h = max(self._hover, 1.0 if self.hasFocus() else 0.0)
+        alpha = 42 if self.isDown() else int(28 * h)
+        if alpha:
+            bg = QColor(ink)
+            bg.setAlpha(alpha)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(bg)
+            p.drawRoundedRect(QRectF(self.rect()), 6, 6)
+        side = 15.0
+        p.translate(self.width() / 2, self.height() / 2)
+        p.rotate(-12.0 * self._hover + self._angle)
+        scale = 0.9 if self.isDown() else 1.0 + 0.08 * self._hover
+        p.scale(scale, scale)
+        p.setOpacity(0.8 + 0.2 * self._hover)
+        p.setPen(QPen(ink, 1.6))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(-side / 2, -side / 2, side, side), 3.4, 3.4)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(ink)
+        off = side * 0.25
+        for dx, dy in ((-1, -1), (1, -1), (0, 0), (-1, 1), (1, 1)):
+            p.drawEllipse(QPointF(dx * off, dy * off), 1.3, 1.3)
+        p.end()
+
+
 def _decorate_repack_entry(entry):
     try:
         from src.core.repacks.base import parse_title
@@ -79,6 +487,10 @@ def _decorate_repack_entry(entry):
         if parsed.clean:
             entry.clean_title = parsed.clean
         entry.meta_text = parsed.display_meta
+    except Exception:
+        pass
+    try:
+        entry.pink_paw = is_pink_paw(entry)
     except Exception:
         pass
     try:
@@ -115,34 +527,7 @@ def _titles_enabled() -> bool:
     except Exception:
         return False
 from src.core.translations import tr, register_locale_refresh
-from src.core.repacks.installer import get_install_coordinator, parse_size_bytes, inspect_inno_setup, build_inno_selection
-try:
-    from src.core.repacks.installer import default_install_dir, remember_install_dir
-except ImportError:
-    def default_install_dir() -> str:
-        import os as _os
-        try:
-            from src.core.config import settings as _s
-            for key in ('games_install_dir', 'install_dir'):
-                d = getattr(_s, key, None)
-                if d:
-                    return d
-        except Exception:
-            pass
-        try:
-            from src.core.config import paths as _paths
-            base = _paths.download_root
-        except Exception:
-            base = _os.path.join(_os.path.expanduser('~'), 'PiraChest')
-        return _os.path.join(base, 'Games')
-
-    def remember_install_dir(root: str) -> None:
-        try:
-            from src.core.config import settings as _s, save_settings as _save
-            _s.games_install_dir = root
-            _save(_s)
-        except Exception:
-            pass
+from src.core.repacks.installer import get_install_coordinator, parse_size_bytes, inspect_inno_setup, build_inno_selection, default_install_dir, remember_install_dir
 _SOURCE_DONATION_URLS = {'fitgirl': 'https://fitgirl-repacks.site/donations/', 'gog': 'https://gog-rev.com/support/'}
 _SOURCE_UPCOMING_SUPPORTED = {'fitgirl'}
 
@@ -411,7 +796,7 @@ class _SteppedAnimator(QObject):
 
 class _AnimatedPosterMixin:
     _LIFT_PX = 8
-    _HOVER_MS = 0
+    _HOVER_MS = 130
     _PRESS_MS = 90
 
     def _init_poster_animations(self) -> None:
@@ -436,7 +821,7 @@ class _AnimatedPosterMixin:
         if not _qt_is_valid(self) or not _qt_is_valid(self._poster_lbl):
             return
         self._pos_anim.stop()
-        if duration <= 0:
+        if duration <= 0 or not animations_enabled():
             self._apply_lift_offset(float(offset_y))
             return
         current_offset = self._anim_base_pos.y() - self._poster_lbl.pos().y()
@@ -483,6 +868,7 @@ class PosterCard(_AnimatedPosterMixin, QWidget):
         self._poster_lbl.setGeometry(0, self._HOVER_HEADROOM_PX, self.POSTER_WIDTH, self.POSTER_HEIGHT)
         self._fallback_icon = None
         self._source_badge_lbl = None
+        self._badge_lbls = []
         self._init_poster_animations()
 
     def bind(self, entry) -> None:
@@ -495,6 +881,7 @@ class PosterCard(_AnimatedPosterMixin, QWidget):
         if self._source_badge_lbl is not None:
             self._source_badge_lbl.deleteLater()
             self._source_badge_lbl = None
+        self.set_badges(badges_for(entry))
         _stop_previous_movie(self._poster_lbl)
         self._poster_lbl.setImage(None)
         self._poster_lbl.setFixedSize(self.POSTER_WIDTH, self.POSTER_HEIGHT)
@@ -502,6 +889,31 @@ class PosterCard(_AnimatedPosterMixin, QWidget):
             self.set_poster_path(entry.poster_path)
         elif not entry.poster_url:
             self.show_fallback_icon()
+
+    def set_badges(self, keys) -> None:
+        for lbl in self._badge_lbls:
+            lbl.deleteLater()
+        self._badge_lbls = []
+        offset = 26 if hasattr(self, '_remove_x') else 0
+        for i, key in enumerate(k for k in keys if k != 'hypervisor'):
+            pix = _badge_pixmap(key, 22, True)
+            if pix.isNull():
+                continue
+            badge = QLabel(self._poster_lbl)
+            badge.setPixmap(pix)
+            badge.setFixedSize(26, 26)
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            badge.setToolTip(_badge_text(key)[0])
+            shadow = QGraphicsDropShadowEffect(badge)
+            shadow.setBlurRadius(6)
+            shadow.setOffset(0, 1)
+            shadow.setColor(QColor(0, 0, 0, 170))
+            badge.setGraphicsEffect(shadow)
+            badge.move(self.POSTER_WIDTH - 26 - 6 - offset - i * 30, 6)
+            badge.show()
+            badge.raise_()
+            self._badge_lbls.append(badge)
 
     def set_source_badge(self, source: str) -> None:
         filename = _SOURCE_TAB_ICON_FILENAMES.get(source)
@@ -900,7 +1312,7 @@ class BookmarksPage(QWidget):
         outer = QVBoxLayout(self)
 
 
-        outer.setContentsMargins(24, 12, 24, 20)
+        outer.setContentsMargins(24, 12, 24, 0)
         outer.setSpacing(10)
         back_btn = PushButton(themed_icon('repacks.bookmarks_back', FluentIcon.RETURN), tr('repacks.back_to_grid'))
         back_btn.setFixedHeight(32)
@@ -1012,11 +1424,60 @@ class MetaField(QWidget):
         value_lbl.setStyleSheet(f'font-weight: 700; color: {palette()['primary_text']};')
         layout.addWidget(value_lbl)
 
-def make_tag_pill(text: str, parent=None) -> PillPushButton:
+_HEART_ICON_CACHE: dict = {}
+
+
+def _filled_heart_icon() -> QIcon:
+    ink = to_color(palette().get('primary_text', '#ffffff'), '#ffffff')
+    cached = _HEART_ICON_CACHE.get(ink.rgba())
+    if cached is not None:
+        return cached
+    path = QPainterPath()
+    path.moveTo(.5, .88)
+    for c in ((.18, .62, .04, .45, .04, .28), (.04, .14, .15, .06, .27, .06), (.37, .06, .46, .12, .5, .2),
+              (.54, .12, .63, .06, .73, .06), (.85, .06, .96, .14, .96, .28), (.96, .45, .82, .62, .5, .88)):
+        path.cubicTo(*c)
+    path.closeSubpath()
+    pm = QPixmap(96, 96)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.scale(96, 96)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(ink)
+    p.drawPath(path)
+    p.end()
+    icon = _HEART_ICON_CACHE[ink.rgba()] = QIcon(pm)
+    return icon
+
+
+def _discord_logo_icon() -> QIcon | None:
+    import sys
+    from pathlib import Path
+    here = Path(__file__).resolve().parent
+    candidates = [base / sub / 'd.png' for base in (here, here.parent) for sub in ('photo', 'photos')]
+    bundle = getattr(sys, '_MEIPASS', None)
+    if bundle:
+        candidates.append(Path(bundle) / 'src' / 'gui' / 'photos' / 'd.png')
+    for candidate in candidates:
+        if candidate.is_file():
+            pm = QPixmap(str(candidate))
+            if not pm.isNull():
+                return QIcon(pm)
+    logger.warning('Discord icon not found')
+    return None
+
+
+def make_tag_pill(text: str, parent=None, on_click=None, tip: str | None = None) -> PillPushButton:
     pill = PillPushButton(text, parent)
     pill.setChecked(True)
     pill.setCheckable(False)
-    pill.setCursor(Qt.CursorShape.ArrowCursor)
+    if on_click is not None:
+        pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        pill.setToolTip(tip or f'Show games tagged "{text}"')
+        pill.clicked.connect(lambda _checked=False, t=text: on_click(t))
+    else:
+        pill.setCursor(Qt.CursorShape.ArrowCursor)
 
     def _repolish():
         style = pill.style()
@@ -1144,6 +1605,11 @@ class ScreenshotEnlargeDialog(QWidget):
             return
         self._closing = True
         self._anim.stop()
+        if not animations_enabled():
+            self.hide()
+            self.finished.emit(0)
+            self.deleteLater()
+            return
         self._anim.setDirection(QAbstractAnimation.Direction.Backward)
         self._anim.start()
 
@@ -1152,8 +1618,12 @@ class ScreenshotEnlargeDialog(QWidget):
         self._fit_to_parent()
         self.raise_()
         self.setFocus(Qt.FocusReason.PopupFocusReason)
-        self._anim.setDirection(QAbstractAnimation.Direction.Forward)
-        self._anim.start()
+        if not animations_enabled():
+            self._t = 1.0
+            self.update()
+        else:
+            self._anim.setDirection(QAbstractAnimation.Direction.Forward)
+            self._anim.start()
         self._request()
 
     def hideEvent(self, event) -> None:
@@ -1627,6 +2097,23 @@ class _RotatingChevron(QWidget):
         painter.drawPath(path)
         painter.end()
 
+class _SiteLinkButton(HyperlinkButton):
+    def __init__(self, text: str, parent, icon, style_fn):
+        super().__init__(parent)
+        self._style_fn = style_fn
+        self.setText(text)
+        self.setIcon(icon)
+        self.setIconSize(QSize(14, 14))
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._style_fn(self)
+
+    def setUrl(self, url) -> None:
+        super().setUrl(url)
+        self._style_fn(self)
+
+
 class CachedRichLabel(BodyLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1841,18 +2328,20 @@ class CollapsibleSection(CardWidget):
         self._apply_body_height()
         target = self._content_height() if expanded else 0
         start = self._body_wrap.height()
-        if start == target:
+        if start == target or not animations_enabled():
             self._anim.stop()
             self._body_wrap.setFixedHeight(target)
+            self._chevron_anim.stop()
+            self._chevron.set_angle(180.0 if expanded else 0.0)
         else:
             self._anim.stop()
             self._anim.setStartValue(start)
             self._anim.setEndValue(target)
             self._anim.start()
-        self._chevron_anim.stop()
-        self._chevron_anim.setStartValue(self._chevron.get_angle())
-        self._chevron_anim.setEndValue(180.0 if expanded else 0.0)
-        self._chevron_anim.start()
+            self._chevron_anim.stop()
+            self._chevron_anim.setStartValue(self._chevron.get_angle())
+            self._chevron_anim.setEndValue(180.0 if expanded else 0.0)
+            self._chevron_anim.start()
         self._update_header_style()
 
     def _on_wrap_height(self, value) -> None:
@@ -2325,95 +2814,450 @@ def send_to_external_torrent_client(source: str, parent=None) -> bool:
         InfoBar.error(title=tr('settings.external_client_failed_title'), content=tr('settings.external_client_failed_content'), orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=4000, parent=parent)
     return True
 
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import QAbstractItemView, QFrame, QStyledItemDelegate
+from qfluentwidgets import LineEdit, TransparentPushButton, TransparentToolButton
+
+_ROLE_KIND = Qt.ItemDataRole.UserRole + 1
+_ROLE_TINT = Qt.ItemDataRole.UserRole + 2
+_ROLE_NOTE = Qt.ItemDataRole.UserRole + 3
+_ROW_H = 28
+
+
+def _qc(value, fallback: str) -> QColor:
+    c = QColor(str(value)) if value else QColor()
+    return c if c.isValid() else QColor(fallback)
+
+
+def _check_state(index) -> Qt.CheckState:
+    try:
+        return Qt.CheckState(index.siblingAtColumn(0).data(Qt.ItemDataRole.CheckStateRole))
+    except (TypeError, ValueError):
+        return Qt.CheckState.Unchecked
+
+
+class _FileTree(TreeWidget):
+    resized = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.hover = None
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+
+    def _set_hover(self, item) -> None:
+        if item is not self.hover:
+            self.hover = item
+            self.viewport().update()
+
+    def mouseMoveEvent(self, event) -> None:
+        self._set_hover(self.itemAt(event.position().toPoint()))
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._set_hover(None)
+        super().leaveEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.resized.emit()
+
+
+class _SpaceBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(3)
+        self._ratio, self._short = 0.0, False
+
+    def set_state(self, ratio: float, short: bool) -> None:
+        self._ratio, self._short = max(0.0, min(1.0, ratio)), short
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setPen(Qt.PenStyle.NoPen)
+        r = QRectF(self.rect())
+        p.setBrush(QColor(255, 255, 255, 24) if isDarkTheme() else QColor(0, 0, 0, 20))
+        p.drawRoundedRect(r, 1.5, 1.5)
+        if self._ratio > 0:
+            p.setBrush(_qc(palette().get('state_error'), '#d13438') if self._short else themeColor())
+            p.drawRoundedRect(QRectF(0, 0, max(3.0, r.width() * self._ratio), r.height()), 1.5, 1.5)
+
+
+class _FileRowDelegate(QStyledItemDelegate):
+    _LEFT = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+    _RIGHT = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+
+    def __init__(self, tree: _FileTree):
+        super().__init__(tree)
+        self._tree = tree
+
+    def sizeHint(self, option, index) -> QSize:
+        return QSize(option.rect.width(), _ROW_H)
+
+    @staticmethod
+    def _box(rect, cat: bool) -> QRectF:
+        return QRectF(rect.left() + (22 if cat else 30), rect.center().y() - 7, 14, 14)
+
+    def paint(self, p, option, index) -> None:
+        tree, rect, col = self._tree, option.rect, index.column()
+        cat = index.data(_ROLE_KIND) == 'cat'
+        dark = isDarkTheme()
+        text = _qc(palette().get('primary_text'), '#ffffff' if dark else '#1a1a1a')
+        muted = _qc(_muted_text_color(), '#9a9a9a' if dark else '#666666')
+        accent = QColor(themeColor())
+        state = _check_state(index)
+        value = str(index.data(Qt.ItemDataRole.DisplayRole) or '')
+        font = QFont(option.font)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setClipRect(rect)
+        if tree.hover is not None and tree.itemFromIndex(index.siblingAtColumn(0)) is tree.hover:
+            p.fillRect(rect, QColor(255, 255, 255, 12) if dark else QColor(0, 0, 0, 9))
+        if col == 0:
+            box = self._box(rect, cat)
+            self._draw_box(p, box, state, accent, muted)
+            tx, right = int(box.right()) + 8, rect.right() - 14
+            if cat:
+                cx, cy = rect.left() + 10, rect.center().y()
+                pts = ((-3, -1.5), (0, 1.5), (3, -1.5)) if tree.isExpanded(index) else ((-1.5, -3), (1.5, 0), (-1.5, 3))
+                path = QPainterPath()
+                path.moveTo(cx + pts[0][0], cy + pts[0][1])
+                for dx, dy in pts[1:]:
+                    path.lineTo(cx + dx, cy + dy)
+                pen = QPen(muted, 1.4)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                p.setPen(pen)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPath(path)
+                note = str(index.data(_ROLE_NOTE) or '')
+                nw = QFontMetrics(font).horizontalAdvance(note)
+                p.setPen(muted)
+                p.drawText(QRectF(right - nw, rect.top(), nw, rect.height()), int(self._RIGHT), note)
+                right -= nw + 12
+                font.setBold(True)
+            p.setFont(font)
+            p.setPen(text)
+            avail = max(int(right - tx), 10)
+            p.drawText(QRectF(tx, rect.top(), avail, rect.height()), int(self._LEFT),
+                       QFontMetrics(font).elidedText(value, Qt.TextElideMode.ElideRight, avail))
+        else:
+            font.setPointSizeF(max(font.pointSizeF() - 0.5, 7.5))
+            p.setFont(font)
+            p.setPen(_qc(index.data(_ROLE_TINT), muted.name()) if col == 1 else muted)
+            align = self._LEFT if col == 1 else self._RIGHT
+            avail = max(rect.width() - (24 if col == 2 else 20), 10)
+            p.drawText(QRectF(rect.left() + 10, rect.top(), avail, rect.height()), int(align),
+                       QFontMetrics(font).elidedText(value, Qt.TextElideMode.ElideRight, int(avail)))
+        p.restore()
+
+    @staticmethod
+    def _draw_box(p, box: QRectF, state, accent: QColor, muted: QColor) -> None:
+        if state == Qt.CheckState.Unchecked:
+            p.setPen(QPen(muted, 1.2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(box.adjusted(0.6, 0.6, -0.6, -0.6), 3, 3)
+            return
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(accent)
+        p.drawRoundedRect(box, 3, 3)
+        mark = QPen(QColor('#ffffff'), 1.7)
+        mark.setCapStyle(Qt.PenCapStyle.RoundCap)
+        mark.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(mark)
+        c, path = box.center(), QPainterPath()
+        if state == Qt.CheckState.Checked:
+            path.moveTo(c.x() - 3.4, c.y() + 0.2)
+            path.lineTo(c.x() - 1.0, c.y() + 2.6)
+            path.lineTo(c.x() + 3.6, c.y() - 2.6)
+        else:
+            path.moveTo(c.x() - 3.2, c.y())
+            path.lineTo(c.x() + 3.2, c.y())
+        p.drawPath(path)
+
+    def editorEvent(self, event, model, option, index) -> bool:
+        etype = event.type()
+        if etype == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+            if index.data(_ROLE_KIND) == 'cat' and not self._box(option.rect, True).adjusted(-6, -6, 6, 6).contains(event.position()):
+                self._tree.setExpanded(index, not self._tree.isExpanded(index))
+                return True
+        elif not (etype == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Select)):
+            return False
+        item = self._tree.itemFromIndex(index.siblingAtColumn(0))
+        if item is None or not item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+            return False
+        item.setCheckState(0, Qt.CheckState.Unchecked if item.checkState(0) == Qt.CheckState.Checked else Qt.CheckState.Checked)
+        return True
+
+
+def _tr_or(key: str, default: str) -> str:
+    text = tr(key)
+    return default if not text or text == key else text
+
+
 class SelectiveDownloadDialog(MessageBoxBase):
     _ORDERED_CATEGORIES = ('Required', 'Bonus Content')
 
     def __init__(self, entries: list[SelectiveDownloadEntry], parent=None, subtitle: str | None=None,
-                 context: str = 'other'):
+                 context: str = 'other', space=None, start_dir: str = ''):
         super().__init__(parent)
-        self._entries = entries
-        self._checkboxes: dict[str, QTreeWidgetItem] = {}
-        self.titleLabel = SubtitleLabel(tr('repacks.choose_files_to_download'), self)
-        self.viewLayout.addWidget(self.titleLabel)
-        if subtitle:
-            name_lbl = CaptionLabel(subtitle, self)
-            name_lbl.setWordWrap(True)
-            name_lbl.setStyleSheet(f'color: {_muted_text_color()};')
-            self.viewLayout.addWidget(name_lbl)
-        safety = assess_source_files([entry.patterns[0] if entry.patterns else entry.label for entry in entries],
-                                     context=context)
-        info = CaptionLabel(tr('repacks.required_files_hint'), self)
-        info.setWordWrap(True)
-        info.setStyleSheet(f'color: {_muted_text_color()};')
+        self._entries, self._space, self._start_dir = entries, space, start_dir
+        self._rows: list[tuple[SelectiveDownloadEntry, QTreeWidgetItem]] = []
+        self._cats: list[QTreeWidgetItem] = []
+        self._busy = self._user_sized = self._fitting = False
+        pal, dark = palette(), isDarkTheme()
+        muted = _muted_text_color()
+        lay = self.viewLayout
+        lay.setSpacing(8)
+        self.titleLabel = StrongBodyLabel(tr('repacks.choose_files_to_download'), self)
+        lay.addWidget(self.titleLabel)
+        safety = assess_source_files([e.patterns[0] if e.patterns else e.label for e in entries], context=context)
+        hint = ' · '.join(filter(None, (subtitle, tr('repacks.required_files_hint'))))
         if safety.level != 'ok':
-            info.setText(f"{info.text()}\n{safety.summary}. {tr('repacks.file_type_review')}")
+            hint = f"{hint}\n{safety.summary}. {tr('repacks.file_type_review')}"
+        info = CaptionLabel(hint, self)
+        info.setWordWrap(True)
+        info.setStyleSheet(f'color: {muted};')
+        if safety.level != 'ok':
             info.setToolTip(safety.details)
-        self.viewLayout.addWidget(info)
-        self._tree = TreeWidget(self)
-        self._tree.setHeaderLabels([tr('repacks.include'), tr('repacks.file_type'), tr('repacks.size')])
-        self._tree.header().setStretchLastSection(False)
-        self._tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self._tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self._tree.setColumnWidth(1, 72)
-        self._tree.setColumnWidth(2, 92)
-        self._tree.setTextElideMode(Qt.TextElideMode.ElideRight)
-        self._name_delegate = ScrollingTextDelegate(self._tree, 0, padding=4)
-        self._tree.setRootIsDecorated(True)
-        self._tree.setBorderVisible(True)
-        self._tree.setBorderRadius(8)
-        self._tree.setMinimumHeight(320)
-        self.viewLayout.addWidget(self._tree)
-        highlighted = {name.lower() for name in safety.highlighted}
-        pal = palette()
-        by_category: dict[str, list[SelectiveDownloadEntry]] = {}
+        lay.addWidget(info)
+        bar = QHBoxLayout()
+        bar.setSpacing(4)
+        self._search = SearchLineEdit(self)
+        self._search.setPlaceholderText(tr('repacks.search_files'))
+        self._search.setClearButtonEnabled(True)
+        self._search.setFixedSize(160, 30)
+        self._search.textChanged.connect(self._filter)
+        bar.addWidget(self._search)
+        all_btn = TransparentPushButton(tr('repacks.select_all'), self)
+        all_btn.setFixedHeight(30)
+        all_btn.clicked.connect(lambda: self._set_all(Qt.CheckState.Checked))
+        bar.addWidget(all_btn)
+        self._loc_edit = LineEdit(self)
+        self._loc_edit.setPlaceholderText(_tr_or('repacks.location_placeholder', 'Empty = default download location'))
+        self._loc_edit.setClearButtonEnabled(True)
+        self._loc_edit.setFixedHeight(30)
+        self._loc_edit.textChanged.connect(self._update_total)
+        bar.addWidget(self._loc_edit, 1)
+        self._loc_btn = TransparentToolButton(FluentIcon.FOLDER, self)
+        self._loc_btn.setFixedSize(30, 30)
+        self._loc_btn.setToolTip(_tr_or('repacks.change_location', 'Change location'))
+        self._loc_btn.clicked.connect(self._browse)
+        bar.addWidget(self._loc_btn)
+        lay.addLayout(bar)
+        tree = self._tree = _FileTree(self)
+        tree.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        tree.setColumnCount(3)
+        tree.setHeaderLabels([tr('files.col_name'), tr('repacks.file_type'), tr('repacks.size')])
+        tree.headerItem().setTextAlignment(2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        tree.setRootIsDecorated(False)
+        tree.setIndentation(0)
+        tree.setUniformRowHeights(True)
+        tree.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tree.setExpandsOnDoubleClick(False)
+        tree.setBorderVisible(False)
+        tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tree.viewport().setAutoFillBackground(False)
+        tree.setMinimumHeight(300)
+        tree.setItemDelegate(_FileRowDelegate(tree))
+        head = tree.header()
+        head.setStretchLastSection(True)
+        head.setSectionsMovable(False)
+        head.setHighlightSections(False)
+        head.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        head.setMinimumSectionSize(56)
+        head.setFixedHeight(26)
+        head.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        line = 'rgba(255,255,255,0.10)' if dark else 'rgba(0,0,0,0.10)'
+        head.setStyleSheet(
+            f"QHeaderView{{background:transparent;border:none;border-bottom:1px solid {line};}}"
+            f"QHeaderView::section{{background:transparent;color:{muted};border:none;border-right:1px solid {line};padding:0 10px;font-size:11px;}}"
+            f"QHeaderView::section:last{{border-right:none;}}"
+            f"QHeaderView::section:hover{{color:{pal.get('primary_text') or muted};}}")
+        head.resizeSection(1, 64)
+        head.sectionResized.connect(self._section)
+        tree.resized.connect(self._fit)
+        box = QFrame(self)
+        box.setObjectName('fileBox')
+        box.setStyleSheet(f"#fileBox{{background:{'rgba(0,0,0,0.28)' if dark else 'rgba(0,0,0,0.045)'};border-radius:8px;}}")
+        box_lay = QVBoxLayout(box)
+        box_lay.setContentsMargins(4, 2, 4, 4)
+        box_lay.addWidget(tree)
+        lay.addWidget(box, 1)
+        highlighted = {n.lower() for n in safety.highlighted}
+        by_cat: dict[str, list[SelectiveDownloadEntry]] = {}
         for e in entries:
-            by_category.setdefault(e.category, []).append(e)
-        _category_labels = {'Required': tr('repacks.required'), 'Bonus Content': tr('repacks.bonus_content')}
-        for cat in self._ORDERED_CATEGORIES:
-            if cat not in by_category:
+            by_cat.setdefault(e.category, []).append(e)
+        names = {'Required': tr('repacks.required'), 'Bonus Content': tr('repacks.bonus_content')}
+        user_check = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+        for cat in (*self._ORDERED_CATEGORIES, *(c for c in by_cat if c not in self._ORDERED_CATEGORIES)):
+            group = by_cat.get(cat)
+            if not group:
                 continue
-            cat_item = QTreeWidgetItem([_category_labels.get(cat, cat), '', ''])
-            cat_item.setFlags(cat_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
-            self._tree.addTopLevelItem(cat_item)
-            font = self._tree.font()
-            font.setBold(True)
-            cat_item.setFont(0, font)
-            for entry in by_category[cat]:
-                path = entry.patterns[0] if entry.patterns else entry.label
-                file_info = classify_file(path)
-                child = QTreeWidgetItem([entry.label, file_info.label, entry.size_hint])
-                child.setToolTip(1, file_info.reason)
+            top = QTreeWidgetItem([names.get(cat, cat), '', ''])
+            top.setFlags(user_check)
+            top.setData(0, _ROLE_KIND, 'cat')
+            top.setData(0, _ROLE_NOTE, f"{len(group)} · {_human_size(sum(e.size_bytes for e in group))}")
+            tree.addTopLevelItem(top)
+            tree.setFirstColumnSpanned(tree.indexOfTopLevelItem(top), tree.rootIndex(), True)
+            for e in group:
+                path = e.patterns[0] if e.patterns else e.label
+                finfo = classify_file(path)
+                child = QTreeWidgetItem([e.label, finfo.label, e.size_hint])
+                child.setFlags(user_check)
+                for c in range(3):
+                    child.setData(c, _ROLE_KIND, 'file')
+                child.setToolTip(0, path)
+                child.setToolTip(1, finfo.reason)
                 if os.path.basename(path.replace('\\', '/')).lower() in highlighted:
-                    color = pal['state_error'] if file_info.risk == 'dangerous' else pal['state_verifying']
-                    child.setForeground(1, QBrush(QColor(color)))
-                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    child.setData(1, _ROLE_TINT, pal['state_error'] if finfo.risk == 'dangerous' else pal['state_verifying'])
                 child.setCheckState(0, Qt.CheckState.Checked)
-                cat_item.addChild(child)
-                self._checkboxes[entry.label] = child
-            cat_item.setExpanded(True)
-        self._size_by_label: dict[str, int] = {e.label: e.size_bytes for e in entries}
-        self._total_lbl = StrongBodyLabel('', self)
-        self.viewLayout.addWidget(self._total_lbl)
-        self._tree.itemChanged.connect(self._update_total)
+                top.addChild(child)
+                self._rows.append((e, child))
+            top.setCheckState(0, Qt.CheckState.Checked)
+            top.setExpanded(True)
+            self._cats.append(top)
+        tree.itemChanged.connect(self._changed)
+        foot = QHBoxLayout()
+        foot.setSpacing(12)
+        self._total_lbl = BodyLabel('', self)
+        self._total_lbl.setStyleSheet('font-weight:600;')
+        self._count_lbl = CaptionLabel('', self)
+        self._space_lbl = CaptionLabel('', self)
+        self._count_lbl.setStyleSheet(f'color: {muted};')
+        foot.addWidget(self._total_lbl)
+        foot.addStretch(1)
+        foot.addWidget(self._count_lbl)
+        foot.addWidget(self._space_lbl)
+        lay.addLayout(foot)
+        self._bar = _SpaceBar(self)
+        lay.addWidget(self._bar)
         self._update_total()
         self.yesButton.setText(tr('repacks.ok'))
         self.cancelButton.setText(tr('repacks.cancel'))
-        self.widget.setMinimumWidth(680)
+        self.yesButton.setFixedHeight(32)
+        self.cancelButton.setFixedHeight(32)
+        self.buttonGroup.setMinimumHeight(56)
+        self.buttonLayout.setContentsMargins(24, 12, 24, 12)
+        self.widget.setMinimumWidth(780)
+        self.widget.setMaximumWidth(940)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self._fit)
+
+    def _browse(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, _tr_or('repacks.change_location', 'Change location'), self._loc_edit.text().strip() or self._start_dir)
+        if path:
+            self._loc_edit.setText(os.path.normpath(path))
+
+    def selected_folder(self) -> str | None:
+        return os.path.normpath(self._loc_edit.text().strip()) if self._loc_edit.text().strip() else None
+
+    def _section(self, logical: int, *_args) -> None:
+        if not self._fitting and logical < 2:
+            self._user_sized = True
+            self._clamp(logical)
+
+    def _clamp(self, logical: int) -> None:
+        head, vw = self._tree.header(), self._tree.viewport().width()
+        if vw <= 0:
+            return
+        sizes, mins = [head.sectionSize(0), head.sectionSize(1)], (120, 56)
+        over = sum(sizes) - (vw - 64)
+        if over <= 0:
+            return
+        for i in (logical if logical < 2 else 1, 1 - logical if logical < 2 else 0):
+            cut = min(over, sizes[i] - mins[i])
+            sizes[i] -= max(cut, 0)
+            over -= max(cut, 0)
+        self._fitting = True
+        head.resizeSection(0, sizes[0])
+        head.resizeSection(1, sizes[1])
+        self._fitting = False
+
+    def _fit(self) -> None:
+        head, vw = self._tree.header(), self._tree.viewport().width()
+        if vw <= 0:
+            return
+        if self._user_sized:
+            self._clamp(0)
+            return
+        self._fitting = True
+        head.resizeSection(0, max(120, vw - head.sectionSize(1) - 90))
+        self._fitting = False
+
+    def _sync(self, cat: QTreeWidgetItem) -> None:
+        n = sum(cat.child(i).checkState(0) == Qt.CheckState.Checked for i in range(cat.childCount()))
+        cat.setCheckState(0, Qt.CheckState.Unchecked if not n else Qt.CheckState.Checked if n == cat.childCount() else Qt.CheckState.PartiallyChecked)
+
+    def _changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if self._busy or column != 0:
+            return
+        self._busy = True
+        try:
+            if item.parent() is None:
+                if item.checkState(0) != Qt.CheckState.PartiallyChecked:
+                    for i in range(item.childCount()):
+                        if not item.child(i).isHidden():
+                            item.child(i).setCheckState(0, item.checkState(0))
+                self._sync(item)
+            else:
+                self._sync(item.parent())
+        finally:
+            self._busy = False
+        self._update_total()
+
+    def _set_all(self, state: Qt.CheckState) -> None:
+        self._busy = True
+        try:
+            for _e, item in self._rows:
+                if not item.isHidden():
+                    item.setCheckState(0, state)
+            for cat in self._cats:
+                self._sync(cat)
+        finally:
+            self._busy = False
+        self._update_total()
+
+    def _filter(self, text: str) -> None:
+        q = text.strip().lower()
+        for cat in self._cats:
+            shown = 0
+            for i in range(cat.childCount()):
+                child = cat.child(i)
+                hit = not q or _tm_contains(q, child.text(0))
+                child.setHidden(not hit)
+                shown += hit
+            cat.setHidden(not shown)
 
     def _update_total(self, *_args) -> None:
-        total = 0
-        for label, item in self._checkboxes.items():
-            if item.checkState(0) == Qt.CheckState.Checked:
-                total += self._size_by_label.get(label, 0)
-        self._total_lbl.setText(tr('repacks.total_download_size', size=_human_size(total)))
+        picked = [e for e, item in self._rows if item.checkState(0) == Qt.CheckState.Checked]
+        size = sum(e.size_bytes for e in picked)
+        self._total_lbl.setText(tr('repacks.total_download_size', size=_human_size(size)))
+        self._count_lbl.setText(tr('repacks.files_selected', count=len(picked), total=len(self._rows)))
+        try:
+            free = self._space(self.selected_folder()) if self._space else None
+        except OSError:
+            free = None
+        short = free is not None and size > free
+        self._bar.setVisible(free is not None)
+        self._space_lbl.setVisible(free is not None)
+        if free is not None:
+            self._bar.set_state(size / free if free else float(size > 0), short)
+            text = tr('repacks.not_enough_space', need=_human_size(size), size=_human_size(free)) if short else tr('repacks.free_space', size=_human_size(free))
+            self._space_lbl.setText(text)
+            self._space_lbl.setStyleSheet(f"color: {palette()['state_error'] if short else _muted_text_color()};")
+        self.yesButton.setEnabled(bool(picked) and not short)
+
+    def selected_indices(self) -> list[int]:
+        return sorted({e.file_index for e, item in self._rows if e.file_index and item.checkState(0) == Qt.CheckState.Checked})
 
     def selected_labels(self) -> set[str]:
-        selected = set()
-        for label, item in self._checkboxes.items():
-            if item.checkState(0) == Qt.CheckState.Checked:
-                selected.add(label)
-        return selected
+        return {e.label for e, item in self._rows if item.checkState(0) == Qt.CheckState.Checked}
+
 
 def _guarded(method):
     n_params = method.__code__.co_argcount - 1
@@ -2446,7 +3290,7 @@ class _FileListFetchThread(QThread):
         self.finished_ok.emit(files)
 
 class _SetupExeFetchThread(QThread):
-    finished_ok = Signal(str)
+    finished_ok = Signal(str, object)
     finished_err = Signal(str)
     progress = Signal(int, int)
 
@@ -2467,7 +3311,13 @@ class _SetupExeFetchThread(QThread):
         except Exception as exc:
             self.finished_err.emit(str(exc))
             return
-        self.finished_ok.emit(path or '')
+        inspected = {}
+        if path and not self._cancelled.is_set():
+            try:
+                inspected = inspect_inno_setup(path)
+            except Exception:
+                logger.exception('Could not inspect Inno Setup options for %s', path)
+        self.finished_ok.emit(path or '', inspected)
 
 class DownloadActionWidget(AccentColorMixin, QWidget):
     download_started = Signal()
@@ -2483,6 +3333,7 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
         self._setup_thread: _SetupExeFetchThread | None = None
         self._pending_queue_args: tuple | None = None
         self._setup_cache: dict[str, str | None] = {}
+        self._setup_inspected: dict[str, dict] = {}
         self._setup_retry_counts: dict[str, int] = {}
         self._queued_download_sources: set = set()
         layout = QVBoxLayout(self)
@@ -2508,7 +3359,7 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
         self._button.setText(tr('repacks.download'))
         self._button.setEnabled(True)
         self._setup_cache = {}
-        self._maybe_prefetch_setup_exe_silently()
+        self._setup_inspected = {}
 
     def _recover_from_error(self, exc: BaseException) -> None:
         self._pending_queue_args = None
@@ -2543,25 +3394,13 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
         except RuntimeError:
             pass
 
-    def _maybe_prefetch_setup_exe_silently(self) -> None:
+    def _prefetch_setup_exe(self, source: str) -> None:
         if self._source_key != 'fitgirl' or self._details is None:
             return
         if not _auto_install_enabled():
             logger.info('setup.exe prefetch skipped for %r: auto install is disabled', getattr(self._details, 'title', ''))
             return
-        if not self._details.extra.get('selective_download'):
-            logger.info('setup.exe prefetch skipped for %r: not a Selective Download release, nothing optional to inspect', getattr(self._details, 'title', ''))
-            return
-        if self._details.extra.get('download_sources'):
-            logger.info('setup.exe prefetch deferred for %r: multiple download_sources, waiting for user pick', getattr(self._details, 'title', ''))
-            return
-        magnet_url = self._details.extra.get('magnet_url')
-        torrent_url = self._details.extra.get('torrent_url')
-        source = magnet_url or torrent_url
-        if not source:
-            logger.info('setup.exe prefetch skipped for %r: no magnet_url/torrent_url in details.extra', getattr(self._details, 'title', ''))
-            return
-        logger.info('setup.exe prefetch starting silently for %r (source=%s)', getattr(self._details, 'title', ''), source)
+        logger.info('setup.exe prefetch starting for %r', getattr(self._details, 'title', ''))
         self._start_setup_exe_prefetch(source, silent=True)
 
     def _reapply_accent_color(self) -> None:
@@ -2570,13 +3409,52 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
             color = self._default_button_color()
         luminance = 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
         text_color = '#1a1a1a' if luminance > 150 else '#ffffff'
-        hover = color.lighter(112)
-        pressed = color.darker(112)
-        self._button.setStyleSheet(f'PrimaryPushButton {{ background-color: rgb({color.red()}, {color.green()}, {color.blue()}); color: {text_color}; border: none; border-radius: 8px; }} PrimaryPushButton:hover {{ background-color: rgb({hover.red()}, {hover.green()}, {hover.blue()}); color: {text_color}; }} PrimaryPushButton:pressed {{ background-color: rgb({pressed.red()}, {pressed.green()}, {pressed.blue()}); color: {text_color}; }} PrimaryPushButton:disabled {{ background-color: rgb({color.red()}, {color.green()}, {color.blue()}); color: {text_color}; }}')
+        def rgb(col):
+            return f'rgb({col.red()}, {col.green()}, {col.blue()})'
+
+        def grad(top, bottom):
+            return f'qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {rgb(top)}, stop:1 {rgb(bottom)})'
+
+        base = grad(color.lighter(106), color.darker(104))
+        hover = grad(color.lighter(118), color.lighter(106))
+        pressed = grad(color.darker(108), color.darker(116))
+        font = QFont(self._button.font())
+        font.setPointSizeF(10.5)
+        font.setWeight(QFont.Weight.Medium)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
+        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
+        font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+        self._button.setFont(font)
+        self._button.setStyleSheet(
+            f'PrimaryPushButton {{ background: {base}; color: {text_color}; border: none; border-radius: 5px; padding: 0 12px; }} '
+            f'PrimaryPushButton:hover {{ background: {hover}; color: {text_color}; }} '
+            f'PrimaryPushButton:pressed {{ background: {pressed}; color: {text_color}; }} '
+            f'PrimaryPushButton:disabled {{ background: {base}; color: {text_color}; }}')
+
+    def _on_links_loaded(self, details) -> None:
+        self._links_loading = False
+        if self._details is None or not _qt_is_valid(self):
+            return
+        for key in ('magnet_url', 'torrent_url', 'download_sources', 'download_links'):
+            if key in details.extra:
+                self._details.extra[key] = details.extra[key]
+        self._details.extra.pop('links_pending', None)
+        self._on_click()
+
+    def _on_links_failed(self, message=None) -> None:
+        self._links_loading = False
+        logger.error('Download link fetch failed: %s', message)
 
     @_guarded
     def _on_click(self) -> None:
         if self._details is None or self._item_id is not None:
+            return
+        if self._details.extra.get('links_pending'):
+            if not getattr(self, '_links_loading', False):
+                self._links_loading = True
+                entry = RepackEntry(source=self._details.source, title=self._details.title, url=self._details.url, extra={'want_links': True})
+                fetch_details_async(self._details.source, entry, on_done=self._on_links_loaded, on_error=self._on_links_failed,
+                                    use_cache=False, owner=self)
             return
         download_sources = self._details.extra.get('download_sources') or {}
         if download_sources:
@@ -2643,6 +3521,7 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
         self._item_id = self._manager.add_http(url, title=self._details.title, file_name=safe_name, source='Kryoto', category='repacks')
 
     _FILELIST_TIMEOUT_MS = 15000
+    _INSPECT_WAIT_MS = 15000
 
     def _nothing_found_text(self) -> str:
         return tr('repacks.dead_link_gog') if self._source_key == 'gog' else tr('repacks.nothing_found')
@@ -2650,11 +3529,6 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
     def _start_selective_download(self, source: str) -> None:
         if self._filelist_thread is not None and self._filelist_thread.isRunning():
             return
-
-
-        if self._setup_thread is not None and self._setup_thread.source == source:
-            self._cancel_setup_thread(only_source=source)
-            self._setup_cache.pop(source, None)
         self._button.setText(tr('repacks.loading_file_list'))
         self._button.setEnabled(False)
         thread = _FileListFetchThread(self._manager, source, None, category='tbhb' if self._source_key == 'tbhb' else 'repacks')
@@ -2709,6 +3583,7 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
 
     def _on_file_list_failed(self, source: str, err: str) -> None:
         logger.error('Failed to fetch file list for selective download: %s', err)
+        self._cancel_setup_thread()
         self._button.setText(self._nothing_found_text())
         self._button.setEnabled(False)
 
@@ -2716,48 +3591,77 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
     def _on_file_list_ready(self, source: str, torrent_files: list[tuple[str, int]]) -> None:
         self._button.setText(tr('repacks.download'))
         self._button.setEnabled(True)
-        if self._source_key == 'fitgirl' and self._details is not None and self._details.extra.get('selective_download') and _auto_install_enabled():
-            self._start_setup_exe_prefetch(source, silent=True)
+        if self._source_key == 'fitgirl' and self._details is not None:
+            self._prefetch_setup_exe(source)
         if not torrent_files or len(torrent_files) == 1:
+            if torrent_files and self._warn_low_space(torrent_files[0][1]):
+                self._cancel_setup_thread()
+                return
             self._queue_download(source, file_ids=None)
             return
         paths = [p for p, _size in torrent_files]
         sizes = [s for _p, s in torrent_files]
         entries = build_selective_entries_from_torrent(paths, sizes)
-        dialog = SelectiveDownloadDialog(entries, parent=self.window(), context='repack')
+        dialog = SelectiveDownloadDialog(entries, parent=self.window(), context='repack', start_dir=category_dir(self._space_target()[0]),
+                                         space=lambda folder=None: self._manager.usable_space(*self._space_target(), folder=folder))
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._cancel_setup_thread()
             return
-        selected_labels = dialog.selected_labels()
-        file_ids = resolve_selective_file_indices(entries, selected_labels, paths)
+        self.__dict__.setdefault('_save_dirs', {})[source] = dialog.selected_folder() or ''
+        file_ids = dialog.selected_indices()
         if not file_ids:
             logger.warning('Selective download selection produced no file indices; downloading full torrent')
             file_ids = None
         self._queue_download(source, file_ids=file_ids)
 
+    def _space_target(self) -> tuple[str, str]:
+        tbhb = self._source_key == 'tbhb'
+        return ('tbhb' if tbhb else 'repacks', (getattr(self._details, 'category_name', '') or '') if tbhb else '')
+
+    def _warn_low_space(self, need: int) -> bool:
+        free = self._manager.usable_space(*self._space_target())
+        if free is None or need <= free:
+            return False
+        InfoBar.warning(title=tr('repacks.not_enough_space_title'), content=tr('repacks.not_enough_space', need=_human_size(need), size=_human_size(free)), orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP_RIGHT, duration=6000, parent=self.window())
+        return True
+
     def _queue_download(self, source: str, file_ids: list[int] | None) -> None:
         if self._source_key == 'fitgirl' and self._details is not None:
+            if not _auto_install_enabled():
+                self._continue_queue_download(source, file_ids, install_spec=None)
+                return
             self._pending_queue_args = (source, file_ids)
-            if not _auto_install_enabled() or not self._details.extra.get('selective_download'):
-                self._show_install_options_dialog(setup_path='')
-                return
             cached = self._setup_cache.get(source, '')
-            if cached != '' or (self._setup_thread is not None and self._setup_thread.source == source):
-                if cached != '':
-                    self._show_install_options_dialog(setup_path=cached or '')
-                else:
-                    self._button.setText(tr('repacks.inspecting_installer'))
-                    self._button.setEnabled(False)
-                    try:
-                        self._setup_thread.progress.disconnect(self._on_setup_exe_progress)
-                    except (TypeError, RuntimeError):
-                        pass
-                    self._setup_thread.progress.connect(self._on_setup_exe_progress)
+            if cached != '':
+                self._show_install_options_dialog(setup_path=cached or '')
                 return
-            self._start_setup_exe_prefetch(source, silent=False)
-            if self._setup_thread is None and self._setup_cache.get(source, '') == '' and self._pending_queue_args is not None:
-                self._show_install_options_dialog(setup_path='')
+            if self._setup_thread is not None and self._setup_thread.source == source:
+                self._button.setText(tr('repacks.inspecting_installer'))
+                self._button.setEnabled(False)
+                try:
+                    self._setup_thread.progress.disconnect(self._on_setup_exe_progress)
+                except (TypeError, RuntimeError):
+                    pass
+                self._setup_thread.progress.connect(self._on_setup_exe_progress)
+            else:
+                self._start_setup_exe_prefetch(source, silent=False)
+                if self._setup_thread is None:
+                    if self._setup_cache.get(source, '') == '' and self._pending_queue_args is not None:
+                        self._show_install_options_dialog(setup_path='')
+                    return
+            pending = self._pending_queue_args
+            QTimer.singleShot(self._INSPECT_WAIT_MS, lambda p=pending, s=source: self._on_inspect_wait_timeout(s, p))
             return
         self._continue_queue_download(source, file_ids, install_spec=None)
+
+    def _has_active_item(self, source: str) -> bool:
+        active = (DLState.queued, DLState.downloading, DLState.verifying,
+                  DLState.paused, DLState.seeding)
+        try:
+            return any(item.torrent_file == source and item.state in active
+                       for item in self._manager.items_in_order())
+        except Exception:
+            return False
 
     @_guarded
     def _start_setup_exe_prefetch(self, source: str, silent: bool) -> None:
@@ -2765,18 +3669,22 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
             return
         if self._setup_cache.get(source, '') != '':
             return
+        if self._has_active_item(source):
+            logger.info('setup.exe prefetch skipped for %r: the torrent is already active', getattr(self._details, 'title', ''))
+            return
         if self._setup_thread is not None:
             if self._setup_thread.source == source:
                 return
+            self._cancel_setup_thread()
         self._setup_cache[source] = ''
         if not silent:
             self._button.setText(tr('repacks.inspecting_installer'))
             self._button.setEnabled(False)
         category = 'tbhb' if self._source_key == 'tbhb' else 'repacks'
         thread = _SetupExeFetchThread(self._manager, source, category=category)
-        thread.finished_ok.connect(lambda path, s=source: self._on_setup_exe_ready(s, path))
+        thread.finished_ok.connect(lambda path, inspected, s=source: self._on_setup_exe_ready(s, path, inspected))
         thread.finished_err.connect(lambda err, s=source: self._on_setup_exe_failed(s, err))
-        thread.finished.connect(self._on_setup_thread_finished)
+        thread.finished.connect(lambda t=thread: self._on_setup_thread_finished(t))
         if not silent:
             thread.progress.connect(self._on_setup_exe_progress)
         self._setup_thread = thread
@@ -2790,8 +3698,9 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
         else:
             self._button.setText(base)
 
-    def _on_setup_thread_finished(self) -> None:
-        self._setup_thread = None
+    def _on_setup_thread_finished(self, thread=None) -> None:
+        if thread is None or self._setup_thread is thread:
+            self._setup_thread = None
 
     @_guarded
     def _on_setup_exe_failed(self, source: str, err: str) -> None:
@@ -2810,16 +3719,28 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
             self._show_install_options_dialog(setup_path='')
 
     @_guarded
-    def _on_setup_exe_ready(self, source: str, setup_path: str) -> None:
+    def _on_inspect_wait_timeout(self, source: str, pending) -> None:
+        if self._pending_queue_args is not pending:
+            return
+        if self._setup_cache.get(source, '') != '':
+            return
+        logger.info('Inno inspection is taking too long for %s; continuing with default options', source)
+        self._setup_cache[source] = None
+        self._cancel_setup_thread(only_source=source)
+        self._show_install_options_dialog(setup_path='')
+
+    @_guarded
+    def _on_setup_exe_ready(self, source: str, setup_path: str, inspected: dict | None = None) -> None:
         if setup_path:
             logger.info('setup.exe pre-fetch finished for %s -> %s', source, setup_path)
         else:
             logger.warning('setup.exe pre-fetch finished for %s but no path returned (no setup.exe filename found in torrent, or fetch timed out)', source)
         self._setup_cache[source] = setup_path or None
+        self._setup_inspected[source] = inspected or {}
         if self._pending_queue_args is not None and self._pending_queue_args[0] == source:
-            self._show_install_options_dialog(setup_path=setup_path)
+            self._show_install_options_dialog(setup_path=setup_path, inspected=inspected or {})
 
-    def _show_install_options_dialog(self, setup_path: str) -> None:
+    def _show_install_options_dialog(self, setup_path: str, inspected: dict | None = None) -> None:
         args = self._pending_queue_args
         self._pending_queue_args = None
         if args is None or self._details is None:
@@ -2831,12 +3752,21 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
         if not _auto_install_enabled():
             self._continue_queue_download(source, file_ids, install_spec=None)
             return
-        dlg = GameInstallOptionsDialog(self._details, setup_path=setup_path, parent=self.window())
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        inspected = inspected or self._setup_inspected.get(source)
+        try:
+            dlg = GameInstallOptionsDialog(self._details, setup_path=setup_path, inspected=inspected, parent=self.window())
+            accepted = dlg.exec() == QDialog.DialogCode.Accepted
+            install_spec = dlg.result_spec() if accepted else None
+        except Exception:
+            logger.exception('Could not show the install options dialog; starting the download without auto-install')
+            self._button.setText(tr('repacks.download'))
+            self._button.setEnabled(True)
+            self._continue_queue_download(source, file_ids, install_spec=None)
+            return
+        if not accepted:
             self._button.setText(tr('repacks.download'))
             self._button.setEnabled(True)
             return
-        install_spec = dlg.result_spec()
         self._continue_queue_download(source, file_ids, install_spec=install_spec)
 
     def _continue_queue_download(self, source: str, file_ids: list[int] | None, install_spec: dict | None) -> None:
@@ -2854,9 +3784,15 @@ class DownloadActionWidget(AccentColorMixin, QWidget):
             category = 'repacks'
             console = ''
             source_label = 'FitGirl'
-        self._item_id = self._manager.add(torrent_file=source, file_id=file_ids[0] if file_ids else 1, file_ids=file_ids, game_name=self._details.title, console=console, source=source_label, category=category)
+        self._item_id = self._manager.add(torrent_file=source, file_id=file_ids[0] if file_ids else 1, file_ids=file_ids, game_name=self._details.title, console=console, source=source_label, category=category,
+                                          save_dir=self.__dict__.get('_save_dirs', {}).pop(source, ''))
         if install_spec is not None:
-            get_install_coordinator().register_pending(self._item_id, install_spec)
+            coordinator = get_install_coordinator()
+            coordinator.register_pending(self._item_id, install_spec)
+            item = self._manager.get(self._item_id)
+            state_name = getattr(getattr(item, 'state', None), 'value', '')
+            if item is not None and (state_name in ('completed', 'seeding') or item.progress >= 99.9):
+                coordinator.on_download_completed(self._item_id, self._details.title)
 
     def _on_item_updated(self, item_id: str) -> None:
         if item_id != self._item_id:
@@ -3118,7 +4054,6 @@ class SteamMatchDialog(MessageBoxBase):
 
 
 class _FrameAnimation(QObject):
-    """Small looped frame player for formats QMovie cannot open (animated AVIF)."""
 
     frame = Signal(QImage)
 
@@ -3235,8 +4170,6 @@ class _SteamDesc(QTextBrowser):
             movie.deleteLater()
             self._on_image_failed(src, html)
             return
-        # QMovie.frameChanged(int) passes the frame number; swallow it so the
-        # captured source stays the first positional argument.
         movie.frameChanged.connect(lambda _frame, s=src, m=movie: self._on_movie_frame(s, m))
         self._movies[src] = movie
         movie.jumpToFrame(0)
@@ -3310,6 +4243,7 @@ class _SteamDesc(QTextBrowser):
 class RepackDetailsView(DetailsViewMixin, QWidget):
     back_requested = Signal()
     banner_changed = Signal()
+    tag_requested = Signal(str)
     COVER_WIDTH = 280
     COVER_HEIGHT = 392
 
@@ -3319,6 +4253,7 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
 
     def __init__(self, manager: DownloadManager, source_key: str | None=None, parent=None):
         super().__init__(parent)
+        self._tags_clickable = source_key in REPACK_LIST_MENUS
         self._download_action = DownloadActionWidget(manager, source_key, self)
         self._cover_src: str | None = None
         self._cover_token = 0
@@ -3330,7 +4265,7 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         outer = QVBoxLayout(self)
 
 
-        outer.setContentsMargins(24, 0, 24, 20)
+        outer.setContentsMargins(24, 0, 24, 0)
         outer.setSpacing(10)
         back_btn = PushButton(themed_icon('repacks.detail_back', FluentIcon.RETURN), tr('repacks.back_to_grid'))
         back_btn.setFixedHeight(32)
@@ -3416,7 +4351,18 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         self._title_lbl = TitleLabel('')
         self._title_lbl.setWordWrap(True)
         self._title_lbl.setStyleSheet(f'font-weight: 700; color: {palette()['primary_text']};')
-        info_col.addWidget(self._title_lbl)
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(10)
+        title_row.addWidget(self._title_lbl, 1)
+        self._badge_box = QHBoxLayout()
+        self._badge_box.setContentsMargins(0, 0, 0, 0)
+        self._badge_box.setSpacing(6)
+        self._badge_keys = None
+        title_row.addLayout(self._badge_box)
+        info_col.addLayout(title_row)
+        pink_paw_store().changed.connect(self._sync_badges)
+        register_theme_refresh(self, self._on_badge_theme)
         self._logo_lbl = QLabel(info_col_container)
         self._logo_lbl.setStyleSheet('background: transparent;')
         self._logo_lbl.setVisible(False)
@@ -3485,16 +4431,14 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         sections_header.setStyleSheet(f'font-size: 16px; font-weight: 600; color: {palette()['primary_text']};')
         self._sections_header = sections_header
         self._sections_col.addWidget(sections_header)
-        self._site_link_btn = HyperlinkButton('', tr('repacks.view_on_website'), sections_container, themed_icon('repacks.site_link', FluentIcon.LINK))
-        self._site_link_btn.setIconSize(QSize(14, 14))
-        qconfig.themeColorChanged.connect(self._deferred_apply_site_link_style)
-        qconfig.themeChanged.connect(self._deferred_apply_site_link_style)
-        self._site_link_btn.setVisible(False)
-        self._sections_col.addWidget(self._site_link_btn)
-        self._steam_btn = HyperlinkButton('', tr('steam.view_on_steam', 'View on Steam'), sections_container, themed_icon('repacks.site_link', FluentIcon.LINK))
-        self._steam_btn.setIconSize(QSize(14, 14))
-        self._steam_btn.setVisible(False)
-        self._sections_col.addWidget(self._steam_btn)
+        link_icon = themed_icon('repacks.site_link', FluentIcon.LINK)
+        self._site_link_btn = _SiteLinkButton(tr('repacks.view_on_website'), sections_container, link_icon, self._style_site_link)
+        self._steam_btn = _SiteLinkButton(tr('steam.view_on_steam', 'View on Steam'), sections_container, link_icon, self._style_site_link)
+        for btn in (self._site_link_btn, self._steam_btn):
+            btn.setVisible(False)
+            self._sections_col.addWidget(btn)
+        for sig in (qconfig.themeColorChanged, qconfig.themeChanged):
+            sig.connect(lambda *_: QTimer.singleShot(0, self._apply_site_link_style))
         self._apply_site_link_style()
         self._sections_insert_index = self._sections_col.count()
         self._sections_header.setVisible(False)
@@ -3535,15 +4479,25 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         self._site_link_btn.setText(tr('repacks.view_on_website'))
         self._steam_btn.setText(tr('steam.view_on_steam', 'View on Steam'))
 
-    def _apply_site_link_style(self) -> None:
-        color = themeColor()
-        base_alpha = 55 if isDarkTheme() else 40
-        hover_alpha = 85 if isDarkTheme() else 65
-        text_color = palette()['primary_text']
-        qss = f'HyperlinkButton {{ background-color: rgba({color.red()}, {color.green()}, {color.blue()}, {base_alpha}); border-radius: 6px; padding: 6px 10px 6px 30px; font-weight: 600; color: {text_color}; }} HyperlinkButton:hover {{ background-color: rgba({color.red()}, {color.green()}, {color.blue()}, {hover_alpha}); color: {text_color}; }}'
-        for btn in (self._site_link_btn, self._steam_btn):
+    def _site_link_qss(self) -> str:
+        c = themeColor()
+        dark = isDarkTheme()
+        rgb = f'{c.red()}, {c.green()}, {c.blue()}'
+        text = palette()['primary_text']
+        return (f'HyperlinkButton {{ background-color: rgba({rgb}, {55 if dark else 40}); border: none; border-radius: 6px; padding: 6px 10px 6px 30px; font-weight: 600; color: {text}; }} '
+                f'HyperlinkButton:hover {{ background-color: rgba({rgb}, {85 if dark else 65}); color: {text}; }} '
+                f'HyperlinkButton:pressed {{ background-color: rgba({rgb}, {100 if dark else 80}); color: {text}; }}')
+
+    def _style_site_link(self, btn) -> None:
+        qss = self._site_link_qss()
+        if btn.styleSheet() != qss:
             btn.setStyleSheet(qss)
-            btn.setIcon(themed_icon('repacks.site_link', FluentIcon.LINK, color=text_color))
+            btn.setIcon(themed_icon('repacks.site_link', FluentIcon.LINK, color=palette()['primary_text']))
+
+    def _apply_site_link_style(self) -> None:
+        if _qt_is_valid(self):
+            for btn in (self._site_link_btn, self._steam_btn):
+                self._style_site_link(btn)
 
     def _apply_desc_style(self) -> None:
         title_color = palette()['primary_text']
@@ -3604,6 +4558,38 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         steam = self._steam_widget is not None and not self._steam_widget.isHidden()
         self._steam_host.setVisible(meta or steam)
 
+    def _on_badge_theme(self) -> None:
+        self._badge_keys = None
+        self._sync_badges()
+
+    def _sync_badges(self, *_args) -> None:
+        box = getattr(self, '_badge_box', None)
+        if box is None:
+            return
+        keys: list = []
+        for source in (getattr(self, '_current_entry', None), getattr(self, '_current_details', None)):
+            if source is not None:
+                keys.extend(k for k in badges_for(source) if k not in keys)
+        if tuple(keys) == self._badge_keys:
+            return
+        self._badge_keys = tuple(keys)
+        while box.count():
+            item = box.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        for key in keys:
+            pix = _banner_pixmap(22) if key == 'hypervisor' else _badge_pixmap(key, 30)
+            if pix.isNull():
+                continue
+            lbl = _BadgeLabel(key, self)
+            lbl.setFixedSize(pix.deviceIndependentSize().toSize() if key == 'hypervisor' else QSize(34, 34))
+            lbl.setPixmap(pix)
+            lbl.clicked.connect(self._on_badge_clicked)
+            box.addWidget(lbl, 0, Qt.AlignmentFlag.AlignTop if key != 'hypervisor' else Qt.AlignmentFlag.AlignVCenter)
+
+    def _on_badge_clicked(self, key: str) -> None:
+        show_badge_info(key, self.window())
+
     def _apply_clean_title(self, raw_title: str) -> None:
         self._ensure_steam_ui()
         try:
@@ -3614,6 +4600,7 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
             parsed = None
         self._parsed_title = parsed
         self._title_lbl.setText((parsed.clean if parsed else '') or raw_title or '')
+        self._sync_badges()
         meta = parsed.display_meta if parsed else ''
         self._meta_lbl.setText(meta)
         self._meta_lbl.setVisible(bool(meta))
@@ -4021,7 +5008,7 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         self._tags_header.setVisible(bool(genre_tags))
         self._tags_container.setVisible(bool(genre_tags))
         for tag_text in genre_tags:
-            pill = make_tag_pill(tag_text, self._tags_container)
+            pill = make_tag_pill(tag_text, self._tags_container, on_click=self.tag_requested.emit if self._tags_clickable else None)
             pill.adjustSize()
             self._tags_layout.addWidget(pill)
             self._tag_widgets.append(pill)
@@ -4104,7 +5091,6 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         if not src:
             self._cover_src = None
             self._cancel_cover()
-            self._cover_lbl.setVisible(False)
             self._show_cover_fallback(title)
             return
         self._cover_lbl.setVisible(True)
@@ -4124,7 +5110,10 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         _stop_previous_movie(self._cover_lbl)
 
         def _apply(pix):
-            if gen != self._cover_gen or not _qt_is_valid(self) or pix.isNull():
+            if gen != self._cover_gen or not _qt_is_valid(self):
+                return
+            if pix.isNull():
+                self._show_cover_fallback(title)
                 return
             self._cover_lbl.setImage(pix)
             self._cover_lbl.setFixedSize(*size)
@@ -4136,8 +5125,38 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
             small = images.peek(src, (PosterCard.POSTER_WIDTH, PosterCard.POSTER_HEIGHT))
             if small is not None and not small.isNull():
                 _apply(small)
+            else:
+                self._show_cover_fallback(title)
             self._cover_token = images.get(src, size, _apply, owner=self)
         images.dominant(src, _accent, owner=self)
+
+    def _show_cover_fallback(self, title: str) -> None:
+        w, h = self.COVER_WIDTH, self.COVER_HEIGHT
+        pix = QPixmap(w * 2, h * 2)
+        pix.setDevicePixelRatio(2.0)
+        pix.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(0, 0, w, h, 10, 10)
+        p.fillPath(path, QColor(255, 255, 255, 36) if isDarkTheme() else QColor(0, 0, 0, 36))
+        icon = themed_icon('repacks.detail_cover_fallback', FluentIcon.GAME, size=48, color=_body_text_color()).pixmap(48, 48)
+        text = QRect(20, h // 2 + 8, w - 40, h // 2 - 20)
+        p.setPen(to_color(palette().get('primary_text', '#ffffff'), '#ffffff'))
+        f = p.font()
+        f.setPixelSize(13)
+        p.setFont(f)
+        br = p.boundingRect(text, int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap), title or '')
+        top = (h - 48 - 10 - br.height()) // 2
+        p.drawPixmap(QPoint((w - 48) // 2, top), icon)
+        p.drawText(QRect(20, top + 58, w - 40, br.height() + 4), int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap), title or '')
+        p.end()
+        _stop_previous_movie(self._cover_lbl)
+        self._cover_lbl.setImage(pix)
+        self._cover_lbl.setFixedSize(w, h)
+        self._cover_fallback.setVisible(False)
+        self._cover_lbl.setVisible(True)
 
     def _cancel_cover(self) -> None:
         self._cover_gen += 1
@@ -4146,6 +5165,21 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
             self._cover_token = 0
 
 def _fade_in_widget(widget, duration_ms: int = 140, owner=None, slot: str = "_fade_anim") -> None:
+    if not animations_enabled():
+        prev = getattr(owner, slot, None) if owner is not None else None
+        if prev is not None:
+            with suppress(Exception):
+                prev.stop()
+            if owner is not None:
+                with suppress(Exception):
+                    setattr(owner, slot, None)
+        try:
+            if widget is not None and _qt_is_valid(widget) and isinstance(
+                    widget.graphicsEffect(), QGraphicsOpacityEffect):
+                widget.setGraphicsEffect(None)
+        except Exception:
+            pass
+        return
     try:
         prev = getattr(owner, slot, None) if owner is not None else None
         if prev is not None:
@@ -4208,6 +5242,10 @@ def _fade_in_widget(widget, duration_ms: int = 140, owner=None, slot: str = "_fa
 
 class SourceTab(MediaPageBase):
     _FADE_MS = 140
+    tag_set_requested = Signal(list)
+    tags_confirmed = Signal(list)
+    tags_retry = Signal(list)
+    random_busy = Signal(bool)
 
     def __init__(self, source_key: str, source_name: str, manager: DownloadManager, parent=None):
         super().__init__(parent)
@@ -4219,10 +5257,64 @@ class SourceTab(MediaPageBase):
         self._is_loading = False
         self._loaded_once = False
         self._search_query = ''
+        self._list_key: str | None = None
+        if source_key in REPACK_LIST_MENUS:
+            pink_paw_store().request(source_key)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 12, 0, 0)
         layout.setSpacing(8)
+        self._tag_bar = QWidget(self)
+        self._tag_bar.setStyleSheet('background: transparent;')
+        tag_row = QHBoxLayout(self._tag_bar)
+        tag_row.setContentsMargins(24, 0, 24, 0)
+        tag_row.setSpacing(8)
+        self._tag_hint = CaptionLabel('Showing games tagged')
+        self._tag_hint.setStyleSheet(f'font-weight: 400; color: {_muted_text_color()}; background: transparent;')
+        register_theme_refresh(self._tag_hint, lambda: self._tag_hint.setStyleSheet(
+            f'font-weight: 400; color: {_muted_text_color()}; background: transparent;'))
+        self._tag_pills = QHBoxLayout()
+        self._tag_pills.setContentsMargins(0, 0, 0, 0)
+        self._tag_pills.setSpacing(6)
+        self._tag_note = CaptionLabel('')
+        self._tag_note.setStyleSheet(f'font-weight: 400; color: {_muted_text_color()}; background: transparent;')
+        self._tag_note.setVisible(False)
+        self._tag_seq = 0
+        self._excl_ready = False
+        self._excl_loading = False
+        self._excl_urls: set = set()
+        self._raw_entries: list = []
+        self._excl_timer_on = False
+        self._tag_pool: list = []
+        self._tag_pool_loading = False
+        self._tag_open_pending = False
+        if source_key in REPACK_LIST_MENUS:
+            QTimer.singleShot(2500, lambda: self._load_tag_pool(True) if _qt_is_valid(self) else None)
+        self._tag_add = TransparentToolButton(FluentIcon.ADD)
+        apply_tool_button_theme(self._tag_add)
+        self._tag_add.setFixedSize(24, 24)
+        self._tag_add.setIconSize(QSize(12, 12))
+        self._tag_add.setToolTip('Add or remove genres')
+        self._tag_add.clicked.connect(lambda _c=False: self._open_tag_menu())
+        tag_row.addWidget(self._tag_hint)
+        tag_row.addLayout(self._tag_pills)
+        tag_row.addWidget(self._tag_add)
+        tag_row.addWidget(self._tag_note)
+        tag_row.addStretch(1)
+        self._tag_bar.setVisible(False)
+        layout.addWidget(self._tag_bar)
+        self._suggest_bar = QWidget(self)
+        self._suggest_bar.setStyleSheet('background: transparent;')
+        self._suggest_row = QHBoxLayout(self._suggest_bar)
+        self._suggest_row.setContentsMargins(24, 0, 24, 0)
+        self._suggest_row.setSpacing(8)
+        self._suggest_bar.setVisible(False)
+        self._last_tag_query: list = []
+        self._random_token = 0
+        self._random_task_id = None
+        self._last_random = None
+        layout.addWidget(self._suggest_bar)
         self._status_lbl = CaptionLabel('')
+        self._status_lbl.setContentsMargins(24, 0, 24, 0)
         self._status_lbl.setVisible(False)
         layout.addWidget(self._status_lbl)
         self._stack = QStackedWidget()
@@ -4239,9 +5331,11 @@ class SourceTab(MediaPageBase):
         self._grid = PosterGrid(
             self, header=carousel, subtitle_fn=_source_subtitle, colors_fn=_grid_colors,
             title_attr='display_title', cover_attrs=('poster_path', 'poster_url', 'poster_fallback', 'steam_poster'),
-            show_caption=_titles_enabled(), meta_fn=_entry_meta_text, search_fn=_entry_search_text,
+            show_caption=_titles_enabled(), meta_fn=_entry_meta_text, search_fn=_entry_search_text, badge_fn=_entry_badges,
             fallback_icon_fn=lambda: themed_icon('repacks.card_fallback', FluentIcon.GAME, size=48, color=_body_text_color()))
         self._caption_on = _titles_enabled()
+        pink_paw_store().changed.connect(self._grid.viewport().update)
+        register_theme_refresh(self, self._on_badge_theme)
         self._grid.context_requested.connect(self._show_grid_menu)
         self._grid.poster_clicked.connect(self._show_details)
         self._grid.download_requested.connect(self.open_details_and_download)
@@ -4250,10 +5344,15 @@ class SourceTab(MediaPageBase):
         self._grid.visible_changed.connect(self._on_visible_changed)
         carousel.hovered.connect(self._on_grid_hover)
         grid_row_layout.addWidget(self._grid, 1)
+        self._busy_ring = IndeterminateProgressRing(self._grid)
+        self._busy_ring.setFixedSize(84, 84)
+        self._busy_ring.setStrokeWidth(6)
+        self._busy_ring.hide()
+        self._grid.installEventFilter(self)
         grid_page_layout.addWidget(grid_row, 1)
         self._retry_bar = QWidget()
         retry_bar_layout = QHBoxLayout(self._retry_bar)
-        retry_bar_layout.setContentsMargins(0, 4, 0, 8)
+        retry_bar_layout.setContentsMargins(0, 4, 0, 0)
         retry_bar_layout.addStretch(1)
         self._retry_btn = PushButton(self._safe_tr('repacks.retry_loading', 'Retry loading more'))
         self._retry_btn.clicked.connect(self._on_retry_clicked)
@@ -4266,6 +5365,7 @@ class SourceTab(MediaPageBase):
         self._details = RepackDetailsView(manager, source_key, self)
         self._details.back_requested.connect(self._show_grid)
         self._stack.addWidget(self._details)
+        self._stack.currentChanged.connect(lambda _i: self._refresh_bars())
         self._latest_task = None
         self._auto_click_download = False
         self._load_watchdog = QTimer(self)
@@ -4275,6 +5375,7 @@ class SourceTab(MediaPageBase):
         self._last_fetch_mono = 0.0
         self._stall_retries = 0
         self._active_fetch_task_id = None
+        self._search_task_id = None
         self._hover_entry = None
         self._prefetch_queue: list[RepackEntry] = []
         self._prefetch_touched: set[str] = set()
@@ -4285,6 +5386,28 @@ class SourceTab(MediaPageBase):
         self._prefetch_dwell.timeout.connect(self._prefetch_hovered_details)
         self._stack.setCurrentWidget(grid_page)
         self._load_latest_repacks()
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._grid and event.type() == QEvent.Type.Resize:
+            self._place_busy_ring()
+        return super().eventFilter(obj, event)
+
+    def _place_busy_ring(self) -> None:
+        r, g = self._busy_ring, self._grid
+        r.move((g.width() - r.width()) // 2, max(0, (g.height() - r.height()) // 2 - 40))
+
+    def _set_busy(self, on: bool) -> None:
+        r = getattr(self, '_busy_ring', None)
+        if r is None or not _qt_is_valid(r):
+            return
+        if on:
+            color = themeColor()
+            r.setCustomBarColor(color, color)
+            self._place_busy_ring()
+            r.show()
+            r.raise_()
+        else:
+            r.hide()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -4302,14 +5425,16 @@ class SourceTab(MediaPageBase):
                     setattr(grid, attr, on)
         grid.refresh()
 
-    def _load_latest_repacks(self) -> None:
+    def _load_latest_repacks(self, use_cache: bool = True) -> None:
         if self._latest_task is not None:
-            return
-        self._latest_task = fetch_popular_repacks_async(self._source_key, on_done=self._on_latest_repacks_loaded, use_cache=True)
+            if use_cache:
+                return
+            cancel_task(self._latest_task)
+        self._latest_task = fetch_popular_repacks_async(self._source_key, on_done=self._on_latest_repacks_loaded, use_cache=use_cache)
 
     def _on_latest_repacks_loaded(self, entries: list) -> None:
         self._latest_task = None
-        if self._search_query:
+        if self._search_query or self._list_key is not None:
             return
         self._grid.set_latest_entries(self._decorate_entries(entries or []))
 
@@ -4337,6 +5462,7 @@ class SourceTab(MediaPageBase):
             self._active_fetch_task_id = None
         if self._stall_retries >= 3:
             self._is_loading = False
+            self._set_busy(False)
             self._set_status(tr('repacks.load_failed_message', message=tr('repacks.timed_out')))
             self._retry_bar.setVisible(True)
             logger.error('Repack page load timed out after %d retries for %s', self._stall_retries, self._source_key)
@@ -4413,21 +5539,46 @@ class SourceTab(MediaPageBase):
         self._grid.filter_by_title(query)
         self._run_search(query)
 
-    def _run_search(self, query: str) -> None:
+    def _run_search(self, query: str, send: str | None=None) -> None:
+        if send is None:
+            self._search_alts = _tm_variants(query)[1:]
+            self._search_fallback = False
+        self._search_send = send or query
+        self._set_busy(True)
         self._set_status(tr('repacks.searching_for', query=query))
-        fetch_search_async(self._source_key, query, 1, on_done=lambda result, q=query: self._on_search_done(q, result), on_error=lambda message, q=query: self._on_search_error(q, message), use_cache=False)
+        if self._search_task_id is not None:
+            cancel_task(self._search_task_id)
+        self._search_task_id = fetch_search_async(self._source_key, send or query, 1, on_done=lambda result, q=query: self._on_search_done(q, result), on_error=lambda message, q=query: self._on_search_error(q, message), use_cache=False)
 
     def _on_search_done(self, query: str, result) -> None:
         if query != self._search_query:
             return
+        self._search_task_id = None
+        entries = result.entries
+        if self._search_send != query:
+            entries = [entry for entry in entries if _tm_contains(query, entry.title or '')]
+        alts = getattr(self, '_search_alts', None)
+        if not entries and alts:
+            self._run_search(query, alts.pop(0))
+            return
+        if not entries and not getattr(self, '_search_fallback', False):
+            fallback = _tm_fallback_query(query)
+            if fallback and _tm_fold(fallback) != _tm_fold(query):
+                self._search_fallback = True
+                self._run_search(query, fallback)
+                return
+        self._set_busy(False)
         self._grid.set_latest_section_visible(False)
-        self._grid.set_entries(self._decorate_entries(result.entries))
+        self._grid.set_entries(self._decorate_entries(entries))
+        self._grid.set_highlight(query)
         self._stack.setCurrentWidget(self._grid_row)
-        self._set_status('' if result.entries else tr('repacks.no_games_matching', query=query))
+        self._set_status('' if entries else tr('repacks.no_games_matching', query=query))
 
     def _on_search_error(self, query: str, message: str) -> None:
         if query != self._search_query:
             return
+        self._search_task_id = None
+        self._set_busy(False)
         if message == '__no_search__':
             self._grid.set_latest_section_visible(False)
             self._grid.filter_by_title(query)
@@ -4439,10 +5590,13 @@ class SourceTab(MediaPageBase):
         logger.error('Repack search failed for %s (%r): %s', self._source_key, query, message)
 
     def _restore_browse_view(self) -> None:
+        if self._search_task_id is not None:
+            cancel_task(self._search_task_id)
+            self._search_task_id = None
         self._stack.setCurrentWidget(self._grid_row)
         self._set_status('')
         self._retry_bar.setVisible(False)
-        self._grid.set_latest_section_visible(True)
+        self._grid.set_latest_section_visible(self._list_key is None)
         self._grid.clear()
         self._drop_prefetch_queue()
         self._current_page = 0
@@ -4452,15 +5606,40 @@ class SourceTab(MediaPageBase):
         self.load_initial()
 
     def refresh(self) -> None:
+        if self._stack.currentWidget() is self._details:
+            entry = getattr(self._details, '_current_entry', None)
+            if entry is not None:
+                self._auto_click_download = False
+                self._details.show_loading(entry)
+                fetch_details_async(self._source_key, entry, on_done=self._on_details_loaded, on_error=self._on_details_error, use_cache=False)
+            return
+        if self._search_query:
+            self._run_search(self._search_query)
+            return
         from src.core.repacks.base import clear_source_cache
         clear_source_cache(self._source_key)
+        if self._active_fetch_task_id is not None:
+            cancel_task(self._active_fetch_task_id)
+            self._active_fetch_task_id = None
+        self._load_watchdog.stop()
+        self._is_loading = False
+        self._stall_retries = 0
+        self._stale_pages = 0
         self._drop_prefetch_queue()
         self._retry_bar.setVisible(False)
+        self._set_status('')
+        browsing_root = self._list_key is None
+        self._grid.set_latest_section_visible(browsing_root)
         self._grid.clear()
         self._current_page = 0
         self._has_more = True
         self._load_next_page(use_cache=False)
-        self._load_latest_repacks()
+        if browsing_root:
+            self._load_latest_repacks(use_cache=False)
+
+    def _on_badge_theme(self) -> None:
+        _badge_cache.clear()
+        self._grid.viewport().update()
 
     def _on_near_bottom(self) -> None:
         if not _qt_is_valid(self) or not _qt_is_valid(self._grid):
@@ -4477,15 +5656,366 @@ class SourceTab(MediaPageBase):
             return
         if self._is_loading or not self._has_more:
             return
+        exc = split_tags((self._list_key or '')[4:].split(','))[1] if (self._list_key or '').startswith('tag:') else []
+        native_exclude = bool(exc) and self._source_key in _TAG_EXCLUDE_SOURCES
+        if native_exclude:
+            self._excl_ready = True
+            self._excl_loading = False
+            self._excl_urls = set()
+        elif exc and not self._excl_ready and not self._excl_loading:
+            if not self._excl_loading:
+                self._excl_start(self._list_key, exc)
         self._is_loading = True
         self._load_watchdog.start()
+        if self._current_page == 0:
+            self._set_busy(True)
         next_page = self._current_page + 1
-        self._active_fetch_task_id = fetch_page_async(self._source_key, next_page, on_done=self._on_page_loaded, on_error=self._on_page_error, use_cache=use_cache)
+        key = self._list_key
+        done = lambda result, k=key: self._on_fetched(k, result)
+        err = lambda message, k=key: self._on_fetch_failed(k, message)
+        inc = split_tags(key[4:].split(','))[0] if key and key.startswith('tag:') else []
+        if inc:
+            self._active_fetch_task_id = fetch_tag_async(
+                self._source_key, ','.join(inc), next_page, on_done=done, on_error=err,
+                use_cache=use_cache, exclude=','.join(exc) if native_exclude else None)
+        elif key and key.startswith('tag:'):
+            self._active_fetch_task_id = fetch_page_async(
+                self._source_key, next_page, on_done=done, on_error=err,
+                use_cache=use_cache, exclude=','.join(exc) if native_exclude else None)
+        elif key:
+            self._active_fetch_task_id = fetch_list_async(self._source_key, key, next_page, on_done=done, on_error=err, use_cache=use_cache)
+        else:
+            self._active_fetch_task_id = fetch_page_async(self._source_key, next_page, on_done=done, on_error=err, use_cache=use_cache)
+
+    def _excl_start(self, key, names) -> None:
+        self._excl_loading = True
+        self._excl_inflight = 0
+        self._excl_left = 0
+        self._excl_urls = set()
+        for name in names:
+            cached = _EXCL_CACHE.get((self._source_key, norm_tag(name)))
+            if cached is not None:
+                self._excl_urls |= cached
+                continue
+            self._excl_left += 1
+            self._excl_tag_urls = getattr(self, '_excl_tag_urls', {})
+            self._excl_tag_urls[name] = set()
+            self._excl_lanes = getattr(self, '_excl_lanes', {})
+            self._excl_lanes[name] = _EXCL_LANES
+            for lane in range(_EXCL_LANES):
+                self._excl_fetch(key, name, lane + 1)
+        if not self._excl_inflight:
+            self._excl_finish(key)
+
+    def _excl_fetch(self, key, name, page) -> None:
+        self._excl_inflight += 1
+        fetch_tag_async(
+            self._source_key, name, page,
+            on_done=lambda r, n=name, p=page, k=key: self._excl_page(k, n, p, r),
+            on_error=lambda _m, n=name, k=key: self._excl_lane_done(k, n), use_cache=True)
+
+    def _excl_page(self, key, name, page, result) -> None:
+        if key != self._list_key or not _qt_is_valid(self):
+            return
+        self._excl_inflight -= 1
+        urls = [e.url for e in result.entries]
+        self._excl_tag_urls[name].update(urls)
+        self._excl_urls.update(urls)
+        self._excl_schedule()
+        if urls and result.has_more and page + _EXCL_LANES <= _EXCL_MAX_PAGES:
+            self._excl_fetch(key, name, page + _EXCL_LANES)
+            return
+        self._excl_lane_done(key, name, counted=True)
+
+    def _excl_lane_done(self, key, name, counted=False) -> None:
+        if key != self._list_key or not _qt_is_valid(self):
+            return
+        if not counted:
+            self._excl_inflight -= 1
+        self._excl_lanes[name] -= 1
+        if self._excl_lanes[name] == 0:
+            _EXCL_CACHE[(self._source_key, norm_tag(name))] = set(self._excl_tag_urls[name])
+        if self._excl_inflight <= 0:
+            self._excl_finish(key)
+
+    def _excl_finish(self, key) -> None:
+        self._excl_loading = False
+        self._excl_ready = True
+        self._excl_refilter()
+
+    def _excl_schedule(self) -> None:
+        if not self._excl_timer_on:
+            self._excl_timer_on = True
+            QTimer.singleShot(400, self._excl_refilter)
+
+    def _excl_refilter(self) -> None:
+        self._excl_timer_on = False
+        if not _qt_is_valid(self) or not self._excl_urls:
+            return
+        kept = [e for e in self._raw_entries if e.url not in self._excl_urls]
+        if len(kept) != self._grid.count_entries():
+            self._grid.clear()
+            self._grid.append_entries(kept)
+
+    def _on_fetched(self, list_key, result) -> None:
+        if list_key != self._list_key:
+            return
+        self._on_page_loaded(result)
+
+    def _on_fetch_failed(self, list_key, message: str) -> None:
+        if list_key != self._list_key:
+            return
+        self._on_page_error(message)
+
+    def active_list(self) -> str | None:
+        return self._list_key
+
+    def _current_tag_names(self) -> list:
+        key = self._list_key or ''
+        return [n for n in key[4:].split(',') if n] if key.startswith('tag:') else []
+
+    def _open_tag_menu(self) -> None:
+        if self._tag_pool:
+            show_tag_menu(self._tag_add, self._tag_pool, self._current_tag_names(), self._on_tag_pick, self._on_tag_exclude)
+            return
+        self._tag_open_pending = True
+        self._load_tag_pool(False)
+
+    def _load_tag_pool(self, low: bool) -> None:
+        if self._tag_pool or self._tag_pool_loading:
+            return
+        self._tag_pool_loading = True
+        fetch_all_tags_async(self._source_key, on_done=self._on_tag_pool_loaded, on_error=self._on_tag_pool_failed, low=low)
+
+    def _on_tag_pool_loaded(self, names) -> None:
+        self._tag_pool_loading = False
+        if not _qt_is_valid(self):
+            return
+        self._tag_pool = [str(n) for n in names or ()]
+        if self._tag_open_pending and self._tag_pool and self._tag_bar.isVisible():
+            self._open_tag_menu()
+        self._tag_open_pending = False
+
+    def _on_tag_pool_failed(self, _message: str) -> None:
+        self._tag_pool_loading = False
+        self._tag_open_pending = False
+
+    def _on_tag_pick(self, name: str) -> None:
+        self.tag_set_requested.emit(toggled_tags(self._current_tag_names(), name))
+
+    def _on_tag_exclude(self, name: str) -> None:
+        self.tag_set_requested.emit(toggled_tags(self._current_tag_names(), name, True))
+
+    def _sync_tag_bar(self) -> None:
+        key = self._list_key or ''
+        on = key.startswith('tag:')
+        while self._tag_pills.count():
+            item = self._tag_pills.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._tag_note.setText('')
+        self._tag_note.setVisible(False)
+        self._clear_suggestions()
+        if on:
+            names = [n for n in key[4:].split(',') if n]
+            for name in names:
+                self._tag_pills.addWidget(make_tag_chip(name, self._tag_bar, self._on_tag_pick))
+            inc, exc = split_tags(names)
+            self._tag_hint.setText(('Showing games with all of these tags' if len(inc) > 1 else 'Showing games tagged') if inc else 'Hiding games tagged')
+        self._tag_bar.setVisible(on and self._bars_allowed())
+
+    def search_tags(self, tags: list) -> None:
+        self._leave_details()
+        if self._source_key not in REPACK_LIST_MENUS:
+            self._set_status('Tag search is not available for this source.')
+            return
+        if not tags:
+            self._set_status('Type tags after "tag:", e.g.  tag:action, rpg, 3D  then press Enter.')
+            return
+        self._tag_seq += 1
+        seq = self._tag_seq
+        self._last_tag_query = list(tags)
+        self._clear_suggestions()
+        self._set_busy(True)
+        self._set_status('Looking up tags\u2026')
+        want_inc, want_exc = split_tags(tags)
+        self._want_exc = want_exc
+        resolve_tags_async(self._source_key, want_inc + want_exc,
+                           on_done=lambda result, s=seq: self._on_tags_resolved(s, result),
+                           on_error=lambda message, s=seq: self._on_tags_lookup_failed(s, message))
+
+    def _on_tags_resolved(self, seq: int, result) -> None:
+        if seq != self._tag_seq or not _qt_is_valid(self):
+            return
+        found = [str(t) for t in (result or {}).get('tags') or ()]
+        missing = [str(t) for t in (result or {}).get('missing') or ()]
+        suggestions = dict((result or {}).get('suggestions') or {})
+        if not found:
+            self._set_busy(False)
+            names = ', '.join(f'"{m}"' for m in missing) or 'that'
+            hint = '' if suggestions else ' Check the spelling (e.g. tag:action, open world, 3D).'
+            self._set_status(f'No tag named {names}.{hint}')
+            self._show_suggestions(missing, suggestions)
+            return
+        inc, exc = partition_resolved(found, getattr(self, '_want_exc', []))
+        self.show_list('tag:' + ','.join(join_tags(inc, exc)))
+        if missing:
+            self._tag_note.setText('Ignored unknown: ' + ', '.join(missing))
+            self._tag_note.setVisible(True)
+            self._show_suggestions(missing, suggestions)
+        self.tags_confirmed.emit(join_tags(inc, exc))
+
+    def _bars_allowed(self) -> bool:
+        details = getattr(self, '_details', None)
+        return details is None or self._stack.currentWidget() is not details
+
+    def _refresh_bars(self) -> None:
+        allowed = self._bars_allowed()
+        self._tag_bar.setVisible(allowed and bool(self._current_tag_names()))
+        self._suggest_bar.setVisible(allowed and self._suggest_row.count() > 0)
+
+    def _clear_suggestions(self) -> None:
+        while self._suggest_row.count():
+            item = self._suggest_row.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._suggest_bar.setVisible(False)
+
+    def _show_suggestions(self, missing: list, suggestions: dict) -> None:
+        self._clear_suggestions()
+        shown = False
+        for name in missing:
+            close = suggestions.get(name) or []
+            if not close:
+                continue
+            hint = CaptionLabel(f'Did you mean, instead of "{name}":')
+            hint.setStyleSheet(f'font-weight: 400; color: {_muted_text_color()}; background: transparent;')
+            self._suggest_row.addWidget(hint)
+            for label in close[:3]:
+                pill = make_tag_pill(label, self._suggest_bar, on_click=lambda t, m=name: self._retry_with(m, t))
+                pill.adjustSize()
+                self._suggest_row.addWidget(pill)
+            shown = True
+        if shown:
+            self._suggest_row.addStretch(1)
+        self._suggest_bar.setVisible(shown and self._bars_allowed())
+
+    def _retry_with(self, missing: str, suggestion: str) -> None:
+        def norm(t: str) -> str:
+            return re.sub(r'\s+', ' ', t or '').strip().lower()
+        query, replaced = [], False
+        for t in self._last_tag_query:
+            if norm(t.lstrip('-')) == norm(missing):
+                query.append(('-' if t.startswith('-') else '') + suggestion)
+                replaced = True
+            else:
+                query.append(t)
+        if not replaced:
+            query.append(suggestion)
+        self.tags_retry.emit(query)
+
+
+    def surprise_me(self) -> None:
+        self._random_token += 1
+        token = self._random_token
+        if self._random_task_id is not None:
+            cancel_task(self._random_task_id)
+            self._random_task_id = None
+        self.random_busy.emit(True)
+
+        def _done(entry) -> None:
+            if token != self._random_token or not _qt_is_valid(self):
+                return
+            self._random_task_id = None
+            self.random_busy.emit(False)
+            if entry is None:
+                self._random_notice(tr('repacks.random_empty_title', default='Nothing to pick from'),
+                                    tr('repacks.random_empty', default='This source has no games yet.'))
+                return
+            self._last_random = getattr(entry, 'url', None)
+            try:
+                self._show_details(_decorate_repack_entry(entry))
+            except Exception:
+                logger.exception('Failed to open random %s game', self._source_key)
+
+        def _fail(message) -> None:
+            if token != self._random_token or not _qt_is_valid(self):
+                return
+            logger.error('%s random pick error: %s', self._source_key, message)
+            self._random_task_id = None
+            self.random_busy.emit(False)
+            self._random_notice(tr('repacks.random_failed_title', default="Couldn't pick a game"),
+                                tr('repacks.random_failed', default='Nothing came back this time. Try again in a moment.'))
+
+        try:
+            self._random_task_id = random_entry_async(self._source_key, self._last_random, on_done=_done, on_error=_fail)
+        except Exception as exc:
+            _fail(str(exc))
+
+    def cancel_random(self) -> None:
+        self._random_token += 1
+        if self._random_task_id is not None:
+            cancel_task(self._random_task_id)
+            self._random_task_id = None
+        self.random_busy.emit(False)
+
+    def _random_notice(self, title: str, content: str) -> None:
+        InfoBar.warning(title=title, content=content, orient=Qt.Orientation.Horizontal, isClosable=True,
+                        position=InfoBarPosition.TOP_RIGHT, duration=3000, parent=self.window())
+
+    def _on_tags_lookup_failed(self, seq: int, message: str) -> None:
+        if seq != self._tag_seq or not _qt_is_valid(self):
+            return
+        self._set_busy(False)
+        self._set_status(f'Tag lookup failed: {message}')
+
+    def _leave_details(self) -> None:
+        self._auto_click_download = False
+        self._pending_auto_download_url = None
+        if self._stack.currentWidget() is not self._grid_row:
+            self._switch_stack_animated(self._grid_row)
+            with suppress(Exception):
+                self._details.pause_media()
+            QTimer.singleShot(230, self._refresh_grid_after_show)
+
+    def show_list(self, list_key: str | None) -> None:
+        if not _qt_is_valid(self):
+            return
+        if list_key == self._list_key and self._loaded_once:
+            self._leave_details()
+            return
+        if self._active_fetch_task_id is not None:
+            cancel_task(self._active_fetch_task_id)
+            self._active_fetch_task_id = None
+        self._load_watchdog.stop()
+        self._list_key = list_key or None
+        self._excl_ready = False
+        self._excl_loading = False
+        self._excl_urls = set()
+        self._raw_entries = []
+        self._excl_tag_urls = {}
+        self._excl_lanes = {}
+        self._search_query = ''
+        self._stall_retries = 0
+        self._stale_pages = 0
+        self._loaded_once = True
+        self._is_loading = False
+        self._has_more = True
+        self._current_page = 0
+        self._retry_bar.setVisible(False)
+        self._set_status('')
+        self._sync_tag_bar()
+        self._drop_prefetch_queue()
+        self._grid.clear()
+        self._grid.set_latest_section_visible(self._list_key is None)
+        self._leave_details()
+        self._load_next_page(use_cache=True)
 
     def _on_page_loaded(self, result) -> None:
         if not _qt_is_valid(self) or not _qt_is_valid(self._grid):
             return
         self._load_watchdog.stop()
+        self._set_busy(False)
         self._active_fetch_task_id = None
         self._stall_retries = 0
         self._last_fetch_mono = time.monotonic()
@@ -4495,27 +6025,32 @@ class SourceTab(MediaPageBase):
             return
         self._current_page = result.page
         self._has_more = result.has_more
-        before = self._grid.count_entries()
-        self._grid.append_entries(self._decorate_entries(result.entries))
-        added = self._grid.count_entries() - before
+        self._raw_entries.extend(result.entries)
+        entries = [e for e in result.entries if e.url not in self._excl_urls] if self._excl_urls else result.entries
+        if result.entries and not entries and self._has_more:
+            QTimer.singleShot(0, lambda: self._load_next_page(use_cache=True) if _qt_is_valid(self) else None)
+            return
+        decorated = self._decorate_entries(entries)
+        added = sum(1 for e in decorated if e.url not in self._grid._keys)
+        self._grid.append_entries_ready(decorated, on_done=lambda: QTimer.singleShot(150, self._on_near_bottom) if _qt_is_valid(self) else None)
         logger.info('Repack page %d: +%d entries, has_more=%s', result.page, added, result.has_more)
-        if added == 0 and result.entries:
+        if added == 0 and entries:
             self._stale_pages = getattr(self, '_stale_pages', 0) + 1
             if self._stale_pages >= 3:
                 self._has_more = False
                 logger.warning('Repack feed repeating pages; stopped at page %d', result.page)
         elif added > 0:
             self._stale_pages = 0
-        if not result.entries and self._current_page == 1:
+        if not entries and self._current_page == 1:
             self._set_status(tr('repacks.no_repacks_found'))
         else:
             self._set_status('')
-        QTimer.singleShot(150, self._on_near_bottom)
 
     def _on_page_error(self, message: str) -> None:
         if not _qt_is_valid(self):
             return
         self._load_watchdog.stop()
+        self._set_busy(False)
         self._active_fetch_task_id = None
         self._is_loading = False
         self._set_status(tr('repacks.failed_to_load', message=message))
@@ -4534,7 +6069,6 @@ class SourceTab(MediaPageBase):
         except Exception:
             pass
         super()._switch_stack_animated(widget)
-        _fade_in_widget(widget, self._FADE_MS, self)
 
     def _show_details(self, entry: RepackEntry) -> None:
         self._auto_click_download = getattr(entry, 'url', None) == getattr(self, '_pending_auto_download_url', None)
@@ -4581,9 +6115,15 @@ class SourceTab(MediaPageBase):
         while self._prefetch_inflight < _DETAILS_PREFETCH_MAX and self._prefetch_queue:
             entry = self._prefetch_queue.pop(0)
             self._prefetch_inflight += 1
-            fetch_details_async(self._source_key, entry, on_done=self._on_prefetch_settled,
+            fetch_details_async(self._source_key, entry, on_done=lambda d, e=entry: self._on_prefetch_done(e, d),
                                 on_error=self._on_prefetch_settled, use_cache=True, owner=self,
                                 priority=Priority.PREFETCH)
+
+    def _on_prefetch_done(self, entry, details) -> None:
+        if _qt_is_valid(self) and not getattr(entry, 'poster_url', None) and getattr(details, 'cover_url', None):
+            entry.poster_url = details.cover_url
+            self._grid.refresh_covers()
+        self._on_prefetch_settled()
 
     def _on_prefetch_settled(self, _result=None) -> None:
         self._prefetch_inflight = max(0, self._prefetch_inflight - 1)
@@ -4933,7 +6473,7 @@ class UpcomingRepacksCard(QWidget):
         self._list_container = QWidget()
         self._list_container.setStyleSheet('background: transparent;')
         self._list_layout = QVBoxLayout(self._list_container)
-        self._list_layout.setContentsMargins(0, 8, 8, 4)
+        self._list_layout.setContentsMargins(0, 8, 8, 0)
         self._list_layout.setSpacing(8)
         self._list_layout.addStretch(1)
         self._scroll.setWidget(self._list_container)
@@ -5104,7 +6644,7 @@ class ReleasedRepacksDialog(MessageBoxBase):
         self._body = QWidget()
         self._body.setStyleSheet('background: transparent;')
         self._grid = QGridLayout(self._body)
-        self._grid.setContentsMargins(0, 12, 0, 4)
+        self._grid.setContentsMargins(0, 12, 0, 0)
         self._grid.setHorizontalSpacing(16)
         self._grid.setVerticalSpacing(14)
         self._scroll.setWidget(self._body)
@@ -5209,7 +6749,7 @@ class _ReleaseNotifier(QObject):
                 old.hide()
                 old.deleteLater()
             tray = QSystemTrayIcon(icon, self)
-            tray.setToolTip('PiraChest')
+            tray.setToolTip(app.applicationName() or 'PiraChest')
             tray.messageClicked.connect(self._on_toast_clicked)
             tray.show()
             names = [h.get('title', '') for h in hits]
@@ -5296,14 +6836,15 @@ class RepacksPage(QWidget):
         self._search_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._search_debounce = QTimer(self)
         self._search_debounce.setSingleShot(True)
-        self._search_debounce.setInterval(250)
+        self._search_debounce.setInterval(320)
         self._search_debounce.timeout.connect(lambda: self._on_search_text_changed(self._search_bar.text()))
         self._search_bar.textChanged.connect(lambda _text: self._search_debounce.start())
         self._search_bar.searchSignal.connect(self._on_search_immediate)
+        bind_enter(self._search_bar, lambda: self._on_search_immediate(self._search_bar.text()))
         self._search_bar.clearSignal.connect(lambda: self._on_search_immediate(''))
-        self._donate_btn = PushButton(themed_icon('repacks.donate', FluentIcon.HEART), tr('repacks.donate_to_fitgirl'))
+        self._donate_btn = PushButton(_filled_heart_icon(), tr('repacks.donate_to_fitgirl'))
         apply_tool_button_theme(self._donate_btn)
-        apply_slot_icon_theme(self._donate_btn, 'repacks.donate', FluentIcon.HEART)
+        register_theme_refresh(self._donate_btn, lambda: self._donate_btn.setIcon(_filled_heart_icon()))
         self._donate_btn.clicked.connect(self._on_donate_clicked)
         self._upcoming_btn = PushButton(themed_icon('repacks.upcoming', FluentIcon.CALENDAR), tr('repacks.upcoming_repacks'))
         apply_tool_button_theme(self._upcoming_btn)
@@ -5314,6 +6855,8 @@ class RepacksPage(QWidget):
         self._refresh_btn.setToolTip(tr('repacks.refresh_tooltip'))
         self._refresh_btn.setFixedSize(32, 32)
         self._refresh_btn.clicked.connect(self._on_refresh_clicked)
+        self._dice_btn = _DiceButton(tr('repacks.random', default='Surprise me'), self)
+        self._dice_btn.clicked.connect(self._on_random_clicked)
         self._view_btn = ViewModeButton(parent=self, list_tip=tr('repacks.list_view', default='List view'),
                                         grid_tip=tr('repacks.grid_view', default='Grid view'))
         apply_tool_button_theme(self._view_btn)
@@ -5331,9 +6874,11 @@ class RepacksPage(QWidget):
         self._bookmarks_btn.setFixedSize(32, 32)
         self._bookmarks_btn.setCheckable(True)
         self._bookmarks_btn.clicked.connect(self._on_bookmarks_clicked)
-        self._discord_btn = PushButton(themed_icon('repacks.discord', FluentIcon.CHAT), tr('repacks.gog_discord'))
+        _discord_logo = _discord_logo_icon()
+        self._discord_btn = PushButton(_discord_logo or themed_icon('repacks.discord', FluentIcon.CHAT), tr('repacks.gog_discord'))
         apply_tool_button_theme(self._discord_btn)
-        apply_slot_icon_theme(self._discord_btn, 'repacks.discord', FluentIcon.CHAT)
+        if _discord_logo is None:
+            apply_slot_icon_theme(self._discord_btn, 'repacks.discord', FluentIcon.CHAT)
         self._discord_btn.clicked.connect(self._on_discord_clicked)
         search_row = QHBoxLayout()
         search_row.setContentsMargins(24, 0, 24, 0)
@@ -5346,6 +6891,15 @@ class RepacksPage(QWidget):
         search_row.addWidget(self._refresh_btn, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addWidget(self._view_btn, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addStretch(1)
+        self._tag_from_search = False
+        self._list_bars: dict[str, QWidget] = {}
+        self._list_buttons: dict[str, dict[str, tuple]] = {}
+        self._list_reset_btns: dict[str, TransparentToolButton] = {}
+        for source_key, groups in REPACK_LIST_MENUS.items():
+            bar = self._build_list_bar(source_key, groups)
+            self._list_bars[source_key] = bar
+            search_row.addWidget(bar, 0, Qt.AlignmentFlag.AlignRight)
+        search_row.addWidget(self._dice_btn, 0, Qt.AlignmentFlag.AlignRight)
         header_layout.addLayout(search_row)
         outer.addWidget(self._header)
         self._stack = QStackedWidget()
@@ -5426,14 +6980,85 @@ class RepacksPage(QWidget):
                 pass
         self.open_detail(entry, 'fitgirl')
 
+    _LIST_ICONS = {'collections': ('LIBRARY', 'TAG'), 'popular': ('PEOPLE', 'FLAG')}
+
+    def _build_list_bar(self, source_key: str, groups) -> QWidget:
+        bar = QWidget(self)
+        bar.setStyleSheet('background: transparent;')
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        buttons: dict[str, tuple] = {}
+        reset = TransparentToolButton(FluentIcon.CLOSE)
+        apply_tool_button_theme(reset)
+        reset.setFixedSize(32, 32)
+        reset.setToolTip(tr('repacks.list_reset', default='Back to latest repacks'))
+        reset.clicked.connect(lambda _c=False, k=source_key: self._on_list_chosen(k, None))
+        reset.setVisible(False)
+        row.addWidget(reset)
+        for group_id, group_label, entries in groups:
+            icon = _fluent_icon(*self._LIST_ICONS.get(group_id, ('TAG',)))
+            slot = f'repacks.list_{group_id}'
+            btn = PushButton(themed_icon(slot, icon), group_label)
+            apply_tool_button_theme(btn)
+            apply_slot_icon_theme(btn, slot, icon)
+            btn.clicked.connect(lambda _c=False, k=source_key, g=group_id: self._open_list_menu(k, g))
+            row.addWidget(btn)
+            buttons[group_id] = (btn, group_label, {lk for lk, _ in entries}, dict(entries))
+        self._list_buttons[source_key] = buttons
+        self._list_reset_btns[source_key] = reset
+        bar.setVisible(False)
+        return bar
+
+    def _open_list_menu(self, source_key: str, group_id: str) -> None:
+        btn, _label, _keys, names = self._list_buttons[source_key][group_id]
+        tab = self._tabs.get(source_key)
+        active = tab.active_list() if tab is not None else None
+        menu = _mica_menu(self)
+        for list_key, entry_label in names.items():
+            act = QAction(('\u2713  ' if list_key == active else '') + entry_label, menu)
+            act.triggered.connect(lambda _c=False, k=source_key, lk=list_key: self._on_list_chosen(k, lk))
+            menu.addAction(act)
+        menu.exec(btn.mapToGlobal(QPoint(0, btn.height() + 4)))
+
+    def _on_list_chosen(self, source_key: str, list_key) -> None:
+        tab = self._tabs.get(source_key)
+        if tab is None:
+            return
+        self._leave_bookmarks()
+        self._tag_from_search = False
+        self._search_debounce.stop()
+        if self._search_bar.text():
+            self._search_bar.clear()
+        tab.show_list(list_key)
+        if isinstance(list_key, str) and list_key.startswith('tag:'):
+            names = [n for n in list_key[4:].split(',') if n]
+            self._tag_from_search = True
+            self._search_bar.blockSignals(True)
+            self._search_bar.setText('tag:' + ', '.join(names))
+            self._search_bar.blockSignals(False)
+        self._update_list_buttons(source_key)
+
+    def _update_list_buttons(self, key: str) -> None:
+        for source_key, bar in self._list_bars.items():
+            bar.setVisible(source_key == key)
+        tab = self._tabs.get(key)
+        active = tab.active_list() if tab is not None else None
+        for group_id, (btn, label, keys, names) in self._list_buttons.get(key, {}).items():
+            btn.setToolTip(names[active] if active in keys else '')
+        reset = self._list_reset_btns.get(key)
+        if reset is not None:
+            reset.setVisible(bool(active))
+
     def _apply_locale(self, *_args) -> None:
         self._search_bar.setPlaceholderText(tr('repacks.search_placeholder'))
+        self._dice_btn.setToolTip(tr('repacks.random', default='Surprise me'))
         self._upcoming_btn.setText(tr('repacks.upcoming_repacks'))
         self._refresh_btn.setToolTip(tr('repacks.refresh_tooltip'))
         self._bookmarks_btn.setToolTip(tr('repacks.bookmarks_tooltip_count', count=bookmark_store().count()))
 
     def _on_global_theme_changed(self, *_args) -> None:
-        if getattr(self, '_repolish_pending', False):
+        if getattr(self, '_repolish_pending', False) or not self.isVisible():
             return
         self._repolish_pending = True
         QTimer.singleShot(0, self._repolish_subtree)
@@ -5479,6 +7104,32 @@ class RepacksPage(QWidget):
             if key:
                 self._pivot.setCurrentItem(key)
                 self._stack.setCurrentWidget(self._tabs[key])
+
+    def _leave_bookmarks(self) -> None:
+        if self._bookmarks_btn.isChecked():
+            self._on_bookmarks_back_clicked()
+
+    def _on_random_clicked(self) -> None:
+        if self._tabs.get(self._pivot.currentRouteKey()) is None:
+            return
+        self._leave_bookmarks()
+        tab = self._tabs.get(self._pivot.currentRouteKey())
+        if tab is not None:
+            tab.surprise_me()
+
+    def _on_random_busy(self, source_key: str, busy: bool) -> None:
+        if source_key == self._pivot.currentRouteKey():
+            self._dice_btn.set_busy(busy)
+
+    def _on_tags_retry(self, source_key: str, tags: list) -> None:
+        tab = self._tabs.get(source_key)
+        if tab is None:
+            return
+        self._tag_from_search = True
+        self._search_bar.blockSignals(True)
+        self._search_bar.setText('tag:' + ', '.join(tags))
+        self._search_bar.blockSignals(False)
+        tab.search_tags(tags)
 
     def _on_bookmarks_back_clicked(self) -> None:
         self._bookmarks_btn.setChecked(False)
@@ -5535,16 +7186,22 @@ class RepacksPage(QWidget):
             logger.exception('Failed to clear repacks cache on shutdown')
 
     def _on_tab_changed(self, key: str) -> None:
+        for other_key, other in self._tabs.items():
+            if other_key != key:
+                other.cancel_random()
+        self._dice_btn.set_busy(False)
         if self._bookmarks_btn.isChecked():
             self._bookmarks_btn.blockSignals(True)
             self._bookmarks_btn.setChecked(False)
             self._bookmarks_btn.blockSignals(False)
         self._switch_tab_animated(key)
         self._tabs[key].load_initial()
-        self._tabs[key].filter_grid(self._search_bar.text())
+        text = self._search_bar.text()
+        self._tabs[key].filter_grid('' if self._parse_tag_query(text) is not None else text)
         self._update_donate_button(key)
         self._update_upcoming_button(key)
         self._update_discord_button(key)
+        self._update_list_buttons(key)
 
     def open_detail(self, entry: 'RepackEntry', source_key: str='fitgirl') -> None:
         from src.core.config import is_tab_enabled
@@ -5557,6 +7214,7 @@ class RepacksPage(QWidget):
         self._update_donate_button(source_key)
         self._update_upcoming_button(source_key)
         self._update_discord_button(source_key)
+        self._update_list_buttons(source_key)
         if hasattr(tab, '_show_details'):
             tab._show_details(entry)
 
@@ -5633,12 +7291,10 @@ class RepacksPage(QWidget):
         current_key = self._pivot.currentRouteKey()
         if not current_key or current_key not in self._tabs:
             return
-        from src.core.repacks.base import clear_source_cache
         try:
-            clear_source_cache(current_key)
+            self._tabs[current_key].refresh()
         except Exception:
-            logger.exception('Failed to clear cache for %s during refresh', current_key)
-        self._tabs[current_key].refresh()
+            logger.exception('Failed to refresh repacks tab %r', current_key)
 
     def refresh_visible(self) -> None:
         try:
@@ -5673,18 +7329,64 @@ class RepacksPage(QWidget):
             except Exception:
                 logger.exception('Failed to prefetch upcoming repacks for %r', current_key)
 
+    _TAG_QUERY_RE = re.compile(r'^\s*tags?\s*[:\uff1a]\s*(.*)$', re.IGNORECASE | re.DOTALL)
+
+    @classmethod
+    def _parse_tag_query(cls, text: str):
+        match = cls._TAG_QUERY_RE.match(text or '')
+        if not match:
+            return None
+        seen: set = set()
+        tags: list = []
+        for part in re.split(r'[,;]+', match.group(1)):
+            tag = re.sub(r'\s+', ' ', part).strip()
+            if tag and tag.lower() not in seen:
+                seen.add(tag.lower())
+                tags.append(tag)
+        return tags
+
     def _on_search_text_changed(self, text: str) -> None:
         current_key = self._pivot.currentRouteKey()
-        if current_key in self._tabs:
-            self._tabs[current_key].filter_grid(text)
+        tab = self._tabs.get(current_key)
+        if tab is None:
+            return
+        if self._parse_tag_query(text) is not None:
+            return
+        if not text.strip() and self._tag_from_search:
+            self._on_list_chosen(current_key, None)
+            return
+        tab.filter_grid(text)
 
     def _on_search_immediate(self, text: str) -> None:
         self._search_debounce.stop()
-        self._on_search_text_changed(text)
+        tags = self._parse_tag_query(text)
+        if tags is None:
+            self._on_search_text_changed(text)
+            return
+        current_key = self._pivot.currentRouteKey()
+        tab = self._tabs.get(current_key)
+        if tab is None:
+            return
+        self._leave_bookmarks()
+        self._tag_from_search = True
+        tab.search_tags(tags)
+
+    def _on_tags_confirmed(self, source_key: str, tags: list) -> None:
+        self._update_list_buttons(source_key)
+        if not self._tag_from_search or self._parse_tag_query(self._search_bar.text()) is None:
+            return
+        self._search_bar.blockSignals(True)
+        self._search_bar.setText('tag:' + ', '.join(tags))
+        self._search_bar.blockSignals(False)
 
     def _add_source_tab(self, key: str, display_name: str) -> None:
         tab = SourceTab(key, display_name, self._manager, self)
         tab._details.banner_changed.connect(self._sync_top)
+        tab.random_busy.connect(lambda busy, k=key: self._on_random_busy(k, busy))
+        tab.tags_retry.connect(lambda tags, k=key: self._on_tags_retry(k, tags))
+        tab.tags_confirmed.connect(lambda tags, k=key: self._on_tags_confirmed(k, tags))
+        tab.tag_set_requested.connect(lambda names, k=key: self._on_list_chosen(k, ('tag:' + ','.join(names)) if names else None))
+        tab._details.tag_requested.connect(lambda tag, k=key: self._on_list_chosen(k, 'tag:' + tag))
         self._tabs[key] = tab
         self._view_btn.bind(tab._grid)
         self._tab_display_names[key] = display_name
@@ -5719,6 +7421,7 @@ class RepacksPage(QWidget):
         self._update_donate_button(current)
         self._update_upcoming_button(current)
         self._update_discord_button(current)
+        self._update_list_buttons(current)
 
     def _on_tab_visibility_changed(self, scope: str) -> None:
         if scope == 'repacks':
@@ -5770,6 +7473,219 @@ def _grid_colors() -> tuple[QColor, QColor, QColor]:
 def _inactive_dot_color() -> str:
     return _alpha_rgba('255,255,255' if isDarkTheme() else '0,0,0', 26)
 
+_EXCLUDE_COLOR = '#e5484d'
+
+def _exclude_color() -> QColor:
+    return QColor(str(palette().get('danger') or _EXCLUDE_COLOR))
+
+def split_tags(tags) -> tuple:
+    inc, exc = [], []
+    for t in tags or ():
+        t = (t or '').strip()
+        if t.startswith('-') and t[1:].strip():
+            exc.append(t[1:].strip())
+        elif t:
+            inc.append(t)
+    return inc, exc
+
+def join_tags(inc, exc) -> list:
+    return list(inc) + ['-' + n for n in exc]
+
+def norm_tag(t: str) -> str:
+    return re.sub(r'\W+', '', (t or '').lower())
+
+def partition_resolved(found, exc_wanted) -> tuple:
+    wanted = {norm_tag(n) for n in exc_wanted}
+    inc = [n for n in found if norm_tag(n) not in wanted]
+    return inc, [n for n in found if norm_tag(n) in wanted]
+
+def toggled_tags(selected, name: str, exclude: bool=False) -> list:
+    name = name.strip()
+    exclude = exclude or name.startswith('-')
+    base = name.lstrip('-').strip()
+    target = '-' + base if exclude else base
+    low = base.lower()
+    kept = [t for t in selected if t.strip().lstrip('-').strip().lower() != low]
+    return kept if any(t.strip().lower() == target.lower() for t in selected) else kept + [target]
+
+
+class _TagPickerView(FlyoutViewBase):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(260, 340)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        self.search = SearchLineEdit(self)
+        self.search.setPlaceholderText(tr('repacks.tag_search', default='Search genres'))
+        self.list = ListWidget(self)
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.list.setUniformItemSizes(True)
+        layout.addWidget(self.search)
+        layout.addWidget(self.list)
+        self._rows: list = []
+        self._sig = None
+        self._on_pick = None
+        self._on_exclude = None
+        self._flyout = None
+        self.search.textChanged.connect(self._filter)
+        self.list.itemClicked.connect(self._clicked)
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._right_clicked)
+
+    def load(self, names, selected, on_pick, on_exclude=None) -> None:
+        self._on_pick = on_pick
+        self._on_exclude = on_exclude
+        sig = hash(tuple(names))
+        if sig != self._sig:
+            self.list.setUpdatesEnabled(False)
+            self.list.clear()
+            self._rows = []
+            for name in names:
+                item = QListWidgetItem(name)
+                item.setData(Qt.ItemDataRole.UserRole, name)
+                item.setData(Qt.ItemDataRole.UserRole + 1, norm_tag(name))
+                self.list.addItem(item)
+                self._rows.append((item, name.strip().lower()))
+            self.list.setUpdatesEnabled(True)
+            self._sig = sig
+        inc, exc = split_tags(selected)
+        chosen = {t.lower() for t in inc}
+        dropped = {t.lower() for t in exc}
+        sel_sig = (frozenset(chosen), frozenset(dropped))
+        if sig == getattr(self, '_sel_sig_names', None) and sel_sig == getattr(self, '_sel_sig', None):
+            if self.search.text():
+                self.search.clear()
+            return
+        red = QBrush(_exclude_color())
+        for item, low in self._rows:
+            want = low in chosen
+            if item.isSelected() != want:
+                item.setSelected(want)
+            out = low in dropped
+            state = 'x' if out else ('o' if want else '')
+            if getattr(item, '_pira_tag_state', None) != state:
+                item._pira_tag_state = state
+                item.setForeground(red if out else QBrush())
+                font = item.font()
+                font.setStrikeOut(out)
+                item.setFont(font)
+        self._sel_sig = sel_sig
+        self._sel_sig_names = sig
+        if self.search.text():
+            self.search.clear()
+
+    def _filter(self, text: str) -> None:
+        query = norm_tag(text)
+        for item, _low in self._rows:
+            hidden = bool(query) and query not in (item.data(Qt.ItemDataRole.UserRole + 1) or '')
+            if item.isHidden() != hidden:
+                item.setHidden(hidden)
+
+    def _right_clicked(self, pos) -> None:
+        item = self.list.itemAt(pos)
+        if item is None or self._on_exclude is None:
+            return
+        if self._flyout is not None:
+            self._flyout.close()
+        self._on_exclude(item.data(Qt.ItemDataRole.UserRole))
+
+    def _clicked(self, item) -> None:
+        name = item.data(Qt.ItemDataRole.UserRole)
+        if self._flyout is not None:
+            self._flyout.close()
+        if self._on_pick is not None:
+            self._on_pick(name)
+
+
+def show_tag_menu(anchor, names, selected, on_pick, on_exclude=None) -> None:
+    view = getattr(anchor, '_tag_picker', None)
+    if view is None:
+        view = _TagPickerView()
+        anchor._tag_picker = view
+    view.load(names, selected, on_pick, on_exclude)
+    previous = view._flyout
+    flyout = Flyout.make(view, anchor, anchor.window(), FlyoutAnimationType.DROP_DOWN, isDeleteOnClose=False)
+    view._flyout = flyout
+    if previous is not None and previous is not flyout:
+        try:
+            previous.deleteLater()
+        except RuntimeError:
+            pass
+    view.search.setFocus()
+
+
+class _TagChip(PillPushButton):
+    def __init__(self, text: str, parent, on_remove):
+        super().__init__(parent)
+        self._excluded = text.startswith('-') and len(text) > 1
+        self._label = text[1:] if self._excluded else text
+        self.setChecked(True)
+        self.setCheckable(False)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        space = max(1, QFontMetrics(self.font()).horizontalAdvance('\u00a0'))
+        self.setText(self._label + '\u00a0' * (-(-24 // space)))
+        self._remove = TransparentToolButton(FluentIcon.CLOSE, self)
+        apply_tool_button_theme(self._remove)
+        self._remove.setFixedSize(18, 18)
+        self._remove.setIconSize(QSize(9, 9))
+        self._remove.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._remove.setToolTip(tr('repacks.tag_remove', default='Remove'))
+        self._remove.clicked.connect(lambda _c=False, t=text: on_remove(t))
+        register_theme_refresh(self, self._repolish)
+
+    def _repolish(self) -> None:
+        style = self.style()
+        style.unpolish(self)
+        style.polish(self)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        if not self._excluded:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        color = _exclude_color()
+        fill = QColor(color)
+        fill.setAlpha(48)
+        painter.setPen(QPen(color, 1))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+        font = self.font()
+        font.setStrikeOut(True)
+        painter.setFont(font)
+        painter.drawText(rect.adjusted(12, 0, -24, 0), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), self._label)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._remove.move(self.width() - 24, (self.height() - 18) // 2)
+
+
+class _EnterFilter(QObject):
+    def __init__(self, edit, fn):
+        super().__init__(edit)
+        self._fn = fn
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) \
+                and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self._fn()
+            return True
+        return False
+
+
+def bind_enter(edit, fn) -> None:
+    flt = _EnterFilter(edit, fn)
+    edit.installEventFilter(flt)
+    edit._enter_filter = flt
+
+
+def make_tag_chip(text: str, parent, on_remove) -> QWidget:
+    return _TagChip(text, parent, on_remove)
+
+
 def _mica_menu(parent=None):
     try:
         return RoundMenu(parent=parent)
@@ -5791,10 +7707,12 @@ def _sanitize_dirname(title: str) -> str:
     return name[:80] or 'Game'
 
 class GameInstallOptionsDialog(MessageBoxBase):
-    def __init__(self, details, setup_path: str='', parent=None):
+    def __init__(self, details, setup_path: str='', inspected: dict | None = None, parent=None):
         super().__init__(parent)
         self._details = details
-        if setup_path:
+        if inspected is not None:
+            self._inspected = inspected
+        elif setup_path:
             self._inspected = inspect_inno_setup(setup_path)
             if not self._inspected.get('available'):
                 logger.info('Install options: inspection unavailable for %s, using static options', setup_path)
@@ -5817,6 +7735,19 @@ class GameInstallOptionsDialog(MessageBoxBase):
         row.addWidget(self._dir_edit, 1)
         row.addWidget(browse)
         self.viewLayout.addLayout(row)
+        self._lang_combo = None
+        language_items = self._inspected.get('language_items') or []
+        if len(language_items) > 1:
+            lang_row = QHBoxLayout()
+            lang_row.addWidget(BodyLabel(tr('library.opt_language'), self))
+            self._lang_combo = ComboBox(self)
+            for item in language_items:
+                self._lang_combo.addItem(item.get('label') or item['name'], userData=item['name'])
+            default_index = next((i for i, item in enumerate(language_items)
+                                  if item['name'].lower().startswith('english')), 0)
+            self._lang_combo.setCurrentIndex(default_index)
+            lang_row.addWidget(self._lang_combo, 1)
+            self.viewLayout.addLayout(lang_row)
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
@@ -5915,6 +7846,22 @@ class GameInstallOptionsDialog(MessageBoxBase):
         local_selected = [name for name, c in self._local_checks if c.isChecked()]
         other_selected = [name for name, c in self._other_checks if c.isChecked()]
         inno = build_inno_selection(self._inspected, redist=self._chk_redist.isChecked(), verify=verify_checked, local_children=local_selected, other_selected=other_selected)
-        if self._inspected.get('types'):
-            inno['types'] = self._inspected['types'][0]
-        return {'title': title, 'enabled': self._chk_auto.isChecked(), 'scan_before': self._chk_scan_before.isChecked(), 'scan_after': self._chk_scan_after.isChecked(), 'install_dir': os.path.join(root, _sanitize_dirname(title)), 'options': {'ram2gb': self._chk_ram.isChecked(), 'directx': self._chk_redist.isChecked(), 'vcredist': self._chk_redist.isChecked(), 'startmenu': self._chk_sm.isChecked(), 'verify_installer': verify_checked, 'inno': inno}, 'size_bytes': parse_size_bytes(getattr(self._details, 'size_info', '') or '') or parse_size_bytes(str(extra.get('repack_size', ''))), 'cover_url': getattr(self._details, 'cover_url', '') or '', 'description': (getattr(self._details, 'description', '') or '')[:2500], 'screenshots': list(getattr(self._details, 'screenshot_urls', []) or [])[:4], 'metadata': {k: extra.get(k) for k in ('genres', 'company', 'languages', 'original_size', 'repack_size') if extra.get(k)}}
+        if self._inspected.get('available') and self._inspected.get('tasks'):
+            chosen_tasks = []
+            for task in self._inspected.get('tasks') or []:
+                kind = task.get('kind')
+                if kind == 'startmenu':
+                    enabled = self._chk_sm.isChecked()
+                elif kind == 'redist':
+                    enabled = self._chk_redist.isChecked()
+                elif kind == 'ram2gb':
+                    enabled = self._chk_ram.isChecked()
+                elif kind == 'desktopicon':
+                    enabled = True
+                else:
+                    enabled = bool(task.get('default_checked', True))
+                if enabled:
+                    chosen_tasks.append(task['name'])
+            inno['tasks'] = ','.join(chosen_tasks)
+        language = self._lang_combo.currentData() if self._lang_combo is not None else ''
+        return {'title': title, 'enabled': self._chk_auto.isChecked(), 'scan_before': self._chk_scan_before.isChecked(), 'scan_after': self._chk_scan_after.isChecked(), 'install_dir': os.path.join(root, _sanitize_dirname(title)), 'options': {'ram2gb': self._chk_ram.isChecked(), 'directx': self._chk_redist.isChecked(), 'vcredist': self._chk_redist.isChecked(), 'startmenu': self._chk_sm.isChecked(), 'verify_installer': verify_checked, 'language': language, 'inno': inno}, 'size_bytes': parse_size_bytes(getattr(self._details, 'size_info', '') or '') or parse_size_bytes(str(extra.get('repack_size', ''))), 'install_size_bytes': parse_size_bytes(str(extra.get('original_size', ''))) or 0, 'cover_url': getattr(self._details, 'cover_url', '') or '', 'description': (getattr(self._details, 'description', '') or '')[:2500], 'screenshots': list(getattr(self._details, 'screenshot_urls', []) or [])[:4], 'metadata': {k: extra.get(k) for k in ('genres', 'company', 'languages', 'original_size', 'repack_size') if extra.get(k)}}

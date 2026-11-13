@@ -21,7 +21,7 @@ from ..downloader import NET, Cancelled, HttpError, SegmentedDownload, new_sessi
 
 logger = logging.getLogger(__name__)
 
-_NS = "yt-v2"  # v2: manual-only subtitle metadata; invalidates stale cached caption data
+_NS = "yt-v2"
 _TTL = 1800
 _STALE_AFTER = 1500
 _WINDOW = 10 * 1024 * 1024
@@ -213,7 +213,6 @@ def _audio_tiers(formats: list[dict]) -> list[dict]:
 
 
 def _subtitle_map(raw: dict) -> dict[str, dict]:
-    """Manual captions only. Automatic captions trigger HTTP 429 on YouTube."""
     found: dict[str, dict] = {}
     for lang, variants in (raw.get("subtitles") or {}).items():
         if lang == "live_chat":
@@ -623,7 +622,6 @@ def _install_ffmpeg(on_progress: Callable[[int, int], None], is_cancelled: Optio
 
 def install_ffmpeg(on_progress: Callable[[int, int], None],
                    is_cancelled: Optional[Callable[[], bool]] = None) -> None:
-    """Install only ffmpeg/ffprobe into the managed tools folder."""
     os.makedirs(_dir(), exist_ok=True)
     _install_ffmpeg(on_progress, is_cancelled)
 

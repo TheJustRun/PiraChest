@@ -14,6 +14,32 @@ from src.core.cache import cache
 from src.core.worker import submit, Priority
 from .models import parse_nyaa_results, to_int
 
+import re as _tm_re
+import unicodedata as _tm_ud
+
+
+def _tm_fold(text: str) -> str:
+    plain = _tm_ud.normalize('NFKD', str(text or '').casefold())
+    plain = ''.join(c for c in plain if not _tm_ud.combining(c))
+    plain = plain.replace('&', ' and ').replace('+', ' and ').replace("'", '').replace('\u2019', '')
+    return ' '.join(_tm_re.sub(r'[^0-9a-z\u0400-\u04ff\u3040-\u30ff\u4e00-\u9fff]+', ' ', plain).split())
+
+
+def _tm_variants(query: str) -> list[str]:
+    q = ' '.join(str(query or '').split())
+    out: list[str] = []
+    if _tm_re.search(r'[&+]', q):
+        out.append(' '.join(_tm_re.sub(r'\s*[&+]\s*', ' and ', q).split()))
+    if _tm_re.search(r'\band\b', q, _tm_re.I):
+        out.append(_tm_re.sub(r'\band\b', '&', q, flags=_tm_re.I))
+    plain = _tm_fold(q)
+    out.append(plain)
+    if ' and ' in f' {plain} ':
+        out.append(' '.join(w for w in plain.split() if w != 'and'))
+    seen = {q}
+    return [v for v in out if v and not (v in seen or seen.add(v))]
+
+
 logger = logging.getLogger(__name__)
 
 API_BASE = "https://theblackholebay.lol/api"
@@ -351,7 +377,7 @@ def _nyaa_or_empty(query: str, use_cache: bool) -> list:
         return []
 
 
-def search_with_nyaa(query: str, category: int = 0, page: int = 0, use_cache: bool = True) -> dict:
+def _search_with_nyaa_once(query: str, category: int = 0, page: int = 0, use_cache: bool = True) -> dict:
     category = to_int(category)
     want_nyaa = page == 0 and category in (0, 200)
     nyaa_future = _executor.submit(_nyaa_or_empty, query, use_cache) if want_nyaa else None
@@ -372,6 +398,32 @@ def search_with_nyaa(query: str, category: int = 0, page: int = 0, use_cache: bo
         seen = {str(r.get("info_hash") or "").lower() for r in data["results"] if isinstance(r, dict)}
         data = {**data, "results": [*data["results"],
                                     *[r for r in extra if (r.get("info_hash") or "").lower() not in seen]]}
+    return data
+
+
+def search_with_nyaa(query: str, category: int = 0, page: int = 0, use_cache: bool = True) -> dict:
+    alts = _tm_variants(query) if page == 0 else []
+    error = None
+    try:
+        data = _search_with_nyaa_once(query, category, page, use_cache)
+        if data.get("results") or not alts:
+            return data
+    except TBHBError as exc:
+        if not alts or isinstance(exc, (TBHBBanned, TBHBRateLimited)):
+            raise
+        error, data = exc, {"results": []}
+    for alt in alts:
+        try:
+            found = _search_with_nyaa_once(alt, category, page, use_cache)
+        except TBHBBanned:
+            raise
+        except TBHBError as exc:
+            error = exc
+            continue
+        if found.get("results"):
+            return found
+    if error is not None and not data.get("results"):
+        raise error
     return data
 
 

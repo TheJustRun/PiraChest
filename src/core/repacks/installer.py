@@ -9,10 +9,10 @@ import subprocess
 import time
 from ctypes import wintypes
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QThread, QTimer, Signal
 
-from . import (_slugify, delete_lnk, fallback_exe, find_game_shortcut,
-               _library_dir, remember_install_dir, upsert_game)
+from . import (_slugify, default_install_dir, delete_lnk, fallback_exe,
+               find_game_shortcut, _library_dir, remember_install_dir, upsert_game)
 
 logger = logging.getLogger(__name__)
 
@@ -114,20 +114,26 @@ def parse_size_bytes(text: str) -> int:
 
 
 def build_fitgirl_switches(options: dict, install_dir: str) -> list:
-    tasks = ['desktopicon']
-    if options.get('startmenu'):
-        tasks.append(_FITGIRL_TASKS['startmenu'])
-    if options.get('directx'):
-        tasks.append(_FITGIRL_TASKS['directx'])
-    if options.get('vcredist'):
-        tasks.append(_FITGIRL_TASKS['vcredist'])
-    if options.get('ram2gb'):
-        tasks.append(_FITGIRL_TASKS['ram2gb'])
-    args = ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
-            f'/DIR={install_dir}', '/TASKS=' + ','.join(tasks)]
-
-
     inno = options.get('inno') or {}
+    tasks = inno.get('tasks')
+    if not isinstance(tasks, str):
+        fallback = ['desktopicon']
+        if options.get('startmenu'):
+            fallback.append(_FITGIRL_TASKS['startmenu'])
+        if options.get('directx'):
+            fallback.append(_FITGIRL_TASKS['directx'])
+        if options.get('vcredist'):
+            fallback.append(_FITGIRL_TASKS['vcredist'])
+        if options.get('ram2gb'):
+            fallback.append(_FITGIRL_TASKS['ram2gb'])
+        tasks = ','.join(fallback)
+    args = ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
+            '/CLOSEAPPLICATIONS', f'/DIR={install_dir}',
+            '/TASKS=' + tasks]
+
+    language = (options.get('language') or inno.get('language') or '').strip()
+    if language:
+        args.append('/LANG=' + language)
     if inno.get('types'):
         args.append('/TYPE=' + inno['types'])
     if inno.get('components'):
@@ -141,7 +147,7 @@ _SECTION_RE = re.compile(r'^\[(\w+)\]\s*$')
 _KV_RE = re.compile(r'^\s*([A-Za-z]+)\s*:\s*(.*?)\s*$')
 
 
-_REDIST_TOKENS = ('directx', 'vc_2022_x86', 'vc_2022_x64', 'vcredist', 'vc_redist', 'vc_20', 'msvc', 'visualcplusplus')
+_REDIST_TOKENS = ('directx', 'vc_2022_x86', 'vc_2022_x64', 'vcredist', 'vc_redist', 'vc_20', 'msvc', 'visualcplusplus', 'visual c++')
 _VERIFY_TOKENS = ('quicksfv', 'verify', 'checksum', 'md5')
 _LOCAL_TOKEN = 'local'
 _LANGUAGE_HINTS = ('speech', 'voice', 'voiceover', 'audio', 'dub', 'lang', 'text', 'subtitle',
@@ -221,7 +227,8 @@ def _parse_inno_kv_block(lines: list, start: int) -> tuple:
 
 def _parse_inno_script(text: str) -> dict:
     lines = text.replace('\r\n', '\n').split('\n')
-    sections: dict = {'Types': [], 'Components': [], 'Run': [], 'Files': []}
+    sections: dict = {'Types': [], 'Components': [], 'Tasks': [], 'Languages': [],
+                      'Run': [], 'Files': []}
     i = 0
     while i < len(lines):
         m = _SECTION_RE.match(lines[i].strip())
@@ -313,9 +320,22 @@ def _classify_component(name: str) -> str:
     return 'other'
 
 
+def _classify_task(rec: dict) -> str:
+    blob = f"{rec.get('name', '')} {rec.get('description', '')}".lower()
+    if 'start' in blob and 'menu' in blob:
+        return 'startmenu'
+    if 'desktop' in blob:
+        return 'desktopicon'
+    if any(tok in blob for tok in _REDIST_TOKENS):
+        return 'redist'
+    if '2gb' in blob or '2 gb' in blob or 'ram' in blob:
+        return 'ram2gb'
+    return 'other'
+
+
 def inspect_inno_setup(setup_path: str) -> dict:
-    result = {'available': False, 'types': [], 'redist': None, 'verify': None,
-              'local': None, 'other': [], 'raw': {}}
+    result = {'available': False, 'types': [], 'languages': [], 'language_items': [],
+              'tasks': [], 'redist': None, 'verify': None, 'local': None, 'other': [], 'raw': {}}
     if not setup_path or not os.path.isfile(setup_path):
         logger.warning('inspect_inno_setup: setup_path missing or not a file: %r', setup_path)
         return result
@@ -344,13 +364,15 @@ def inspect_inno_setup(setup_path: str) -> dict:
 
     def _default_checked(rec: dict) -> bool:
         flags = (rec.get('flags', '') or '').lower()
-        if 'unchecked' in flags:
+        if 'unchecked' in flags or 'excluded' in flags:
             return False
+        if 'fixed' in flags:
+            return True
         types_field = (rec.get('types') or '').strip()
         if not types_field:
-            return False
+            return True
         rec_types = {t.strip() for t in types_field.split() if t.strip()}
-        return bool(default_type) and default_type in rec_types
+        return not default_type or default_type in rec_types
 
     redist_names, verify_names = [], []
     local_by_name: dict = {}
@@ -376,7 +398,7 @@ def inspect_inno_setup(setup_path: str) -> dict:
             is_core = bool(type_names) and rec_types >= type_names
             flags = (rec.get('flags', '') or '').lower()
             entry = {'name': name, 'description': rec.get('description', name),
-                     'required': flags == 'fixed' or is_core,
+                     'required': 'fixed' in flags.split() or is_core,
                      'default_checked': _default_checked(rec)}
             prev = other_by_name.get(name)
             if prev is None or lang in ('', 'en'):
@@ -392,7 +414,9 @@ def inspect_inno_setup(setup_path: str) -> dict:
         is_group = _has_local_children(name, local_names)
         ancestor = _nearest_named_local_ancestor(name, local_names)
         ancestor_rec = local_by_name.get(ancestor) if ancestor and ancestor.lower() != _LOCAL_TOKEN else None
+        under_local = name.lower().startswith((_LOCAL_TOKEN + '\\', _LOCAL_TOKEN + '/'))
         lang_related = (_is_language_related(name, rec['description'])
+                        or under_local
                         or (ancestor_rec is not None
                             and _is_language_related(ancestor, ancestor_rec['description'])))
         if is_group:
@@ -426,6 +450,25 @@ def inspect_inno_setup(setup_path: str) -> dict:
         result['local'] = {'children': [it['name'] for it in lang_items],
                            'items': lang_items, 'groups': lang_groups}
     result['other'] = other
+
+    language_items = []
+    for rec in sections.get('Languages', []):
+        name = (rec.get('name') or '').strip()
+        if name:
+            label = (rec.get('description') or '').strip() or name.replace('_', ' ').title()
+            language_items.append({'name': name, 'label': label})
+    result['languages'] = [it['name'] for it in language_items]
+    result['language_items'] = language_items
+
+    task_items = []
+    for rec in sections.get('Tasks', []):
+        name = (rec.get('name') or '').strip()
+        if name:
+            task_items.append({'name': name,
+                               'description': (rec.get('description') or name).strip(),
+                               'kind': _classify_task(rec),
+                               'default_checked': _default_checked(rec)})
+    result['tasks'] = task_items
     return result
 
 
@@ -754,6 +797,15 @@ def _set_process_tree_mute(root_pid: int, mute: bool) -> None:
     t.join(timeout=1.0)
 
 
+def _auto_install_allowed() -> bool:
+    try:
+        from src.core.config import settings
+    except Exception:
+        return False
+    return bool(getattr(settings, 'auto_install_games', False)) and bool(
+        getattr(settings, 'experimental_acknowledged', False))
+
+
 class FitGirlInstallWorker(QThread):
     progress = Signal(int, str)
     succeeded = Signal(object)
@@ -769,14 +821,16 @@ class FitGirlInstallWorker(QThread):
         self._cancel = True
 
     def _minimal(self, install_dir: str) -> list:
-        return ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/LANG=english', f'/DIR={install_dir}']
+        return ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
+                '/CLOSEAPPLICATIONS', f'/DIR={install_dir}']
 
     def _start(self, setup_path: str, args: list, install_dir: str):
+        workdir = os.path.dirname(setup_path) or install_dir
         if os.name == 'nt':
-            return _launch_elevated(setup_path, args, cwd=install_dir)
-        return subprocess.Popen([setup_path] + args, cwd=os.path.dirname(setup_path) or None, **_popen_kwargs())
+            return _launch_elevated(setup_path, args, cwd=workdir)
+        return subprocess.Popen([setup_path] + args, cwd=workdir, **_popen_kwargs())
 
-    def _run_scan(self, root: str, label: str) -> bool:
+    def _run_scan(self, root: str, label: str, fatal: bool = True) -> bool:
         self.progress.emit(-1, f'{label}: scanning…')
         result = verify_repack(
             root,
@@ -794,16 +848,18 @@ class FitGirlInstallWorker(QThread):
         else:
             self.progress.emit(-1, f'{label}: {result.summary()}')
         if result.missing:
-            self.failed.emit(f'{label} found {len(result.missing)} missing file(s); the download is incomplete')
-            return False
+            message = f'{label} found {len(result.missing)} missing file(s)'
+            if fatal:
+                self.failed.emit(f'{message}; the download is incomplete')
+                return False
+            self.progress.emit(-1, f'{message} — continuing')
         return True
 
     def run(self):
         spec = self._spec
         install_dir = os.path.abspath(spec['install_dir'])
         self.progress.emit(-1, 'Locating installer…')
-        min_mtime = spec.get('queued_at', 0.0) - 10
-        setup_path = find_setup_exe_polling(self._roots, min_mtime, 120.0, should_cancel=lambda: self._cancel)
+        setup_path = find_setup_exe_polling(self._roots, 0.0, 120.0, should_cancel=lambda: self._cancel)
         if self._cancel:
             self.failed.emit('Installation cancelled')
             return
@@ -823,7 +879,7 @@ class FitGirlInstallWorker(QThread):
             self.failed.emit(f'Cannot create install directory: {exc}')
             return
         minimal = self._minimal(install_dir)
-        attempts = [minimal + build_fitgirl_switches(spec.get('options', {}), install_dir)[3:], minimal]
+        attempts = [build_fitgirl_switches(spec.get('options', {}), install_dir), minimal]
         code = None
         muted_pid = 0
         try:
@@ -850,7 +906,8 @@ class FitGirlInstallWorker(QThread):
                         return
                     if time.time() - last >= 3.0:
                         last = time.time()
-                        done, expected = installed_size(install_dir), spec.get('size_bytes') or 0
+                        done = installed_size(install_dir)
+                        expected = (spec.get('install_size_bytes') or 0) or (spec.get('size_bytes') or 0)
                         pct = int(min(96, done / expected * 94)) + 2 if expected > 0 else -1
                         self.progress.emit(pct, f'Extracting game files…   {done / (1 << 30):.1f} GB')
                         if muted_pid:
@@ -874,7 +931,7 @@ class FitGirlInstallWorker(QThread):
             _kill_bundled_verifier(install_dir)
 
         if spec.get('scan_after'):
-            self._run_scan(install_dir, 'Post-install scan')
+            self._run_scan(install_dir, 'Post-install scan', fatal=False)
 
         self.progress.emit(97, 'Detecting game shortcut…')
         shortcut = find_game_shortcut(install_dir, spec['title'], since_ts=self._t_start - 5, timeout_s=15)
@@ -910,6 +967,7 @@ class FitGirlInstallWorker(QThread):
 
 
 class InstallCoordinator(QObject):
+    install_queued = Signal(str)
     install_started = Signal(dict)
     install_progress = Signal(str, int, str)
     install_succeeded = Signal(object)
@@ -918,6 +976,7 @@ class InstallCoordinator(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pending: dict = {}
+        self._queue: list = []
         self._worker: FitGirlInstallWorker | None = None
         self._manager = None
 
@@ -945,6 +1004,16 @@ class InstallCoordinator(QObject):
                 self._pending = json.load(fh) or {}
         except Exception:
             self._pending = {}
+        for item_id, spec in list(self._pending.items()):
+            if not spec.get('enabled'):
+                continue
+            item = manager.get(item_id)
+            state = getattr(item, 'state', None)
+            state_name = getattr(state, 'value', str(state or ''))
+            complete = state_name in ('completed', 'seeding') or (
+                item is not None and float(getattr(item, 'progress', 0.0) or 0.0) >= 99.9)
+            if complete:
+                QTimer.singleShot(1500, lambda i=item_id: self.on_download_completed(i, ''))
 
     def register_pending(self, item_id: str, spec: dict):
         spec = dict(spec)
@@ -960,6 +1029,10 @@ class InstallCoordinator(QObject):
         spec = self._pending.pop(item_id, None)
         self._save_pending()
         if not spec or not spec.get('enabled'):
+            return
+        if not _auto_install_allowed():
+            logger.warning('Skipping auto-install for %r: automatic installs are disabled',
+                           spec.get('title') or game_name or item_id)
             return
         roots = self._collect_roots(item_id)
         self.start_install(spec, roots)
@@ -993,13 +1066,14 @@ class InstallCoordinator(QObject):
         return unique
 
     def is_busy(self) -> bool:
-        return self._worker is not None and self._worker.isRunning()
+        return self._worker is not None
 
     def cancel(self):
         if self._worker is not None:
             self._worker.cancel()
 
     def shutdown(self, wait_ms: int = 3000):
+        self._queue.clear()
         worker = self._worker
         if worker is None:
             return
@@ -1016,28 +1090,39 @@ class InstallCoordinator(QObject):
             self._worker = None
 
     def start_install(self, spec: dict, roots: list):
-        if self.is_busy():
-            self.install_failed.emit(spec['title'], 'Another installation is already running')
+        if self._worker is not None:
+            self._queue.append((dict(spec), list(roots)))
+            self.install_queued.emit(spec.get('title') or 'Game')
             return
+        self._launch(spec, roots)
+
+    def _launch(self, spec: dict, roots: list):
         try:
             remember_install_dir(os.path.dirname(spec['install_dir']))
         except Exception:
             pass
-        self._worker = FitGirlInstallWorker(spec, roots)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._worker.finished.connect(lambda w=self._worker: self._on_worker_finished(w))
-        self._worker.progress.connect(lambda p, s, t=spec['title']: self.install_progress.emit(t, p, s))
-        self._worker.succeeded.connect(self._on_done)
-        self._worker.failed.connect(lambda msg, t=spec['title']: self.install_failed.emit(t, msg))
+        worker = FitGirlInstallWorker(spec, roots)
+        self._worker = worker
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda w=worker: self._on_worker_finished(w))
+        worker.progress.connect(lambda p, s, t=spec['title']: self.install_progress.emit(t, p, s))
+        worker.succeeded.connect(self._on_done)
+        worker.failed.connect(lambda msg, t=spec['title']: self.install_failed.emit(t, msg))
         self.install_started.emit(spec)
-        self._worker.start()
+        worker.start()
 
     def _on_worker_finished(self, worker):
         if self._worker is worker:
             self._worker = None
+        QTimer.singleShot(0, self._start_next)
+
+    def _start_next(self):
+        if self._worker is not None or not self._queue:
+            return
+        spec, roots = self._queue.pop(0)
+        self._launch(spec, roots)
 
     def _on_done(self, record):
-        self._worker = None
         self.install_succeeded.emit(record)
 
 

@@ -131,7 +131,6 @@ class RealDebridProvider(DebridProvider):
             if len(urls) == len(selected):
                 by_index = dict(zip(selected, urls))
         if not by_index:
-            # Real-Debrid packs non-video selections into a single archive link.
             if len(urls) == 1:
                 link = self._unrestrict(files[0].path, urls[0], sum(int(item.size or 0) for item in files))
                 if self._is_archive_link(link) and (

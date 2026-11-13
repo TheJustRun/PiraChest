@@ -1,17 +1,36 @@
 import os
+import sys
 
 from PyInstaller.utils.hooks import collect_data_files
+
+sys.path.insert(0, os.path.abspath(os.getcwd()))
+from src.core.config import APP_NAME, ICON_FILE, SLUG
+from tools.version_info import write_version_file
+
+def _assets(source, target):
+    """Copy runtime assets only: Python sources already live in the PYZ."""
+    items = []
+    for root, dirs, names in os.walk(source):
+        dirs[:] = [d for d in dirs if d != '__pycache__']
+        rel = os.path.relpath(root, source)
+        dest = target if rel == '.' else os.path.join(target, rel)
+        for name in names:
+            if name.endswith(('.py', '.pyc', '.pyo')):
+                continue
+            items.append((os.path.join(root, name), dest))
+    return items
+
 
 datas = [
     # src/core includes the Node bridge scripts and the vendored Vyla SDK.
     # Node.js itself is provisioned on demand into the user data folder
     # (runtime/node), and npm dependencies are installed next to
     # integrations/vyla so the SDK resolves them from an ancestor folder.
-    ('src/gui', 'src/gui'),
-    ('src/core', 'src/core'),
     ('VERSION', '.'),
     ('LICENSE', '.'),
 ]
+datas += _assets('src/gui', 'src/gui')
+datas += _assets('src/core', 'src/core')
 datas += collect_data_files(
     'qfluentwidgets',
     excludes=['_rc/i18n', '_rc/js'],
@@ -95,7 +114,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='PiraChest',
+    name=APP_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -106,7 +125,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['src/gui/photos/icon.ico'],
+    icon=[f'src/gui/photos/{ICON_FILE}'],
+    version=write_version_file(os.path.join(SPECPATH, 'build', 'version_info.txt')),
 )
 coll = COLLECT(
     exe,
@@ -115,5 +135,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='PiraChest',
+    name=SLUG,
 )

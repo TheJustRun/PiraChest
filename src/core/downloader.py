@@ -8,22 +8,25 @@ import ipaddress
 import json
 import logging
 import os
+import random
 import re
 import shutil
+import socket
 import struct
 import sys
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any, Callable, Optional
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal
 
-from src.core.config import libtorrent_defaults, network, paths, save_settings, settings
+from src.core.config import free_space_bytes, libtorrent_defaults, network, paths, save_settings, settings
 from src.core.debrid import DebridError, DebridService, configured as debrid_configured
 from src.core.debrid.archive import ArchiveError, extract_archive
 from src.core.minerva.rom_extract import extract_rom_archives
@@ -85,6 +88,67 @@ _LEGACY_SESSION_SETTINGS = {
 _STALL_REANNOUNCE = 8
 _STALL_SCRAPE = 30
 _STALL_RETRY = 75
+_MAGIC = b"GHD2"
+_HIST = 3600
+_VALID: Optional[frozenset] = None
+
+
+def _tag(source: str) -> str:
+    return hashlib.sha1(source.encode("utf-8", "ignore")).hexdigest()[:8]
+
+
+def _host(url: str) -> str:
+    try:
+        return urlsplit(url).hostname or ""
+    except ValueError:
+        return ""
+
+
+def _known(pack: dict[str, Any]) -> dict[str, Any]:
+    global _VALID
+    if _VALID is None:
+        try:
+            _VALID = frozenset(lt.default_settings())
+        except Exception:
+            _VALID = frozenset()
+    return {k: v for k, v in pack.items() if k in _VALID} if _VALID else pack
+
+
+def _retry_after(value: Optional[str]) -> float:
+    try:
+        return min(60.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        return min(60.0, max(0.0, email.utils.parsedate_to_datetime(value).timestamp() - time.time()))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _peer_flags(f: int) -> str:
+    try:
+        info = lt.peer_info
+        has = lambda name: bool(f & getattr(info, name, 0))
+        out = ""
+        if has("interesting"):
+            out += "d" if has("remote_choked") else "D"
+        if has("remote_interested"):
+            out += "u" if has("choked") else "U"
+        if has("optimistic_unchoke"):
+            out += "O"
+        if has("snubbed"):
+            out += "S"
+        if not has("local_connection"):
+            out += "I"
+        if has("utp_socket"):
+            out += "P"
+        if has("rc4_encrypted") or has("plaintext_encrypted"):
+            out += "E"
+        if has("holepunched"):
+            out += "H"
+        return out
+    except Exception:
+        return ""
 
 
 def _peer_fingerprint() -> str:
@@ -128,6 +192,7 @@ PERMANENT = frozenset({400, 401, 403, 404, 405, 410, 451})
 _RECORD = struct.Struct("<QQQ")
 _NAME_RE = re.compile(r"filename\*=(?:UTF-8\'\')?([^;]+)|filename=\"?([^\";]+)\"?", re.IGNORECASE)
 _META_CACHE = 32
+_MAX_TORRENT = 32 << 20
 _NORMAL, _TOP = 4, 7
 
 
@@ -263,6 +328,8 @@ def _file_flags(fs, i: int) -> int:
 
 def _validate_ti(ti, save_path: str, sel: Optional[list[int]] = None) -> None:
     fs, seen = ti.files(), set()
+    if fs.num_files() > 100_000 or ti.total_size() > 1 << 50:
+        raise RuntimeError("Torrent is unreasonably large")
     for i in range(fs.num_files()):
         if _bad_torrent_path(fs.file_path(i)):
             raise RuntimeError("Torrent contains an unsafe file path")
@@ -287,6 +354,7 @@ def _secs(x) -> int:
 
 def _scrub(text: str) -> str:
     text = re.sub(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@", r"\1***@", str(text))
+    text = re.sub(r"(?i)\b(https?://[^\s?#'\"]+)[?#][^\s'\")]*", r"\1?***", text)
     home = os.path.expanduser("~")
     return text.replace(home, "~") if len(home) > 3 else text
 
@@ -297,7 +365,7 @@ def category_dir(category: str) -> str:
 
 
 def _base_dir(item: "DownloadItem") -> str:
-    return os.path.join(category_dir(item.category), to_safe_name(item.console, "") if item.console else "")
+    return os.path.join(item.save_dir or category_dir(item.category), to_safe_name(item.console, "") if item.console else "")
 
 
 def _game_dir(item: "DownloadItem") -> str:
@@ -336,6 +404,106 @@ class Cancelled(Exception):
     pass
 
 
+class DiskSpaceError(RuntimeError):
+    pass
+
+
+def _reserve() -> int:
+    return max(0, int(getattr(settings, "min_free_space_mb", 512))) << 20
+
+
+def _vol(path: str) -> int:
+    p = os.path.abspath(path)
+    while not os.path.exists(p) and (q := os.path.dirname(p)) != p:
+        p = q
+    try:
+        return os.stat(p).st_dev
+    except OSError:
+        return 0
+
+
+def ensure_space(path: str, need: int, pending: int = 0) -> None:
+    if need <= 0 or (free := free_space_bytes(path)) is None:
+        return
+    keep = _reserve()
+    if free - pending - keep < need:
+        raise DiskSpaceError(f"Not enough disk space: {human_bytes(need)} needed, {human_bytes(max(free - pending, 0))} free"
+                             + (f" ({human_bytes(keep)} kept in reserve)" if keep else ""))
+
+
+def _private(host: str) -> bool:
+    try:
+        ips = [ipaddress.ip_address(host)]
+    except ValueError:
+        if NET.has_proxy:
+            return host.lower() == "localhost" or host.lower().endswith(".local")
+        try:
+            ips = [ipaddress.ip_address(a[4][0].split("%")[0]) for a in socket.getaddrinfo(host, None)]
+        except (OSError, ValueError):
+            return False
+    return any(not ip.is_global for ip in ips)
+
+
+def _redirect_guard(r, *_args, **_kwargs):
+    if r.is_redirect:
+        here, target = urlsplit(r.url), urlsplit(urljoin(r.url, r.headers.get("Location", "")))
+        if target.scheme not in ("http", "https") or not target.hostname:
+            raise HttpError("Blocked a redirect to an unsupported address")
+        if here.scheme == "https" and target.scheme == "http":
+            raise HttpError("Blocked a redirect from HTTPS to HTTP")
+        if _private(target.hostname) and not _private(here.hostname or ""):
+            raise HttpError("Blocked a redirect to a local network address")
+    return r
+
+
+def _check_url(url: str) -> None:
+    if not url.lower().startswith(("http://", "https://")) or not _host(url):
+        raise HttpError("Only valid http:// and https:// links are supported")
+
+
+def _unique(path: str) -> str:
+    root, ext = os.path.splitext(path)
+    out, n = path, 0
+    while os.path.exists(out):
+        n += 1
+        out = f"{root} ({n}){ext}"
+    return out
+
+
+def _valid_torrent(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(1) == b"d"
+    except OSError:
+        return False
+
+
+def parse_checksum(spec: str) -> str:
+    algo, _, digest = spec.strip().lower().rpartition(":")
+    algo = algo or {32: "md5", 40: "sha1", 64: "sha256", 128: "sha512"}.get(len(digest), "")
+    try:
+        ok = bool(re.fullmatch(r"[0-9a-f]+", digest)) and hashlib.new(algo).digest_size * 2 == len(digest)
+    except (ValueError, TypeError):
+        ok = False
+    return f"{algo}:{digest}" if ok else ""
+
+
+def _verify_hash(path: str, spec: str, cancel: threading.Event) -> None:
+    algo, _, digest = (parse_checksum(spec) or ":").partition(":")
+    if not algo:
+        raise HttpError("Unsupported checksum format")
+    h = hashlib.new(algo)
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            if cancel.is_set():
+                raise Cancelled()
+            h.update(chunk)
+    if h.hexdigest() != digest:
+        with suppress(OSError):
+            os.remove(path)
+        raise HttpError("Checksum mismatch; the corrupt file was deleted")
+
+
 class RateLimiter:
     def __init__(self, bytes_per_sec: int = 0):
         self._rate = bytes_per_sec
@@ -365,6 +533,7 @@ class Probe:
     ranged: bool
     name: str
     last_modified: str
+    etag: str = ""
 
 
 @dataclass
@@ -400,10 +569,14 @@ def new_session(connections: int, headers: Optional[dict] = None) -> Any:
     if msg := NET.leak_guard():
         raise HttpError(msg)
     session = requests.Session()
+    session.max_redirects = 10
+    session.hooks["response"].append(_redirect_guard)
     adapter = _Adapter(connections, NET.bind_ip())
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.headers.update({"Accept-Encoding": "identity", "User-Agent": "Mozilla/5.0" if NET.anonymous else _UA, **(headers or {})})
+    if NET.anonymous:
+        session.trust_env = False
     if NET.has_proxy:
         if NET.proxy_type == "socks5" and importlib.util.find_spec("socks") is None:
             raise HttpError("SOCKS proxy for direct downloads needs 'pip install requests[socks]'")
@@ -412,7 +585,7 @@ def new_session(connections: int, headers: Optional[dict] = None) -> Any:
     return session
 
 
-def probe(session: Any, url: str, timeout: float = 20.0) -> Probe:
+def _probe_once(session: Any, url: str, timeout: float) -> Probe:
     with session.get(url, headers={"Range": "bytes=0-0"}, stream=True, timeout=timeout) as r:
         if r.status_code >= 400:
             raise HttpError(f"HTTP {r.status_code}")
@@ -426,7 +599,25 @@ def probe(session: Any, url: str, timeout: float = 20.0) -> Probe:
         match = _NAME_RE.search(r.headers.get("Content-Disposition", ""))
         name = unquote((match.group(1) or match.group(2)).strip()) if match else ""
         name = name or unquote(os.path.basename(urlsplit(r.url).path))
-        return Probe(r.url, size, ranged, to_safe_name(name), r.headers.get("Last-Modified", ""))
+        if (r.headers.get("Content-Type", "").lower().startswith("text/html") and "attachment" not in r.headers.get("Content-Disposition", "").lower()
+                and not name.lower().endswith((".htm", ".html"))):
+            raise HttpError("The link returned a web page instead of a file")
+        return Probe(r.url, size, ranged, to_safe_name(name), r.headers.get("Last-Modified", ""), r.headers.get("ETag", ""))
+
+
+def probe(session: Any, url: str, timeout: float = 20.0) -> Probe:
+    import requests
+    _check_url(url)
+    for attempt in range(3):
+        try:
+            return _probe_once(session, url, timeout)
+        except requests.RequestException:
+            if attempt == 2:
+                raise
+        except HttpError as exc:
+            if attempt == 2 or not str(exc).startswith(("HTTP 429", "HTTP 5")):
+                raise
+        time.sleep(1.5 * (attempt + 1))
 
 
 class SegmentedDownload:
@@ -443,6 +634,7 @@ class SegmentedDownload:
         info: Optional[Probe] = None,
     ):
         self.path = path
+        self._part = path + ".part"
         self.total = 0
         self._url = url
         self._record = path + ".ghd"
@@ -457,6 +649,7 @@ class SegmentedDownload:
         self._segments: list[_Segment] = []
         self._errors: list[BaseException] = []
         self._ranged = False
+        self._validator = b""
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -472,12 +665,15 @@ class SegmentedDownload:
         self._url = info.url
         self.total = info.size
         self._ranged = info.ranged
+        self._validator = (info.etag or info.last_modified).encode("utf-8", "ignore")[:512]
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        resumed = self._ranged and os.path.exists(self.path) and self._load_record(info.size)
+        have = os.path.getsize(self._part) if os.path.isfile(self._part) else 0
+        resumed = self._ranged and have == info.size and self._load_record(info.size)
         if not resumed:
+            ensure_space(self.path, info.size - have)
             self._remove_record()
             self._segments = self._plan(info)
-            with open(self.path, "wb") as f:
+            with open(self._part, "wb") as f:
                 if info.size:
                     f.truncate(info.size)
         pending = [s for s in self._segments if s.end < 0 or s.pos <= s.end]
@@ -497,6 +693,18 @@ class SegmentedDownload:
         if self._cancel.is_set():
             self._save_record()
             raise Cancelled()
+        got = os.path.getsize(self._part)
+        if info.size and got != info.size:
+            self._remove_record()
+            raise HttpError(f"Incomplete download: received {got} of {info.size} bytes")
+        for attempt in range(5):
+            try:
+                os.replace(self._part, self.path)
+                break
+            except OSError as exc:
+                if attempt == 4:
+                    raise HttpError(f"Could not finalize the file: {exc}") from exc
+                time.sleep(0.5)
         self._remove_record()
         if info.last_modified:
             try:
@@ -517,10 +725,17 @@ class SegmentedDownload:
     def _load_record(self, size: int) -> bool:
         try:
             with open(self._record, "rb") as f:
-                segments = [_Segment(s, e, p) for s, p, e in _RECORD.iter_unpack(f.read())]
-        except (OSError, struct.error):
+                raw = f.read()
+        except OSError:
             return False
-        if not segments or max(s.end for s in segments) != size - 1:
+        if len(raw) < 6 or raw[:4] != _MAGIC:
+            return False
+        vlen = struct.unpack_from("<H", raw, 4)[0]
+        body = raw[6 + vlen:]
+        if raw[6:6 + vlen] != self._validator or len(body) % _RECORD.size:
+            return False
+        segments = [_Segment(s, e, p) for s, p, e in _RECORD.iter_unpack(body)]
+        if not segments or max(s.end for s in segments) != size - 1 or any(s.pos < s.start for s in segments):
             return False
         self._segments = segments
         return True
@@ -529,7 +744,8 @@ class SegmentedDownload:
         if not self._ranged:
             return
         with self._lock:
-            payload = b"".join(_RECORD.pack(s.start, s.pos, s.end) for s in self._segments)
+            body = b"".join(_RECORD.pack(s.start, s.pos, s.end) for s in self._segments)
+        payload = _MAGIC + struct.pack("<H", len(self._validator)) + self._validator + body
         tmp = self._record + ".tmp"
         try:
             with open(tmp, "wb") as f:
@@ -546,10 +762,11 @@ class SegmentedDownload:
                 pass
 
     def _bytes(self) -> int:
-        return sum(s.pos - s.start for s in self._segments)
+        return sum(s.pos - s.start for s in list(self._segments))
 
     def _supervise(self, done: threading.Event) -> None:
         last_t, last_n, speed = time.monotonic(), self._bytes(), 0.0
+        saved = last_t
         while not done.wait(0.5):
             now, n = time.monotonic(), self._bytes()
             instant = (n - last_n) / max(now - last_t, 1e-6)
@@ -557,7 +774,9 @@ class SegmentedDownload:
             last_t, last_n = now, n
             if self._on_progress:
                 self._on_progress(n, self.total, speed)
-            self._save_record()
+            if now - saved >= 2.0:
+                saved = now
+                self._save_record()
         if self._on_progress:
             n = self._bytes()
             self._on_progress(n, self.total or n, 0.0)
@@ -576,7 +795,7 @@ class SegmentedDownload:
 
     def _worker(self, seg: _Segment) -> None:
         try:
-            with open(self.path, "r+b", buffering=0) as f:
+            with open(self._part, "r+b", buffering=0) as f:
                 while seg is not None and not self._cancel.is_set():
                     self._fetch(seg, f)
                     seg = self._steal() if self._ranged else None
@@ -585,6 +804,10 @@ class SegmentedDownload:
         except Exception as exc:
             self._errors.append(exc)
             self._cancel.set()
+
+    def _range_ok(self, r, pos: int) -> bool:
+        span, _, total = r.headers.get("Content-Range", "").partition(" ")[2].partition("/")
+        return span.partition("-")[0] == str(pos) and (not total.isdigit() or int(total) == self.total)
 
     def _write(self, f, chunk: bytes) -> None:
         try:
@@ -604,15 +827,20 @@ class SegmentedDownload:
             else:
                 hi = min(seg.end, seg.pos + self._window - 1) if self._window else seg.end
                 headers = {"Range": f"bytes={seg.pos}-{hi}"}
+            hint = 0.0
             try:
                 with self._session.get(self._url, headers=headers, stream=True, timeout=(10, 30)) as r:
                     if r.status_code in PERMANENT:
                         raise HttpError(f"HTTP {r.status_code}")
                     if r.status_code != (200 if stream else 206):
+                        if r.status_code in (429, 503):
+                            hint = _retry_after(r.headers.get("Retry-After"))
                         raise requests.RequestException(f"HTTP {r.status_code}")
                     if stream:
                         f.truncate(0)
                         seg.pos = 0
+                    elif not self._range_ok(r, seg.pos):
+                        raise HttpError("The server returned the wrong byte range or the file changed")
                     f.seek(seg.pos)
                     for chunk in r.iter_content(READ_CHUNK):
                         if self._cancel.is_set():
@@ -634,7 +862,7 @@ class SegmentedDownload:
                 attempt += 1
                 if attempt > RETRIES:
                     raise HttpError(str(exc)) from exc
-                self._cancel.wait(min(2 ** attempt, 15))
+                self._cancel.wait(max(hint, min(2 ** attempt, 15)) * (0.75 + random.random() / 2))
 
 
 @dataclass
@@ -649,10 +877,12 @@ class DownloadItem:
     category: str = "minerva"
     url: str = ""
     file_name: str = ""
+    checksum: str = ""
     file_ids: list[int] = field(default_factory=list)
     debrid_provider: str = ""
     debrid_transfer_id: str = ""
     info_hash: str = ""
+    save_dir: str = ""
     fallback_used: bool = False
     seed_after: bool = True
     max_down_kbps: int = 0
@@ -709,14 +939,17 @@ class _HttpJob(QRunnable):
         self._path = item.download_path
         self._dir = _base_dir(item)
         self._file_name = item.file_name
+        self._checksum = item.checksum
         self._signals = signals
         self._limiter = limiter
         self._connections = connections
         self.download: Optional[SegmentedDownload] = None
         self.cancelled = False
+        self._cancel = threading.Event()
 
     def cancel(self) -> None:
         self.cancelled = True
+        self._cancel.set()
         if self.download:
             self.download.cancel()
 
@@ -725,7 +958,9 @@ class _HttpJob(QRunnable):
             with new_session(1) as session:
                 info = probe(session, self._url)
             if not self._path:
-                self._path = os.path.join(self._dir, to_safe_name(self._file_name) if self._file_name else info.name)
+                self._path = _unique(os.path.join(self._dir, to_safe_name(self._file_name) if self._file_name else info.name))
+                if not _contained(self._dir, self._path):
+                    raise HttpError("Refusing to write through a link or outside the download folder")
             self._signals.started.emit(self.item_id, os.path.basename(self._path), self._path)
             self.download = SegmentedDownload(
                 info.url, self._path, connections=self._connections, limiter=self._limiter, info=info,
@@ -734,6 +969,8 @@ class _HttpJob(QRunnable):
             if self.cancelled:
                 return
             self.download.run()
+            if self._checksum:
+                _verify_hash(self._path, self._checksum, self._cancel)
         except Cancelled:
             return
         except Exception as exc:
@@ -884,6 +1121,7 @@ class _DebridJob(QRunnable):
                 return
             root, folder = self._target(resolution)
             os.makedirs(folder, exist_ok=True)
+            ensure_space(folder, sum(int(getattr(link, "size", 0) or 0) for link in resolution.links if link) * (2 if resolution.archive else 1))
             self._signals.started.emit(self.item_id, os.path.basename(folder), folder)
             if resolution.archive:
                 total = sum(int(link.size or 0) for link in resolution.links)
@@ -985,6 +1223,8 @@ class DownloadManager(QObject):
         self._probes: dict[str, Any] = {}
         self._locks: dict[str, threading.Lock] = {}
         self._stats = {"dht_nodes": 0, "incoming": False}
+        self._hist: dict[str, deque] = {}
+        self._pieces_cache: dict[str, tuple[float, Any]] = {}
         self._cap, self._best, self._peak = 0, 0.0, 0.0
         self._tick, self._was_working = 0, False
         self._limiter = RateLimiter(self.global_down_kbps * 1024)
@@ -999,6 +1239,11 @@ class DownloadManager(QObject):
         self._external_op.connect(self._run_external_op, Qt.ConnectionType.QueuedConnection)
         self._save_timer = QTimer(self, singleShot=True, interval=500)
         self._save_timer.timeout.connect(self._write_state)
+        self._state_lock = threading.Lock()
+        self._state_disk_lock = threading.Lock()
+        self._state_payload = ""
+        self._state_pending: Optional[str] = None
+        self._state_writing = False
         os.makedirs(_RESUME_DIR, exist_ok=True)
         os.makedirs(paths.torrent_cache, exist_ok=True)
         self._load_net()
@@ -1006,7 +1251,7 @@ class DownloadManager(QObject):
         self._timer = QTimer(self, interval=1000)
         self._timer.timeout.connect(self._poll)
         self._timer.start()
-        self._fast = QTimer(self, interval=250)
+        self._fast = QTimer(self, interval=500)
         self._fast.timeout.connect(self._poll_live)
         self._try_start_next()
 
@@ -1023,7 +1268,7 @@ class DownloadManager(QObject):
                         params = lt.read_session_params(fh.read(), lt.save_state_flags_t.save_dht_state)
                 except Exception:
                     params = lt.session_params()
-                params.settings = {**self._perf_pack(), **self._net_pack()}
+                params.settings = _known({**self._perf_pack(), **self._net_pack()})
                 self._ses = lt.session(params)
                 self._ses.set_alert_notify(self._wake.emit)
         return self._ses
@@ -1046,7 +1291,19 @@ class DownloadManager(QObject):
             "max_out_request_queue": 1500, "max_allowed_in_request_queue": 2000,
             "suggest_mode": int(lt.suggest_mode_t.suggest_read_cache),
             "allow_multiple_connections_per_ip": True, "rate_limit_ip_overhead": True,
-            "hashing_threads": 4, "file_pool_size": 200,
+            "alert_queue_size": 20000,
+            "aio_threads": max(4, min(8, os.cpu_count() or 4)),
+            "hashing_threads": max(2, min(8, (os.cpu_count() or 4) // 2)),
+            "file_pool_size": 200, "checking_mem_usage": 1024, "max_queued_disk_bytes": 8 << 20,
+            "send_buffer_watermark": 1 << 20, "send_buffer_low_watermark": 128 << 10, "send_buffer_watermark_factor": 150,
+            "torrent_connect_boost": 60, "listen_queue_size": 256, "max_peerlist_size": 8000,
+            "seeding_outgoing_connections": True, "piece_extent_affinity": True,
+            "tracker_completion_timeout": 30, "tracker_receive_timeout": 10, "stop_tracker_timeout": 3,
+            "dht_privacy_lookups": True, "dht_enforce_node_id": True, "dht_restrict_routing_ips": True,
+            "dht_restrict_search_ips": True, "dht_extended_routing_table": True,
+            "no_connect_privileged_ports": True, "ssrf_mitigation": True, "validate_https_trackers": True,
+            "apply_ip_filter_to_trackers": True, "report_web_seed_downloads": False, "close_redundant_connections": True,
+            "upnp_ignore_nonrouters": True, "announce_ip": "",
             "alert_mask": int(cat.error_notification | cat.status_notification | cat.storage_notification | cat.stats_notification),
         }
 
@@ -1090,7 +1347,7 @@ class DownloadManager(QObject):
         settings.net = asdict(NET)
         save_settings(settings)
         if self._ses is not None:
-            self._ses.apply_settings(self._net_pack(session_start=False))
+            self._ses.apply_settings(_known(self._net_pack(session_start=False)))
         if NET.leak_guard():
             self.pause_all()
 
@@ -1140,9 +1397,11 @@ class DownloadManager(QObject):
         return os.path.join(_RESUME_DIR, iid + ".fastresume")
 
     def _write_resume(self, iid: str, params) -> None:
+        path = self._resume_path(iid)
         try:
-            with open(self._resume_path(iid), "wb") as fh:
+            with open(path + ".tmp", "wb") as fh:
                 fh.write(lt.write_resume_data_buf(params))
+            os.replace(path + ".tmp", path)
         except OSError:
             logger.warning("Could not write resume data for %s", iid)
 
@@ -1183,23 +1442,61 @@ class DownloadManager(QObject):
 
     def add(self, torrent_file: str, file_id: int, game_name: str, console: str, source: str = "Minerva",
             file_ids: Optional[list[int]] = None, category: Optional[str] = None, *, backend: str = "",
-            debrid_provider: str = "", info_hash: str = "") -> str:
+            debrid_provider: str = "", info_hash: str = "", save_dir: str = "") -> str:
         source = source or "Minerva"
         resolved_category = category or ("repacks" if _is_remote_source(torrent_file) else "minerva")
+        ids = sorted({int(f) for f in file_ids or ()})
+        if dup := self._dup(torrent_file=torrent_file, file_id=int(file_id or 1), file_ids=ids, category=resolved_category):
+            return dup
         chosen = backend.strip().lower() or ("debrid" if self._auto_debrid(resolved_category) else "torrent")
         if chosen not in ("torrent", "debrid"):
             chosen = "torrent"
         return self._new(
-            torrent_file=torrent_file, file_id=int(file_id or 1), file_ids=sorted({int(f) for f in file_ids or ()}),
+            torrent_file=torrent_file, file_id=int(file_id or 1), file_ids=ids,
             game_name=game_name or "Unknown", console=console or "", source=source, category=resolved_category,
             backend=chosen, debrid_provider=debrid_provider or (getattr(settings, "debrid_provider", "") if chosen == "debrid" else ""),
-            info_hash=info_hash,
+            info_hash=info_hash, save_dir=os.path.abspath(save_dir) if save_dir else "",
         )
 
-    def add_http(self, url: str, title: str = "", file_name: str = "", source: str = "Direct", category: str = "direct") -> str:
-        tail = unquote(os.path.basename(urlsplit(url).path)) or "download"
+    def add_http(self, url: str, title: str = "", file_name: str = "", source: str = "Direct", category: str = "direct", checksum: str = "") -> str:
+        url = url.strip()
+        digest = parse_checksum(checksum)
+        bad = ("" if url.lower().startswith(("http://", "https://")) and _host(url) else "Only valid http:// and https:// links are supported") \
+            or ("Invalid checksum format" if checksum.strip() and not digest else "")
+        if not bad and (dup := self._dup(url=url)):
+            return dup
+        tail = "" if bad else unquote(os.path.basename(urlsplit(url).path))
         return self._new(backend="http", url=url, game_name=title or to_safe_name(tail), file_name=to_safe_name(file_name) if file_name else "",
-                         source=source, category=category)
+                         source=source, category=category, checksum=digest,
+                         state=DLState.error if bad else DLState.queued, error=bad)
+
+    def _dup(self, **match: Any) -> Optional[str]:
+        live = (*_LIVE, DLState.paused, DLState.seeding)
+        return next((i.id for i in self._items.values() if i.state in live and all(getattr(i, k) == v for k, v in match.items())), None)
+
+    def _pending(self, skip: str = "", path: str = "") -> int:
+        vol = _vol(path)
+        return sum(max(i.total_bytes - i.downloaded_bytes, 0) for i in self._items.values()
+                   if i.id != skip and i.backend == "torrent" and i.state in _RUNNING and _vol(_base_dir(i)) == vol)
+
+    def _room(self, item: DownloadItem, ti, sel: list[int], path: str) -> None:
+        ensure_space(path, self._measure(ti, sel) - item.downloaded_bytes, self._pending(item.id, path))
+
+    def usable_space(self, category: str, console: str = "", folder: Optional[str] = None) -> Optional[int]:
+        path = os.path.join(folder or category_dir(category), to_safe_name(console, "") if console else "")
+        free = free_space_bytes(path)
+        return None if free is None else max(free - self._pending(path=path) - _reserve(), 0)
+
+    def _guard_disk(self) -> None:
+        floor, free = _reserve() // 2, {}
+        if not floor:
+            return
+        for item in [i for i in self._items.values() if i.state == DLState.downloading and i.backend in ("torrent", "http", "debrid") and i.progress < 100.0]:
+            folder = os.path.dirname(item.download_path) if item.backend == "http" and item.download_path else _base_dir(item)
+            if folder not in free:
+                free[folder] = free_space_bytes(folder)
+            if free[folder] is not None and free[folder] < floor:
+                self._fail(item.id, f"Stopped to protect your disk: only {human_bytes(free[folder])} free")
 
     def add_external(self, *, game_name: str, console: str = "", source: str = "", category: str = "music", item_id: Optional[str] = None, total_bytes: int = 0) -> str:
         return self._new(id=item_id, game_name=game_name or "Unknown", console=console or "", source=source or category.title(),
@@ -1300,11 +1597,15 @@ class DownloadManager(QObject):
 
     def _try_start_next(self) -> None:
         limit = max(1, int(getattr(settings, "max_active_downloads", 3)))
-        running = sum(i.backend != "external" and i.state in _RUNNING for i in self._items.values())
+        seed = lambda i: i.backend == "torrent" and i.progress >= 100.0
+        running = sum(i.backend != "external" and i.state in _RUNNING and not seed(i) for i in self._items.values())
         queued = sorted((i for i in self.items_in_order() if i.state == DLState.queued and i.backend != "external"), key=lambda i: i.category != "repacks")
         for item in queued:
-            if item.state == DLState.queued and running < limit + (item.category == "repacks"):
-                running += 1
+            if item.state != DLState.queued:
+                continue
+            resumed = seed(item)
+            if resumed or running < limit + (item.category == "repacks"):
+                running += not resumed
                 self._start(item)
 
     def _start(self, item: DownloadItem) -> None:
@@ -1472,6 +1773,8 @@ class DownloadManager(QObject):
         self._last_emit.pop(item_id, None)
         self._stall_stage.pop(item_id, None)
         self._sig.pop(item_id, None)
+        self._hist.pop(item_id, None)
+        self._pieces_cache.pop(item_id, None)
         self.item_removed.emit(item_id)
 
     def _fail(self, item_id: str, error: str) -> None:
@@ -1565,6 +1868,7 @@ class DownloadManager(QObject):
                 if not resumed:
                     atp.save_path = self._dest(item, atp.ti)
                 _validate_ti(atp.ti, atp.save_path, sel)
+                self._room(item, atp.ti, sel, atp.save_path)
             if (probe := self._probes.pop(item.torrent_file, None)) is not None:
                 self._drop(probe)
             handle = ses.add_torrent(atp)
@@ -1643,11 +1947,15 @@ class DownloadManager(QObject):
         if item is None or ti is None:
             return
         try:
+            if ti.priv():
+                with suppress(Exception):
+                    handle.replace_trackers(list(ti.trackers()))
             sel = self._select(item, ti)
             old, keep = list(handle.get_file_priorities()), set(sel)
             handle.prioritize_files([((old[i] if i < len(old) and old[i] else _NORMAL) if i in keep else 0) for i in range(ti.num_files())])
             dest = self._dest(item, ti)
             _validate_ti(ti, dest, sel)
+            self._room(item, ti, sel, dest)
             if os.path.normcase(os.path.abspath(handle.status().save_path)) != os.path.normcase(os.path.abspath(dest)):
                 handle.move_storage(dest)
             self._sel[iid], item.total_bytes = sel, self._measure(ti, sel)
@@ -1670,6 +1978,7 @@ class DownloadManager(QObject):
         self._sync_fast_timer()
         self._tick += 1
         self._drain()
+        self._sample()
         active = bool(self._handles or self._probes) or any(
             item.state in _LIVE for item in self._items.values())
         if not active:
@@ -1687,9 +1996,11 @@ class DownloadManager(QObject):
                 self._request_resume(handle)
         if self._tick % 600 == 0 and self._ses is not None:
             self._save_dht()
+        if self._tick % 5 == 0:
+            self._guard_disk()
         if self._tick % 30 == 0:
             self._prune_missing()
-        if self._tick % 5 == 0:
+        if self._tick % 30 == 0:
             self._save_state()
         self.stats_changed.emit()
         self._try_start_next()
@@ -1726,21 +2037,26 @@ class DownloadManager(QObject):
             self._cap = int(cap)
             self._ses.apply_settings({"upload_rate_limit": self._cap})
 
-    def _poll_one(self, iid: str, handle) -> None:
+    def _poll_one(self, iid: str, handle, s=None) -> None:
         item = self._items.get(iid)
         if item is None or item.state == DLState.paused:
             return
         try:
-            s = handle.status()
+            if s is None:
+                s = handle.status()
             self._totals(item, s)
             total = item.total_bytes
             item.speed_down_kbps, item.speed_up_kbps = s.download_rate / 1024.0, s.upload_rate / 1024.0
             item.peers, item.seeds = s.num_peers, s.num_seeds
-            item.ratio = s.all_time_upload / max(s.all_time_download or item.downloaded_bytes, 1)
-            item.seed_seconds = int(s.seeding_duration.total_seconds())
-            if s.is_finished and total > 0 and item.state != DLState.seeding:
-                self._on_finished(item, handle, s)
-            elif item.state != DLState.seeding:
+            item.ratio = s.all_time_upload / max(s.all_time_download or s.total_wanted or item.total_bytes, 1)
+            item.seed_seconds = _secs(s.seeding_duration)
+            finished = s.is_finished and s.total_wanted > 0 and s.total_wanted_done >= s.total_wanted
+            if finished:
+                if item.state != DLState.seeding:
+                    self._on_finished(item, handle, s)
+            else:
+                if item.state == DLState.seeding:
+                    self._notified.discard(iid)
                 item.state = DLState.verifying if s.state.name.startswith("checking") else DLState.downloading
                 if item.state == DLState.downloading:
                     self._unstall(iid, handle, s.download_rate)
@@ -1826,10 +2142,10 @@ class DownloadManager(QObject):
 
 
     def _owned_paths(self, item: DownloadItem) -> list[str]:
-        roots = (category_dir(item.category), settings.download_dir, paths.download_root)
+        roots = tuple(filter(None, (item.save_dir, category_dir(item.category), settings.download_dir, paths.download_root)))
         out = [item.download_path] if item.download_path and any(_inside(r, item.download_path) for r in roots) else []
         if item.backend == "http" and item.download_path:
-            out += [item.download_path + ".ghd", item.download_path + ".ghd.tmp"]
+            out += [item.download_path + s for s in (".part", ".ghd", ".ghd.tmp")]
         if item.backend in ("torrent", "debrid") and not item.download_path and item.game_name:
             out.append(_game_dir(item))
         return out
@@ -1885,11 +2201,57 @@ class DownloadManager(QObject):
         if h is None or item is None:
             return None
         s = h.status()
-        return {"progress": h.file_progress(), "prios": h.get_file_priorities(), "state": item.state,
+        return {"progress": h.file_progress(getattr(lt.torrent_handle, "piece_granularity", 0)), "prios": h.get_file_priorities(), "state": item.state,
                 "stats": {"done": s.total_wanted_done, "wanted": s.total_wanted, "progress": item.progress,
                           "down": item.speed_down_kbps, "up": item.speed_up_kbps, "eta": item.eta, "ratio": item.ratio,
                           "seeds": s.num_seeds, "peers": s.num_peers, "list_seeds": s.list_seeds,
                           "list_peers": s.list_peers, "availability": s.distributed_copies}}
+
+    def _sample(self) -> None:
+        now = time.monotonic()
+        for iid, item in self._items.items():
+            if item.state in _RUNNING or item.state == DLState.seeding:
+                rows = self._hist.get(iid)
+                if rows is None:
+                    rows = self._hist[iid] = deque(maxlen=_HIST)
+                rows.append((now, item.speed_down_kbps, item.speed_up_kbps, item.peers, item.seeds))
+
+    def history(self, iid: str, seconds: float = 300.0) -> Optional[list[tuple]]:
+        if iid not in self._items:
+            return None
+        cutoff = time.monotonic() - seconds
+        return [r for r in self._hist.get(iid, ()) if r[0] >= cutoff]
+
+    def piece_map(self, iid: str, buckets: int = 360) -> Optional[dict[str, Any]]:
+        h = self._handle(iid)
+        if h is None:
+            return None
+        now = time.monotonic()
+        cached = self._pieces_cache.get(iid)
+        if cached is not None and now - cached[0] < 1.0:
+            return cached[1]
+        try:
+            flag = getattr(lt.torrent_handle, "query_pieces", None)
+            s = h.status(flag) if flag is not None else h.status()
+            have = list(s.pieces)
+            total = len(have)
+            if not total:
+                return None
+            skip = None
+            if len(self._sel.get(iid) or ()) < h.torrent_file().num_files():
+                skip = [p == 0 for p in h.get_piece_priorities()]
+            n = min(buckets, total)
+            out = []
+            for b in range(n):
+                lo, hi = b * total // n, (b + 1) * total // n
+                span = max(hi - lo, 1)
+                out.append((sum(have[lo:hi]) / span, sum(skip[lo:hi]) / span if skip else 0.0))
+            result = {"buckets": out, "total": total, "have": int(s.num_pieces)}
+        except Exception:
+            logger.debug("piece map failed for %s", iid, exc_info=True)
+            return None
+        self._pieces_cache[iid] = (now, result)
+        return result
 
     def set_file_priorities(self, iid: str, changes: dict[int, int]) -> bool:
         item, h = self._items.get(iid), self._handle(iid)
@@ -1905,6 +2267,7 @@ class DownloadManager(QObject):
             if not sel:
                 return False
             _validate_ti(ti, h.status().save_path, sel)
+            self._room(item, ti, sel, h.status().save_path)
             h.prioritize_files(prios)
             self._sel[iid], item.file_ids = sel, [i + 1 for i in sel]
             item.total_bytes = self._measure(ti, sel)
@@ -1916,6 +2279,9 @@ class DownloadManager(QObject):
             self._request_resume(h)
             self._changed(iid)
             return True
+        except DiskSpaceError as exc:
+            logger.warning("%s", exc)
+            return False
         except Exception:
             logger.exception("Could not change file priorities for %s", iid)
             return False
@@ -1937,8 +2303,12 @@ class DownloadManager(QObject):
             return None
         try:
             s, ti = h.status(), h.torrent_file()
-            ih = s.info_hashes
+            ih, rows, active = s.info_hashes, self._hist.get(iid) or (), _secs(s.active_duration)
             return {
+                "avg_down": s.all_time_download / max(active, 1), "avg_up": s.all_time_upload / max(active, 1),
+                "peak_down": max((r[1] for r in rows), default=0.0) * 1024, "peak_up": max((r[2] for r in rows), default=0.0) * 1024,
+                "seed_time": _secs(s.seeding_duration), "uploads": s.num_uploads, "availability": s.distributed_copies,
+                "hashfails": s.total_failed_bytes, "tracker": _host(s.current_tracker),
                 "active": _secs(s.active_duration), "down": s.all_time_download, "down_s": s.total_download,
                 "up": s.all_time_upload, "up_s": s.total_upload, "down_rate": s.download_rate, "up_rate": s.upload_rate,
                 "down_lim": item.max_down_kbps * 1024, "up_lim": item.max_up_kbps * 1024, "eta": item.eta, "ratio": item.ratio,
@@ -1968,7 +2338,7 @@ class DownloadManager(QObject):
                 except ValueError:
                     host = "?"
                 out.append((host, t.get("tier", 0), str(ep.get("message") or t.get("message") or "")[:120],
-                            ep.get("scrape_complete", -1), ep.get("scrape_incomplete", -1)))
+                            ep.get("scrape_complete", -1), ep.get("scrape_incomplete", -1), ep.get("scrape_downloaded", -1)))
         except Exception:
             logger.debug("tracker list failed for %s", iid, exc_info=True)
         return out
@@ -1981,7 +2351,7 @@ class DownloadManager(QObject):
         try:
             for p in h.get_peer_info():
                 c = p.client if isinstance(p.client, str) else bytes(p.client).decode("utf-8", "replace")
-                out.append((f"{p.ip[0]}:{p.ip[1]}", c[:40], p.progress, p.down_speed, p.up_speed, p.total_download, p.total_upload))
+                out.append((f"{p.ip[0]}:{p.ip[1]}", c[:40], p.progress, p.down_speed, p.up_speed, p.total_download, p.total_upload, _peer_flags(p.flags)))
         except Exception:
             logger.debug("peer list failed for %s", iid, exc_info=True)
         out.sort(key=lambda r: r[3] + r[4], reverse=True)
@@ -2041,7 +2411,7 @@ class DownloadManager(QObject):
                         raise TimeoutError(f"Timed out waiting for torrent metadata after {timeout:.0f}s ({handle.status().num_peers} peers, {self._stats['dht_nodes']} DHT nodes)")
                     time.sleep(0.05)
                 ti = handle.torrent_file()
-                logger.info("Metadata for %.60s fetched in %.1fs (%d peers)", source, time.monotonic() - start, handle.status().num_peers)
+                logger.info("Metadata for %s fetched in %.1fs (%d peers)", _tag(source), time.monotonic() - start, handle.status().num_peers)
             finally:
                 if self._probes.get(source) is handle:
                     del self._probes[source]
@@ -2058,7 +2428,7 @@ class DownloadManager(QObject):
         except Exception:
             if not (bool(getattr(settings, "debrid_enabled", False)) and debrid_configured()):
                 raise
-            logger.info("Reading the file list through the debrid provider for %s", torrent_file[:120])
+            logger.info("Reading the file list through the debrid provider for %s", _tag(torrent_file))
             service = DebridService.from_settings()
             try:
                 return service.file_list(torrent_file, timeout=max(timeout_secs, 90.0))
@@ -2230,17 +2600,26 @@ class DownloadManager(QObject):
             return name
         if os.path.isfile(name):
             return os.path.abspath(name)
-        cached = os.path.join(paths.torrent_cache, hashlib.sha1(name.encode()).hexdigest() + ".torrent" if name.startswith(("http://", "https://")) else name)
-        if os.path.isfile(cached):
+        cached = os.path.join(paths.torrent_cache, hashlib.sha1(name.encode()).hexdigest() + ".torrent" if name.startswith(("http://", "https://")) else to_safe_name(name))
+        if _valid_torrent(cached):
             return cached
         with new_session(1) as s:
             def pull(url: str) -> Optional[str]:
-                r = s.get(url, timeout=network.torrent_download_timeout)
-                if r.status_code == 404:
+                _check_url(url)
+                body = bytearray()
+                with s.get(url, timeout=network.torrent_download_timeout, stream=True) as r:
+                    if r.status_code == 404:
+                        return None
+                    r.raise_for_status()
+                    for chunk in r.iter_content(65536):
+                        body += chunk
+                        if len(body) > _MAX_TORRENT:
+                            raise RuntimeError("Torrent file is too large")
+                if body[:1] != b"d":
                     return None
-                r.raise_for_status()
-                with open(cached, "wb") as fh:
-                    fh.write(r.content)
+                with open(cached + ".tmp", "wb") as fh:
+                    fh.write(body)
+                os.replace(cached + ".tmp", cached)
                 return cached
 
             cdn = lambda n: pull(f"{network.cdn_base}/{quote(n, safe='')}")
@@ -2268,16 +2647,57 @@ class DownloadManager(QObject):
         if not self._save_timer.isActive():
             self._save_timer.start()
 
-    def _write_state(self) -> None:
+    def _write_state(self, force: bool = False, sync: bool = False) -> None:
         items = [i for i in self.items_in_order() if not (NET.private_history and i.state in (DLState.completed, DLState.cancelled))]
         payload = json.dumps({"order": self._order, "items": [i.to_persist_dict() for i in items]}, separators=(",", ":"))
+        if not force and payload == self._state_payload:
+            return
+        self._state_payload = payload
+        if sync:
+            with self._state_disk_lock:
+                self._persist_state(payload, fsync=True)
+            return
+        with self._state_lock:
+            self._state_pending = payload
+            if self._state_writing:
+                return
+            self._state_writing = True
+        submit(self._drain_state_writes, pool=IO, priority=Priority.LOW)
+
+    def _drain_state_writes(self) -> None:
+        while True:
+            with self._state_lock:
+                if self._closed:
+                    self._state_pending = None
+                    self._state_writing = False
+                    return
+                payload = self._state_pending
+                self._state_pending = None
+                if payload is None:
+                    self._state_writing = False
+                    return
+            with self._state_disk_lock:
+                if self._closed:
+                    with self._state_lock:
+                        self._state_writing = False
+                    return
+                self._persist_state(payload)
+
+    @staticmethod
+    def _persist_state(payload: str, fsync: bool = False) -> None:
+        tmp = f"{_QUEUE_FILE}.{uuid.uuid4().hex}.tmp"
         try:
             os.makedirs(os.path.dirname(_QUEUE_FILE), exist_ok=True)
-            with open(_QUEUE_FILE + ".tmp", "w", encoding="utf-8") as fh:
+            with open(tmp, "w", encoding="utf-8") as fh:
                 fh.write(payload)
-            os.replace(_QUEUE_FILE + ".tmp", _QUEUE_FILE)
+                fh.flush()
+                if fsync:
+                    os.fsync(fh.fileno())
+            os.replace(tmp, _QUEUE_FILE)
         except OSError:
             logger.exception("Failed to save download queue state")
+            with suppress(OSError):
+                os.remove(tmp)
 
     @staticmethod
     def _apply_net(values: dict) -> None:
@@ -2303,7 +2723,12 @@ class DownloadManager(QObject):
         try:
             with open(_QUEUE_FILE, encoding="utf-8") as fh:
                 stored = json.load(fh)
-        except (OSError, ValueError):
+        except OSError:
+            return
+        except ValueError:
+            with suppress(OSError):
+                os.replace(_QUEUE_FILE, _QUEUE_FILE + ".corrupt")
+            logger.warning("Download queue was unreadable; a copy was kept as %s.corrupt", os.path.basename(_QUEUE_FILE))
             return
         for entry in stored.get("items", []):
             try:
@@ -2330,6 +2755,8 @@ class DownloadManager(QObject):
                     pass
 
     def _save_dht(self) -> None:
+        if NET.anonymous or NET.private_history:
+            return
         try:
             with open(_DHT_FILE, "wb") as fh:
                 fh.write(lt.write_session_params_buf(self._ses.session_state(lt.save_state_flags_t.save_dht_state)))
@@ -2354,6 +2781,7 @@ class DownloadManager(QObject):
         self._pool.waitForDone(3000)
         if (ses := self._ses) is not None:
             ses.set_alert_notify(lambda: None)
+            ses.pause()
             pending = len(self._handles)
             for handle in self._handles.values():
                 self._request_resume(handle)
@@ -2368,7 +2796,7 @@ class DownloadManager(QObject):
                         pending -= 1
             self._save_dht()
             self._ses = None
-        self._write_state()
+        self._write_state(force=True, sync=True)
 
 
 def _benchmark_process_rss() -> int | None:

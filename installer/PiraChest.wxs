@@ -1,33 +1,44 @@
+<?ifndef Brand?><?define Brand="PiraChest"?><?endif?>
+<?ifndef ExeName?><?define ExeName="PiraChest.exe"?><?endif?>
+<?ifndef Manufacturer?><?define Manufacturer="PiraChest"?><?endif?>
+<?ifndef Version?><?define Version="1.0.0"?><?endif?>
+<?ifndef ProjectUrl?><?define ProjectUrl="https://example.com"?><?endif?>
+<?ifndef UpgradeCode?><?define UpgradeCode="a3f6c2d1-7b4e-4c9a-8f2d-5e1b0c7a9d34"?><?endif?>
+<?ifndef DialogBmp?><?define DialogBmp="assets\dialog.bmp"?><?endif?>
+<?ifndef BannerBmp?><?define BannerBmp="assets\banner.bmp"?><?endif?>
+<?ifndef SourceDir?><?error SourceDir must be passed with -d SourceDir=...?><?endif?>
+<?ifndef IconFile?><?error IconFile must be passed with -d IconFile=...?><?endif?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
-  <Package Name="PiraChest" Manufacturer="$(var.Manufacturer)" Version="$(var.Version)" UpgradeCode="a3f6c2d1-7b4e-4c9a-8f2d-5e1b0c7a9d34" Scope="perUser" Compressed="yes">
-    <SummaryInformation Description="PiraChest installer" />
-    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of PiraChest is already installed." />
+  <Package Name="$(var.Brand)" Manufacturer="$(var.Manufacturer)" Version="$(var.Version)" UpgradeCode="$(var.UpgradeCode)" Scope="perUser" Compressed="yes">
+    <SummaryInformation Description="$(var.Brand) installer" />
+    <MajorUpgrade AllowDowngrades="yes" />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
     <Icon Id="AppIcon.ico" SourceFile="$(var.IconFile)" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+    <Property Id="DESKTOPSHORTCUT" Value="1" />
     <Property Id="ARPURLINFOABOUT" Value="$(var.ProjectUrl)" />
     <WixVariable Id="WixUIDialogBmp" Value="$(var.DialogBmp)" />
     <WixVariable Id="WixUIBannerBmp" Value="$(var.BannerBmp)" />
-    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch PiraChest" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch $(var.Brand)" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsFolder" Name="Programs">
-        <Directory Id="INSTALLFOLDER" Name="PiraChest" />
+        <Directory Id="INSTALLFOLDER" Name="$(var.Brand)" />
       </Directory>
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
       <Component Id="StartMenuShortcut" Guid="*">
-        <Shortcut Id="StartMenuShortcut" Name="PiraChest" Description="PiraChest" Target="[INSTALLFOLDER]PiraChest.exe" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon.ico" />
-        <RegistryValue Root="HKCU" Key="Software\PiraChest" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+        <Shortcut Id="StartMenuShortcut" Name="$(var.Brand)" Description="$(var.Brand)" Target="[INSTALLFOLDER]$(var.ExeName)" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon.ico" />
+        <RegistryValue Root="HKCU" Key="Software\$(var.Brand)" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </StandardDirectory>
 
     <StandardDirectory Id="DesktopFolder">
       <Component Id="DesktopShortcut" Guid="*" Condition="DESKTOPSHORTCUT = 1">
-        <Shortcut Id="DesktopShortcut" Name="PiraChest" Description="PiraChest" Target="[INSTALLFOLDER]PiraChest.exe" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon.ico" />
-        <RegistryValue Root="HKCU" Key="Software\PiraChest" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+        <Shortcut Id="DesktopShortcut" Name="$(var.Brand)" Description="$(var.Brand)" Target="[INSTALLFOLDER]$(var.ExeName)" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon.ico" />
+        <RegistryValue Root="HKCU" Key="Software\$(var.Brand)" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </StandardDirectory>
 
@@ -35,16 +46,39 @@
       <Files Include="$(var.SourceDir)\**" />
     </ComponentGroup>
 
-    <Feature Id="Main" Title="PiraChest" Level="1" AllowAdvertise="no">
+    <Feature Id="Main" Title="$(var.Brand)" Level="1" AllowAdvertise="no">
       <ComponentGroupRef Id="AppFiles" />
       <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="DesktopShortcut" />
     </Feature>
 
-    <CustomAction Id="LaunchApp" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]PiraChest.exe&quot;" Return="asyncNoWait" />
+    <CustomAction Id="UninstallOld" Directory="SystemFolder" ExeCommand="msiexec.exe /x [WIX_UPGRADE_DETECTED]" Return="asyncNoWait" />
+    <CustomAction Id="RepairOld" Directory="SystemFolder" ExeCommand="msiexec.exe /fa [WIX_UPGRADE_DETECTED]" Return="asyncNoWait" />
+    <CustomAction Id="LaunchApp" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]$(var.ExeName)&quot;" Return="asyncNoWait" />
 
     <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
     <UI>
+      <Dialog Id="ExistingDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="WixUI_Bmp_Dialog" />
+        <Control Id="Title" Type="Text" X="135" Y="20" Width="220" Height="30" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}$(var.Brand) is already installed" />
+        <Control Id="Desc" Type="Text" X="135" Y="60" Width="220" Height="60" Transparent="yes" NoPrefix="yes" Text="Choose what to do: install again (upgrade or reinstall), repair the existing installation, uninstall it, or close." />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Install" Type="PushButton" X="100" Y="243" Width="56" Height="17" Default="yes" Text="Install">
+          <Publish Event="NewDialog" Value="InstallDirDlg" />
+        </Control>
+        <Control Id="Repair" Type="PushButton" X="160" Y="243" Width="56" Height="17" Text="Repair">
+          <Publish Event="DoAction" Value="RepairOld" Order="1" />
+          <Publish Event="EndDialog" Value="Exit" Order="2" />
+        </Control>
+        <Control Id="Uninstall" Type="PushButton" X="220" Y="243" Width="56" Height="17" Text="Uninstall">
+          <Publish Event="DoAction" Value="UninstallOld" Order="1" />
+          <Publish Event="EndDialog" Value="Exit" Order="2" />
+        </Control>
+        <Control Id="Close" Type="PushButton" X="296" Y="243" Width="56" Height="17" Cancel="yes" Text="Close">
+          <Publish Event="EndDialog" Value="Exit" />
+        </Control>
+      </Dialog>
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="ExistingDlg" Order="3" Condition="WIX_UPGRADE_DETECTED AND NOT Installed" />
       <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="2" Condition="NOT Installed" />
       <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2" />
       <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApp" Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed" />

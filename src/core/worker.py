@@ -559,8 +559,10 @@ def _with_cancel(is_cancelled, fn, *args, **kwargs):
         reset_cancel_check(token)
 
 
-def _do_fetch_repack_page(source_key, page, use_cache=True, is_cancelled=None):
-    return _with_cancel(is_cancelled, lambda: _need(source_key).fetch_page(page, use_cache=use_cache))
+def _do_fetch_repack_page(source_key, page, use_cache=True, exclude=None, is_cancelled=None):
+    source = _need(source_key)
+    fn = lambda: source.fetch_page(page, use_cache=use_cache, exclude=exclude) if exclude else source.fetch_page(page, use_cache=use_cache)
+    return _with_cancel(is_cancelled, fn)
 
 
 def _do_fetch_repack_details(source_key, entry, use_cache=True, is_cancelled=None):
@@ -581,6 +583,34 @@ def _do_fetch_popular_repacks(source_key, use_cache=True, is_cancelled=None):
     return _with_cancel(is_cancelled, lambda: source.fetch_popular_repacks(use_cache=use_cache)) if source else []
 
 
+def _do_fetch_pink_paw(source_key, use_cache=True, is_cancelled=None):
+    source = _resolve_repack_source(source_key)
+    fn = getattr(source, "badge_slugs", None)
+    return _with_cancel(is_cancelled, lambda: fn(use_cache=use_cache)) if fn else {}
+
+
+def _do_random_entry(source_key, exclude=None, token=0, is_cancelled=None):
+    return _with_cancel(is_cancelled, lambda: _need(source_key).random_entry(exclude))
+
+
+def _do_all_tag_names(source_key, is_cancelled=None):
+    return _with_cancel(is_cancelled, lambda: _need(source_key).all_tag_names())
+
+
+def _do_resolve_tags(source_key, names, is_cancelled=None):
+    source = _resolve_repack_source(source_key)
+    fn = getattr(source, "resolve_tags", None)
+    return _with_cancel(is_cancelled, lambda: fn(list(names))) if fn else {"tags": list(names), "missing": [], "suggestions": {}}
+
+
+def _do_fetch_repack_tag(source_key, tag, page, use_cache=True, exclude=None, is_cancelled=None):
+    return _with_cancel(is_cancelled, lambda: _need(source_key).fetch_tag(tag, page, use_cache=use_cache, exclude=exclude))
+
+
+def _do_fetch_repack_list(source_key, list_key, page, use_cache=True, is_cancelled=None):
+    return _with_cancel(is_cancelled, lambda: _need(source_key).fetch_list(list_key, page, use_cache=use_cache))
+
+
 def _do_search_repacks(source_key, query, page, use_cache=True, is_cancelled=None):
     try:
         return _with_cancel(is_cancelled, lambda: _need(source_key).search(query, page, use_cache=use_cache))
@@ -588,9 +618,9 @@ def _do_search_repacks(source_key, query, page, use_cache=True, is_cancelled=Non
         raise RuntimeError("__no_search__") from None
 
 
-def fetch_page_async(source_key, page, on_done=None, on_error=None, use_cache=True, owner=None):
-    return submit(_do_fetch_repack_page, (source_key, page), {"use_cache": use_cache},
-                  on_done, on_error, Priority.HIGH, owner=owner, key=("rp", source_key, page, use_cache))
+def fetch_page_async(source_key, page, on_done=None, on_error=None, use_cache=True, owner=None, exclude=None):
+    return submit(_do_fetch_repack_page, (source_key, page), {"use_cache": use_cache, "exclude": exclude},
+                  on_done, on_error, Priority.HIGH, owner=owner, key=("rp", source_key, page, use_cache, exclude))
 
 
 def fetch_details_async(source_key, entry, on_done=None, on_error=None, use_cache=True, owner=None,
@@ -615,6 +645,39 @@ def fetch_popular_repacks_async(source_key, on_done=None, use_cache=True, owner=
     done = on_done or (lambda _r: None)
     return submit(_do_fetch_popular_repacks, (source_key,), {"use_cache": use_cache},
                   done, lambda _e: done([]), Priority.LOW, owner=owner, key=("rpop", source_key, use_cache))
+
+
+def fetch_pink_paw_async(source_key, on_done=None, on_error=None, use_cache=True, owner=None):
+    return submit(_do_fetch_pink_paw, (source_key,), {"use_cache": use_cache},
+                  on_done, on_error, Priority.LOW, owner=owner, key=("rpp", source_key, use_cache))
+
+
+def random_entry_async(source_key, exclude=None, on_done=None, on_error=None, owner=None):
+    import time as _time
+    token = _time.monotonic_ns()
+    return submit(_do_random_entry, (source_key, exclude, token), {},
+                  on_done, on_error, Priority.HIGH, owner=owner, key=("rnd", source_key, token))
+
+
+def fetch_all_tags_async(source_key, on_done=None, on_error=None, owner=None, low=False):
+    return submit(_do_all_tag_names, (source_key,), {}, on_done, on_error,
+                  Priority.LOW if low else Priority.HIGH, owner=owner, key=("rat", source_key))
+
+
+def resolve_tags_async(source_key, names, on_done=None, on_error=None, owner=None):
+    return submit(_do_resolve_tags, (source_key, tuple(names)), {},
+                  on_done, on_error, Priority.HIGH, owner=owner, key=("rtr", source_key, tuple(names)))
+
+
+def fetch_tag_async(source_key, tag, page, on_done=None, on_error=None, use_cache=True, owner=None, exclude=None):
+    return submit(_do_fetch_repack_tag, (source_key, tag, page), {"use_cache": use_cache, "exclude": exclude},
+                  on_done, on_error, Priority.HIGH, owner=owner,
+                  key=("rtg", source_key, tag, page, use_cache, exclude))
+
+
+def fetch_list_async(source_key, list_key, page, on_done=None, on_error=None, use_cache=True, owner=None):
+    return submit(_do_fetch_repack_list, (source_key, list_key, page), {"use_cache": use_cache},
+                  on_done, on_error, Priority.HIGH, owner=owner, key=("rls", source_key, list_key, page, use_cache))
 
 
 def fetch_search_async(source_key, query, page, on_done=None, on_error=None, use_cache=True, owner=None):

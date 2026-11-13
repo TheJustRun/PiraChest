@@ -5,6 +5,7 @@ import base64
 import importlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -24,13 +25,13 @@ from functools import partial
 from urllib.parse import urlparse
 
 import httpx
-from PySide6.QtCore import (QByteArray, QEasingCurve, QObject, QPoint, QPropertyAnimation, QRect,
+from PySide6.QtCore import (QByteArray, QEasingCurve, QEvent, QObject, QPoint, QPropertyAnimation, QRect,
                             QRectF, QRunnable, QSize, Qt, QUrl, QThreadPool, QTimer, QVariantAnimation, Signal)
-from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetrics, QLinearGradient, QPainter,
-                           QPainterPath, QPalette, QPen, QPixmap)
+from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetrics, QImage, QLinearGradient, QPainter,
+                           QPainterPath, QPalette, QPen, QPixmap, QRadialGradient, QBrush)
 from PySide6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
                                QListWidgetItem, QProxyStyle, QScrollArea, QSizePolicy, QSlider,
                                QStackedWidget, QStyle, QStyledItemDelegate, QToolButton, QVBoxLayout,
                                QWidget)
@@ -47,6 +48,56 @@ from src.core.models import MusicItem as Song
 from src.core.net import LazyHttpClient
 from src.core.translations import register_locale_refresh, tr
 from src.core.worker import cancel, submit, wrap_callback
+
+import re as _tm_re
+import unicodedata as _tm_ud
+
+_TM_ROMAN = {'ii': '2', 'iii': '3', 'iv': '4', 'v': '5', 'vi': '6', 'vii': '7', 'viii': '8', 'ix': '9', 'x': '10', 'xi': '11', 'xii': '12'}
+_TM_CACHE: dict[str, str] = {}
+
+
+def _clean_query(text: str) -> str:
+    value = _tm_re.sub(r'\s+', ' ', str(text or '')).strip()
+    return value.strip('"\'.,;:!?()[]{}<>')
+
+
+def _tm_fold(text: str) -> str:
+    text = str(text or '')
+    hit = _TM_CACHE.get(text)
+    if hit is not None:
+        return hit
+    plain = _tm_ud.normalize('NFKD', _tm_ud.normalize('NFKC', text).casefold())
+    plain = ''.join(c for c in plain if not _tm_ud.combining(c))
+    plain = plain.replace('&', ' and ').replace('+', ' and ').replace("'", '').replace('\u2019', '').replace('`', '')
+    plain = _tm_re.sub(r'[^0-9a-z\u0400-\u04ff\u3040-\u30ff\u4e00-\u9fff]+', ' ', plain)
+    out = ' '.join(_TM_ROMAN.get(w, w) for w in plain.split())
+    if len(_TM_CACHE) > 6000:
+        _TM_CACHE.clear()
+    _TM_CACHE[text] = out
+    return out
+
+
+def _tm_contains(query: str, text: str) -> bool:
+    q = _tm_fold(query)
+    if not q:
+        return True
+    t = _tm_fold(text)
+    qc, tc = q.replace(' ', ''), t.replace(' ', '')
+    if q in t or (len(qc) >= 3 and qc in tc):
+        return True
+    words = t.split()
+    for term in q.split():
+        if term in ('the', 'a', 'an', 'of', 'and'):
+            continue
+        if not (term in words or any(w.startswith(term) for w in words if len(term) >= 2)):
+            return False
+    return True
+
+
+def _tm_variants(query: str) -> list[str]:
+    q = _clean_query(query)
+    return [q] if q else []
+
 
 _USER_AGENT_FALLBACK = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -80,6 +131,7 @@ install_fake_useragent_stub()
 logger = logging.getLogger(__name__)
 
 _ROW_H, _BAR_H, _CARD_W, _CARD_H, _COVER = 54, 96, 180, 244, 168
+_ROW_COVER = _ROW_H - 14
 _AUDIO_EXT = ('.mp3', '.flac', '.m4a', '.mp4', '.aac', '.ogg', '.wav')
 _MIME_EXT = {'audio/flac': '.flac', 'audio/x-flac': '.flac', 'audio/mp4': '.m4a', 'audio/aac': '.aac',
              'audio/ogg': '.ogg', 'audio/wav': '.wav'}
@@ -139,10 +191,6 @@ except Exception:
 
 _MUSIC_CFG_DIR = os.path.join(app_paths.config_dir, 'music')
 _MUSIC_SETTINGS_FILE = os.path.join(_MUSIC_CFG_DIR, 'music_settings.json')
-# Providers verified to return complete, playable tracks (not previews) with a
-# working direct URL.  Ordered alphabetically; the search pool starts all of
-# them at once.  Slow or corrupt providers stay selectable in search filters
-# but are intentionally not enabled by default.
 DEFAULT_SOURCES = [
     "AudiusMusicClient",
     "FiveSingMusicClient",
@@ -151,8 +199,6 @@ DEFAULT_SOURCES = [
     "NeteaseMusicClient",
     "YinyuekuMusicClient",
 ]
-# The previous default list.  Configs that still contain exactly this list are
-# treated as untouched and upgraded to the curated one on load.
 LEGACY_DEFAULT_SOURCES = [
     "BodianMusicClient",
     "DeezerMusicClient",
@@ -179,7 +225,7 @@ LEGACY_DEFAULT_SOURCES = [
     "TuneHubMusicClient",
     "MituMusicClient",
 ]
-SEARCH_TIMEOUT_S = 40.0  # Slowest curated source lands around 25-30s; keep headroom.
+SEARCH_TIMEOUT_S = 40.0
 QUALITY_TIERS = ['lossless', 'mp3', 'aac', 'other']
 SLOW_OR_GATED_SOURCES = ['AppleMusicClient', 'SoundCloudMusicClient', 'StreetVoiceMusicClient', 'TIDALMusicClient', 'YouTubeMusicClient', 'SpotifyMusicClient', 'MituMusicClient', 'GequbaoMusicClient', 'YinyuedaoMusicClient', 'BuguyyMusicClient']
 
@@ -194,6 +240,7 @@ class MusicSettings:
     lyrics_custom_font_path: str = ''
     lyrics_font_scale: float = 1.0
     lyrics_align: str = 'center'
+    reduce_motion: bool = False
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
@@ -203,8 +250,6 @@ class MusicSettings:
         data = dict(data)
         saved = data.get('preferred_sources')
         if isinstance(saved, list) and sorted(saved) == sorted(LEGACY_DEFAULT_SOURCES):
-            # Untouched config from before the provider cleanup: move it to the
-            # verified defaults and drop the old (slow) search sizing.
             data['preferred_sources'] = list(DEFAULT_SOURCES)
             data['search_size_per_source'] = 4
             data['max_concurrent_searches'] = 8
@@ -989,6 +1034,12 @@ class _DownloadTask(QRunnable):
         self.signals.finished.emit(False, '', 'Cancelled' if self._cancelled else err or 'All sources failed.')
 
 
+def _n_songs(n: int) -> str:
+    if n == 1:
+        return _t('music.one_song', '{n} song').format(n=n)
+    return _t('music.n_songs', '{n} songs').format(n=n)
+
+
 class Playlist:
     __slots__ = ('id', 'name', 'songs')
 
@@ -1355,7 +1406,8 @@ def _columns(w: int) -> tuple:
     alw = rest - nw - aw if wide else 0
     ax, alx = pad + nw, pad + nw + aw
     mx = alx + alw
-    return (pad, nw), (ax, aw), (alx, alw), (mx, meta), (mx + meta, dur)
+    lead = _ROW_COVER + 14
+    return (pad + lead, max(0, nw - lead)), (ax, aw), (alx, alw), (mx, meta), (mx + meta, dur)
 
 
 class _Delegate(QStyledItemDelegate):
@@ -1400,6 +1452,16 @@ class SongDelegate(_Delegate):
             p.setPen(color)
             p.drawText(rect, Qt.AlignVCenter | align, QFontMetrics(font).elidedText(text, Qt.ElideRight, rect.width()))
 
+        art = QRect(r.x() + cols[0][0] - _ROW_COVER - 14, r.center().y() - _ROW_COVER // 2, _ROW_COVER, _ROW_COVER)
+        src = song.cover_url
+        pm = images.peek(src, _ROW_COVER) if src else None
+        if src and pm is None:
+            images.get(src, _ROW_COVER, lambda got: got.isNull() or self.view.viewport().update(), owner=self.view)
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(art), 5, 5)
+        p.setClipPath(clip)
+        p.drawPixmap(art, pm if pm is not None and not pm.isNull() else _ph(_ROW_COVER))
+        p.setClipping(False)
         btns = self.view.button_rects(r, hover)
         shrink = cols[0][1] - (min(b.x() for b in btns.values()) - r.x() - cols[0][0]) if btns else 0
         cell(0, song.song_name or '', self._title, accent if playing else _fg(), shrink=shrink)
@@ -1555,6 +1617,8 @@ class SongGrid(_CoverGrid):
     def __init__(self, parent=None):
         super().__init__('key', 'song_name', parent)
         self.playing_key = None
+        self._btn = self._btn_press = None
+        self._tooltip_fn = lambda s: ' – '.join(x for x in (s.song_name, s.singers) if x)
         self._title, self._sub = _font(14, QFont.DemiBold), _font(12)
         self.context_requested.connect(lambda song, pos: _song_menu(self, song, pos))
 
@@ -1579,6 +1643,47 @@ class SongGrid(_CoverGrid):
         y = row.y() + 6 + (cp - d) // 2
         return {n: QRect(x0 + i * (d + gap), y, d, d) for i, n in enumerate(('play', 'add', 'dl'))}
 
+    def _btn_at(self, point):
+        pos = self._hit(point)
+        if pos is None:
+            return None
+        for name, r in self.button_rects(self._cell_rect(pos), True).items():
+            if r.contains(point):
+                return pos, name
+        return None
+
+    def _set_btn(self, btn) -> None:
+        if btn != self._btn:
+            self._btn = btn
+            self.viewport().update()
+
+    def mouseMoveEvent(self, e) -> None:
+        super().mouseMoveEvent(e)
+        self._set_btn(None if self.is_scrolling else self._btn_at(e.position().toPoint()))
+
+    def leaveEvent(self, e) -> None:
+        super().leaveEvent(e)
+        self._btn_press = None
+        self._set_btn(None)
+
+    def mousePressEvent(self, e) -> None:
+        btn = self._btn_at(e.position().toPoint()) if e.button() == Qt.LeftButton else None
+        if btn is None:
+            super().mousePressEvent(e)
+            return
+        self._btn_press = btn
+        self._set_btn(btn)
+        self.viewport().update()
+
+    def mouseReleaseEvent(self, e) -> None:
+        press, self._btn_press = self._btn_press, None
+        if press is None:
+            super().mouseReleaseEvent(e)
+            return
+        self.viewport().update()
+        if e.button() == Qt.LeftButton and self._btn_at(e.position().toPoint()) == press:
+            {'play': self.play, 'add': self.add, 'dl': self.download}[press[1]].emit(self._entry(press[0]))
+
     def _paint_card(self, p: QPainter, pos: int, cell: QRect) -> None:
         song = self._entry(pos)
         hover = pos == self._hover
@@ -1592,11 +1697,17 @@ class SongGrid(_CoverGrid):
             p.setBrush(Qt.NoBrush)
             p.drawRoundedRect(cover.adjusted(1, 1, -1, -1), 8, 8)
         for name, br in self.button_rects(cell, hover).items():
-            p.setPen(QColor(255, 255, 255, 230))
-            p.setBrush(QColor(0, 0, 0, 90))
+            over = self._btn == (pos, name)
+            down = over and self._btn_press == self._btn
+            filled = name == 'play'
+            br = br.adjusted(1, 1, -1, -1) if down else br.adjusted(-2, -2, 2, 2) if over else br
+            p.setPen(Qt.NoPen if filled else QPen(QColor(255, 255, 255, 255 if over else 200), 1.5))
+            p.setBrush(QColor(255, 255, 255, 215 if down else 255) if filled
+                       else QColor(255, 255, 255, 70) if down else QColor(40, 40, 40, 235) if over else QColor(0, 0, 0, 140))
             p.drawEllipse(br)
-            icon, px = ('Play', 20) if name == 'play' else (_ICON[name], 16)
-            p.drawPixmap(br.x() + (br.width() - px) // 2, br.y() + (br.height() - px) // 2, icon_pm(icon, '#FFFFFF', px))
+            icon, px = ('Play', 20) if filled else (_ICON[name], 16)
+            p.drawPixmap(br.x() + (br.width() - px) // 2, br.y() + (br.height() - px) // 2,
+                         icon_pm(icon, '#111111' if filled else '#FFFFFF', px))
         y = cell.y() + cp + 14
         for text, font, color, dy in (
                 (song.song_name or '', self._title, accent if playing else _fg(), 0),
@@ -1610,6 +1721,9 @@ class SongGrid(_CoverGrid):
         p.restore()
 
     def mouseDoubleClickEvent(self, e) -> None:
+        if self._btn_at(e.position().toPoint()) is not None:
+            self.mousePressEvent(e)
+            return
         pos = self._hit(e.position().toPoint())
         if pos is not None:
             self.play.emit(self._entry(pos))
@@ -1638,13 +1752,37 @@ class ListHeader(QWidget):
 
 class PlaylistGrid(_CoverGrid):
     open, play, rename, delete = Signal(str), Signal(str), Signal(str), Signal(str)
+    _HOVER_CURSOR = Qt.CursorShape.PointingHandCursor
 
     def __init__(self, parent=None):
         super().__init__('id', 'name', parent)
+        self._tooltip_fn = lambda pl: f'{pl.name} · {_n_songs(len(pl.songs))}'
         self.context_requested.connect(self._menu)
 
     def set_playlists(self, pls: list) -> None:
         self.set_entries(pls)
+
+    def _on_play_button(self, pos: int, point: QPoint) -> bool:
+        return pos == self._hover and self.play_rect(self._cell_rect(pos)).contains(point)
+
+    def mouseReleaseEvent(self, e) -> None:
+        if e.button() == Qt.LeftButton:
+            pt = e.position().toPoint()
+            pos = self._hit(pt)
+            if pos is not None and self._on_play_button(pos, pt):
+                self._pressed = None
+                self.play.emit(self._entry(pos).id)
+                return
+        super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e) -> None:
+        if e.button() != Qt.LeftButton:
+            return
+        pt = e.position().toPoint()
+        pos = self._hit(pt)
+        if pos is None or self._on_play_button(pos, pt):
+            return
+        self.open.emit(self._entry(pos).id)
 
     def play_rect(self, r: QRect) -> QRect:
         return QRect(r.x() + 6 + (self.cover_px - 44) // 2, r.y() + 6 + (self.cover_px - 44) // 2, 44, 44)
@@ -1661,18 +1799,18 @@ class PlaylistGrid(_CoverGrid):
         if hover:
             c = self.play_rect(cell)
             p.setPen(QColor(255, 255, 255, 230))
-            p.setBrush(QColor(0, 0, 0, 80))
+            p.setBrush(themeColor())
             p.drawEllipse(c)
             p.drawPixmap(c.x() + 11, c.y() + 11, icon_pm('Play', '#FFFFFF', 22))
         f = _font(14, QFont.DemiBold)
         p.setFont(f)
-        p.setPen(_fg())
+        p.setPen(themeColor() if hover else _fg())
         p.drawText(QRect(cell.x() + 6, cell.y() + cp + 14, cp, 22), Qt.AlignVCenter,
                    QFontMetrics(f).elidedText(pl.name, Qt.ElideRight, cp))
         p.setFont(_font(12))
         p.setPen(_dim(0.55))
         p.drawText(QRect(cell.x() + 6, cell.y() + cp + 36, cp, 20), Qt.AlignVCenter,
-                   _t('music.n_songs', '{n} songs').format(n=len(pl.songs)))
+                   _n_songs(len(pl.songs)))
         p.restore()
 
     def _menu(self, playlist, global_pos) -> None:
@@ -1810,11 +1948,6 @@ def _audio_info(song, meta_kbps: int = 0) -> str:
     return ' • '.join(p for p in parts if p)
 
 
-def _accent(c: QColor) -> QColor:
-    h, s, _, _ = c.getHsl()
-    return QColor.fromHsl(max(h, 0), min(s, 150), 175)
-
-
 class PlayBar(QWidget):
     open_playing = Signal(int)
     add_requested = Signal()
@@ -1839,8 +1972,8 @@ class PlayBar(QWidget):
         col = QVBoxLayout()
         col.setSpacing(1)
         self.title = ElidedLabel(16, QFont.DemiBold, parent=left)
-        self.artist = ElidedLabel(14, color=QColor(255, 255, 255, 215), parent=left)
-        self.detail = ElidedLabel(13, color=QColor(255, 255, 255, 215), parent=left)
+        self.artist = ElidedLabel(14, color=QColor(255, 255, 255, 240), parent=left)
+        self.detail = ElidedLabel(13, color=QColor(255, 255, 255, 225), parent=left)
         col.addStretch(1)
         for w in (self.title, self.artist, self.detail):
             col.addWidget(w)
@@ -1870,7 +2003,7 @@ class PlayBar(QWidget):
         prog.setSpacing(12)
         self.t_cur, self.t_tot = CaptionLabel('0:00', self), CaptionLabel('0:00', self)
         for t in (self.t_cur, self.t_tot):
-            t.setStyleSheet('color:rgba(255,255,255,215);background:transparent;font-size:13px;')
+            t.setStyleSheet('color:rgba(255,255,255,240);background:transparent;font-size:13px;')
             t.setFixedWidth(46)
         self.t_cur.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.seek = HollowSlider(self)
@@ -1939,13 +2072,13 @@ class PlayBar(QWidget):
         self.cover.set_song(song)
 
     def _apply_accent(self, c: QColor) -> None:
-        self._dark, acc = _tone(c), _accent(c)
-        self.b_play.set_colors(self._dark, acc)
+        self._dark, white = _tone(c).darker(135), QColor('white')
+        self.b_play.set_colors(self._dark, white)
         for b in self._btns:
-            b.accent = acc
+            b.accent = white
             b.update()
         for sl in (self.seek, self.vol):
-            sl.accent = acc
+            sl.accent = white
             sl.update()
 
     def set_color(self, c: QColor) -> None:
@@ -1961,8 +2094,11 @@ class PlayBar(QWidget):
 
     def paintEvent(self, _):
         p = QPainter(self)
-        p.fillRect(self.rect(), self._color)
-        p.fillRect(0, 0, self.width(), 1, QColor(255, 255, 255, 28))
+        g = QLinearGradient(0, 0, 0, self.height())
+        g.setColorAt(0, self._color.lighter(118))
+        g.setColorAt(1, self._color.darker(130))
+        p.fillRect(self.rect(), g)
+        p.fillRect(0, 0, self.width(), 1, QColor(255, 255, 255, 60))
 
     def _pos(self, ms: int) -> None:
         if not self.seek.isSliderDown():
@@ -2038,6 +2174,8 @@ class LyricView(QScrollArea):
         self._active = -1
         self._free_until = 0.0
         self._ani = QPropertyAnimation(self.verticalScrollBar(), b'value', self)
+        self._fade = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._fade)
         self.status = QLabel('', self)
         self.status.setAlignment(Qt.AlignCenter)
         self.status.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -2048,6 +2186,10 @@ class LyricView(QScrollArea):
         m = self.height() // 2
         self._lay.setContentsMargins(40, m, 40, m)
         self.status.setGeometry(0, 0, self.width(), self.height())
+        g = QLinearGradient(0, 0, 0, max(1, self.height()))
+        for pos, a in ((0, 0), (.14, 255), (.86, 255), (1, 0)):
+            g.setColorAt(pos, QColor(0, 0, 0, a))
+        self._fade.setOpacityMask(QBrush(g))
 
     def wheelEvent(self, e):
         sb = self.verticalScrollBar()
@@ -2203,7 +2345,7 @@ class FontPopup(CardWidget):
         q = text.strip().lower()
         for i in range(self.list.count()):
             it = self.list.item(i)
-            it.setHidden(bool(q) and q not in it.text().lower())
+            it.setHidden(bool(q) and not _tm_contains(q, it.text()))
 
     def register(self, path: str) -> str | None:
         fid = QFontDatabase.addApplicationFont(path)
@@ -2242,12 +2384,193 @@ class FontPopup(CardWidget):
         e.acceptProposedAction()
 
 
+_MESH_WIDTH = 192
+_MESH_FALLBACK = ('#8a2a4a', '#2a4a9a', '#9a4a1a', '#4a2a8a', '#1a6a6a')
+_MESH_GLOW = ((0.0, 255), (0.3, 205), (0.6, 80), (1.0, 0))
+_MESH_POINTS = (
+    (0.85, 0.35, 0.30, 0.35, 0.31, 0.23, 1.1, 5.0, 0.50),
+    (0.15, 0.20, 0.25, 0.30, 0.27, 0.37, 0.0, 1.3, 0.45),
+    (0.60, 0.90, 0.35, 0.25, 0.35, 0.29, 2.1, 0.4, 0.50),
+    (0.25, 0.85, 0.25, 0.25, 0.29, 0.41, 4.0, 2.2, 0.42),
+    (0.95, 0.95, 0.25, 0.30, 0.39, 0.33, 5.2, 3.1, 0.42),
+)
+
+
+def _reduced_motion() -> bool:
+    if music_settings.reduce_motion:
+        return True
+    if sys.platform == 'win32':
+        import ctypes
+        flag = ctypes.c_int(1)
+        if ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(flag), 0):
+            return not flag.value
+    return False
+
+
+def _mesh_palette(colors: list) -> list:
+    src = [c for c in colors if c.isValid()] or [QColor(c) for c in _MESH_FALLBACK]
+    src.sort(key=lambda c: c.getHsv()[1] * c.getHsv()[2], reverse=True)
+    out = []
+    for i in range(len(_MESH_POINTS)):
+        h, s, l, _ = src[i % len(src)].getHsl()
+        c = QColor.fromHsl(max(h, 0), min(max(int(s * 1.25), 140), 255), min(max(l, 85), 135))
+        out.append([float(c.red()), float(c.green()), float(c.blue())])
+    h, s, l, _ = src[0].getHsl()
+    c = QColor.fromHsl(max(h, 0), min(max(s, 60), 200), 16)
+    out.append([float(c.red()), float(c.green()), float(c.blue())])
+    return out
+
+
+class _Mesh(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cur = _mesh_palette([])
+        self._tgt = [list(c) for c in self._cur]
+        self._img = QImage(_MESH_WIDTH, _MESH_WIDTH * 9 // 16, QImage.Format_RGB32)
+        self._time, self._last, self._still = 0.0, 0.0, False
+        self._speed = self._goal = 0.0
+        noise = os.urandom(96 * 96)
+        raw = bytearray(96 * 96 * 4)
+        raw[0::4] = raw[1::4] = raw[2::4] = noise
+        raw[3::4] = bytes([14]) * (96 * 96)
+        self._grain = QPixmap.fromImage(QImage(bytes(raw), 96, 96, 96 * 4, QImage.Format_ARGB32).copy())
+        self._timer = QTimer(self, interval=16, timeout=self._tick)
+        self._timer.setTimerType(Qt.PreciseTimer)
+        self._render()
+
+    def set_colors(self, colors: list) -> None:
+        self._tgt = _mesh_palette(colors)
+        if self._still or not self.isVisible():
+            self._cur = [list(c) for c in self._tgt]
+            self._render()
+            self.update()
+        else:
+            self._sync()
+
+    def set_playing(self, on: bool) -> None:
+        self._goal = 1.0 if on else 0.0
+        self._sync()
+
+    def _idle(self) -> bool:
+        return self._speed == self._goal == 0.0 and self._tgt == self._cur
+
+    def _sync(self) -> None:
+        live = self.isVisible() and not self.window().isMinimized() and not self._still and not self._idle()
+        if live and not self._timer.isActive():
+            self._last = time.monotonic()
+            self._timer.start()
+        elif not live:
+            self._timer.stop()
+
+    def _tick(self) -> None:
+        now = time.monotonic()
+        dt, self._last = min(now - self._last, 0.1), now
+        self._speed += (self._goal - self._speed) * (1.0 - math.exp(-dt / 0.5))
+        if self._goal == 0.0 and self._speed < 0.003:
+            self._speed = 0.0
+        self._time += dt * self._speed
+        k = 1.0 - math.exp(-dt / 0.9)
+        for cur, tgt in zip(self._cur, self._tgt):
+            for j in range(3):
+                d = tgt[j] - cur[j]
+                cur[j] = tgt[j] if abs(d) < 0.25 else cur[j] + d * k
+        self._render()
+        self.update()
+        if self._idle():
+            self._timer.stop()
+
+    def _render(self) -> None:
+        w, h, t = self._img.width(), self._img.height(), self._time
+        big = max(w, h)
+        p = QPainter(self._img)
+        rect = self._img.rect()
+        base = self._cur[-1]
+        p.fillRect(rect, QColor(round(base[0]), round(base[1]), round(base[2])))
+        glows = []
+        for (cx, cy, ax, ay, fx, fy, px, py, rad), col in zip(_MESH_POINTS, self._cur):
+            x = w * (cx + ax * math.sin(fx * t + px) + 0.08 * math.sin(2.3 * fx * t + py))
+            y = h * (cy + ay * math.sin(fy * t + py) + 0.08 * math.sin(1.9 * fy * t + px))
+            c = QColor(round(col[0]), round(col[1]), round(col[2]))
+            hue, sat, lig, _ = c.getHsl()
+            if hue >= 0:
+                c.setHsl((hue + round(14 * math.sin(0.21 * t + px))) % 360, sat, lig)
+            r = big * rad * (1 + 0.12 * math.sin(0.37 * t + px))
+            g = QRadialGradient(x, y, r)
+            for pos, a in _MESH_GLOW:
+                c.setAlpha(a)
+                g.setColorAt(pos, c)
+            p.fillRect(rect, g)
+            glows.append((x, y, r, c.lighter(165)))
+        for k, (idx, ph) in enumerate(((1, 0.0), (3, 2.4))):
+            col = self._cur[idx]
+            p.save()
+            p.translate(w / 2, h / 2)
+            p.rotate(28 - 56 * k + 18 * math.sin(0.13 * t + ph))
+            off = 0.35 * w * math.sin(0.17 * t + ph)
+            g = QLinearGradient(off - 0.28 * w, 0, off + 0.28 * w, 0)
+            lit = QColor(round(col[0]), round(col[1]), round(col[2])).lighter(150)
+            for pos, a in ((0.0, 0), (0.5, 46), (1.0, 0)):
+                lit.setAlpha(a)
+                g.setColorAt(pos, lit)
+            p.fillRect(QRectF(-2 * big, -2 * big, 4 * big, 4 * big), g)
+            p.restore()
+        p.setCompositionMode(QPainter.CompositionMode_Plus)
+        for x, y, r, c in glows:
+            g = QRadialGradient(x, y, r * 0.38)
+            c.setAlpha(70)
+            g.setColorAt(0.0, c)
+            c.setAlpha(0)
+            g.setColorAt(1.0, c)
+            p.fillRect(rect, g)
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        swell = round(28 + 14 * math.sin(0.29 * t))
+        p.fillRect(rect, QColor(0, 0, 0, swell + 20))
+        v = QRadialGradient(w / 2, h / 2, big * 0.8)
+        v.setColorAt(0.0, QColor(0, 0, 0, 0))
+        v.setColorAt(0.6, QColor(0, 0, 0, 0))
+        v.setColorAt(1.0, QColor(0, 0, 0, 110))
+        p.fillRect(rect, v)
+        p.end()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self.width() > 0 and self.height() > 0:
+            size = (_MESH_WIDTH, max(1, round(_MESH_WIDTH * self.height() / self.width())))
+            if (self._img.width(), self._img.height()) != size:
+                self._img = QImage(size[0], size[1], QImage.Format_RGB32)
+                self._render()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._still = _reduced_motion()
+        self.window().installEventFilter(self)
+        if self._still:
+            self._cur = [list(c) for c in self._tgt]
+            self._render()
+        self._sync()
+
+    def hideEvent(self, e):
+        self._timer.stop()
+        super().hideEvent(e)
+
+    def eventFilter(self, o, e):
+        if e.type() == QEvent.WindowStateChange:
+            self._sync()
+        return False
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        p.drawImage(self.rect(), self._img)
+        p.drawTiledPixmap(self.rect(), self._grain)
+
+
 class PlayingView(QWidget):
     back = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._base, self._blur = QColor('#2b2233'), QPixmap()
+        self._bg = _Mesh(self)
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 14, 24, 8)
 
@@ -2272,9 +2595,6 @@ class PlayingView(QWidget):
             top.addWidget(b)
         root.addLayout(top)
 
-        self.cover = Cover(64, 0, self)
-        self.cover.hide()
-        self.cover.loaded.connect(self._rebuild_bg)
         self.stack = QStackedWidget()
         self.lyrics = LyricView()
         self.queue = SongList()
@@ -2357,32 +2677,15 @@ class PlayingView(QWidget):
         self._font_pop.hide()
         super().hideEvent(e)
 
-    def set_song(self, song) -> None:
-        self.cover.set_song(song)
-        if song is None:
-            self._blur = QPixmap()
-            self.update()
-
     def set_colors(self, colors: list) -> None:
-        self._base = _tone(_vivid(colors)).darker(130)
-        self.update()
+        self._bg.set_colors(colors)
 
-    def _rebuild_bg(self) -> None:
-        self._blur = self.cover.pm.scaled(28, 28, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-        self.update()
+    def set_playing(self, on: bool) -> None:
+        self._bg.set_playing(on)
 
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.SmoothPixmapTransform)
-        p.fillRect(self.rect(), self._base)
-        if not self._blur.isNull():
-            p.setOpacity(0.55)
-            p.drawPixmap(self.rect(), self._blur)
-            p.setOpacity(1)
-        g = QLinearGradient(0, 0, 0, self.height())
-        g.setColorAt(0, QColor(0, 0, 0, 60))
-        g.setColorAt(1, QColor(0, 0, 0, 120))
-        p.fillRect(self.rect(), g)
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._bg.setGeometry(self.rect())
 
 
 class SlideStack(QWidget):
@@ -2519,7 +2822,20 @@ class MusicPage(QWidget):
 
         pt = QStackedWidget()
         self.grid = PlaylistGrid()
-        pt.addWidget(self.grid)
+        home = QWidget()
+        hl = QVBoxLayout(home)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(8)
+        hrow = QHBoxLayout()
+        self._pl_empty = CaptionLabel(_t('music.no_playlists', 'No playlists yet. Create one to get started.'), home)
+        self._b_new = PrimaryPushButton(FluentIcon.ADD, tr('music.new_playlist'), home)
+        self._b_new.clicked.connect(self._new_playlist)
+        hrow.addWidget(self._pl_empty)
+        hrow.addStretch(1)
+        hrow.addWidget(self._b_new)
+        hl.addLayout(hrow)
+        hl.addWidget(self.grid, 1)
+        pt.addWidget(home)
         detail = QWidget()
         dl = QVBoxLayout(detail)
         dl.setContentsMargins(0, 0, 0, 0)
@@ -2533,10 +2849,11 @@ class MusicPage(QWidget):
         self._pl_count = CaptionLabel('', detail)
         brow = QHBoxLayout()
         b_play = PrimaryPushButton(FluentIcon.PLAY, _t('music.play_all', 'Play all'), detail)
+        b_shuf = PushButton(getattr(FluentIcon, 'SHUFFLE', FluentIcon.SYNC), _t('music.shuffle', 'Shuffle'), detail)
         b_dlall = PushButton(FluentIcon.DOWNLOAD, _t('music.download_all', 'Download all'), detail)
         b_ren = TransparentToolButton(FluentIcon.EDIT, detail)
         b_del = TransparentToolButton(FluentIcon.DELETE, detail)
-        for w in (b_play, b_dlall, b_ren, b_del):
+        for w in (b_play, b_shuf, b_dlall, b_ren, b_del):
             brow.addWidget(w)
         brow.addStretch(1)
         info.addStretch(1)
@@ -2571,14 +2888,18 @@ class MusicPage(QWidget):
         self.grid.rename.connect(self._rename_playlist)
         self.grid.delete.connect(self._delete_playlist)
         b_play.clicked.connect(lambda: self._play_playlist(self._cur_pl))
+        b_shuf.clicked.connect(lambda: self._play_playlist(self._cur_pl, True))
         b_dlall.clicked.connect(lambda: self._download_all(self._pl_songs_now()))
         b_ren.clicked.connect(lambda: self._rename_playlist(self._cur_pl))
         b_del.clicked.connect(lambda: self._delete_playlist(self._cur_pl))
         self._store.playlists_changed.connect(self._refresh_playlists)
         self.bar.open_playing.connect(self._open_playing)
+        self.bar.cover.loaded.connect(self._extract_colors)
         self.bar.add_requested.connect(self._add_current)
         self.bar.hide()
         self._player.state_changed.connect(lambda _s: QTimer.singleShot(0, self._check_idle))
+        self._player.state_changed.connect(lambda st: self.view.set_playing(st == 'playing'))
+        self.view.set_playing(self._player.is_playing)
         self.view.back.connect(lambda: self._main.set_open(False))
         self.view.lyrics.seek.connect(self._player.seek)
         self._player.song_changed.connect(self._on_song_changed)
@@ -2599,12 +2920,27 @@ class MusicPage(QWidget):
             self._on_song_changed(None)
 
     def _open_playing(self, tab: int = 0) -> None:
+        if self._main.is_open and self.view.b_queue.isChecked() == bool(tab):
+            self._main.set_open(False)
+            return
         self.view.show_tab(tab)
         self._main.set_open(True)
         self._want_lyrics()
 
 
+    def keyPressEvent(self, e) -> None:
+        if e.key() == Qt.Key_Escape:
+            if self._main.is_open:
+                self._main.set_open(False)
+                return
+            if self._cur_pl is not None:
+                self._close_playlist()
+                return
+        super().keyPressEvent(e)
+
     def _apply_locale(self, *_):
+        self._b_new.setText(tr('music.new_playlist'))
+        self._pl_empty.setText(_t('music.no_playlists', 'No playlists yet. Create one to get started.'))
         self._search.setPlaceholderText(tr('music.search_placeholder'))
         self._pivot.setItemText('playlists', tr('music.playlists'))
         if not self._songs:
@@ -2631,7 +2967,7 @@ class MusicPage(QWidget):
 
 
     def _on_search(self) -> None:
-        q = self._search.text().strip()
+        q = _clean_query(self._search.text())
         if not q:
             return
         if self._token is not None:
@@ -2735,13 +3071,11 @@ class MusicPage(QWidget):
             lst.set_playing(key)
         self.bar.set_song(song)
         self.bar.setVisible(song is not None)
-        self.view.set_song(song)
         self._lrc_shown = None
         self.view.lyrics.clear()
         if song is None:
             return
-        if song.cover_url:
-            images.dominant(song.cover_url, partial(self._on_colors, key), count=5, owner=self)
+        self._extract_colors()
         self._want_lyrics()
 
     def _want_lyrics(self) -> None:
@@ -2756,6 +3090,11 @@ class MusicPage(QWidget):
             task = _LrcTask(song)
             task.signals.finished.connect(self._on_lrc)
             QThreadPool.globalInstance().start(task)
+
+    def _extract_colors(self) -> None:
+        song = self._player.current_song
+        if song is not None and song.cover_url:
+            images.dominant(song.cover_url, partial(self._on_colors, song.key), count=5, owner=self)
 
     def _on_colors(self, key, colors) -> None:
         if key == self._cur_key and colors:
@@ -2785,7 +3124,9 @@ class MusicPage(QWidget):
 
 
     def _refresh_playlists(self) -> None:
-        self.grid.set_playlists(self._store.all_playlists())
+        pls = self._store.all_playlists()
+        self.grid.set_playlists(pls)
+        self._pl_empty.setVisible(not pls)
         if self._cur_pl:
             pl = self._store.get(self._cur_pl)
             if pl is None:
@@ -2795,7 +3136,7 @@ class MusicPage(QWidget):
 
     def _fill_detail(self, pl) -> None:
         self._pl_name.setText(pl.name)
-        self._pl_count.setText(_t('music.n_songs', '{n} songs').format(n=len(pl.songs)))
+        self._pl_count.setText(_n_songs(len(pl.songs)))
         self._pl_cover.set_url(next((s.cover_url for s in pl.songs if s.cover_url), None))
         self.pl_songs.set_songs(pl.songs)
         self.pl_songs.set_playing(self._cur_key)
@@ -2815,22 +3156,30 @@ class MusicPage(QWidget):
         self._cur_pl = None
         self._pl_stack.setCurrentIndex(0)
 
-    def _play_playlist(self, pid) -> None:
+    def _play_playlist(self, pid, shuffle: bool = False) -> None:
         pl = self._store.get(pid) if pid else None
         if pl is None or not pl.songs:
             return
-        first = next((s for s in pl.songs if _playable(s)), None)
-        if first is None:
+        songs = [s for s in pl.songs if _playable(s)]
+        if not songs:
             self._toast('warning', tr('music.no_preview_title'), tr('music.no_preview_in_playlist_content'))
-        else:
-            self._play(first, pl.songs)
+            return
+        if shuffle:
+            random.shuffle(songs)
+        self._play(songs[0], songs)
+
+    def _new_playlist(self) -> None:
+        dlg = NameDialog(tr('music.new_playlist'), '', self.window())
+        if dlg.exec() and dlg.text():
+            pl = self._store.create(dlg.text())
+            self._toast('success', tr('music.saved_title'), pl.name, 2000)
 
     def _rename_playlist(self, pid) -> None:
         pl = self._store.get(pid) if pid else None
         if pl is None:
             return
         dlg = NameDialog(_t('music.rename_playlist', 'Rename playlist'), pl.name, self.window())
-        if dlg.exec() and dlg.text():
+        if dlg.exec() and dlg.text() and dlg.text() != pl.name:
             self._store.rename(pid, dlg.text())
 
     def _delete_playlist(self, pid) -> None:
@@ -2854,7 +3203,10 @@ class MusicPage(QWidget):
             if not pid:
                 self._toast('warning', tr('music.no_playlist_selected_title'), tr('music.no_playlist_selected_content'))
                 return
-        name = self._store.get(pid).name
+        target = self._store.get(pid)
+        if target is None:
+            return
+        name = target.name
         if self._store.add_song(pid, song):
             self._toast('success', tr('music.saved_title'), tr('music.added_to_playlist', name=name), 2500)
         else:

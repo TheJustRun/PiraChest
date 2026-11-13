@@ -159,6 +159,7 @@ class CacheManager:
         self._exec('PRAGMA wal_checkpoint(TRUNCATE)')
 
     def size_bytes(self) -> int:
+        self._exec('PRAGMA wal_checkpoint(PASSIVE)')
         return sum(_file_size(self._path + suffix) for suffix in ('', '-wal', '-shm'))
 
     def flush_all(self) -> None:
@@ -187,7 +188,32 @@ cache = CacheManager()
 
 
 def _sidecar_dirs() -> tuple[str, ...]:
-    return (os.path.join(paths.cache_dir, 'shaders'), paths.torrent_cache, paths.stream_cache)
+    folders = (os.path.join(paths.cache_dir, 'shaders'), paths.torrent_cache, paths.stream_cache)
+    roots = [os.path.normcase(os.path.abspath(p)) for p in (settings.download_dir, paths.download_root) if p]
+    keep = []
+    for folder in folders:
+        path = os.path.normcase(os.path.abspath(folder))
+        if any(path == root or path.startswith(root + os.sep) for root in roots):
+            continue
+        keep.append(folder)
+    return tuple(keep)
+
+
+def _cache_tree_size() -> int:
+    skip = {os.path.normcase(d) for d in _sidecar_dirs()} | {os.path.normcase(cache._path + s) for s in ('', '-wal', '-shm')}
+    total = 0
+    try:
+        with os.scandir(paths.cache_dir) as entries:
+            for entry in entries:
+                if os.path.normcase(entry.path) in skip:
+                    continue
+                try:
+                    total += dir_size_bytes(entry.path) if entry.is_dir(follow_symlinks=False) else entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
 
 
 def _stop_stream() -> None:
@@ -213,6 +239,8 @@ def trim_stream_cache(limit_gb: int | None = None) -> None:
                 continue
             files.append((st.st_mtime, st.st_size, path))
             total += st.st_size
+    if total <= limit:
+        return
     for _mtime, size, path in sorted(files):
         if total <= limit:
             break
@@ -229,7 +257,7 @@ def clear_stream_cache() -> None:
 
 
 def app_cache_size() -> int:
-    return cache.size_bytes() + sum(dir_size_bytes(d) for d in _sidecar_dirs())
+    return cache.size_bytes() + sum(dir_size_bytes(d) for d in _sidecar_dirs()) + _cache_tree_size()
 
 
 def clear_app_cache() -> None:
@@ -237,3 +265,15 @@ def clear_app_cache() -> None:
     cache.clear_all()
     for folder in _sidecar_dirs():
         empty_dir(folder)
+    skip = {os.path.normcase(d) for d in _sidecar_dirs()} | {os.path.normcase(cache._path + s) for s in ('', '-wal', '-shm')}
+    try:
+        with os.scandir(paths.cache_dir) as entries:
+            for entry in list(entries):
+                if os.path.normcase(entry.path) in skip or os.path.normcase(entry.path) == os.path.normcase(os.path.join(paths.cache_dir, 'shaders')):
+                    continue
+                try:
+                    shutil.rmtree(entry.path, ignore_errors=True) if entry.is_dir(follow_symlinks=False) else os.remove(entry.path)
+                except OSError:
+                    pass
+    except OSError:
+        pass

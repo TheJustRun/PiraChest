@@ -3,7 +3,6 @@ from __future__ import annotations
 import collections
 import ctypes
 import gc
-import importlib
 import logging
 import math
 import os
@@ -11,7 +10,6 @@ import re
 import struct
 import subprocess
 import sys
-import threading
 import time
 import weakref
 from contextlib import suppress
@@ -28,6 +26,8 @@ from PySide6.QtCore import (
     QEvent,
     qInstallMessageHandler,
     QObject,
+    QParallelAnimationGroup,
+    QSequentialAnimationGroup,
     QPoint,
     QPointF,
     QPropertyAnimation,
@@ -128,6 +128,7 @@ from qfluentwidgets import (
     NavigationItemPosition,
     Pivot,
     PrimaryPushButton,
+    ProgressBar,
     PushButton,
     qconfig,
     setFont,
@@ -147,7 +148,9 @@ from shiboken6 import (
 )
 
 from src.core.config import (
+    APP_NAME,
     apply_settings,
+    nav_order,
     associations_available,
     associations_need_repair,
     check_dir_writable,
@@ -157,7 +160,10 @@ from src.core.config import (
     format_size,
     free_space_bytes,
     get_launch_at_startup,
+    ICON_FILE,
     is_admin,
+    IS_CANARY,
+    LOGO_FILE,
     paths,
     register_associations,
     resolve_theme,
@@ -170,11 +176,13 @@ from src.core.theme import (
     activate_theme,
     active_preset_id,
     all_preset_ids,
+    animations_enabled,
     apply_label_theme,
     apply_pivot_theme,
     apply_tool_button_theme,
     ChromeChip,
     ensure_contrast,
+    fade_in,
     filled_icon,
     global_app_qss,
     manager as theme_manager,
@@ -378,7 +386,8 @@ out vec4 fragColor;
 uniform sampler2D src;
 uniform float qt_Opacity;
 void main() {
-    fragColor = texture(src, qt_TexCoord0) * qt_Opacity;
+    vec4 c = texture(src, qt_TexCoord0) * qt_Opacity;
+    fragColor = vec4(c.rgb, 1.0);
 }
 """
 
@@ -1133,6 +1142,17 @@ class ShaderBackgroundWidget(_GLBackground):
         self._image_tex_path = self._image_path
 
 
+def _flatten_on_black(image: QImage) -> QImage:
+    if not image.hasAlphaChannel():
+        return image
+    flat = QImage(image.size(), QImage.Format.Format_RGB32)
+    flat.fill(Qt.GlobalColor.black)
+    painter = QPainter(flat)
+    painter.drawImage(0, 0, image)
+    painter.end()
+    return flat
+
+
 class MediaBackgroundWidget(_GLBackground):
 
     failed = Signal(str)
@@ -1345,17 +1365,28 @@ class MediaBackgroundWidget(_GLBackground):
 
     def _sync_frame_texture(self, image: QImage) -> None:
         texture = self._frame_tex
-        if texture is not None and (texture.width() != image.width() or texture.height() != image.height()):
+        w, h = image.width(), image.height()
+        if texture is not None and (texture.width() != w or texture.height() != h):
             texture.destroy()
             texture = None
-        if texture is None:
-            texture = QOpenGLTexture(image, QOpenGLTexture.MipMapGeneration.DontGenerateMipMaps)
-            texture.setMinificationFilter(QOpenGLTexture.Filter.Linear)
-            texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
-            texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
-            self._frame_tex = texture
-        else:
-            texture.setData(image)
+        rgba = image.convertToFormat(QImage.Format.Format_RGBA8888_Premultiplied).mirrored(False, True)
+        pixels = bytes(rgba.constBits())
+        if texture is not None:
+            try:
+                texture.setData(QOpenGLTexture.PixelFormat.RGBA, QOpenGLTexture.PixelType.UInt8, pixels)
+                return
+            except Exception:
+                texture.destroy()
+        texture = QOpenGLTexture(QOpenGLTexture.Target.Target2D)
+        texture.setFormat(QOpenGLTexture.TextureFormat.RGBA8_UNorm)
+        texture.setSize(w, h)
+        texture.setMipLevels(1)
+        texture.allocateStorage(QOpenGLTexture.PixelFormat.RGBA, QOpenGLTexture.PixelType.UInt8)
+        texture.setMinificationFilter(QOpenGLTexture.Filter.Linear)
+        texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
+        texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
+        texture.setData(QOpenGLTexture.PixelFormat.RGBA, QOpenGLTexture.PixelType.UInt8, pixels)
+        self._frame_tex = texture
 
     def _ensure_fbos(self) -> bool:
         dpr = self.devicePixelRatioF()
@@ -1383,6 +1414,38 @@ _KONAMI_CODE = (
     Qt.Key.Key_B, Qt.Key.Key_A,
 )
 _KONAMI_URL = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
+
+
+class _ResizeWatcher(QObject):
+
+    def __init__(self, target, callback) -> None:
+        super().__init__(target)
+        self._callback = callback
+        self._queued = False
+        target.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.Show) and not self._queued:
+            self._queued = True
+            QTimer.singleShot(0, self._fire)
+        return False
+
+    def _fire(self) -> None:
+        self._queued = False
+        self._callback()
+
+
+class _NavGhost(QWidget):
+
+    def __init__(self, pixmap, parent) -> None:
+        super().__init__(parent)
+        self._pixmap = pixmap
+        self.setFixedSize(pixmap.deviceIndependentSize().toSize())
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.drawPixmap(0, 0, self._pixmap)
 
 
 class _AdminShield(QWidget):
@@ -1498,6 +1561,35 @@ def _load_bundled_figtree_fonts() -> bool:
 _FLUENT_UPLIFT_APPLIED = False
 
 
+def _apply_checkbox_contrast() -> None:
+    from PySide6.QtWidgets import QCheckBox, QStyle, QStyleOptionButton
+    from qfluentwidgets.components.widgets.check_box import CheckBox as _FluentCheckBox, CheckBoxIcon
+    from src.core.theme import text_on
+
+    def paintEvent(self, e):
+        QCheckBox.paintEvent(self, e)
+        painter = QPainter(self)
+        painter.setRenderHints(QPainter.RenderHint.Antialiasing)
+        opt = QStyleOptionButton()
+        opt.initFrom(self)
+        rect = self.style().subElementRect(QStyle.SubElement.SE_CheckBoxIndicator, opt, self)
+        background = self._backgroundColor()
+        painter.setPen(self._borderColor())
+        painter.setBrush(background)
+        painter.drawRoundedRect(rect, 4.5, 4.5)
+        state = self.checkState()
+        if state != Qt.CheckState.Unchecked:
+            icon = CheckBoxIcon.ACCEPT if state == Qt.CheckState.Checked else CheckBoxIcon.PARTIAL_ACCEPT
+            if self.isEnabled():
+                icon.render(painter, rect, fill=QColor(text_on(background)).name())
+            else:
+                painter.setOpacity(0.8)
+                icon.render(painter, rect)
+        painter.end()
+
+    _FluentCheckBox.paintEvent = paintEvent
+
+
 def _event_x(e, *accessors: str) -> float:
     for name in accessors:
         fn = getattr(e, name, None)
@@ -1508,9 +1600,9 @@ def _event_x(e, *accessors: str) -> float:
 
 
 def _apply_switch_uplift() -> None:
-    from qfluentwidgets.common.color import fallbackThemeColor, validColor
     from qfluentwidgets.common.style_sheet import ThemeColor, isDarkTheme
     from qfluentwidgets.components.widgets.switch_button import Indicator, SwitchButton
+    from src.core.theme import text_on
 
     def patch(owner, name):
         def install(fn):
@@ -1678,6 +1770,14 @@ def _apply_switch_uplift() -> None:
     @staticmethod
     def _startAnimation(ani: QPropertyAnimation, endValue, startValue):
         ani.stop()
+        if not animations_enabled():
+            target = ani.targetObject()
+            if target is not None:
+                name = ani.propertyName()
+                if not isinstance(name, str):
+                    name = bytes(name).decode()
+                target.setProperty(name, endValue)
+            return
         ani.setStartValue(startValue)
         ani.setEndValue(endValue)
         ani.start()
@@ -1691,11 +1791,7 @@ def _apply_switch_uplift() -> None:
         color = self.darkCheckedColor if isDark else self.lightCheckedColor
         if not self.isEnabled():
             return QColor(255, 255, 255, 41) if isDark else QColor(0, 0, 0, 56)
-        if self.isPressed:
-            return validColor(color, ThemeColor.LIGHT_2.color())
-        elif self.isHover:
-            return validColor(color, ThemeColor.LIGHT_1.color())
-        return fallbackThemeColor(color)
+        return ThemeColor.PRIMARY.color()
 
     @patch(Indicator, '_offBackgroundColor')
     def _offBackgroundColor(self, isDark: bool):
@@ -1730,7 +1826,7 @@ def _apply_switch_uplift() -> None:
     @patch(Indicator, '_onSliderColor')
     def _onSliderColor(self, isDark: bool):
         if self.isEnabled():
-            return QColor(Qt.black if isDark else Qt.white)
+            return QColor(text_on(ThemeColor.PRIMARY.color()))
         return QColor(255, 255, 255, 77) if isDark else QColor(255, 255, 255)
 
     @patch(Indicator, '_offSliderColor')
@@ -1825,16 +1921,80 @@ def _apply_switch_uplift() -> None:
         return super(SwitchButton, self).eventFilter(obj, e)
 
 
+_PIVOT_MOTION_PATCHED = False
+
+
+def _apply_pivot_motion_patch() -> None:
+    global _PIVOT_MOTION_PATCHED
+    if _PIVOT_MOTION_PATCHED:
+        return
+    original = Pivot.setCurrentItem
+
+    def setCurrentItem(self, routeKey):
+        if animations_enabled():
+            return original(self, routeKey)
+        if routeKey not in self.items or routeKey == self.currentRouteKey():
+            return
+        self._currentRouteKey = routeKey
+        self.slideAni.stop()
+        for k, item in self.items.items():
+            item.setSelected(k == routeKey)
+        self.slideAni.setValue(self.currentIndicatorGeometry())
+        self.currentItemChanged.emit(routeKey)
+        self.update()
+
+    Pivot.setCurrentItem = setCurrentItem
+    _PIVOT_MOTION_PATCHED = True
+
+
+_SCROLL_MOTION_PATCHED = False
+
+
+def _apply_scroll_motion_patch() -> None:
+    global _SCROLL_MOTION_PATCHED
+    if _SCROLL_MOTION_PATCHED:
+        return
+    from qfluentwidgets.common.smooth_scroll import SmoothScroll
+    from qfluentwidgets.components.widgets.scroll_bar import SmoothScrollBar
+
+    original_set_value = SmoothScrollBar.setValue
+    original_wheel = SmoothScroll.wheelEvent
+
+    def setValue(self, value, useAni=True):
+        return original_set_value(self, value, useAni and animations_enabled())
+
+    def wheelEvent(self, e):
+        if not animations_enabled():
+            return QAbstractScrollArea.wheelEvent(self.widget, e)
+        return original_wheel(self, e)
+
+    SmoothScrollBar.setValue = setValue
+    SmoothScroll.wheelEvent = wheelEvent
+    _SCROLL_MOTION_PATCHED = True
+
+
 def apply_fluent_uplifts() -> None:
     global _FLUENT_UPLIFT_APPLIED
     if _FLUENT_UPLIFT_APPLIED:
         return
+    try:
+        _apply_pivot_motion_patch()
+    except Exception:
+        logger.exception('Fluent uplift failed: pivot-motion')
+    try:
+        _apply_scroll_motion_patch()
+    except Exception:
+        logger.exception('Fluent uplift failed: scroll-motion')
     if os.environ.get('PIRACHEST_NO_FLUENT_UPLIFT') == '1':
         return
     try:
         _apply_switch_uplift()
     except Exception:
         logger.exception('Fluent uplift failed: switch-button')
+    try:
+        _apply_checkbox_contrast()
+    except Exception:
+        logger.exception('Fluent uplift failed: check-box')
     _FLUENT_UPLIFT_APPLIED = True
 apply_fluent_uplifts()
 
@@ -1971,6 +2131,10 @@ class LazyPage(QWidget):
         page = self._factory()
         self._page = page
         self._layout.addWidget(page)
+        try:
+            fade_in(page)
+        except Exception:
+            pass
         if self._on_ready is not None:
             try:
                 self._on_ready(page)
@@ -2435,6 +2599,7 @@ _LABEL_STYLES = {
     'title': ('title_px', QFont.Weight.DemiBold, ('dialog_title_text', 'primary_text'), '#eaeaea'),
     'subtitle': ('subtitle_px', None, ('muted',), '#9a9a9a'),
     'step': _LABEL_CAPTION,
+    'section': ('subtitle_px', QFont.Weight.Bold, ('dialog_title_text', 'primary_text'), '#eaeaea'),
     'error': ('caption_px', None, ('state_error',), '#e5484d'),
     'accent': ('caption_px', None, ('accent_text', 'accent'), '#0078d4'),
     'body': ('base_px', None, ('primary_text',), '#eaeaea'),
@@ -2605,7 +2770,7 @@ class _ToggleCard(QAbstractButton):
 
     def _animate_knob(self, checked: bool) -> None:
         self._knob_anim.stop()
-        if not self.isVisible():
+        if not self.isVisible() or not animations_enabled():
             self._set_position(1.0 if checked else 0.0)
             return
         self._knob_anim.setStartValue(self._position)
@@ -3152,11 +3317,12 @@ class _ThemeCard(QAbstractButton):
 
 class _ResponsiveGrid(QWidget):
 
-    def __init__(self, gap: int, min_col: int, max_cols: int, parent=None):
+    def __init__(self, gap: int, min_col: int, max_cols: int, parent=None, min_items: int = 0):
         super().__init__(parent)
         self._gap = max(0, int(gap))
         self._min_col = max(1, int(min_col))
         self._max_cols = max(1, int(max_cols))
+        self._min_items = max(0, int(min_items))
         self._items: list[QWidget] = []
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.setMinimumWidth(0)
@@ -3174,7 +3340,7 @@ class _ResponsiveGrid(QWidget):
             return 1
         width = max(1, int(width))
         cols = (width + self._gap) // (self._min_col + self._gap)
-        return max(1, min(self._max_cols, len(self._items), int(cols)))
+        return max(1, min(self._max_cols, max(len(self._items), self._min_items), int(cols)))
 
     def _layout_rows(self, width: int) -> tuple[list[list[QWidget]], list[int], int]:
         width = max(1, int(width))
@@ -3210,7 +3376,7 @@ class _ResponsiveGrid(QWidget):
         rows, heights, _total = self._layout_rows(width)
         if not rows:
             return
-        cols = len(rows[0])
+        cols = self.columns_for(width)
         col_w = (width - self._gap * (cols - 1)) / cols
         y = 0
         for row, row_h in zip(rows, heights):
@@ -3555,6 +3721,11 @@ class _Greeting(QWidget):
         self._fade_out()
 
     def _fade_out(self) -> None:
+        if not animations_enabled():
+            self._fading_out = False
+            self._text = self._target
+            self._set_reveal(1.0)
+            return
         self._fading_out = True
         self._anim.stop()
         self._anim.setStartValue(self._reveal)
@@ -3645,7 +3816,7 @@ class _Progress(QWidget):
             return
         self._target = target
         self._anim.stop()
-        if not animate:
+        if not animate or not animations_enabled():
             self._set_progress(target)
             return
         self._anim.setStartValue(self._progress)
@@ -4168,6 +4339,10 @@ class OnboardingWizard(_OverlayDialog):
             self._fade_page(page)
 
     def _fade_page(self, page: QWidget) -> None:
+        if not animations_enabled():
+            if page.graphicsEffect() is not None:
+                page.setGraphicsEffect(None)
+            return
         if page.graphicsEffect() is not None:
             page.setGraphicsEffect(None)
         effect = QGraphicsOpacityEffect(page)
@@ -4276,15 +4451,8 @@ class OnboardingWizard(_OverlayDialog):
 
     def _build_theme_page(self) -> QWidget:
         page = _Page(self._metrics)
-        grid = _ResponsiveGrid(self._metrics.theme_gap, self._metrics.theme_min_col, 5, page)
-        self._theme_cards = {}
-        for option_id, label, swatch, media, kind in _theme_options():
-            card = _ThemeCard(option_id, label, swatch, media, kind, self._metrics, grid)
-            card.set_selected(option_id == self._state.theme)
-            card.clicked.connect(lambda _checked=False, o=option_id: self._pick_theme(o))
-            grid.add(card)
-            self._theme_cards[option_id] = card
-        page.add(grid, 0)
+        self._theme_cards, self._theme_custom_header = _build_theme_sections(
+            page, self._metrics, self._state.theme, self._pick_theme)
         return page
 
     def _pick_theme(self, option_id: str) -> None:
@@ -4562,10 +4730,10 @@ def _feature_icon(slot: str):
         'nav.pc_games': FluentIcon.GAME,
         'nav.youtube': FluentIcon.PLAY,
         'nav.tv': FluentIcon.PROJECTOR,
-        'nav.tbhb': FluentIcon.SEARCH,
+        'nav.tbhb': FluentIcon.GLOBE,
         'nav.music': FluentIcon.MUSIC,
         'nav.books': FluentIcon.BOOK_SHELF,
-        'nav.sailseek': FluentIcon.GLOBE,
+        'nav.sailseek': FluentIcon.SEARCH,
     }.get(slot, FluentIcon.APPLICATION)
 
 
@@ -4586,6 +4754,41 @@ def _theme_options() -> list[tuple[str, str, tuple, str, str]]:
         options.append((preset_id, preset_label(preset_id),
                         tuple(meta.palette[k] for k in _SWATCH_KEYS), media, kind))
     return options
+
+
+def _is_custom_theme(option_id: str) -> bool:
+    if option_id in _PLAIN_THEMES or option_id == '__draft__':
+        return False
+    meta = preset_meta(option_id)
+    return meta is not None and bool(meta.dir)
+
+
+def _build_theme_sections(page: '_Page', metrics: '_Metrics', current: str,
+                          on_pick: Callable[[str], None]) -> tuple[dict, '_Label']:
+    options = _theme_options()
+    defaults = [o for o in options if not _is_custom_theme(o[0])]
+    customs = [o for o in options if _is_custom_theme(o[0])]
+    cards: dict[str, _ThemeCard] = {}
+
+    def make_grid(items, min_items: int = 0) -> '_ResponsiveGrid':
+        grid = _ResponsiveGrid(metrics.theme_gap, metrics.theme_min_col, 5, page, min_items=min_items)
+        for option_id, label, swatch, media, kind in items:
+            card = _ThemeCard(option_id, label, swatch, media, kind, metrics, grid)
+            card.set_selected(option_id == current)
+            card.clicked.connect(lambda _checked=False, o=option_id: on_pick(o))
+            grid.add(card)
+            cards[option_id] = card
+        return grid
+
+    page.add(make_grid(defaults), 0)
+    header = _Label(tr('settings.theme_custom_header', 'Custom themes'), 'section', metrics)
+    if customs:
+        page.add(header, 24)
+        page.add(make_grid(customs, min_items=5), 10)
+    else:
+        header.setParent(page)
+        header.hide()
+    return cards, header
 
 
 def _activate_option(option_id: str) -> bool:
@@ -4631,15 +4834,8 @@ class ThemePickerDialog(_OverlayDialog):
 
     def _build(self) -> None:
         page = _Page(self._metrics)
-        grid = _ResponsiveGrid(self._metrics.theme_gap, self._metrics.theme_min_col, 5, page)
-        self._cards = {}
-        for option_id, label, swatch, media, kind in _theme_options():
-            card = _ThemeCard(option_id, label, swatch, media, kind, self._metrics, grid)
-            card.set_selected(option_id == self.theme)
-            card.clicked.connect(lambda _checked=False, o=option_id: self._pick(o))
-            grid.add(card)
-            self._cards[option_id] = card
-        page.add(grid, 0)
+        self._cards, self._custom_header = _build_theme_sections(
+            page, self._metrics, self.theme, self._pick)
         self.set_page(page)
         self._page = page
 
@@ -4697,6 +4893,9 @@ class ThemePickerDialog(_OverlayDialog):
             tr('onboarding.theme_continue', 'Continue'),
             True,
         )
+        header = getattr(self, '_custom_header', None)
+        if header is not None:
+            header.setText(tr('settings.theme_custom_header', 'Custom themes'))
         self._request_refit()
 
     def keyPressEvent(self, event) -> None:
@@ -4713,6 +4912,10 @@ class ThemePickerDialog(_OverlayDialog):
 
 def pick_theme(owner: QWidget, current: str,
                on_accept: Callable[[str], None] | None = None) -> str | None:
+    prepare = getattr(owner, '_prepare_gl_surface', None)
+    if callable(prepare):
+        with suppress(Exception):
+            prepare()
     dialog = ThemePickerDialog(owner, current, on_accept)
     try:
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -4751,7 +4954,6 @@ def _maybe_run_onboarding(parent: MainWindow) -> None:
     QTimer.singleShot(2500, parent, parent._freeze_gc)
     _maybe_show_vpn_disclaimer(parent)
     QTimer.singleShot(300, parent._check_update_on_startup)
-    QTimer.singleShot(1500, parent, parent._start_page_preload)
 
 
 def _maybe_show_vpn_disclaimer(parent: MainWindow) -> None:
@@ -4764,14 +4966,6 @@ def _maybe_show_vpn_disclaimer(parent: MainWindow) -> None:
         with suppress(Exception):
             save_settings(settings)
 
-_PAGE_MODULES = (
-    ('pc_games_page', 'src.gui.repacks_page'),
-    ('tbhb_page', 'src.gui.tbhb_page'),
-    ('music_page', 'src.gui.music_page'),
-    ('books_page', 'src.gui.books_page'),
-    ('yt_page', 'src.gui.yt_page'),
-    ('tv_page', 'src.gui.tv_page'),
-)
 
 
 def _lazy_repacks(s):
@@ -4793,18 +4987,24 @@ def _make_minerva_page(s):
     return MinervaPage(s)
 
 
-def _lazy_tv():
+def _lazy_tv(download_manager):
     from .tv_page import TV_page
-    return TV_page()
+    page = TV_page()
+    page.set_download_manager(download_manager)
+    return page
 
 
 class _ThemedSplash(SplashScreen):
 
+    def __init__(self, icon, parent=None, enableShadow: bool = True) -> None:
+        super().__init__(icon, parent, enableShadow)
+        self.titleBar.setStyleSheet('background: transparent;')
+
     def paintEvent(self, _event) -> None:
         try:
-            bg = to_color(palette().get('page_bg'), '#1c1c1c')
+            bg = to_color(palette().get('page_bg'), '#121212')
         except Exception:
-            bg = QColor(32, 32, 32)
+            bg = QColor(18, 18, 18)
         bg.setAlpha(255)
         p = QPainter(self)
         p.fillRect(self.rect(), bg)
@@ -5218,6 +5418,9 @@ class DonateDialog(MessageBoxBase):
             with suppress(Exception):
                 self._fade.finished.disconnect()
             self._fade.stop()
+        if not animations_enabled():
+            self._detail.setGraphicsEffect(None)
+            return
         effect = QGraphicsOpacityEffect(self._detail)
         self._detail.setGraphicsEffect(effect)
         anim = QPropertyAnimation(effect, b'opacity', self._detail)
@@ -5243,9 +5446,23 @@ class DonateDialog(MessageBoxBase):
 
 class MainWindow(FluentWindow):
     _chrome = _shader_bg = _media_bg = _update_overlay = None
+    _closing = False
     _resize_settle_timer = _bg_refresh_debounce_timer = _bg_scaled_cache = None
     _bg_modal_timer = None
     _bg_movie = _bg_player = _bg_video_sink = None
+
+    def _remove_bottom_gaps(self) -> None:
+        with suppress(Exception):
+            lay = self.widgetLayout
+            m = lay.contentsMargins()
+            lay.setContentsMargins(m.left(), m.top(), m.right(), 0)
+        with suppress(Exception):
+            stacked = self.stackedWidget
+            m = stacked.contentsMargins()
+            stacked.setContentsMargins(m.left(), m.top(), m.right(), 0)
+            if stacked.layout() is not None:
+                m = stacked.layout().contentsMargins()
+                stacked.layout().setContentsMargins(m.left(), m.top(), m.right(), 0)
 
     def _apply_theme_background(self, preset_id: str | None) -> None:
         try:
@@ -5273,7 +5490,46 @@ class MainWindow(FluentWindow):
     def _drop_background_photo(self) -> None:
         self._bg_photo_processed = None
         self._bg_fingerprint = None
+        self._bg_pending_key = None
+        self._bg_pending_token = getattr(self, '_bg_pending_token', 0) + 1
         self._stop_background_media()
+
+    def _load_background_photo(self, key, path, blur, darken, token) -> None:
+        if token != self._bg_pending_token or self._bg_pending_key != key:
+            return
+        self._bg_pending_key = None
+        try:
+            reader = QImageReader(path)
+            reader.setAutoTransform(True)
+            size = reader.size()
+            limit = 800 if blur > 0 else 1280
+            radius = blur
+            if size.isValid():
+                old_max = max(size.width(), size.height())
+                new_max = old_max
+                if old_max > limit:
+                    scaled = size.scaled(limit, limit, Qt.AspectRatioMode.KeepAspectRatio)
+                    reader.setScaledSize(scaled)
+                    new_max = max(scaled.width(), scaled.height())
+                reference = min(old_max, 1280)
+                if blur > 0 and reference and new_max != reference:
+                    radius = max(1, round(blur * (new_max / reference)))
+            image = reader.read()
+            if image.isNull():
+                return
+            processed = _process_background_pixmap(QPixmap.fromImage(image), radius, darken)
+            cache = self._bg_pixmap_cache
+            cache[key] = processed
+            while len(cache) > 2:
+                cache.pop(next(iter(cache)))
+            if token != self._bg_pending_token:
+                return
+            self._bg_photo_processed = processed
+            self._bg_fingerprint = key
+        except Exception:
+            logger.exception('Failed to load background photo')
+            return
+        self.update()
 
     def _schedule_background_refresh(self, delay_ms: int = 120) -> None:
         if self._apply_live_media_params():
@@ -5388,7 +5644,7 @@ class MainWindow(FluentWindow):
         preset = active_preset_id()
         shader_frag = theme_shader_path(preset)
         if self._defer_background_until_modal_closes():
-            if shader_frag is None or self._shader_bg is None:
+            if shader_frag is None:
                 self._clear_stale_background()
                 return
         if shader_frag is not None:
@@ -5441,8 +5697,15 @@ class MainWindow(FluentWindow):
             except OSError:
                 stat = None
             key = (os.path.abspath(path), int(blur), int(darken), stat, scope)
+            cached = self._bg_pixmap_cache.get(key)
+            if cached is not None:
+                if key != getattr(self, '_bg_fingerprint', None) or self._bg_photo_processed is None:
+                    self._bg_pending_key = None
+                    self._bg_pending_token += 1
+                    self._bg_photo_processed = cached
+                    self._bg_fingerprint = key
+                return
             if key == getattr(self, '_bg_fingerprint', None) and self._bg_photo_processed is not None:
-                self.update()
                 return
             self._drop_background_photo()
             self._bg_blur = blur
@@ -5464,14 +5727,9 @@ class MainWindow(FluentWindow):
                 self._start_background_movie(movie, darken)
                 self._bg_fingerprint = key
                 return
-            raw = QPixmap(path)
-            if raw.isNull():
-                return
-            max_dim = 1280
-            if raw.width() > max_dim or raw.height() > max_dim:
-                raw = raw.scaled(max_dim, max_dim, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
-            self._bg_photo_processed = _process_background_pixmap(raw, blur, darken)
-            self._bg_fingerprint = key
+            self._bg_pending_key = key
+            token = self._bg_pending_token
+            QTimer.singleShot(20, self, lambda: self._load_background_photo(key, path, blur, darken, token))
         except Exception:
             logger.exception('Failed to refresh background photo')
             self._bg_photo_processed = None
@@ -5578,6 +5836,8 @@ class MainWindow(FluentWindow):
         pix = movie.currentPixmap()
         if pix.isNull():
             return
+        if pix.hasAlphaChannel():
+            pix = QPixmap.fromImage(_flatten_on_black(pix.toImage()))
         self._bg_photo_processed = _process_background_pixmap(pix, getattr(self, '_bg_blur', 0), getattr(self, '_bg_darken', 0))
         self.update()
 
@@ -5657,7 +5917,8 @@ class MainWindow(FluentWindow):
         self.setVisible(False)
         self._ui_ready = False
         self._pending_open_targets = list(initial_targets or [])
-        self.setWindowTitle('PiraChest')
+        self.setWindowTitle(APP_NAME)
+        self.setProperty('pirachestCanary', IS_CANARY)
         self.resize(1100, 740)
         self.setMinimumSize(900, 600)
         self._force_quit = False
@@ -5665,13 +5926,14 @@ class MainWindow(FluentWindow):
         self._konami_seen = 0.0
         self._konami_cooldown = 0.0
         self._konami_stamp = None
-        self._preload_thread = None
-        self._preload_stop = None
         self._tray_icon = None
         self._downloads_badge = None
         self._downloads_badge_count = -1
         self._bg_photo_processed = None
         self._bg_fingerprint = None
+        self._bg_pixmap_cache = {}
+        self._bg_pending_key = None
+        self._bg_pending_token = 0
         self._bg_movie = None
         self._bg_player = None
         self._bg_video_sink = None
@@ -5708,7 +5970,7 @@ class MainWindow(FluentWindow):
                 set_debug_console_visible(True)
         except Exception:
             logger.exception('Failed to restore debug console visibility')
-        app_icon_path = _photo_path('logo.ico', 'icon.ico', 'icon.png', 'logo.png')
+        app_icon_path = _photo_path(LOGO_FILE, ICON_FILE, 'icon.png', 'logo.png')
         if app_icon_path:
             self.setWindowIcon(QIcon(app_icon_path))
         self._apply_taskbar_icon()
@@ -5731,6 +5993,11 @@ class MainWindow(FluentWindow):
         self.navigationInterface.setCollapsible(False)
         self.navigationInterface.setReturnButtonVisible(False)
         self.navigationInterface.setMenuButtonVisible(True)
+        with suppress(Exception):
+            self.navigationInterface.setIndicatorAnimationEnabled(animations_enabled())
+        self._remove_bottom_gaps()
+        QTimer.singleShot(0, self._remove_bottom_gaps)
+        QTimer.singleShot(400, self._remove_bottom_gaps)
         with suppress(Exception):
             _panel = self.navigationInterface.panel
             _hbar = _panel.scrollArea.horizontalScrollBar()
@@ -5776,6 +6043,18 @@ class MainWindow(FluentWindow):
         self.download_manager.item_removed.connect(self._schedule_downloads_badge_update)
         self.download_manager.download_completed.connect(self._on_download_completed)
 
+        from src.core.repacks.installer import get_install_coordinator
+        self._install_bar = None
+        self._install_progress_bar = None
+        self._install_progress_ts = 0.0
+        self.install_coordinator = get_install_coordinator(self)
+        self.install_coordinator.bind(self.download_manager)
+        self.install_coordinator.install_queued.connect(self._on_game_install_queued)
+        self.install_coordinator.install_started.connect(self._on_game_install_started)
+        self.install_coordinator.install_progress.connect(self._on_game_install_progress)
+        self.install_coordinator.install_succeeded.connect(self._on_game_install_succeeded)
+        self.install_coordinator.install_failed.connect(self._on_game_install_failed)
+
         self._downloads_badge_timer = QTimer(self)
         self._downloads_badge_timer.setSingleShot(True)
         self._downloads_badge_timer.setInterval(200)
@@ -5813,15 +6092,15 @@ class MainWindow(FluentWindow):
             logger.exception('Failed to switch to Home on launch')
         self.settings_page.settings_changed.connect(self._on_settings_changed)
         self._load_filters()
-        self._auto_sync()
+        QTimer.singleShot(2500, self, self._auto_sync)
         self._init_keyboard_shortcuts()
         with suppress(Exception):
             self.splashScreen.finish()
         self.splashScreen = None
         _maybe_run_onboarding(self)
-        self._ensure_associations_registered()
         self._ui_ready = True
-        self._settings_warmup_timer = QTimer(self, singleShot=True, interval=1000)
+        QTimer.singleShot(500, self._warm_audio)
+        self._settings_warmup_timer = QTimer(self, singleShot=True, interval=4000)
         self._settings_warmup_timer.timeout.connect(self._prepare_settings_page)
         self._settings_warmup_timer.start()
 
@@ -5859,6 +6138,10 @@ class MainWindow(FluentWindow):
         with suppress(Exception):
             self.sailseek.apply_settings()
 
+    def _warm_audio(self) -> None:
+        with suppress(Exception):
+            get_sound_manager().warm()
+
     def _prepare_settings_page(self) -> None:
         page = getattr(self, 'settings_page', None)
         if page is not None:
@@ -5875,6 +6158,24 @@ class MainWindow(FluentWindow):
     def _create_about_page(self):
         from .about_page import AboutPage
         return AboutPage(self)
+
+    def switchTo(self, interface: QWidget) -> None:
+        stack = self.stackedWidget
+        if stack.currentWidget() is interface:
+            return
+        if isinstance(interface, QAbstractScrollArea):
+            interface.verticalScrollBar().setValue(0)
+        view = getattr(stack, 'view', None)
+        if view is None:
+            super().switchTo(interface)
+            return
+        try:
+            enabled = animations_enabled()
+            view.setAnimationEnabled(enabled)
+            view.setCurrentWidget(interface, False, True, 200 if enabled else 0,
+                                  QEasingCurve.Type.OutCubic)
+        except Exception:
+            super().switchTo(interface)
 
     def _on_stacked_page_changed(self, _index: int) -> None:
         shader_bg = self._shader_bg
@@ -5919,6 +6220,129 @@ class MainWindow(FluentWindow):
                 )
         except Exception:
             logger.exception('Failed to show download-complete notification')
+
+    def _close_install_bar(self) -> None:
+        bar, self._install_bar = self._install_bar, None
+        self._install_progress_bar = None
+        if bar is not None:
+            with suppress(Exception):
+                bar.close()
+
+    def _install_tray_message(self, title: str, body: str, icon) -> None:
+        if self._tray_icon is None or not settings.notify_on_download_complete:
+            return
+        try:
+            self._tray_icon.showMessage(title, body, icon, 5000)
+        except Exception:
+            logger.debug('Could not show install tray notification', exc_info=True)
+
+    def _on_game_install_queued(self, title: str) -> None:
+        name = title or tr('download.rom_fallback')
+        InfoBar.info(
+            title=self.tr_or('notifications.install_queued_title', 'Installation queued'),
+            content=self.tr_or('notifications.install_queued_content', '{name} will be installed after the current game.').format(name=name),
+            orient=Qt.Orientation.Horizontal, isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT, duration=5000, parent=self)
+
+    def _on_game_install_started(self, spec: dict) -> None:
+        self._close_install_bar()
+        title = (spec or {}).get('title') or tr('download.rom_fallback')
+        self._install_progress_ts = 0.0
+        try:
+            self._install_bar = InfoBar.info(
+                title=f"{self.tr_or('notifications.install_started_title', 'Installing game')} · {title}",
+                content=self.tr_or('notifications.install_preparing', 'Preparing installer…'),
+                orient=Qt.Orientation.Horizontal, isClosable=True,
+                position=InfoBarPosition.TOP_RIGHT, duration=-1, parent=self)
+            self._install_progress_bar = ProgressBar(self)
+            self._install_progress_bar.setFixedWidth(110)
+            self._install_progress_bar.setValue(0)
+            self._install_bar.addWidget(self._install_progress_bar)
+        except Exception:
+            logger.exception('Could not show install progress')
+        self._install_tray_message(
+            self.tr_or('notifications.install_started_title', 'Installing game'),
+            self.tr_or('notifications.install_started_content', '{name} is being installed.').format(name=title),
+            QSystemTrayIcon.MessageIcon.Information)
+
+    def _on_game_install_progress(self, title: str, pct: int, status: str) -> None:
+        now = time.monotonic()
+        if now - self._install_progress_ts < 0.5 and pct < 100:
+            return
+        self._install_progress_ts = now
+        bar = self._install_bar
+        if bar is None:
+            return
+        text = f'{pct}% · {status}' if pct >= 0 else status
+        with suppress(Exception):
+            bar.contentLabel.setText(text)
+        if pct >= 0 and self._install_progress_bar is not None:
+            with suppress(Exception):
+                self._install_progress_bar.setValue(max(0, min(100, pct)))
+
+    def _launch_game_from_record(self, record: dict) -> None:
+        exe = str((record or {}).get('exe') or '')
+        if not exe or not os.path.isfile(exe):
+            InfoBar.warning(
+                title=self.tr_or('library.play_failed_title', 'Could not launch the game'),
+                content=self.tr_or('library.play_missing_exe', 'The game executable was not found.'),
+                orient=Qt.Orientation.Horizontal, isClosable=True,
+                position=InfoBarPosition.TOP_RIGHT, duration=6000, parent=self)
+            return
+        try:
+            args = str(record.get('args') or '').strip()
+            cwd = str(record.get('cwd') or os.path.dirname(exe))
+            if args:
+                subprocess.Popen(f'"{exe}" {args}', cwd=cwd)
+            else:
+                os.startfile(exe)
+        except Exception as exc:
+            logger.exception('Could not launch installed game %s', exe)
+            InfoBar.error(
+                title=self.tr_or('library.play_failed_title', 'Could not launch the game'),
+                content=str(exc),
+                orient=Qt.Orientation.Horizontal, isClosable=True,
+                position=InfoBarPosition.TOP_RIGHT, duration=8000, parent=self)
+
+    def _on_game_install_succeeded(self, record) -> None:
+        self._close_install_bar()
+        title = (record or {}).get('title') or tr('download.rom_fallback')
+        exe = str((record or {}).get('exe') or '')
+        content = self.tr_or('notifications.install_done_content', '{name} is ready to play.').format(name=title)
+        if not exe:
+            content = self.tr_or('library.install_no_exe', 'Installed, but no game executable was detected.')
+        bar = InfoBar.success(
+            title=self.tr_or('notifications.install_done_title', 'Game installed'),
+            content=content,
+            orient=Qt.Orientation.Horizontal, isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT, duration=15000, parent=self)
+        if exe:
+            play = PrimaryPushButton(self.tr_or('library.play_now', 'Play now'), self)
+            play.clicked.connect(lambda _=False, rec=dict(record): self._launch_game_from_record(rec))
+            bar.addWidget(play)
+        self._install_tray_message(
+            self.tr_or('notifications.install_done_title', 'Game installed'),
+            content,
+            QSystemTrayIcon.MessageIcon.Information)
+        try:
+            lazy = getattr(self, 'pc_games_page', None)
+            if lazy is not None and getattr(lazy, 'page', None) is not None:
+                lazy.page.refresh_visible()
+        except Exception:
+            logger.debug('Could not refresh the game library after install', exc_info=True)
+
+    def _on_game_install_failed(self, title: str, message: str) -> None:
+        self._close_install_bar()
+        name = title or tr('download.rom_fallback')
+        InfoBar.error(
+            title=self.tr_or('notifications.install_failed_title', 'Installation failed'),
+            content=f'{name}: {message}',
+            orient=Qt.Orientation.Horizontal, isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT, duration=10000, parent=self)
+        self._install_tray_message(
+            self.tr_or('notifications.install_failed_title', 'Installation failed'),
+            f'{name}: {message}',
+            QSystemTrayIcon.MessageIcon.Critical)
 
     def _on_all_downloads_finished(self) -> None:
         action = settings.on_finish_action
@@ -6047,8 +6471,26 @@ class MainWindow(FluentWindow):
         try:
             qss = global_app_qss()
             app = QApplication.instance()
-            if app is not None and app.styleSheet() != qss:
-                app.setStyleSheet(qss)
+            if app is not None:
+                current = app.styleSheet()
+                if current != qss:
+                    accent = str(palette().get('accent') or '')
+                    previous = getattr(self, '_theme_qss_accent', None)
+                    meta = theme_manager._meta
+                    dialogs = any(isinstance(w, QDialog) and w.isVisible()
+                                  for w in app.topLevelWidgets())
+                    fast = bool(accent and previous and previous != accent
+                                and not dialogs and not (meta is not None and meta.custom_qss)
+                                and re.sub(re.escape(previous), accent, current, flags=re.I).lower() == qss.lower())
+                    if not fast:
+                        self._stop_theme_repolish()
+                        enabled = self.updatesEnabled()
+                        self.setUpdatesEnabled(False)
+                        try:
+                            app.setStyleSheet(qss)
+                            self._theme_qss_accent = accent
+                        finally:
+                            self.setUpdatesEnabled(enabled)
             self._chrome.apply()
             self._apply_content_surface_tint()
             self._refresh_nav_icons()
@@ -6056,6 +6498,12 @@ class MainWindow(FluentWindow):
         except Exception:
             logger.exception('Theme repolish failed')
         self._frame_invalidate()
+
+    def _stop_theme_repolish(self) -> None:
+        timer = getattr(self, '_theme_repolish_timer', None)
+        if timer is not None:
+            timer.stop()
+        self._theme_repolish_queue = []
 
     def _frame_invalidate(self) -> None:
         chrome = self._chrome
@@ -6236,7 +6684,7 @@ class MainWindow(FluentWindow):
     def _apply_taskbar_icon(self) -> None:
         if sys.platform != 'win32':
             return
-        path = _photo_path('icon.ico')
+        path = _photo_path(ICON_FILE)
         if not path:
             return
         try:
@@ -6256,9 +6704,9 @@ class MainWindow(FluentWindow):
     def _init_tray_icon(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
-        _tray = _photo_path('icon.ico')
+        _tray = _photo_path(ICON_FILE)
         self._tray_icon = QSystemTrayIcon(QIcon(_tray) if _tray else self.windowIcon(), self)
-        self._tray_icon.setToolTip('PiraChest')
+        self._tray_icon.setToolTip(APP_NAME)
         menu = QMenu()
         show_action = QAction('Show', self)
         show_action.triggered.connect(self._restore_from_tray)
@@ -6642,11 +7090,13 @@ class MainWindow(FluentWindow):
                     event.ignore()
                     self.hide()
                     return
-        self._stop_page_preload()
+        self._closing = True
         controller = getattr(self, 'sailseek', None)
         if controller is not None:
             with suppress(Exception):
                 controller.shutdown()
+        with suppress(Exception):
+            self.install_coordinator.shutdown()
         with suppress(Exception):
             self.download_manager.shutdown()
         with suppress(Exception):
@@ -6681,7 +7131,13 @@ class MainWindow(FluentWindow):
         with suppress(Exception):
             self._register_shortcuts()
         with suppress(Exception):
-            self._sync_optional_pages()
+            self.navigationInterface.setIndicatorAnimationEnabled(animations_enabled())
+        with suppress(Exception):
+            view = getattr(self.stackedWidget, 'view', None)
+            if view is not None:
+                view.setAnimationEnabled(animations_enabled())
+        with suppress(Exception):
+            self._sync_optional_pages(animate=True)
         with suppress(Exception):
             if self.home_page:
                 self.home_page.sync_model()
@@ -6712,28 +7168,184 @@ class MainWindow(FluentWindow):
         if getattr(self.settings_page, '_built', False):
             self.settings_page._chk_youtube.setChecked(False)
 
+    def _schedule_nav_center(self) -> None:
+        timer = self.__dict__.get('_nav_center_timer')
+        if timer is None:
+            timer = self._nav_center_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(16)
+            timer.timeout.connect(self._center_scroll_nav_items)
+        if self.__dict__.get('_nav_anim_state') is not None:
+            timer.start(120)
+            return
+        timer.start()
+
+    def _nav_scroll_widgets(self, layout) -> list:
+        widgets = []
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widgets.append(widget)
+        return widgets
+
     def _center_scroll_nav_items(self) -> None:
         try:
-            layout = self.navigationInterface.panel.scrollLayout
+            panel = self.navigationInterface.panel
+            layout = panel.scrollLayout
         except Exception:
             logger.exception('Failed to access scrollable navigation layout')
             return
         try:
+            if getattr(self, '_nav_resize_watcher', None) is None:
+                self._nav_resize_watcher = _ResizeWatcher(panel, self._schedule_nav_center)
+                self._nav_area_watcher = _ResizeWatcher(panel.scrollArea.viewport(), self._schedule_nav_center)
             for i in reversed(range(layout.count())):
                 item = layout.itemAt(i)
                 if item is not None and item.spacerItem() is not None:
                     layout.takeAt(i)
-            layout.insertStretch(0, 1)
+            widgets = [w for w in self._nav_scroll_widgets(layout) if not w.isHidden()]
+            top = 0
+            if widgets:
+                spacing = max(layout.spacing(), 0)
+                block = sum(max(w.height(), w.sizeHint().height()) for w in widgets) + spacing * (len(widgets) - 1)
+                area = panel.scrollArea
+                area_top = area.mapTo(panel, QPoint(0, 0)).y()
+                free = area.viewport().height() - block
+                desired = panel.height() / 2 - block / 2 - area_top - spacing
+                top = int(max(0, min(desired, free)))
+            if top:
+                layout.insertSpacing(0, top)
             layout.addStretch(1)
         except Exception:
             logger.exception('Failed to center scrollable navigation items')
+
+    def _nav_in_sync(self) -> bool:
+        try:
+            layout = self.navigationInterface.panel.scrollLayout
+            shown = []
+            for widget in self._nav_scroll_widgets(layout):
+                for attr, flag, key, *_rest in self._OPTIONAL_PAGES:
+                    if widget is getattr(self, f'_nav_{key}', None) and not widget.isHidden():
+                        shown.append(key)
+            desired = [k for k in nav_order()
+                       if any(key == k and getattr(settings, flag) for _a, flag, key, *_r in self._OPTIONAL_PAGES)]
+            return shown == desired and bool(shown)
+        except Exception:
+            return False
+
+    def _nav_snapshot(self):
+        if not self.isVisible():
+            return None
+        try:
+            layout = self.navigationInterface.panel.scrollLayout
+            return {w: w.pos() for w in self._nav_scroll_widgets(layout) if not w.isHidden()}
+        except Exception:
+            return None
+
+    def _nav_clear_ghosts(self) -> None:
+        state = self.__dict__.pop('_nav_anim_state', None)
+        if state is None:
+            return
+        group, ghosts, widgets, layout = state
+        group.stop()
+        group.deleteLater()
+        for ghost in ghosts:
+            ghost.hide()
+            ghost.deleteLater()
+        for widget in widgets:
+            with suppress(RuntimeError):
+                widget.setGraphicsEffect(None)
+        layout.setEnabled(True)
+        layout.invalidate()
+        layout.activate()
+
+    def _animate_nav(self, before) -> None:
+        gone = self.__dict__.pop('_nav_gone', [])
+        if not animations_enabled():
+            self._nav_clear_ghosts()
+            QTimer.singleShot(0, self._schedule_nav_center)
+            return
+        if before is None:
+            QTimer.singleShot(0, self._schedule_nav_center)
+            QTimer.singleShot(350, self._schedule_nav_center)
+            return
+        try:
+            self._nav_clear_ghosts()
+            panel = self.navigationInterface.panel
+            layout = panel.scrollLayout
+            layout.activate()
+            hidden_now = {g[0] for g in gone}
+            now = [w for w in self._nav_scroll_widgets(layout) if not w.isHidden() and w not in hidden_now]
+            removed = [(pix, pos) for _w, pix, pos in gone]
+            wait = 110 if removed else 0
+            jobs = []
+            for widget in now:
+                old = before.get(widget)
+                new = widget.pos()
+                if old is None:
+                    jobs.append((widget, QPoint(-widget.width(), new.y()), new, 0, True))
+                elif old != new:
+                    jobs.append((widget, old, new, wait, False))
+            if not jobs and not removed:
+                return
+            layout.setEnabled(False)
+            group = QParallelAnimationGroup(self)
+            ghosts, touched = [], []
+
+            def track(target, start, end, delay, kind, duration, overshoot=0.0, fade=None):
+                curve = QEasingCurve(kind)
+                if overshoot:
+                    curve.setOvershoot(overshoot)
+                step = QParallelAnimationGroup()
+                move = QPropertyAnimation(target, b'pos')
+                move.setEasingCurve(curve)
+                move.setDuration(duration)
+                move.setStartValue(start)
+                move.setEndValue(end)
+                step.addAnimation(move)
+                if fade is not None:
+                    effect = QGraphicsOpacityEffect(target)
+                    effect.setOpacity(fade[0])
+                    target.setGraphicsEffect(effect)
+                    alpha = QPropertyAnimation(effect, b'opacity')
+                    alpha.setDuration(min(duration, 140))
+                    alpha.setStartValue(fade[0])
+                    alpha.setEndValue(fade[1])
+                    step.addAnimation(alpha)
+                seq = QSequentialAnimationGroup()
+                if delay:
+                    seq.addPause(delay)
+                seq.addAnimation(step)
+                group.addAnimation(seq)
+
+            for widget, start, end, delay, fresh in jobs:
+                widget.move(start)
+                touched.append(widget)
+                if fresh:
+                    track(widget, start, end, delay, QEasingCurve.Type.OutBack, 300, 1.4, (0.0, 1.0))
+                else:
+                    track(widget, start, end, delay, QEasingCurve.Type.OutCubic, 260)
+            for pix, pos in removed:
+                ghost = _NavGhost(pix, panel.scrollWidget)
+                ghost.move(pos)
+                ghost.show()
+                ghosts.append(ghost)
+                track(ghost, pos, QPoint(-ghost.width() - 6, pos.y()), 0,
+                      QEasingCurve.Type.InCubic, 190, 0.0, (1.0, 0.0))
+            self._nav_anim_state = (group, ghosts, touched, layout)
+            group.finished.connect(self._nav_clear_ghosts)
+            group.start()
+        except Exception:
+            logger.exception('Failed to animate navigation items')
+            self._nav_clear_ghosts()
 
     _OPTIONAL_PAGES = (
         ('home_page', 'minerva_enabled', 'minerva', FluentIcon.APPLICATION, 'minervaPage',
          lambda s: _make_minerva_page(s)),
         ('pc_games_page', 'pc_games_enabled', 'pc_games', FluentIcon.GAME, 'pcGamesPage',
          lambda s: LazyPage(_lazy_repacks(s), keep_alive=True, shutdown=_shutdown_repacks_page)),
-        ('tbhb_page', 'tbhb_enabled', 'tbhb', FluentIcon.SEARCH, 'tbhbPage',
+        ('tbhb_page', 'tbhb_enabled', 'tbhb', FluentIcon.GLOBE, 'tbhbPage',
          lambda s: LazyPage(_lazy_tbhb(s), keep_alive=True, shutdown=_shutdown_page)),
         ('music_page', 'music_enabled', 'music', FluentIcon.MUSIC, 'musicPage',
          lambda s: LazyPage(s._create_music_page, keep_alive=True, shutdown=_shutdown_page)),
@@ -6742,7 +7354,7 @@ class MainWindow(FluentWindow):
         ('yt_page', 'youtube_enabled', 'youtube', FluentIcon.PLAY, 'ytPage',
          lambda s: s._make_yt_page()),
         ('tv_page', 'tv_enabled', 'tv', FluentIcon.PROJECTOR, 'tvPageNav',
-         lambda s: LazyPage(_lazy_tv, keep_alive=True, shutdown=_shutdown_page)),
+         lambda s: LazyPage(lambda: _lazy_tv(s.download_manager), keep_alive=True, shutdown=_shutdown_page)),
     )
 
     def _build_books_page(self):
@@ -6782,37 +7394,13 @@ class MainWindow(FluentWindow):
             bridge = self.yt_bridge = YtDownloadBridge(self.download_manager, self)
         return bridge
 
-    def _start_page_preload(self) -> None:
-        if getattr(self, '_preload_thread', None) is not None:
+    def _sync_optional_pages(self, animate: bool = False) -> None:
+        if self._nav_in_sync():
+            if getattr(self, 'home_nav_page', None) is not None:
+                self.home_nav_page.on_features_changed()
             return
-        modules = [name for attr, name in _PAGE_MODULES
-                   if getattr(self, attr, None) is not None]
-        if not modules:
-            return
-        stop = threading.Event()
-        self._preload_stop = stop
-
-        def run() -> None:
-            for name in modules:
-                if stop.is_set():
-                    return
-                try:
-                    importlib.import_module(name)
-                except Exception:
-                    logger.debug('Page preload failed for %s', name, exc_info=True)
-                if stop.wait(0.10):
-                    return
-
-        thread = threading.Thread(target=run, name='page-preload', daemon=True)
-        self._preload_thread = thread
-        thread.start()
-
-    def _stop_page_preload(self) -> None:
-        stop = getattr(self, '_preload_stop', None)
-        if stop is not None:
-            stop.set()
-
-    def _sync_optional_pages(self) -> None:
+        snapshot = self._nav_snapshot() if animate else None
+        gone = []
         for attr, flag, key, icon, object_name, build in self._OPTIONAL_PAGES:
             page, enabled = getattr(self, attr), getattr(settings, flag)
             if enabled and page is None:
@@ -6822,6 +7410,10 @@ class MainWindow(FluentWindow):
                 setattr(self, f'_nav_{key}', self.addSubInterface(
                     page, themed_nav_icon(f'nav.{key}', icon), tr(f'nav.{key}'), position=NavigationItemPosition.SCROLL))
             elif not enabled and page is not None:
+                nav_widget = getattr(self, f'_nav_{key}', None)
+                if nav_widget is not None:
+                    gone.append((nav_widget, nav_widget.grab(), nav_widget.pos()))
+                    nav_widget.hide()
                 if isinstance(page, LazyPage):
                     page.shutdown_now()
                 self._remove_subinterface(page)
@@ -6829,10 +7421,42 @@ class MainWindow(FluentWindow):
                 setattr(self, f'_nav_{key}', None)
                 if attr == 'books_page':
                     self._shutdown_books_bridge()
+        self._apply_nav_order()
         self._refresh_nav_icons()
         self._center_scroll_nav_items()
+        self._nav_gone = gone
+        self._animate_nav(snapshot)
         if getattr(self, 'home_nav_page', None) is not None:
             self.home_nav_page.on_features_changed()
+
+    def _apply_nav_order(self) -> None:
+        try:
+            layout = self.navigationInterface.panel.scrollLayout
+        except Exception:
+            return
+        wanted = []
+        for key in nav_order():
+            widget = getattr(self, f'_nav_{key}', None)
+            if widget is not None:
+                wanted.append(widget)
+        if len(wanted) < 2:
+            return
+        members = set(wanted)
+        slots = []
+        current = []
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            widget = item.widget() if item is not None else None
+            if widget in members:
+                slots.append(i)
+                current.append(widget)
+        if current == wanted or len(current) != len(wanted):
+            return
+        for widget in current:
+            layout.removeWidget(widget)
+        for slot, widget in zip(slots, wanted):
+            layout.insertWidget(slot, widget, 0, Qt.AlignmentFlag.AlignTop)
+        layout.invalidate()
 
     def _on_open_data_folder(self) -> None:
         path = paths.app_data_dir
@@ -6876,6 +7500,14 @@ class MainWindow(FluentWindow):
 
     def _refresh_nav_icons(self) -> None:
         chrome = self._chrome
+
+        def _apply(widget, slot_id, icon) -> None:
+            themed = themed_nav_icon(slot_id, icon)
+            with suppress(Exception):
+                if widget.icon().cacheKey() == themed.cacheKey():
+                    return
+            widget.setIcon(themed)
+
         for widget, route_key, key, icon in self._nav_items():
             if widget is None:
                 continue
@@ -6884,25 +7516,23 @@ class MainWindow(FluentWindow):
                 if chrome is not None and route_key:
                     with suppress(Exception):
                         chrome.note_nav_item(route_key, slot_id, icon)
-                widget.setIcon(themed_nav_icon(slot_id, icon))
+                _apply(widget, slot_id, icon)
         with suppress(Exception):
             item = self.navigationInterface.widget('openDataFolder')
             if item is not None:
                 if chrome is not None:
                     with suppress(Exception):
                         chrome.note_nav_item('openDataFolder', 'nav.open_data_folder', FluentIcon.FOLDER)
-                item.setIcon(themed_nav_icon('nav.open_data_folder', FluentIcon.FOLDER))
+                _apply(item, 'nav.open_data_folder', FluentIcon.FOLDER)
         with suppress(Exception):
             if chrome is not None:
                 chrome.refresh_nav()
 
-    _PAGE_ORDER_ATTRS = ('home_nav_page', 'home_page', 'pc_games_page', 'tbhb_page',
-                         'music_page', 'books_page', 'yt_page', 'tv_page',
-                         'download_page', 'settings_page', 'about_page')
-
     def _ordered_pages(self) -> list:
         pages = []
-        for attr in self._PAGE_ORDER_ATTRS:
+        attr_by_key = {key: attr for attr, _flag, key, *_rest in self._OPTIONAL_PAGES}
+        optional = [attr_by_key[key] for key in nav_order() if key in attr_by_key]
+        for attr in ('home_nav_page', *optional, 'download_page', 'settings_page', 'about_page'):
             try:
                 page = getattr(self, attr, None)
             except Exception:
@@ -7726,6 +8356,8 @@ class MainWindow(FluentWindow):
         card.show_anchored(self)
 
     def _check_update_on_startup(self):
+        if not settings.auto_check_updates:
+            return
         update_controller.disconnect_listeners()
         update_controller.check_finished.connect(self._on_startup_update_check_done)
         update_controller.check()
@@ -7825,6 +8457,13 @@ class SyncPromptCard(CardWidget):
         self._fade_out()
 
     def _fade_out(self):
+        if not animations_enabled():
+            for anim in getattr(self, '_entry_anims', ()):
+                with suppress(Exception):
+                    anim.stop()
+            self.hide()
+            self.deleteLater()
+            return
         effect = QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(effect)
         anim = QPropertyAnimation(effect, b'opacity', self)
@@ -7840,10 +8479,14 @@ class SyncPromptCard(CardWidget):
         start_x = window.width() - self.width() - margin
         end_x = start_x
         self.move(start_x, top - 24)
-        self.setWindowOpacity(0.0)
         self.show()
         self.raise_()
         play_popout_sfx('info')
+        if not animations_enabled():
+            self.setWindowOpacity(1.0)
+            self.move(end_x, top)
+            return
+        self.setWindowOpacity(0.0)
         pos_anim = QPropertyAnimation(self, b'pos', self)
         pos_anim.setDuration(220)
         pos_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -7885,9 +8528,9 @@ def create_application(argv: list | None=None):
     QSurfaceFormat.setDefaultFormat(surface_format)
     app = QApplication(argv if argv is not None else sys.argv)
     app.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
-    app.setApplicationName('PiraChest')
-    app.setApplicationDisplayName('PiraChest')
-    _logo = _photo_path('logo.ico')
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    _logo = _photo_path(LOGO_FILE)
     if _logo:
         app.setWindowIcon(QIcon(_logo))
     app.setOrganizationName('PiraChest')
