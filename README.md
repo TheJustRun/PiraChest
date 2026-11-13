@@ -30,9 +30,13 @@ Get the latest build from [GitHub Releases](https://github.com/TheJustRun/PiraCh
 [![Download](https://img.shields.io/badge/Download-Latest%20Release-brightgreen?style=for-the-badge)](https://github.com/TheJustRun/PiraChest/releases)
 
 Chocolatey support is out, installing it is as simple as:
-
+For pre-releases (Canary)
 ```powershell
 choco install pirachest --pre
+```
+For stable releases (Stable requires manual approval by Chocolatey, so don't be surprised if some releases come late or don't work through it)
+```powershell
+choco install pirachest 
 ```
 
 ## Features
@@ -43,7 +47,7 @@ There's a new Home page that acts as a central starting point for discovering co
 
 ### Sailseek
 
-A fast global search system that lets you search across the content and functionality PiraChest offers from one compact interface — movies, shows, games, music, anime, manga, settings, and more. Result cards show relevant metadata like artwork, name, source, and date where available. There's a customizable keyboard shortcut for opening it too.
+A fast global search system that lets you search across the content and functionality PiraChest offers from one compact interface: movies, shows, games, music, anime, manga, settings, and more. Result cards show relevant metadata like artwork, name, source, and date where available. There's a customizable keyboard shortcut for opening it too.
 
 ### ROMs
 
