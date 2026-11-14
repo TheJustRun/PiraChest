@@ -203,13 +203,6 @@ def _merge_sources(merged: dict[str, StreamSource], sources) -> None:
 
 
 async def _find_streams_quick(providers: list, timeout: float = 10.0) -> list[StreamSource]:
-    """Return as soon as a direct source is available.
-
-    Torrent providers keep running in parallel so torrent-only titles still
-    reach the picker, but they are cancelled the moment a direct source
-    arrives. The whole search is also capped so a slow provider cannot keep
-    the picker waiting for its long tail.
-    """
     tasks = [asyncio.ensure_future(provider) for provider in providers]
     merged: dict[str, StreamSource] = {}
     loop = asyncio.get_running_loop()

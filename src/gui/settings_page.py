@@ -10,9 +10,10 @@ import re
 import sys
 import time
 import warnings
+
+import shiboken6
 from contextlib import suppress
 from functools import partial
-from ctypes import wintypes
 from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QStandardPaths, Qt, QTimer, QUrl, Signal
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QStackedWidget,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -101,7 +103,6 @@ from src.core.theme import (
     apply_tool_button_theme,
     branded_icon,
     animations_enabled,
-    dialog_qss,
     ensure_contrast,
     fade_in,
     manager,
@@ -263,81 +264,209 @@ class UpdateController(QObject):
 update_controller = UpdateController()
 
 
-def _changelog_markdown_to_html(text: str) -> str:
-    lines = text.replace('\r\n', '\n').split('\n')
-    out: list[str] = []
+_CL_SKIP = re.compile(r'^(?:\*{0,2}(?:Install|Portable):\*{0,2}.*|.+\(Windows x64\)\.?|-{3,}|\*{3,})$', re.I)
+_CL_HEAD = re.compile(r'^(#{1,6})\s+(.*?)\s*#*$')
+_CL_ITEM = re.compile(r'^(\s*)(?:[*+-]|\d+\.)\s+(.*)$')
+_CL_REF = re.compile(r'\s*\(#(\d+)\)$')
+_CL_PULL = re.compile(r'/(?:pull|issues)/(\d+)$')
+_CL_TOKENS = re.compile(r'\[([^\]]+)\]\((https?://[^)\s]+)\)|(?<!["=>])(https?://[^\s<]+)')
+_CL_CODE = re.compile(r'(`[^`]+`)')
+_CL_BOLD = re.compile(r'\*\*(.+?)\*\*')
+_CL_ITALIC = re.compile(r'(?<!\*)\*([^*\s][^*]*?)\*(?!\*)')
 
-    def _inline(s: str) -> str:
-        s = html.escape(s)
-        s = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', s)
-        s = re.sub(r'(?<!\*)\*([^*]+?)\*(?!\*)', r'<i>\1</i>', s)
-        s = re.sub(r'`([^`]+?)`', r'<code>\1</code>', s)
-        return s
 
-    pending_blank = False
-    for raw_line in lines:
-        line = raw_line.rstrip()
-        stripped = line.strip()
-        if not stripped:
-            pending_blank = True
-            continue
-        heading_match = re.match(r'^(#{1,6})\s+(.*)$', stripped)
-        if heading_match:
-            pending_blank = False
-            out.append(f'<p style="margin:10px 0 4px 0; font-size:16px; font-weight:600; color:{palette()["accent"]}; line-height:100%;">{_inline(heading_match.group(2))}</p>')
-            continue
-        if pending_blank:
-            out.append('<p style="margin:4px 0 0 0; line-height:100%;">&nbsp;</p>')
-            pending_blank = False
-        bullet_match = re.match(r'^(\s*)[*\-]\s+(.*)$', line)
-        if bullet_match:
-            indent = len(bullet_match.group(1))
-            left = 32 if indent >= 2 else 16
-            out.append(f'<p style="margin:1px 0 1px {left}px; line-height:130%; text-indent:-14px;">&bull;&nbsp;&nbsp;{_inline(bullet_match.group(2))}</p>')
-            continue
-        out.append(f'<p style="margin:1px 0; line-height:130%;">{_inline(stripped)}</p>')
+def _cl_link(m: re.Match) -> str:
+    if m.group(1):
+        return f'<a href="{m.group(2)}">{m.group(1)}</a>'
+    url = m.group(3).rstrip('.,;:!?)')
+    tail = m.group(3)[len(url):]
+    ref = _CL_PULL.search(url)
+    bare = url.split('://', 1)[1]
+    label = f'#{ref.group(1)}' if ref else (bare if len(bare) <= 48 else bare[:47] + '\u2026')
+    return f'<a href="{url}">{label}</a>{tail}'
+
+
+def _cl_inline(text: str) -> str:
+    out = []
+    for i, part in enumerate(_CL_CODE.split(html.escape(text, quote=False))):
+        if i & 1:
+            out.append(f'<code>&nbsp;{part[1:-1]}&nbsp;</code>')
+        else:
+            part = _CL_TOKENS.sub(_cl_link, part)
+            part = _CL_BOLD.sub(r'<b>\1</b>', part)
+            out.append(_CL_ITALIC.sub(r'<i>\1</i>', part))
     return ''.join(out)
 
 
+def _changelog_markdown_to_html(text: str) -> str:
+    pal = palette()
+    muted = _pal('muted', '#888888').name()
+    heads = (
+        f'<p style="margin:22px 0 6px 0; font-size:15px; font-weight:600; line-height:130%; color:{_pal("accent", APP_ACCENT_COLOR).name()};">',
+        f'<p style="margin:18px 0 4px 0; font-size:14px; font-weight:600; line-height:130%; color:{to_color(pal.get("dialog_title_text") or pal.get("primary_text"), "#ffffff").name()};">',
+    )
+    out = []
+    open_li = [False] * 6
+
+    def close(to: int) -> None:
+        for d in range(len(open_li) - 1, to, -1):
+            if open_li[d]:
+                out.append('</li></ul>')
+                open_li[d] = False
+            elif d <= depth[0]:
+                out.append('</ul>')
+        depth[0] = min(depth[0], to)
+
+    depth = [0]
+    for raw in text.replace('\r\n', '\n').split('\n'):
+        s = raw.strip()
+        if not s or _CL_SKIP.match(s):
+            continue
+        m = _CL_HEAD.match(s)
+        if m:
+            close(0)
+            if open_li[0]:
+                out.append('</li>')
+                open_li[0] = False
+            ref = _CL_REF.search(m.group(2))
+            head = heads[len(m.group(1)) > 2]
+            label = _cl_inline(_CL_REF.sub('', m.group(2)))
+            if ref:
+                label += f' <span style="color:{muted}; font-weight:400;">#{ref.group(1)}</span>'
+            out.append(f'{head}{label}</p>')
+            continue
+        m = _CL_ITEM.match(raw.rstrip())
+        if m:
+            level = min(len(m.group(1).replace('\t', '  ')) // 2, 3) + 1
+            close(level)
+            if open_li[level]:
+                out.append('</li>')
+                open_li[level] = False
+            while depth[0] < level:
+                depth[0] += 1
+                out.append(f'<ul style="-qt-list-indent:{depth[0]};">')
+            item = m.group(2).replace('[ ] ', '\u2610 ', 1).replace('[x] ', '\u2611 ', 1)
+            out.append(f'<li>{_cl_inline(item)}')
+            open_li[level] = True
+            continue
+        close(0)
+        out.append(f'<p>{_cl_inline(s)}</p>')
+    close(0)
+    return ''.join(out)
+
+
+def _mix(a: QColor, b: QColor, t: float) -> QColor:
+    return QColor(*(round(x + (y - x) * t) for x, y in zip(a.getRgb()[:3], b.getRgb()[:3])))
+
+
+def _alpha(c: QColor, a: int) -> str:
+    c = QColor(c)
+    c.setAlpha(a)
+    return f'rgba({c.red()}, {c.green()}, {c.blue()}, {a})'
+
+
+def _changelog_css(body: QColor, strong: QColor, accent: QColor, code_bg: QColor) -> str:
+    return (
+        f'p, li {{ color: {body.name()}; line-height: 150%; }}'
+        'p { margin: 4px 0; }'
+        f'b {{ color: {strong.name()}; font-weight: 600; }}'
+        'ul { margin: 4px 0 6px -22px; }'
+        'li { margin: 4px 0; }'
+        f'code {{ background-color: {code_bg.name()}; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }}'
+        f'a {{ color: {accent.name()}; text-decoration: none; }}'
+    )
+
+
+class _NotesView(QTextBrowser):
+    _FADE = 36
+
+    def __init__(self, bg: QColor, parent=None):
+        super().__init__(parent)
+        self._bg = bg
+        self.setOpenExternalLinks(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setViewportMargins(0, 0, 10, 0)
+        self.document().setDocumentMargin(0)
+        self.verticalScrollBar().valueChanged.connect(self.viewport().update)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        bar = self.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        port = self.viewport()
+        p = QPainter(port)
+        solid, clear = QColor(self._bg), QColor(self._bg)
+        clear.setAlpha(0)
+        h = self._FADE
+        if bar.value() > 0:
+            g = QLinearGradient(0, 0, 0, h)
+            g.setColorAt(0, solid)
+            g.setColorAt(1, clear)
+            p.fillRect(0, 0, port.width(), h, g)
+        if bar.value() < bar.maximum():
+            y = port.height() - h
+            g = QLinearGradient(0, y, 0, port.height())
+            g.setColorAt(0, clear)
+            g.setColorAt(1, solid)
+            p.fillRect(0, y, port.width(), h, g)
+
+
 def show_update_dialog(parent: QWidget, result: dict, allow_skip: bool = True) -> str:
+    pal = palette()
+    bg = _pal('dialog_bg', '#202020')
+    body = _pal('body_text', '#dddddd')
+    strong = to_color(pal.get('dialog_title_text') or pal.get('primary_text'), '#ffffff')
+    accent = _pal('accent', APP_ACCENT_COLOR)
+    muted = _pal('muted', '#888888')
     box = MessageBoxBase(parent)
-    box.widget.setMinimumWidth(560)
-    box_layout = QVBoxLayout()
-    box_layout.setContentsMargins(0, 0, 0, 0)
-    box_layout.addWidget(StrongBodyLabel(tr('update.available_title', tag=result['tag'])))
+    box.widget.setMinimumWidth(740)
+    with suppress(AttributeError):
+        box.viewLayout.setContentsMargins(28, 26, 28, 4)
+        box.buttonGroup.setFixedHeight(76)
+        box.buttonLayout.setContentsMargins(28, 14, 28, 26)
+    layout = QVBoxLayout()
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+    title = QLabel(tr('update.available_title', tag=result['tag']))
+    title.setWordWrap(True)
+    title.setStyleSheet(f'QLabel {{ background: transparent; color: {strong.name()}; font-size: 17px; font-weight: 600; }}')
+    layout.addWidget(title)
+    layout.addSpacing(5)
+    channel = tr_or('update.channel_canary', 'Canary') if result.get('canary') else tr_or('update.channel_stable', 'Stable')
+    size = int(result.get('asset_size') or 0)
+    meta = QLabel(f'<span style="color:{accent.name()}; font-weight:600;">{html.escape(channel)}</span>'
+                  + (f'&nbsp;&nbsp;\u00b7&nbsp;&nbsp;{_fmt_bytes(size)}' if size else ''))
+    meta.setStyleSheet(f'QLabel {{ background: transparent; color: {muted.name()}; font-size: 12px; }}')
+    layout.addWidget(meta)
     if result.get('canary'):
+        layout.addSpacing(6)
         notice = QLabel(tr('update.canary_notice',
                            'Experimental PiraChest Canary build. It can be unstable, but stable releases are still offered when they are newer.'))
         notice.setWordWrap(True)
-        notice.setStyleSheet(f'QLabel {{ background: transparent; color: {palette()["accent"]}; font-size: 12px; }}')
-        box_layout.addWidget(notice)
-    notes = result.get('notes') or tr('update.no_notes')
-    notes_lbl = QLabel(_changelog_markdown_to_html(notes[:4000]))
-    notes_lbl.setTextFormat(Qt.TextFormat.RichText)
-    notes_lbl.setWordWrap(True)
-    notes_lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-    notes_lbl.setContentsMargins(0, 0, 4, 0)
-    notes_lbl.setStyleSheet(f'QLabel {{ background: transparent; font-size: 14px; color: {palette()["body_text"]}; }}')
-    scroll = make_smooth_scroll_area(box)
-    scroll.setWidgetResizable(True)
-    scroll.setFrameShape(QFrame.Shape.NoFrame)
-    scroll.setContentsMargins(0, 0, 8, 0)
-    scroll.setStyleSheet(
-        'QScrollArea { background: transparent; border: none; }'
-        'QScrollBar:vertical { width: 6px; background: transparent; margin: 0px; }'
-        'QScrollBar::handle:vertical { background: rgba(255, 255, 255, 50); border-radius: 3px; min-height: 24px; }'
-        'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }'
-    )
-    scroll.viewport().setStyleSheet('background: transparent;')
-    scroll.setWidget(notes_lbl)
-    scroll.setMinimumHeight(260)
-    scroll.setMaximumHeight(460)
-    box_layout.addWidget(scroll)
+        notice.setStyleSheet(f'QLabel {{ background: transparent; color: {muted.name()}; font-size: 12px; }}')
+        layout.addWidget(notice)
+    layout.addSpacing(16)
+    view = _NotesView(bg, box)
+    view.document().setDefaultStyleSheet(_changelog_css(_mix(body, bg, 0.16), strong, accent, _mix(bg, body, 0.12)))
+    notes = _changelog_markdown_to_html((result.get('notes') or '')[:8000]) or f'<p>{html.escape(tr("update.no_notes"))}</p>'
+    view.setHtml(notes + '<p style="margin:0; font-size:14px;">&nbsp;</p>')
+    view.setStyleSheet(
+        'QTextBrowser { background: transparent; border: none; font-size: 13px; }'
+        f'QTextBrowser {{ selection-background-color: {_alpha(accent, 90)}; }}'
+        'QScrollBar:vertical { width: 6px; background: transparent; margin: 0; }'
+        f'QScrollBar::handle:vertical {{ background: {_alpha(body, 50)}; border-radius: 3px; min-height: 28px; }}'
+        f'QScrollBar::handle:vertical:hover {{ background: {_alpha(body, 100)}; }}'
+        'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }'
+        'QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }')
+    view.setMinimumHeight(400)
+    layout.addWidget(view, 1)
     skip_chk = None
     if allow_skip:
+        layout.addSpacing(14)
         skip_chk = CheckBox(tr('update.never_show_this_version'))
-        box_layout.addWidget(skip_chk)
-    box.viewLayout.addLayout(box_layout)
+        layout.addWidget(skip_chk)
+    box.viewLayout.addLayout(layout)
     box.yesButton.setText(tr('update.update_now'))
     box.cancelButton.setText(tr('update.later'))
     accepted = bool(box.exec())
@@ -546,6 +675,20 @@ class _UpdateRail(QWidget):
             x += w + gap
 
 
+class _UpdateCard(QFrame):
+    def paintEvent(self, _event) -> None:
+        dark = isDarkTheme()
+        pal = palette()
+        base = to_color(pal.get('dialog_bg') or pal.get('card_bg'), '#26262b' if dark else '#fafafa')
+        base.setAlpha(255)
+        edge = QColor(255, 255, 255, 38) if dark else QColor(0, 0, 0, 38)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(edge, 1))
+        painter.setBrush(base)
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 10, 10)
+
+
 class UpdateOverlay(QWidget):
     _STAGE_KEYS = {'download': 0, 'verify': 1, 'extract': 2}
     _RISE = 10
@@ -567,7 +710,7 @@ class UpdateOverlay(QWidget):
             tr('update.stage_prepare', 'Preparing files'),
             tr('update.stage_restart', 'Restarting PiraChest'),
         ]
-        self._card = QFrame(self)
+        self._card = _UpdateCard(self)
         self._card.setObjectName('pirachestUpdateCard')
         self._card.setFixedWidth(460)
         layout = QVBoxLayout(self._card)
@@ -640,6 +783,7 @@ class UpdateOverlay(QWidget):
         parent.installEventFilter(self)
         update_controller.download_stage.connect(self._on_stage)
         register_theme_refresh(self, self._restyle)
+        self._restyle()
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() == QEvent.Type.Resize and obj is self.parentWidget() and self.isVisible():
@@ -648,7 +792,7 @@ class UpdateOverlay(QWidget):
 
     def _restyle(self) -> None:
         pal = palette()
-        self._card.setStyleSheet(dialog_qss(('#pirachestUpdateCard',)))
+        self._card.setStyleSheet('#pirachestUpdateCard{background: transparent; border: none;}')
         primary = _css_rgba(to_color(pal.get('dialog_title_text') or pal.get('primary_text'), '#ffffff'))
         body = _css_rgba(to_color(pal.get('dialog_body_text') or pal.get('body_text'), '#dddddd'))
         muted = _css_rgba(to_color(pal.get('muted'), '#999999'))
@@ -865,8 +1009,8 @@ _SFX_FILENAMES = {
     'popout_error': 'popout_error.wav',
 }
 _AMBIANCE_FILENAME = 'ambiance.mp3'
-_SFX_DEFAULT_VOLUME = 70
-_AMBIANCE_DEFAULT_VOLUME = 30
+_SFX_DEFAULT_VOLUME = 25
+_AMBIANCE_DEFAULT_VOLUME = 45
 
 _AMBIANCE_TICK_MS = 400
 _AMBIANCE_FADE_MS = 500
@@ -1246,8 +1390,10 @@ class SoundManager(QObject):
 
     def _ambiance_window_visible(self) -> bool:
         app = QApplication.instance()
-        return app is not None and any(w.isWindow() and w.isVisible() and not w.isMinimized()
-                                       for w in app.topLevelWidgets())
+        if app is None or app.applicationState() != Qt.ApplicationState.ApplicationActive:
+            return False
+        active = app.activeWindow()
+        return active is not None and active.isVisible() and not active.isMinimized()
 
     def _sync_ambiance(self) -> None:
         if not self._available or self._suspended:
@@ -2002,6 +2148,11 @@ def _contrast_text(color: QColor) -> QColor:
 
 
 class _PillButton(PillPushButton):
+    hovered = Signal()
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        self.hovered.emit()
 
     def paintEvent(self, event) -> None:
         if not self.isChecked():
@@ -2251,8 +2402,56 @@ class SettingsPage(QWidget):
         'private_history': FluentIcon.DELETE,
     }
 
+    _PAGES = {
+        'appearance': ('_build_general', '_build_sound'),
+        'sections': ('_build_sections_start', '_build_sections_books', '_build_sections_tv', '_build_sections_end'),
+        'sailseek': ('_build_sailseek',),
+        'downloads': ('_build_downloads',),
+        'network': ('_build_privacy',),
+        'integrations': ('_build_integrations', '_build_debrid'),
+        'shortcuts': ('_build_shortcuts',),
+        'advanced': ('_build_advanced', '_build_experimental'),
+    }
+    _LISTS = ('_switches', '_sections', '_combos', '_spins', '_checks', '_texts', '_switch_labels')
+    _ATTR_PAGES = {
+        **dict.fromkeys(('_chk_close_to_tray', '_chk_console_structure', '_chk_delete_torrent',
+                         '_chk_notify_download', '_spin_speed', '_spin_upload_speed', '_spin_seed',
+                         '_spin_reserve'), 'downloads'),
+        **dict.fromkeys(('_chk_minerva', '_chk_minerva_extract', '_chk_pc_games', '_chk_music', '_chk_books',
+                         '_chk_youtube', '_chk_tv', '_chk_tbhb'), 'sections'),
+        **dict.fromkeys(('_chk_external_client', '_chk_launch_startup'), 'integrations'),
+        **dict.fromkeys(('_chk_admin_mode', '_chk_show_console', '_chk_log_to_file', '_chk_auto_update',
+                         '_chk_canary_update', '_chk_auto_install'), 'advanced'),
+        '_chk_sailseek': 'sailseek',
+    }
+    _GROUP_TARGETS = {
+        'settings.group_appearance': ('appearance', '_general_group'),
+        'settings.group_general': ('appearance', '_general_group'),
+        'settings.group_downloads': ('downloads', '_dl_group'),
+        'settings.group_downloads_network': ('downloads', '_dl_group'),
+        'settings.group_network': ('network', '_privacy_group'),
+        'settings.privacy_group': ('network', '_privacy_group'),
+        'settings.group_features': ('sections', '_feature_group'),
+        'settings.group_sections': ('sections', '_feature_group'),
+        'settings.group_sound': ('appearance', '_sound_group'),
+        'settings.group_shortcuts': ('shortcuts', '_shortcuts_group'),
+        'settings.group_sailseek': ('sailseek', '_sailseek_group'),
+        'settings.group_integrations': ('integrations', '_integrations_group'),
+        'settings.group_debrid': ('integrations', '_debrid_group'),
+        'settings.group_advanced': ('advanced', '_adv_group'),
+        'settings.group_experimental': ('advanced', '_experimental_group'),
+    }
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._loaded = set()
+        self._ranges = {}
+        self._jobs = {}
+        self._ticking = False
+        self._owned = {}
+        self._stepping = False
+        self._shell = False
+        self._stale = set()
         self._built = False
         self._building = False
         self._loading = False
@@ -2260,172 +2459,178 @@ class SettingsPage(QWidget):
         self._surface_styled = False
         self._pending_bind = None
         self._capturing_shortcut = None
-        self._texts: list = []
-        self._icon_entries: list = []
-        self._switch_labels: dict = {}
+        self._texts = []
+        self._icon_entries = {}
+        self._switch_labels = {}
         self._last_cache_probe = 0.0
-        self._switches: list = []
-        self._sections: list = []
-        self._combos: list = []
-        self._spins: list = []
-        self._checks: list = []
-        self._download_dir_widgets: dict = {}
-        self._download_dir_cards: list = []
-        self._shortcut_rows: dict = {}
-        self._sailseek_source_switches: dict = {}
-        self._sailseek_dependents: list = []
+        self._switches = []
+        self._sections = []
+        self._combos = []
+        self._spins = []
+        self._checks = []
+        self._download_dir_widgets = {}
+        self._download_dir_cards = []
+        self._shortcut_rows = {}
+        self._sailseek_source_switches = {}
+        self._sailseek_dependents = []
         self._sailseek_status_lbl = None
         self._net_apply = None
         self._net_loading = False
-        self._net_widgets: dict = {}
+        self._net_widgets = {}
         self._theme_dirty = False
+        self._scroll = None
         self.setStyleSheet('background: transparent;')
-        self._build_steps = None
-        self._pending_group_adjust: set = set()
+        self._pending_group_adjust = set()
         self._active_category = self._CATEGORIES[0][0]
-        self._selected_category = self._CATEGORIES[0][0]
-        self._category_buttons: dict = {}
-        self._category_layouts: dict = {}
-        self._category_pages: dict = {}
+        self._selected_category = self._active_category
+        self._category_buttons = {}
+        self._category_layouts = {}
+        self._category_pages = {}
         self._prebuild_timer = QTimer(self)
         self._prebuild_timer.setSingleShot(True)
         self._prebuild_timer.setInterval(0)
         self._prebuild_timer.timeout.connect(self._try_prebuild)
 
     def prepare(self) -> None:
-        if self._built or self._building:
-            return
-        if not self._prebuild_timer.isActive():
+        if not self._built and not self._jobs and not self._prebuild_timer.isActive():
             self._prebuild_timer.start()
 
-
     def _ensure_built(self) -> None:
-        if self._built:
-            return
-        if self._building:
-            self._finish_background_build()
-            return
-        self._build_ui()
+        self._ensure_category(self._selected_category)
 
     def __getattr__(self, name):
-        if name in ('_chk_close_to_tray', '_chk_youtube') and not self.__dict__.get('_built', False):
-            self._ensure_built()
+        key = self._ATTR_PAGES.get(name)
+        d = self.__dict__
+        if key is None or '_loaded' not in d or d.get('_stepping'):
+            raise AttributeError(name)
+        if key in d.get('_jobs', ()) or key not in d['_loaded']:
+            self._ensure_category(key)
             return object.__getattribute__(self, name)
         raise AttributeError(name)
 
     def _try_prebuild(self) -> None:
-        if self._built or self._building:
+        if self._built or self._jobs:
             return
         app = QApplication.instance()
         if app is not None and app.activeModalWidget() is not None:
             self._prebuild_timer.start(600)
             return
-        self._build_ui(background=True)
+        self._ensure_category(self._selected_category, sliced=True)
 
-    def _build_ui(self, background: bool = False) -> None:
-        self._building = True
+    def _ensure_shell(self) -> None:
+        if self._shell:
+            return
+        self._shell = True
         self._build_locale = current_language()
         with suppress(Exception):
             self.setStyleSheet(settings_qss())
             self._surface_styled = True
-        self._build_steps = self._build_slices()
-        if background:
-            self._advance_background_build()
-            return
-        self._finish_background_build()
-
-    def _advance_background_build(self) -> None:
-        steps = self._build_steps
-        if steps is None:
-            return
-        app = QApplication.instance()
-        if app is not None and app.activeModalWidget() is not None:
-            QTimer.singleShot(400, self, self._advance_background_build)
-            return
-        deadline = time.perf_counter() + 0.006
-        try:
-            while time.perf_counter() < deadline:
-                next(steps)
-        except StopIteration:
-            self._finish_build()
-            return
-        except Exception:
-            self._build_steps = None
-            self._building = False
-            raise
-        QTimer.singleShot(0, self, self._advance_background_build)
-
-    def _finish_background_build(self) -> None:
-        steps = self._build_steps
-        try:
-            if steps is not None:
-                for _step in steps:
-                    pass
-        except Exception:
-            self._build_steps = None
-            self._building = False
-            raise
-        self._finish_build()
-
-    def _finish_build(self) -> None:
-        self._build_steps = None
-        self._building = False
-        self._built = True
-        self._last_cache_probe = 0.0
-        self._populate()
-        self._flush_group_adjust()
+        self._make_shell()
         register_locale_refresh(self, self._apply_locale)
         register_theme_refresh(self, self._on_theme_refresh)
-        if self._build_locale != current_language():
-            self._apply_locale()
-        pending = self._pending_bind
-        self._pending_bind = None
-        if pending is not None:
-            self.bind_network(*pending)
-        self._refresh_cache_size()
 
-    def _build_slices(self):
-        self._make_shell()
-        yield
-        self._active_category = 'appearance'
-        yield from self._build_general()
-        self._active_category = 'downloads'
-        yield from self._build_downloads()
-        self._active_category = 'network'
-        yield from self._build_privacy()
-        self._active_category = 'sections'
-        yield from self._build_sections_start()
-        yield from self._build_sections_books()
-        yield from self._build_sections_tv()
-        yield from self._build_sections_end()
-        self._active_category = 'appearance'
-        yield from self._build_sound()
-        self._active_category = 'sailseek'
-        yield from self._build_sailseek()
-        self._active_category = 'integrations'
-        yield from self._build_integrations()
-        yield from self._build_debrid()
-        self._active_category = 'advanced'
-        yield from self._build_advanced()
-        yield from self._build_experimental()
-        self._active_category = 'shortcuts'
-        yield from self._build_shortcuts()
-        for layout in self._category_layouts.values():
-            groups = [
-                layout.itemAt(i).widget()
-                for i in range(layout.count())
-                if isinstance(layout.itemAt(i).widget(), SettingCardGroup)
-            ]
-            if len(groups) == 1:
-                groups[0].titleLabel.hide()
-            layout.addStretch(1)
-        self._active_category = self._selected_category
+    def _ensure_category(self, key: str, sliced: bool = False) -> None:
+        self._ensure_shell()
+        if key in self._loaded:
+            if key in self._jobs and not sliced:
+                self._advance_job(key)
+            return
+        self._start_job(key)
+        if sliced:
+            self._schedule_jobs()
+        else:
+            self._advance_job(key)
+
+    def _start_job(self, key: str) -> None:
+        self._loaded.add(key)
+        page = self._make_category_page(key)
+        page.setUpdatesEnabled(False)
+
+        def chain():
+            for name in self._PAGES[key]:
+                yield from getattr(self, name)()
+
+        self._jobs[key] = {
+            'gen': chain(), 'page': page, 'attrs': set(), 'objs': [],
+            'lists': {n: ({} if n == '_switch_labels' else []) for n in self._LISTS},
+        }
+
+    def _schedule_jobs(self) -> None:
+        if not self._ticking:
+            self._ticking = True
+            QTimer.singleShot(0, self, self._tick_jobs)
+
+    def _tick_jobs(self) -> None:
+        self._ticking = False
+        if not self._jobs:
+            return
+        key = self._selected_category if self._selected_category in self._jobs else next(iter(self._jobs))
+        visible = key == self._selected_category and self.isVisible()
+        self._advance_job(key, 0.014 if visible else 0.01)
+        if self._jobs:
+            self._schedule_jobs()
+
+    def _advance_job(self, key: str, budget: float | None = None) -> bool:
+        job = self._jobs.get(key)
+        if job is None:
+            return True
+        prev = self._active_category
+        self._active_category = key
+        self._stepping = True
+        saved = {n: getattr(self, n) for n in self._LISTS}
+        for n in self._LISTS:
+            setattr(self, n, job['lists'][n])
+        attrs0 = set(self.__dict__)
+        kids0 = {id(c) for c in self.children()}
+        end = None if budget is None else time.perf_counter() + budget
+        done = False
+        try:
+            while True:
+                next(job['gen'])
+                if end is not None and time.perf_counter() >= end:
+                    break
+        except StopIteration:
+            done = True
+        except Exception:
+            self._jobs.pop(key, None)
+            job['page'].setUpdatesEnabled(True)
+            raise
+        finally:
+            for n in self._LISTS:
+                setattr(self, n, saved[n])
+            self._stepping = False
+            self._active_category = prev
+            job['attrs'] |= set(self.__dict__) - attrs0
+            job['objs'].extend(c for c in self.children() if id(c) not in kids0)
+        if done:
+            self._finish_job(key)
+        return done
+
+    def _finish_job(self, key: str) -> None:
+        job = self._jobs.pop(key)
+        page = job['page']
+        rng = {}
+        for n in self._LISTS:
+            box = getattr(self, n)
+            src = job['lists'][n]
+            a = len(box)
+            if isinstance(box, dict):
+                box.update(src)
+            else:
+                box.extend(src)
+            rng[n] = (a, len(box))
+        self._ranges[key] = rng
+        self._owned[key] = (job['attrs'], job['objs'])
+        page.setUpdatesEnabled(True)
+        self._populate(key)
+        self._flush_group_adjust()
+        _restyle_setting_cards(page)
+        self._built = True
 
     def _make_shell(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-
         self._category_bar = QWidget(self)
         self._category_bar.setObjectName('settingsCategoryBar')
         self._category_bar.setStyleSheet('background: transparent;')
@@ -2434,23 +2639,16 @@ class SettingsPage(QWidget):
         self._category_flow.setHorizontalSpacing(6)
         self._category_flow.setVerticalSpacing(6)
         outer.addWidget(self._category_bar)
-
         self._category_group = QButtonGroup(self)
         self._category_group.setExclusive(True)
-
         self._stack = QStackedWidget(self)
         self._stack.setStyleSheet('QStackedWidget { background: transparent; border: none; }')
         outer.addWidget(self._stack, 1)
-
         for key, text_key, fallback in self._CATEGORIES:
-            self._make_category_page(key)
             self._make_category_button(key, text_key, fallback)
+        self._category_buttons[self._selected_category].setChecked(True)
 
-        self._active_category = self._CATEGORIES[0][0]
-        self._scroll = self._category_pages[self._active_category]
-        self._show_category(self._active_category, animate=False)
-
-    def _make_category_page(self, key: str) -> None:
+    def _make_category_page(self, key: str):
         scroll = make_smooth_scroll_area(self._stack)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -2462,80 +2660,136 @@ class SettingsPage(QWidget):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(24, 4, 28, 24)
         layout.setSpacing(4)
+        layout.addStretch(1)
         self._stack.addWidget(scroll)
         self._category_pages[key] = scroll
         self._category_layouts[key] = layout
+        if self._scroll is None:
+            self._scroll = scroll
+        return scroll
 
     def _make_category_button(self, key: str, text_key: str, fallback: str) -> None:
         button = _PillButton(self._t(text_key, fallback), self._category_bar)
         button.setCheckable(True)
         button.setFixedHeight(30)
         button.clicked.connect(lambda _checked=False, k=key: self._show_category(k))
+        button.hovered.connect(partial(self._prefetch, key))
         self._bind(button.setText, text_key, fallback)
         self._category_group.addButton(button)
         self._category_buttons[key] = button
         self._category_flow.addWidget(button)
 
-    def _show_category(self, key: str, animate: bool = True) -> None:
-        page = self._category_pages.get(key)
-        if page is None:
+    def _prefetch(self, key: str) -> None:
+        if key not in self._loaded:
+            QTimer.singleShot(45, self, partial(self._prefetch_now, key))
+
+    def _prefetch_now(self, key: str) -> None:
+        if key in self._loaded or not self.isVisible():
             return
-        button = self._category_buttons.get(key)
-        if button is not None and not button.isChecked():
+        if self._category_buttons[key].underMouse():
+            app = QApplication.instance()
+            if app is None or app.activeModalWidget() is None:
+                self._ensure_category(key, sliced=True)
+
+    def _refresh_page(self, key: str) -> None:
+        if key not in self._stale:
+            return
+        self._stale.discard(key)
+        self._refresh_icons(key)
+
+    def _teardown(self, key: str) -> None:
+        if key == 'network':
+            self._net_widgets.clear()
+            self._net_apply = None
+        elif key == 'shortcuts':
+            self._cancel_shortcut_capture()
+            self._shortcut_rows.clear()
+        elif key == 'sailseek':
+            self._sailseek_source_switches.clear()
+            self._sailseek_dependents = []
+            self._sailseek_status_lbl = None
+        elif key == 'sections':
+            self._download_dir_widgets.clear()
+            self._download_dir_cards.clear()
+            with suppress(Exception):
+                self._vyla_update_finished.disconnect(self._on_vyla_update_finished)
+        elif key == 'advanced':
+            with suppress(Exception):
+                self._cache_size_ready.disconnect(self.__dict__['_cache_ready_slot'])
+            with suppress(Exception):
+                self._cache_clear_finished.disconnect(self._on_cache_cleared)
+
+    def _evict_pages(self, keep: str | None, sync: bool = False) -> None:
+        for key in list(self._loaded):
+            if key == keep or key not in self._owned or key in self._jobs:
+                continue
+            self._teardown(key)
+            self._loaded.discard(key)
+            rng = self._ranges.pop(key)
+            for name in self._LISTS:
+                a, b = rng[name]
+                box = getattr(self, name)
+                if isinstance(box, dict):
+                    for k in list(box)[a:b]:
+                        del box[k]
+                else:
+                    del box[a:b]
+                for other in self._ranges.values():
+                    x, y = other[name]
+                    if x >= b:
+                        other[name] = (x - (b - a), y - (b - a))
+            attrs, objs = self._owned.pop(key)
+            for name in attrs:
+                self.__dict__.pop(name, None)
+            for obj in objs:
+                with suppress(RuntimeError):
+                    if sync and shiboken6.isValid(obj):
+                        shiboken6.delete(obj)
+                    else:
+                        obj.deleteLater()
+            self._icon_entries.pop(key, None)
+            self._stale.discard(key)
+            self._category_layouts.pop(key, None)
+            page = self._category_pages.pop(key, None)
+            if page is not None:
+                self._stack.removeWidget(page)
+                page.hide()
+                if sync and shiboken6.isValid(page):
+                    shiboken6.delete(page)
+                else:
+                    page.deleteLater()
+
+    def _show_category(self, key: str, animate: bool = True) -> None:
+        if key not in self._category_buttons:
+            return
+        self._ensure_category(key)
+        page = self._category_pages[key]
+        button = self._category_buttons[key]
+        if not button.isChecked():
             button.setChecked(True)
-        self._active_category = key
-        self._selected_category = key
+        self._active_category = self._selected_category = key
         self._scroll = page
+        if self._capturing_shortcut is not None:
+            self._cancel_shortcut_capture()
+        if key in self._jobs:
+            page.setUpdatesEnabled(True)
+            self._schedule_jobs()
         if self._stack.currentWidget() is page:
             return
+        self._refresh_page(key)
         self._stack.setCurrentWidget(page)
-        if animate:
+        if animate and key not in self._jobs:
             fade_in(page, 110)
 
     def scroll_to_group(self, key: str) -> None:
-        if not self._built:
-            self._ensure_built()
-        if not self._built:
+        target = self._GROUP_TARGETS.get(key)
+        if target is None:
             return
-        attrs = {
-            'settings.group_appearance': '_general_group',
-            'settings.group_general': '_general_group',
-            'settings.group_downloads': '_dl_group',
-            'settings.group_downloads_network': '_dl_group',
-            'settings.group_network': '_privacy_group',
-            'settings.privacy_group': '_privacy_group',
-            'settings.group_features': '_feature_group',
-            'settings.group_sections': '_feature_group',
-            'settings.group_sound': '_sound_group',
-            'settings.group_shortcuts': '_shortcuts_group',
-            'settings.group_sailseek': '_sailseek_group',
-            'settings.group_integrations': '_integrations_group',
-            'settings.group_debrid': '_debrid_group',
-            'settings.group_advanced': '_adv_group',
-            'settings.group_experimental': '_experimental_group',
-        }
-        pages = {
-            'settings.group_appearance': 'appearance',
-            'settings.group_general': 'appearance',
-            'settings.group_downloads': 'downloads',
-            'settings.group_downloads_network': 'downloads',
-            'settings.group_network': 'network',
-            'settings.privacy_group': 'network',
-            'settings.group_features': 'sections',
-            'settings.group_sections': 'sections',
-            'settings.group_sound': 'appearance',
-            'settings.group_shortcuts': 'shortcuts',
-            'settings.group_sailseek': 'sailseek',
-            'settings.group_integrations': 'integrations',
-            'settings.group_debrid': 'integrations',
-            'settings.group_advanced': 'advanced',
-            'settings.group_experimental': 'advanced',
-        }
-        widget = getattr(self, attrs.get(key, ''), None)
-        if widget is None:
-            return
-        self._show_category(pages.get(key, 'appearance'), animate=False)
-        QTimer.singleShot(0, lambda: self._scroll_to_widget(widget))
+        self._show_category(target[0], animate=False)
+        self._ensure_category(target[0])
+        widget = getattr(self, target[1], None)
+        if widget is not None:
+            QTimer.singleShot(0, lambda: self._scroll_to_widget(widget))
 
     def _scroll_to_widget(self, widget) -> None:
         def _apply() -> None:
@@ -2547,6 +2801,115 @@ class SettingsPage(QWidget):
         _apply()
         QTimer.singleShot(80, _apply)
 
+    def _populate(self, key: str | None = None) -> None:
+        if key is None:
+            for k in list(self._ranges):
+                self._populate(k)
+            return
+        ranges = self._ranges.get(key)
+        if ranges is None:
+            return
+
+        def part(name):
+            a, b = ranges[name]
+            return getattr(self, name)[a:b]
+
+        self._loading = True
+        try:
+            for card, attr in part('_switches'):
+                checked = bool(getattr(settings, attr, False))
+                if isinstance(card, SwitchButton):
+                    self._quiet_switch(card, checked)
+                else:
+                    self._quiet(card, card.setChecked, checked)
+            for card, attr in part('_sections'):
+                self._quiet_switch(card.switch, bool(getattr(settings, attr, False)))
+            for combo, attr in part('_combos'):
+                index = combo.findData(getattr(settings, attr, None))
+                self._quiet(combo, combo.setCurrentIndex, max(0, index))
+            for spin, attr in part('_spins'):
+                with suppress(TypeError, ValueError):
+                    self._quiet(spin, spin.setValue, int(getattr(settings, attr, 0) or 0))
+            for box, attr in part('_checks'):
+                self._quiet(box, box.setChecked, bool(getattr(settings, attr, False)))
+        finally:
+            self._loading = False
+        fill = getattr(self, '_fill_' + key, None)
+        if fill is not None:
+            fill()
+
+    def _fill_appearance(self) -> None:
+        self._bg_path_edit.setText(settings.background_image_path or '')
+        blur = int(settings.background_image_blur)
+        self._quiet(self._bg_blur_slider, self._bg_blur_slider.setValue, blur)
+        self._bg_blur_value_lbl.setText(str(blur))
+        darken = int(settings.background_image_darken)
+        self._quiet(self._bg_darken_slider, self._bg_darken_slider.setValue, darken)
+        self._bg_darken_value_lbl.setText(f'{darken}%')
+        self._accent_color_btn.setColor(QColor(settings.accent_color))
+        language = current_language()
+        if language in self._lang_codes:
+            self._quiet(self._lang_combo, self._lang_combo.setCurrentIndex, self._lang_codes.index(language))
+        off = self._t('settings.volume_off', 'Off')
+        sfx = int(settings.sfx_volume)
+        self._quiet(self._sfx_slider, self._sfx_slider.setValue, sfx)
+        self._sfx_value_lbl.setText(str(sfx) if sfx > 0 else off)
+        ambiance = int(settings.ambiance_volume)
+        self._quiet(self._ambiance_slider, self._ambiance_slider.setValue, ambiance)
+        self._ambiance_value_lbl.setText(str(ambiance) if ambiance > 0 else off)
+        self._sync_theme_lock_state()
+
+    def _fill_sections(self) -> None:
+        self._quiet(self._edit_stream_addons, self._edit_stream_addons.setText,
+                    getattr(settings, 'tv_stream_addons', '') or '')
+        reorder = getattr(self, '_section_reorder', None)
+        if reorder is not None:
+            reorder.arrange(nav_order())
+
+    def _fill_sailseek(self) -> None:
+        for key, switch in self._sailseek_source_switches.items():
+            self._quiet_switch(switch, self._sailseek_category_enabled(key))
+        self.refresh_sailseek_status()
+        self._sync_sailseek_state()
+
+    def _fill_integrations(self) -> None:
+        self._quiet(self._chk_launch_startup, self._chk_launch_startup.setChecked, bool(get_launch_at_startup()))
+        self._refresh_debrid_token_state()
+        if os.name == 'nt':
+            self._refresh_associations_status()
+
+    def _fill_advanced(self) -> None:
+        if IS_CANARY:
+            self._quiet_switch(self._chk_canary_update.switchButton, True)
+            self._chk_canary_update.setEnabled(False)
+        self._refresh_cache_size()
+
+    def _fill_network(self) -> None:
+        pending = self._pending_bind
+        if pending is None:
+            return
+        source, apply = pending
+        self._net_apply = apply
+        self._net_loading = True
+        try:
+            prefs = source()
+            for key, widget in self._net_widgets.items():
+                value = prefs.get(key)
+                if key == 'proxy_type':
+                    widget.setCurrentIndex(max(0, widget.findData(value)))
+                elif key == 'proxy_port':
+                    widget.setValue(int(value or 0))
+                elif isinstance(widget, LineEdit):
+                    widget.setText(str(value or ''))
+                else:
+                    widget.setChecked(bool(value))
+        finally:
+            self._net_loading = False
+
+    def bind_network(self, source, apply) -> None:
+        self._pending_bind = (source, apply)
+        if 'network' in self._ranges:
+            self._fill_network()
 
     def _t(self, key: str, fallback: str | None = None, **kwargs) -> str:
         return tr(key, **kwargs) if fallback is None else tr_or(key, fallback, **kwargs)
@@ -2560,12 +2923,12 @@ class SettingsPage(QWidget):
         self._bind(partial(combo.setItemText, index), key, fallback)
 
     def _track_icon(self, widget, slot: str, icon, branded: bool = False) -> None:
-        self._icon_entries.append((widget, slot, icon, branded))
+        self._icon_entries.setdefault(self._active_category, []).append((widget, slot, icon, branded))
 
     def _track_group_icon(self, group, slot: str, icon, branded: bool = False) -> None:
         target = getattr(group, 'iconWidget', None)
         if target is not None:
-            self._icon_entries.append((target, slot, icon, branded))
+            self._icon_entries.setdefault(self._active_category, []).append((target, slot, icon, branded))
 
     def _restyle_cards(self) -> None:
         _restyle_setting_cards(self)
@@ -2578,11 +2941,11 @@ class SettingsPage(QWidget):
 
     def _run_theme_refresh(self) -> None:
         self._theme_dirty = False
+        self._stale = set(self._loaded)
         self.setUpdatesEnabled(False)
         try:
-            self._refresh_icons()
             self._sync_accent_button()
-            self._restyle_cards()
+            self._refresh_page(self._selected_category)
             with suppress(Exception):
                 qss = settings_qss()
                 if self.styleSheet() != qss:
@@ -2590,8 +2953,8 @@ class SettingsPage(QWidget):
         finally:
             self.setUpdatesEnabled(True)
 
-    def _refresh_icons(self) -> None:
-        for entry in self._icon_entries:
+    def _refresh_icons(self, key: str) -> None:
+        for entry in self._icon_entries.get(key, ()):
             widget, slot, icon, branded = entry
             target = (
                 getattr(widget, 'iconLabel', None)
@@ -2660,9 +3023,12 @@ class SettingsPage(QWidget):
         if first and self._active_category in ('appearance', 'integrations', 'advanced'):
             group.titleLabel.hide()
             group.titleLabel.setFixedHeight(0)
-        layout.addWidget(group)
+        elif self._active_category in ('downloads', 'network', 'sailseek', 'shortcuts'):
+            group.titleLabel.hide()
+        index = layout.count() - 1
+        layout.insertWidget(index, group)
         group.show()
-        layout.addSpacing(12)
+        layout.insertSpacing(index + 1, 12)
 
     def _add_card(self, group: SettingCardGroup, card: QWidget) -> None:
         if card.parentWidget() is not group:
@@ -3495,6 +3861,28 @@ class SettingsPage(QWidget):
             'download_dir_tbhb')
         yield
 
+        group = self._sections_general_group = self._group('settings.group_sections_general', 'General')
+        self._add_group(group)
+        yield
+
+        self._history_card = self._switch_card(
+            group, 'settings.search_history', FluentIcon.HISTORY,
+            'settings.search_history_title', 'Search history',
+            'settings.search_history_content',
+            'Show recent searches under each search bar. Turn off to stop recording them.',
+            attr='search_history_enabled')
+        yield
+
+        clear_history = PushButton(self._t('settings.clear_search_history', 'Clear search history'))
+        self._bind(clear_history.setText, 'settings.clear_search_history', 'Clear search history')
+        clear_history.clicked.connect(self._on_clear_search_history)
+        self._plain_card(
+            group, 'settings.clear_search_history', FluentIcon.DELETE,
+            'settings.clear_search_history_title', 'Clear search history',
+            'settings.clear_search_history_content', 'Remove all saved searches from every search bar.',
+            clear_history)
+        yield
+
 
     def _build_sound(self):
         group = self._sound_group = self._group('settings.group_sound', 'Sound & Notifications')
@@ -3661,7 +4049,9 @@ class SettingsPage(QWidget):
         for widget in self._sailseek_dependents:
             with suppress(RuntimeError):
                 widget.setEnabled(enabled)
-        self._restyle_cards()
+        page = self._category_pages.get('sailseek')
+        if page is not None:
+            _restyle_setting_cards(page)
 
     def _sailseek_category_enabled(self, key: str) -> bool:
         raw = getattr(settings, 'sailseek_categories', None) or {}
@@ -4227,77 +4617,6 @@ class SettingsPage(QWidget):
         yield
 
 
-    def _populate(self) -> None:
-        if not self._built:
-            if not self._building:
-                self._ensure_built()
-            return
-        self._loading = True
-        try:
-            for card, attr in self._switches:
-                checked = bool(getattr(settings, attr, False))
-                if isinstance(card, SwitchButton):
-                    self._quiet_switch(card, checked)
-                else:
-                    self._quiet(card, card.setChecked, checked)
-            if IS_CANARY and getattr(self, '_chk_canary_update', None) is not None:
-                self._quiet_switch(self._chk_canary_update.switchButton, True)
-                self._chk_canary_update.setEnabled(False)
-            for card, attr in self._sections:
-                self._quiet_switch(card.switch, bool(getattr(settings, attr, False)))
-            reorder = getattr(self, '_section_reorder', None)
-            if reorder is not None:
-                reorder.arrange(nav_order())
-            for combo, attr in self._combos:
-                value = getattr(settings, attr, None)
-                index = combo.findData(value)
-                self._quiet(combo, combo.setCurrentIndex, max(0, index))
-            for spin, attr in self._spins:
-                with suppress(TypeError, ValueError):
-                    self._quiet(spin, spin.setValue, int(getattr(settings, attr, 0) or 0))
-            for box, attr in self._checks:
-                self._quiet(box, box.setChecked, bool(getattr(settings, attr, False)))
-            for key, switch in list(self._sailseek_source_switches.items()):
-                self._quiet_switch(switch, self._sailseek_category_enabled(key))
-
-            self._quiet(self._chk_launch_startup, self._chk_launch_startup.setChecked,
-                        bool(get_launch_at_startup()))
-            self._quiet(self._sw_auto_pick, self._sw_auto_pick.setChecked, bool(settings.tv_auto_pick))
-            self._quiet(self._edit_stream_addons, self._edit_stream_addons.setText,
-                        getattr(settings, 'tv_stream_addons', '') or '')
-
-            self._bg_path_edit.setText(settings.background_image_path or '')
-            blur = int(settings.background_image_blur)
-            self._quiet(self._bg_blur_slider, self._bg_blur_slider.setValue, blur)
-            self._bg_blur_value_lbl.setText(str(blur))
-            darken = int(settings.background_image_darken)
-            self._quiet(self._bg_darken_slider, self._bg_darken_slider.setValue, darken)
-            self._bg_darken_value_lbl.setText(f'{darken}%')
-
-            self._accent_color_btn.setColor(QColor(settings.accent_color))
-
-            language = current_language()
-            if language in self._lang_codes:
-                self._quiet(self._lang_combo, self._lang_combo.setCurrentIndex,
-                            self._lang_codes.index(language))
-
-            sfx = int(settings.sfx_volume)
-            self._quiet(self._sfx_slider, self._sfx_slider.setValue, sfx)
-            self._sfx_value_lbl.setText(str(sfx) if sfx > 0 else self._t('settings.volume_off', 'Off'))
-            ambiance = int(settings.ambiance_volume)
-            self._quiet(self._ambiance_slider, self._ambiance_slider.setValue, ambiance)
-            self._ambiance_value_lbl.setText(
-                str(ambiance) if ambiance > 0 else self._t('settings.volume_off', 'Off'))
-        finally:
-            self._loading = False
-        self._sync_theme_lock_state()
-        self._refresh_debrid_token_state()
-        self.refresh_sailseek_status()
-        self._sync_sailseek_state()
-        if os.name == 'nt':
-            self._refresh_associations_status()
-
-
     def _apply_locale(self, *_args) -> None:
         self.setUpdatesEnabled(False)
         try:
@@ -4307,7 +4626,7 @@ class SettingsPage(QWidget):
             for switch in self._switch_labels:
                 with suppress(RuntimeError):
                     self._set_switch_text(switch, switch.isChecked())
-            if self._theme_provides_background():
+            if 'appearance' in self._ranges and self._theme_provides_background():
                 self._bg_card.setContent(
                     self._t('settings.background_locked_by_theme', 'This theme includes its own background.'))
         finally:
@@ -4324,17 +4643,25 @@ class SettingsPage(QWidget):
         return 'light' if settings.theme_mode == ThemeMode.LIGHT else 'dark'
 
     def _on_theme_choose_clicked(self) -> None:
-        from src.gui.main_window import pick_theme
-
         if getattr(self, '_theme_picker_open', False):
             return
         self._theme_picker_open = True
-        QTimer.singleShot(400, lambda: setattr(self, '_theme_picker_open', False))
-        self._theme_btn.clearFocus()
-        pick_theme(
-            self.window(), self._current_theme_id(),
-            on_accept=lambda option: self._on_theme_selected(option, activate=False),
-        )
+        QTimer.singleShot(0, self, self._open_theme_picker)
+
+    def _open_theme_picker(self) -> None:
+        from src.gui.main_window import pick_theme
+
+        if self._shell:
+            for k in list(self._jobs):
+                self._advance_job(k)
+            self._evict_pages(self._selected_category, sync=True)
+        try:
+            pick_theme(
+                self.window(), self._current_theme_id(),
+                on_accept=lambda option: self._on_theme_selected(option, activate=False),
+            )
+        finally:
+            self._theme_picker_open = False
 
     def _on_theme_selected(self, option: str, activate: bool = True) -> None:
         if option in ('dark', 'light'):
@@ -4371,6 +4698,7 @@ class SettingsPage(QWidget):
 
 
     def _on_accent_color_changed(self, color: QColor) -> None:
+        self._evict_pages(self._selected_category, sync=True)
         for pill in getattr(self, '_category_buttons', {}).values():
             pill.update()
         self._pending_accent = QColor(color)
@@ -4412,6 +4740,10 @@ class SettingsPage(QWidget):
         self._accent_color_btn.setColor(color)
         self._on_accent_color_changed(color)
 
+    def _on_clear_search_history(self) -> None:
+        from src.gui.stuff.search_history import clear
+        clear()
+
 
     def _background_photo_active(self) -> bool:
         return bool(settings.background_image_enabled) and bool(settings.background_image_path or '')
@@ -4440,6 +4772,8 @@ class SettingsPage(QWidget):
             self.settings_changed.emit()
 
     def _sync_theme_lock_state(self) -> None:
+        if 'appearance' not in self._ranges:
+            return
         theme_owns = self._theme_provides_background()
         self._bg_card.setEnabled(not theme_owns)
         self._set_background_options_enabled(self._bg_card.isChecked() and not theme_owns)
@@ -4913,7 +5247,7 @@ class SettingsPage(QWidget):
 
 
     def _refresh_cache_size(self) -> None:
-        if not self._built:
+        if 'advanced' not in self._ranges:
             return
         now = time.monotonic()
         if now - self._last_cache_probe < 20.0:
@@ -5174,6 +5508,7 @@ class SettingsPage(QWidget):
     def _launch_windows_default_apps_ui(app_registry_name: str) -> bool:
         if os.name != 'nt':
             return False
+        from ctypes import wintypes
         ole32 = ctypes.windll.ole32
         co_init_hr = None
         pointer = ctypes.c_void_p()
@@ -5226,8 +5561,7 @@ class SettingsPage(QWidget):
 
 
     def showEvent(self, event) -> None:
-        if not self._built and not self._building:
-            self._build_ui(background=True)
+        self._show_category(self._selected_category, animate=False)
         super().showEvent(event)
         if self._theme_dirty:
             self._run_theme_refresh()

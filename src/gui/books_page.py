@@ -31,7 +31,7 @@ from .repacks_page import (
     _stop_previous_movie,
     _muted_text_color, _body_text_color, _surface_tint_color, _grid_colors,
 )
-from .grid import PosterGrid, ViewModeButton, attrs_subtitle
+from .stuff.grid import PosterGrid, ViewModeButton, attrs_subtitle
 from .home_page import AccentColorMixin, DetailsViewMixin, MediaPageBase
 from .tv_page import _suggest_genres
 
@@ -712,6 +712,8 @@ class MangaBrowserTab(MediaPageBase):
         self._search_edit.searchSignal.connect(self._on_search)
         self._search_edit.clearSignal.connect(self._on_search)
         self._search_edit.textChanged.connect(self._on_search_text_changed)
+        from src.gui.stuff.search_history import attach as attach_search_history
+        attach_search_history(self._search_edit, 'books', lambda _text: self._on_search())
         header_row.addWidget(self._search_edit)
 
         view_btn = ViewModeButton(self._grid, parent=self, list_tip=tr('books.list_view', default='List view'),

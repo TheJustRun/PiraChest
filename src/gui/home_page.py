@@ -13,7 +13,7 @@ from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QPointF, QRect, QRectF,
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRegion
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget
 from qfluentwidgets import BodyLabel, CardWidget, CaptionLabel, FluentIcon, ProgressBar, SmoothScrollArea, StrongBodyLabel, SubtitleLabel, TitleLabel, TransparentToolButton
-from .grid import PosterStrip, _LIFT, images
+from .stuff.grid import PosterStrip, _LIFT, images
 from src.core.config import paths as app_paths, settings as app_settings, is_tab_enabled, tab_visibility_bus
 from src.core.theme import palette, register_theme_refresh, apply_tool_button_theme, themed_icon, to_color, fade_in, animations_enabled
 from src.core.translations import current_language, register_locale_refresh, tr

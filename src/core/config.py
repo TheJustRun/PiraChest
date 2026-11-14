@@ -375,8 +375,9 @@ class Settings:
     auto_check_updates: bool = True
     canary_updates: bool = False
     notify_on_download_complete: bool = True
-    sfx_volume: int = 45
-    ambiance_volume: int = 0
+    search_history_enabled: bool = True
+    sfx_volume: int = 25
+    ambiance_volume: int = 45
     background_image_enabled: bool = False
     background_image_path: str = ''
     background_image_blur: int = 12

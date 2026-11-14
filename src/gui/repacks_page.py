@@ -219,7 +219,7 @@ from qfluentwidgets import MessageBox, Flyout, FlyoutAnimationType, FlyoutViewBa
 from src.core.worker import fetch_all_tags_async, random_entry_async, resolve_tags_async, fetch_tag_async, fetch_pink_paw_async, fetch_list_async, fetch_page_async, fetch_details_async, fetch_upcoming_repacks_async, fetch_search_async, fetch_popular_repacks_async, cancel as cancel_task, Priority
 from src.core.downloader import DownloadManager, DLState, category_dir
 from src.core.theme import palette, to_color, register_theme_refresh, apply_pivot_theme, apply_tool_button_theme, branded_icon, count_badge_qss, icon_override_pixmap, themed_icon, apply_slot_icon_theme, ScrollingTextDelegate, animations_enabled
-from .grid import PosterGrid, ViewModeButton, attrs_subtitle, play_sfx
+from .stuff.grid import PosterGrid, ViewModeButton, attrs_subtitle, play_sfx
 _source_subtitle = attrs_subtitle('source', labels={'fitgirl': 'FitGirl Repacks', 'gog': 'GOG Revived'})
 
 
@@ -6842,6 +6842,8 @@ class RepacksPage(QWidget):
         self._search_bar.searchSignal.connect(self._on_search_immediate)
         bind_enter(self._search_bar, lambda: self._on_search_immediate(self._search_bar.text()))
         self._search_bar.clearSignal.connect(lambda: self._on_search_immediate(''))
+        from src.gui.stuff.search_history import attach as attach_search_history
+        attach_search_history(self._search_bar, 'repacks', self._on_search_immediate)
         self._donate_btn = PushButton(_filled_heart_icon(), tr('repacks.donate_to_fitgirl'))
         apply_tool_button_theme(self._donate_btn)
         register_theme_refresh(self._donate_btn, lambda: self._donate_btn.setIcon(_filled_heart_icon()))

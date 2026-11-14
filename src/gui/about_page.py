@@ -514,6 +514,8 @@ class AboutPage(QWidget):
     AUTHOR_URL = 'https://github.com/TheJustRun'
     LOGO_ARTIST_REDDIT_USER = 'u/spicysaltysparty'
     LOGO_ARTIST_URL = 'https://reddit.com/u/spicysaltysparty'
+    AMBIANCE_ARTIST_NAME = 'The Improuver'
+    AMBIANCE_ARTIST_URL = 'https://www.youtube.com/@innerfailure'
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -729,7 +731,14 @@ class AboutPage(QWidget):
         logo = tr('about.logo_credit', name=(
             f'<a href="{self.LOGO_ARTIST_URL}" style="color:{accent}; text-decoration:none;">'
             f'{self.LOGO_ARTIST_REDDIT_USER}</a>'))
-        return '<br/>'.join((logo, tr('about.reze_credit_content'),
+        if self.AMBIANCE_ARTIST_URL:
+            ambiance_name = (f'<a href="{self.AMBIANCE_ARTIST_URL}" style="color:{accent}; text-decoration:none;">'
+                             f'{self.AMBIANCE_ARTIST_NAME}</a>')
+        else:
+            primary = palette().get('primary_text', '#ffffff')
+            ambiance_name = f'<span style="color:{primary}; font-weight:600;">{self.AMBIANCE_ARTIST_NAME}</span>'
+        ambiance = tr('about.ambiance_credit', 'Ambiance track created by {name}', name=ambiance_name)
+        return '<br/>'.join((logo, ambiance, tr('about.reze_credit_content'),
                              tr('about.mangadex_credit_content')))
 
     def _packages_html(self) -> str:

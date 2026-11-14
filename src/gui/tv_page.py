@@ -71,7 +71,7 @@ from src.core.translations import tr, register_locale_refresh
 from src.core.theme import to_color, palette, apply_pivot_theme, apply_tool_button_theme, apply_label_theme, count_badge_qss, register_theme_refresh, themed_icon, apply_slot_icon_theme
 from .home_page import MediaPageBase
 from .repacks_page import make_tag_chip, show_tag_menu, toggled_tags, bind_enter, split_tags, join_tags, partition_resolved
-from .grid import PosterGrid, PosterStrip, ViewModeButton, attrs_subtitle, grid_colors as _grid_colors
+from .stuff.grid import PosterGrid, PosterStrip, ViewModeButton, attrs_subtitle, grid_colors as _grid_colors
 
 
 _CATEGORIES = (
@@ -491,10 +491,11 @@ class _AddSourceDialog(MessageBoxBase):
         self.viewLayout.addWidget(title)
         self.viewLayout.addWidget(hint)
 
-        self._mode = SegmentedWidget(self)
+        self._mode = Pivot(self)
         self._mode.addItem("url", tr("tv.channels.mode_link", default="Link"), onClick=lambda: self._set_mode(0))
         self._mode.addItem("file", tr("tv.channels.mode_file", default="Local file"), onClick=lambda: self._set_mode(1))
         self._mode.setCurrentItem("url")
+        apply_pivot_theme(self._mode)
         self.viewLayout.addWidget(self._mode)
 
         self.viewLayout.addWidget(StrongBodyLabel(tr("tv.channels.source_name", default="Name"), self))
@@ -1493,6 +1494,15 @@ class _CountryModel(QAbstractListModel):
             i = self.index(row)
             self.dataChanged.emit(i, i)
 
+    def set_rows(self, rows: list[int], val: bool) -> None:
+        on = self.on
+        changed = [r for r in rows if on[r] != val]
+        if not changed:
+            return
+        for r in changed:
+            on[r] = val
+        self.dataChanged.emit(self.index(min(changed)), self.index(max(changed)))
+
 
 class _CountryDelegate(QStyledItemDelegate):
     def __init__(self, view, model: _CountryModel) -> None:
@@ -1575,7 +1585,7 @@ class _CountrySelectionDialog(MessageBoxBase):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.widget.setMinimumSize(420, 560)
+        self.widget.setMinimumWidth(420)
         lay = self.viewLayout
         lay.setSpacing(10)
 
@@ -1675,24 +1685,34 @@ class _CountrySelectionDialog(MessageBoxBase):
         self._update_summary()
 
     def _set_visible(self, val: bool) -> None:
-        for i in range(self._model.rowCount()):
-            if not self._view.isRowHidden(i):
-                self._model.set_row(i, val)
+        view = self._view
+        self._model.set_rows([i for i in range(self._model.rowCount()) if not view.isRowHidden(i)], val)
         self._update_summary()
 
     def _on_search(self, text: str) -> None:
         q = text.strip()
-        for i, n in enumerate(self._model.low):
-            self._view.setRowHidden(i, bool(q) and not _tm_contains(q, n))
+        view = self._view
+        view.setUpdatesEnabled(False)
+        try:
+            for i, n in enumerate(self._model.low):
+                hide = bool(q) and not _tm_contains(q, n)
+                if view.isRowHidden(i) != hide:
+                    view.setRowHidden(i, hide)
+        finally:
+            view.setUpdatesEnabled(True)
 
     def _update_summary(self) -> None:
-        n = sum(self._model.on)
+        n = self._model.on.count(True)
         self._summary.setText(tr("tv.channels.n_selected", default="{n} selected").format(n=n))
         self._ok.setEnabled(n > 0)
 
     def selected_codes(self) -> list[str]:
         m = self._model
         return [c for c, on in zip(m.codes, m.on, strict=True) if on]
+
+
+def _fetch_countries() -> tuple:
+    return channels_backend.get_available_countries(), channels_backend.get_selected_countries()
 
 
 def _fetch_indexed(use_cache: bool = True) -> list:
@@ -1900,19 +1920,23 @@ class _ChannelsTab(QWidget):
         dlg = _CountrySelectionDialog(self.window())
         task: dict = {"id": None}
 
-        def _fetch() -> None:
+        def _cancel() -> None:
             if task["id"] is not None:
                 _worker_module.cancel(task["id"])
+                task["id"] = None
+
+        def _fetch() -> None:
+            _cancel()
             dlg.set_loading()
 
-            def _done(countries: list) -> None:
+            def _done(res: tuple) -> None:
                 if not _qt_is_valid(dlg):
                     return
                 task["id"] = None
+                countries, sel = res
                 if not countries:
                     dlg.set_error(tr("tv.channels.no_countries", default="No countries available."))
                     return
-                sel = channels_backend.get_selected_countries()
                 dlg.set_countries(countries, set(sel) if sel is not None else None)
 
             def _err(msg: str) -> None:
@@ -1922,22 +1946,21 @@ class _ChannelsTab(QWidget):
                 logger.error("Failed to load country list: %s", msg)
                 dlg.set_error(tr("tv.channels.countries_error", default="Couldn't load the country list."))
 
-            task["id"] = _worker_module.submit(channels_backend.get_available_countries, on_done=_done, on_error=_err)
+            task["id"] = _worker_module.submit(_fetch_countries, on_done=_done, on_error=_err)
+
+        def _finished(code: int) -> None:
+            _cancel()
+            self._prompting = False
+            codes = dlg.selected_codes() if code == QDialog.DialogCode.Accepted else []
+            dlg.deleteLater()
+            if codes:
+                channels_backend.set_selected_countries(codes)
+                self._load_channels(use_cache=True)
 
         dlg.retry_requested.connect(_fetch)
+        dlg.finished.connect(_finished)
         _fetch()
-        try:
-            accepted = dlg.exec() == QDialog.DialogCode.Accepted
-        finally:
-            if task["id"] is not None:
-                _worker_module.cancel(task["id"])
-                task["id"] = None
-            self._prompting = False
-        codes = dlg.selected_codes() if accepted else []
-        dlg.deleteLater()
-        if accepted and codes:
-            channels_backend.set_selected_countries(codes)
-            self._load_channels(use_cache=True)
+        dlg.open()
 
 
     def _cancel_load(self) -> None:
@@ -3893,6 +3916,8 @@ class _MediaTab(MediaPageBase):
         self._search_box.searchSignal.connect(self._on_search_commit)
         bind_enter(self._search_box, self._on_search_commit)
         self._search_box.clearSignal.connect(self._on_search_commit)
+        from src.gui.stuff.search_history import attach as attach_search_history
+        attach_search_history(self._search_box, 'tv', lambda _text: self._on_search_commit())
         self._search_box.setMinimumWidth(280)
         self._search_box.setMaximumWidth(360)
         search_row = QHBoxLayout()

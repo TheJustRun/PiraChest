@@ -5946,7 +5946,7 @@ class MainWindow(FluentWindow):
         self._app_active = True
         self._prepare_gl_surface()
         app = QApplication.instance()
-        self._settings_prepare_timer = QTimer(self, singleShot=True, interval=400)
+        self._settings_prepare_timer = QTimer(self, singleShot=True, interval=120)
         self._settings_prepare_timer.timeout.connect(self._prepare_settings_page)
         app.installEventFilter(self)
         app.applicationStateChanged.connect(self._on_app_state_changed)
@@ -6042,6 +6042,7 @@ class MainWindow(FluentWindow):
         self.download_manager.item_updated.connect(self._schedule_downloads_badge_update)
         self.download_manager.item_removed.connect(self._schedule_downloads_badge_update)
         self.download_manager.download_completed.connect(self._on_download_completed)
+        self.download_manager.download_failed.connect(self._on_download_failed)
 
         from src.core.repacks.installer import get_install_coordinator
         self._install_bar = None
@@ -6100,7 +6101,7 @@ class MainWindow(FluentWindow):
         _maybe_run_onboarding(self)
         self._ui_ready = True
         QTimer.singleShot(500, self._warm_audio)
-        self._settings_warmup_timer = QTimer(self, singleShot=True, interval=4000)
+        self._settings_warmup_timer = QTimer(self, singleShot=True, interval=1500)
         self._settings_warmup_timer.timeout.connect(self._prepare_settings_page)
         self._settings_warmup_timer.start()
 
@@ -6196,7 +6197,13 @@ class MainWindow(FluentWindow):
         except Exception:
             logger.exception('Failed to auto-refresh repacks on navigation')
 
+    def _on_download_failed(self, item_id: str, error: str) -> None:
+        with suppress(Exception):
+            get_sound_manager().play('popout_error')
+
     def _on_download_completed(self, item_id: str, game_name: str) -> None:
+        with suppress(Exception):
+            get_sound_manager().play('popout_success')
         if not settings.notify_on_download_complete:
             return
         display_name = game_name or tr('download.rom_fallback')

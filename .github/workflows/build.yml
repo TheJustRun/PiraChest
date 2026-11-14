@@ -192,21 +192,39 @@ jobs:
     needs: [ version, build-windows ]
     if: needs.version.outputs.is_new == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: windows-package
           path: release-files
 
+      - name: Build release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPO="${{ github.repository }}"
+          SINCE=$(gh api "repos/$REPO/releases?per_page=1" --jq '.[0].published_at // empty')
+          PRS=$(gh pr list --repo "$REPO" --base main --state merged --limit 50 \
+                  ${SINCE:+--search "merged:>$SINCE"} --json number,title,body,mergedAt \
+                | jq -r 'sort_by(.mergedAt)[] | "### \(.title) (#\(.number))\n" + ((.body // "") | gsub("\r";"") | gsub("(?s)<!--.*?-->";"") | sub("^\\s+";"") | sub("\\s+$";"") | .[0:1500]) + "\n"')
+          {
+            echo "${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.version }} (Windows x64)."
+            echo
+            [ -n "$PRS" ] && printf '%s\n\n' "$PRS"
+            cat <<'EOF'
+          **Install:** download the MSI and run it. Choose the install location in the setup wizard. It installs for the current user with a Start Menu shortcut, no admin prompt, and no forced file associations.
+          **Portable:** download the ZIP, extract it, and run `${{ needs.version.outputs.app_name }}.exe`. The ZIP `.sha256` file contains the checksum used by the built-in updater; the MSI `.sha256` verifies the installer.
+          EOF
+          } > notes.md
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: "${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.display }}"
-          body: |
-            ${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.version }} (Windows x64).
-
-            **Install:** download the MSI and run it. Choose the install location in the setup wizard. It installs for the current user with a Start Menu shortcut, no admin prompt, and no forced file associations.
-            **Portable:** download the ZIP, extract it, and run `${{ needs.version.outputs.app_name }}.exe`. The ZIP `.sha256` file contains the checksum used by the built-in updater; the MSI `.sha256` verifies the installer.
+          body_path: notes.md
           generate_release_notes: true
           prerelease: ${{ needs.version.outputs.canary == '1' }}
           make_latest: ${{ needs.version.outputs.canary != '1' }}
@@ -234,7 +252,7 @@ jobs:
             exit 1
           fi
           JSON=$(gh release view "$TAG" --repo "$REPO" --json body,url,isPrerelease,assets)
-          BODY=$(jq -r '.body' <<< "$JSON" | sed -e 's/^### /**/;s/^## /**/' | head -c 3800)
+          BODY=$(jq -r '.body' <<< "$JSON" | grep -v '^\*\*\(Install\|Portable\):\*\*' | sed -E 's/^#{2,3} (.*)$/**\1**/' | head -c 3800)
           URL=$(jq -r '.url' <<< "$JSON")
           MSI=$(jq -r '[.assets[].url | select(endswith(".msi"))][0] // empty' <<< "$JSON")
           ZIP=$(jq -r '[.assets[].url | select(endswith(".zip"))][0] // empty' <<< "$JSON")

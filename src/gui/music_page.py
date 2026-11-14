@@ -42,7 +42,7 @@ from qfluentwidgets import (Action, CaptionLabel, CardWidget, CheckBox, FluentIc
                             SubtitleLabel, Theme, TransparentToolButton, isDarkTheme, themeColor)
 
 from src.core.artwork import images
-from .grid import PosterGrid
+from .stuff.grid import PosterGrid
 from src.core.config import paths as app_paths, settings as app_settings
 from src.core.models import MusicItem as Song
 from src.core.net import LazyHttpClient
@@ -174,6 +174,7 @@ _SVG.update({
     'm_prev': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>',
     'm_shuffle': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/></svg>',
     'm_repeat': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>',
+    'm_repeat_one': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-4-2V9h-1l-2 1v1h1.5v4H13z"/></svg>',
     'm_volup': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>',
     'm_voldown': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M18.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM5 9v6h4l5 5V4L9 9H5z"/></svg>',
     'm_vol0': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#fff" d="M7 9v6h4l5 5V4l-5 5H7z"/></svg>',
@@ -562,6 +563,7 @@ class MusicPreviewPlayer(QObject):
     song_changed = Signal(object)
     queue_changed = Signal()
     error = Signal(str)
+    repeat_changed = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -578,7 +580,7 @@ class MusicPreviewPlayer(QObject):
         self._urls: dict[str, str] = {}
         self._order: list[int] = []
         self._index = -1
-        self._repeat = False
+        self._repeat = 0
         self._shuffle = False
         self._media_controls = _attach_media_controls(self)
 
@@ -600,11 +602,17 @@ class MusicPreviewPlayer(QObject):
         else:
             self._index = -1
 
-    def set_repeat(self, enabled: bool) -> None:
-        self._repeat = enabled
+    def set_repeat(self, mode: int) -> None:
+        mode = max(0, min(2, int(mode)))
+        if mode != self._repeat:
+            self._repeat = mode
+            self.repeat_changed.emit(mode)
+
+    def cycle_repeat(self) -> None:
+        self.set_repeat((self._repeat + 1) % 3)
 
     @property
-    def repeat(self) -> bool:
+    def repeat(self) -> int:
         return self._repeat
 
     def set_shuffle(self, enabled: bool) -> None:
@@ -732,7 +740,10 @@ class MusicPreviewPlayer(QObject):
 
     def _on_media_status_changed(self, status) -> None:
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            if self.has_next:
+            if self._repeat == 2 and self._current_song is not None:
+                self._player.setPosition(0)
+                self._player.play()
+            elif self.has_next:
                 self.next()
             else:
                 self.stop()
@@ -775,6 +786,49 @@ def _first_artist(song) -> str:
 
 def _playable(song) -> bool:
     return isinstance(song.download_url, str) and bool(song.download_url)
+
+
+_RECENT_LIMIT = 100
+_RECENT_FILE = os.path.join(app_paths.config_dir, 'pirachest_music_recent.json')
+
+
+def _load_recent() -> list:
+    try:
+        with open(_RECENT_FILE, 'r', encoding='utf-8') as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    songs = []
+    for item in raw[:_RECENT_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            songs.append(Song.from_dict(item))
+        except Exception:
+            continue
+    return songs
+
+
+def _save_recent(songs: list) -> None:
+    payload = []
+    for song in songs[:_RECENT_LIMIT]:
+        try:
+            data = song.to_dict()
+        except Exception:
+            continue
+        for key in ('raw', 'download_headers', 'download_cookies'):
+            data.pop(key, None)
+        payload.append(data)
+    try:
+        os.makedirs(app_paths.config_dir, exist_ok=True)
+        tmp = _RECENT_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp, _RECENT_FILE)
+    except OSError as exc:
+        logger.debug('Failed to save recent music: %s', exc)
 
 
 def _parse_lrc(text: str | None) -> list[tuple[int, str]]:
@@ -1992,9 +2046,10 @@ class PlayBar(QWidget):
         self.b_play = IconButton('m_play', 54, 30)
         self.b_next = IconButton('m_next', 40, 24)
         self.b_repeat = IconButton('m_repeat', 38, 22)
-        for b, on in ((self.b_shuffle, player.shuffle), (self.b_repeat, player.repeat)):
+        for b in (self.b_shuffle, self.b_repeat):
             b.setCheckable(True)
-            b.setChecked(on)
+        self.b_shuffle.setChecked(player.shuffle)
+        self._sync_repeat(player.repeat)
         for b in (self.b_shuffle, self.b_prev, self.b_play, self.b_next, self.b_repeat):
             row.addWidget(b)
         row.addStretch(1)
@@ -2037,7 +2092,8 @@ class PlayBar(QWidget):
         self.b_prev.clicked.connect(player.previous)
         self.b_next.clicked.connect(player.next)
         self.b_shuffle.toggled.connect(player.set_shuffle)
-        self.b_repeat.toggled.connect(player.set_repeat)
+        self.b_repeat.clicked.connect(player.cycle_repeat)
+        player.repeat_changed.connect(self._sync_repeat)
         self.b_add.clicked.connect(self.add_requested)
         self.b_queue.clicked.connect(lambda: self.open_playing.emit(1))
         self.b_lyrics.clicked.connect(lambda: self.open_playing.emit(0))
@@ -2114,6 +2170,14 @@ class PlayBar(QWidget):
     def _volume(self, v: int) -> None:
         self.player.set_volume(v / 100)
         self._vol_icon(v, False)
+
+    def _sync_repeat(self, mode: int) -> None:
+        b = self.b_repeat
+        b.blockSignals(True)
+        b.setChecked(mode > 0)
+        b.blockSignals(False)
+        b.setIconName('m_repeat_one' if mode == 2 else 'm_repeat')
+        b.setToolTip(('Repeat: off', 'Repeat: all', 'Repeat: one track')[mode])
 
     def _mute(self) -> None:
         m = not self.player.is_muted
@@ -2747,6 +2811,8 @@ class MusicPage(QWidget):
         self._songs: list = []
         self._keys: set = set()
         self._queue: list = []
+        self._recent_songs: list = _load_recent()
+        self._refresh_tried: dict = {}
         self._token = None
         self._cur_pl = None
         self._cur_key = None
@@ -2771,13 +2837,16 @@ class MusicPage(QWidget):
         top = QHBoxLayout()
         self._pivot = Pivot(lib)
         self._pivot.addItem('songs', _t('music.songs', 'Songs'), lambda: self._tabs.setCurrentIndex(0))
-        self._pivot.addItem('playlists', tr('music.playlists'), lambda: self._tabs.setCurrentIndex(1))
+        self._pivot.addItem('recent', _t('music.recent', 'Recent'), lambda: self._tabs.setCurrentIndex(1))
+        self._pivot.addItem('playlists', tr('music.playlists'), lambda: self._tabs.setCurrentIndex(2))
         self._pivot.setCurrentItem('songs')
         self._search = SearchLineEdit(lib)
         self._search.setPlaceholderText(tr('music.search_placeholder'))
         self._search.setFixedWidth(340)
         self._search.returnPressed.connect(self._on_search)
         self._search.searchSignal.connect(lambda _q: self._on_search())
+        from src.gui.stuff.search_history import attach as attach_search_history
+        attach_search_history(self._search, 'music', lambda _text: self._on_search())
         self._b_filter = TransparentToolButton(FluentIcon.FILTER, lib)
         self._b_filter.setToolTip(tr('music.filter'))
         self._b_filter.clicked.connect(self._on_filters)
@@ -2819,6 +2888,23 @@ class MusicPage(QWidget):
         self._empty.setAlignment(Qt.AlignCenter)
         sl.addWidget(self._empty)
         self._tabs.addWidget(st)
+
+        recent = QWidget()
+        rl = QVBoxLayout(recent)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(8)
+        rrow = QHBoxLayout()
+        self._recent_empty = CaptionLabel(_t('music.no_recent', 'No recently played songs yet.'), recent)
+        b_clear_recent = PushButton(FluentIcon.DELETE, _t('music.clear_recent', 'Clear recent'), recent)
+        b_clear_recent.clicked.connect(self._clear_recent)
+        rrow.addWidget(self._recent_empty)
+        rrow.addStretch(1)
+        rrow.addWidget(b_clear_recent)
+        rl.addLayout(rrow)
+        rl.addWidget(ListHeader(recent))
+        self.recent = SongList(parent=recent)
+        rl.addWidget(self.recent, 1)
+        self._tabs.addWidget(recent)
 
         pt = QStackedWidget()
         self.grid = PlaylistGrid()
@@ -2873,12 +2959,13 @@ class MusicPage(QWidget):
         pt.addWidget(detail)
         self._pl_stack = pt
         self._tabs.addWidget(pt)
+
         self._main.set_base(lib)
         self.view = PlayingView()
         self._main.set_over(self.view)
 
         for name, lst in (('results', self.results), ('results', self.grid_songs), ('pl', self.pl_songs),
-                          ('queue', self.view.queue)):
+                          ('queue', self.view.queue), ('recent', self.recent)):
             lst.play.connect(partial(self._on_play_song, name))
             lst.download.connect(self._on_download)
             lst.add.connect(self._on_add_to_playlist)
@@ -2904,9 +2991,27 @@ class MusicPage(QWidget):
         self.view.lyrics.seek.connect(self._player.seek)
         self._player.song_changed.connect(self._on_song_changed)
         self._player.position_changed.connect(self._on_position)
-        self._player.error.connect(lambda m: self._toast('error', tr('music.playback_error_title'), m[:120], 4000))
+        self._player.error.connect(self._on_playback_error)
         register_locale_refresh(self, self._apply_locale)
         self._refresh_playlists()
+        self.recent.set_songs(self._recent_songs)
+        self._recent_empty.setVisible(not self._recent_songs)
+
+    def _remember(self, song) -> None:
+        key = song.key
+        self._recent_songs = [s for s in self._recent_songs if s.key != key]
+        self._recent_songs.insert(0, song)
+        del self._recent_songs[_RECENT_LIMIT:]
+        self.recent.set_songs(self._recent_songs)
+        self.recent.set_playing(self._cur_key)
+        self._recent_empty.setVisible(not self._recent_songs)
+        _save_recent(self._recent_songs)
+
+    def _clear_recent(self) -> None:
+        self._recent_songs = []
+        self.recent.set_songs([])
+        self._recent_empty.setVisible(True)
+        _save_recent(self._recent_songs)
 
     def _add_current(self) -> None:
         song = self._player.current_song
@@ -2943,6 +3048,7 @@ class MusicPage(QWidget):
         self._pl_empty.setText(_t('music.no_playlists', 'No playlists yet. Create one to get started.'))
         self._search.setPlaceholderText(tr('music.search_placeholder'))
         self._pivot.setItemText('playlists', tr('music.playlists'))
+        self._pivot.setItemText('recent', _t('music.recent', 'Recent'))
         if not self._songs:
             self._empty.setText(tr('music.search_hint'))
 
@@ -3052,6 +3158,35 @@ class MusicPage(QWidget):
             self._on_search()
 
 
+    def _on_playback_error(self, message: str) -> None:
+        song = self._player.current_song
+        if song is None or not _playable(song):
+            self._toast('error', tr('music.playback_error_title'), message[:120], 4000)
+            return
+        now = time.monotonic()
+        if now - self._refresh_tried.get(song.key, 0.0) < 30:
+            return
+        self._refresh_tried[song.key] = now
+        self._toast('info', _t('music.refreshing_link', 'Refreshing stream'),
+                    _t('music.refreshing_link_content', 'That link expired. Getting a fresh one…'), 2500)
+        submit(_refresh_url, args=(song,),
+               on_done=lambda url, s=song: self._retry_play(s, url),
+               on_error=lambda err, s=song: self._playback_failed(s, err))
+
+    def _retry_play(self, song, url: str | None) -> None:
+        if self._player.current_song is not song:
+            return
+        if not url:
+            self._playback_failed(song, '')
+            return
+        self._player.play_song(song, url, queue=self._queue)
+
+    def _playback_failed(self, song, error: str) -> None:
+        if self._player.current_song is not song:
+            return
+        self._toast('error', tr('music.playback_error_title'),
+                    str(error or _t('music.playback_error_content', 'Could not play this track.'))[:120], 4000)
+
     def _play(self, song, queue: list) -> None:
         if not _playable(song):
             self._toast('warning', tr('music.no_preview_title'), tr('music.no_preview_content'))
@@ -3062,12 +3197,15 @@ class MusicPage(QWidget):
         self._player.play_song(song, song.download_url, queue=q, urls={s.key: s.download_url for s in q})
 
     def _on_play_song(self, src: str, song) -> None:
-        self._play(song, {'results': self._songs, 'pl': self.pl_songs.songs(), 'queue': self._queue}[src])
+        self._play(song, {'results': self._songs, 'pl': self.pl_songs.songs(), 'queue': self._queue,
+                          'recent': self._recent_songs}[src])
 
     def _on_song_changed(self, song) -> None:
         key = song.key if song else None
         self._cur_key = key
-        for lst in (self.results, self.grid_songs, self.pl_songs, self.view.queue):
+        if song is not None:
+            self._remember(song)
+        for lst in (self.results, self.grid_songs, self.pl_songs, self.view.queue, self.recent):
             lst.set_playing(key)
         self.bar.set_song(song)
         self.bar.setVisible(song is not None)

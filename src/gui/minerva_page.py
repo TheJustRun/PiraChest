@@ -439,6 +439,8 @@ class MinervaPage(QWidget):
         self._search_input.returnPressed.connect(self._on_search_now)
         self._search_input.searchSignal.connect(lambda *_: self._on_search_now())
         self._search_input.textChanged.connect(lambda *_: self._search_timer.start())
+        from src.gui.stuff.search_history import attach as attach_search_history
+        attach_search_history(self._search_input, 'minerva', lambda _text: self._on_search_now())
         row1.addWidget(self._search_input, 3)
         self._source_filter = ComboBox()
         self._console_filter = ConsoleComboBox()

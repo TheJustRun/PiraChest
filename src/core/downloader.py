@@ -1195,6 +1195,7 @@ class DownloadManager(QObject):
     order_changed = Signal()
     all_downloads_finished = Signal()
     download_completed = Signal(str, str)
+    download_failed = Signal(str, str)
     _wake = Signal()
     _external_op = Signal(object)
 
@@ -1799,10 +1800,13 @@ class DownloadManager(QObject):
             self._changed(item_id)
             self._try_start_next()
             return
+        was_error = item.state == DLState.error
         item.state, item.error = DLState.error, _scrub(error)
         item.clear_live()
         self._changed(item_id)
         self._try_start_next()
+        if not was_error:
+            self.download_failed.emit(item_id, item.error)
 
     def _finish(self, item: DownloadItem, path: str = "") -> None:
         if self._closed:
