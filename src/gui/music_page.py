@@ -2189,7 +2189,7 @@ class PlayBar(QWidget):
 
 
 _ALIGN = {'center': Qt.AlignCenter, 'left': Qt.AlignLeft | Qt.AlignVCenter, 'right': Qt.AlignRight | Qt.AlignVCenter}
-_LINE_STYLE = ((44, 800, 255), (30, 600, 165), (26, 500, 115), (24, 500, 85))
+_LINE_STYLE = ((52, 800, 255), (36, 650, 215), (32, 600, 160), (28, 600, 115))
 _FONT_EXT = ('.ttf', '.otf', '.ttc')
 
 
@@ -2200,8 +2200,42 @@ class LyricLine(QLabel):
     def __init__(self, text: str, ms: int, parent=None):
         super().__init__(text, parent)
         self.ms, self.dist, self.hover = ms, 9, False
+        self._alpha = 0.0
+        self.view = None
+        self._ani = QVariantAnimation(self, duration=260, valueChanged=self._set_alpha)
+        self._ani.setEasingCurve(QEasingCurve.OutCubic)
         self.setWordWrap(True)
         self.setCursor(Qt.PointingHandCursor)
+
+    def _set_alpha(self, a) -> None:
+        self._alpha = float(a)
+        self.update()
+
+    def paintEvent(self, e):
+        edge = 1.0
+        if self.view is not None:
+            vh = max(1, self.view.viewport().height())
+            c = self.mapTo(self.view.viewport(), QPoint(0, self.height() // 2)).y()
+            t = max(0.0, min(1.0, min(c, vh - c) / (vh * 0.14)))
+            edge = t * t * (3 - 2 * t)
+        if edge <= 0.0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        p.setOpacity(edge)
+        p.setFont(self.font())
+        p.setPen(QColor(255, 255, 255, int(self._alpha)))
+        p.drawText(self.contentsRect(), int(self.alignment()) | Qt.TextWordWrap, self.text())
+        p.end()
+
+    def fade_to(self, a: int, animate: bool = True) -> None:
+        self._ani.stop()
+        if not animate or not self.isVisible():
+            self._set_alpha(a)
+            return
+        self._ani.setStartValue(self._alpha)
+        self._ani.setEndValue(float(a))
+        self._ani.start()
 
     def enterEvent(self, e):
         self.hover = True
@@ -2231,15 +2265,14 @@ class LyricView(QScrollArea):
         self.setStyleSheet('QScrollArea,QScrollArea>QWidget>QWidget{background:transparent;}')
         self._box = QWidget()
         self._lay = QVBoxLayout(self._box)
-        self._lay.setSpacing(34)
+        self._lay.setSpacing(30)
         self.setWidget(self._box)
         self._labels: list = []
         self._times: list = []
         self._active = -1
         self._free_until = 0.0
         self._ani = QPropertyAnimation(self.verticalScrollBar(), b'value', self)
-        self._fade = QGraphicsOpacityEffect(self)
-        self.setGraphicsEffect(self._fade)
+        self.verticalScrollBar().valueChanged.connect(self._refade)
         self.status = QLabel('', self)
         self.status.setAlignment(Qt.AlignCenter)
         self.status.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -2248,12 +2281,16 @@ class LyricView(QScrollArea):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         m = self.height() // 2
-        self._lay.setContentsMargins(40, m, 40, m)
+        self._lay.setContentsMargins(56, m, 56, m)
         self.status.setGeometry(0, 0, self.width(), self.height())
-        g = QLinearGradient(0, 0, 0, max(1, self.height()))
-        for pos, a in ((0, 0), (.14, 255), (.86, 255), (1, 0)):
-            g.setColorAt(pos, QColor(0, 0, 0, a))
-        self._fade.setOpacityMask(QBrush(g))
+        self._refade()
+
+    def _refade(self, *_) -> None:
+        top = self.verticalScrollBar().value()
+        bottom = top + self.height()
+        for l in self._labels:
+            if l.y() + l.height() >= top and l.y() <= bottom:
+                l.update()
 
     def wheelEvent(self, e):
         sb = self.verticalScrollBar()
@@ -2282,6 +2319,7 @@ class LyricView(QScrollArea):
         self.clear('' if lines else _t('music.no_lyrics_found', 'No lyrics found'))
         for ms, text in lines:
             l = LyricLine(text or '♪', ms, self._box)
+            l.view = self
             l.setAlignment(_ALIGN[self.align])
             l.clicked.connect(self._on_click)
             l.hovered.connect(lambda lab: self._style(lab, lab.dist))
@@ -2299,9 +2337,7 @@ class LyricView(QScrollArea):
         l.dist = dist
         size, weight, alpha = _LINE_STYLE[min(dist, 3)]
         l.setFont(_font(max(8, int(size * self.scale)), QFont.Weight(weight), self.family))
-        pal = l.palette()
-        pal.setColor(QPalette.WindowText, QColor(255, 255, 255, max(alpha, 200) if l.hover else alpha))
-        l.setPalette(pal)
+        l.fade_to(max(alpha, 235) if l.hover else alpha, animate=dist < 9)
 
     def restyle(self) -> None:
         for i, l in enumerate(self._labels):
@@ -2477,7 +2513,7 @@ def _mesh_palette(colors: list) -> list:
     out = []
     for i in range(len(_MESH_POINTS)):
         h, s, l, _ = src[i % len(src)].getHsl()
-        c = QColor.fromHsl(max(h, 0), min(max(int(s * 1.25), 140), 255), min(max(l, 85), 135))
+        c = QColor.fromHsl(max(h, 0), min(max(int(s * 1.25), 140), 255), min(max(l, 70), 108))
         out.append([float(c.red()), float(c.green()), float(c.blue())])
     h, s, l, _ = src[0].getHsl()
     c = QColor.fromHsl(max(h, 0), min(max(s, 60), 200), 16)
@@ -2493,11 +2529,6 @@ class _Mesh(QWidget):
         self._img = QImage(_MESH_WIDTH, _MESH_WIDTH * 9 // 16, QImage.Format_RGB32)
         self._time, self._last, self._still = 0.0, 0.0, False
         self._speed = self._goal = 0.0
-        noise = os.urandom(96 * 96)
-        raw = bytearray(96 * 96 * 4)
-        raw[0::4] = raw[1::4] = raw[2::4] = noise
-        raw[3::4] = bytes([14]) * (96 * 96)
-        self._grain = QPixmap.fromImage(QImage(bytes(raw), 96, 96, 96 * 4, QImage.Format_ARGB32).copy())
         self._timer = QTimer(self, interval=16, timeout=self._tick)
         self._timer.setTimerType(Qt.PreciseTimer)
         self._render()
@@ -2588,11 +2619,11 @@ class _Mesh(QWidget):
             p.fillRect(rect, g)
         p.setCompositionMode(QPainter.CompositionMode_SourceOver)
         swell = round(28 + 14 * math.sin(0.29 * t))
-        p.fillRect(rect, QColor(0, 0, 0, swell + 20))
+        p.fillRect(rect, QColor(0, 0, 0, swell + 46))
         v = QRadialGradient(w / 2, h / 2, big * 0.8)
         v.setColorAt(0.0, QColor(0, 0, 0, 0))
         v.setColorAt(0.6, QColor(0, 0, 0, 0))
-        v.setColorAt(1.0, QColor(0, 0, 0, 110))
+        v.setColorAt(1.0, QColor(0, 0, 0, 140))
         p.fillRect(rect, v)
         p.end()
 
@@ -2626,7 +2657,6 @@ class _Mesh(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         p.drawImage(self.rect(), self._img)
-        p.drawTiledPixmap(self.rect(), self._grain)
 
 
 class PlayingView(QWidget):
@@ -2663,13 +2693,15 @@ class PlayingView(QWidget):
         self.lyrics = LyricView()
         self.queue = SongList()
         self.queue.setStyleSheet('QListWidget{background:rgba(0,0,0,70);border:none;border-radius:10px;}')
+        qwrap = QWidget()
+        ql = QHBoxLayout(qwrap)
+        ql.setContentsMargins(0, 0, 0, 0)
+        ql.addStretch(1)
+        ql.addWidget(self.queue, 5)
+        ql.addStretch(1)
         self.stack.addWidget(self.lyrics)
-        self.stack.addWidget(self.queue)
-        body = QHBoxLayout()
-        body.addStretch(1)
-        body.addWidget(self.stack, 5)
-        body.addStretch(1)
-        root.addLayout(body, 1)
+        self.stack.addWidget(qwrap)
+        root.addWidget(self.stack, 1)
 
 
         self._size_pop = QWidget(self)

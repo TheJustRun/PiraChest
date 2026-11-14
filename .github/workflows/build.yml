@@ -101,7 +101,7 @@ jobs:
           $exe = (Resolve-Path "$distDir/$exeName").Path
           $srcDir = (Resolve-Path $distDir).Path
           $canary = "${{ needs.version.outputs.canary }}" -eq "1"
-          $ico = if ($canary -and (Test-Path 'src/gui/photos/icon_c.ico')) { (Resolve-Path 'src/gui/photos/icon_c.ico').Path } else { Get-ChildItem -Recurse -File -Filter *.ico | Where-Object { $_.FullName -notmatch '[\\/](dist|build|package|\.venv|venv|node_modules|site-packages)[\\/]' } | Sort-Object Length -Descending | Select-Object -First 1 -ExpandProperty FullName }
+          $ico = if ($canary -and (Test-Path 'src/gui/photos/icon_c.ico')) { (Resolve-Path 'src/gui/photos/icon_c.ico').Path } elseif (Test-Path 'src/gui/photos/icon.ico') { (Resolve-Path 'src/gui/photos/icon.ico').Path } else { Get-ChildItem -Recurse -File -Filter *.ico | Where-Object { $_.FullName -notmatch '[\\/](dist|build|package|\.venv|venv|node_modules|site-packages)[\\/]' } | Sort-Object Length -Descending | Select-Object -First 1 -ExpandProperty FullName }
           $iconSrc = if ($ico) { $ico } else { $exe }
           Add-Type -AssemblyName System.Drawing
           $png = Join-Path $env:GITHUB_WORKSPACE "package/$slug-icon.png"
@@ -111,43 +111,16 @@ jobs:
           } catch {
             [System.Drawing.Icon]::ExtractAssociatedIcon($exe).ToBitmap().Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
           }
-          $art = Join-Path $env:RUNNER_TEMP 'msi-art'
-          New-Item -ItemType Directory -Force $art | Out-Null
-          $dlgBmp = Join-Path $art 'dialog.bmp'
-          $banBmp = Join-Path $art 'banner.bmp'
-          $logo = [System.Drawing.Image]::FromFile($png)
-          $hex = { param($c) [System.Drawing.ColorTranslator]::FromHtml($c) }
-          function New-Bmp($path, $w, $h, $draw) {
-            $bmp = New-Object System.Drawing.Bitmap($w, $h, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
-            $g = [System.Drawing.Graphics]::FromImage($bmp)
-            $g.SmoothingMode = 'AntiAlias'
-            $g.InterpolationMode = 'HighQualityBicubic'
-            $g.TextRenderingHint = 'ClearTypeGridFit'
-            $g.Clear([System.Drawing.Color]::White)
-            & $draw $g
-            $g.Dispose()
-            $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Bmp)
-            $bmp.Dispose()
+          $assets = Join-Path $env:GITHUB_WORKSPACE 'installer/assets'
+          $dlgBmp = Join-Path $assets 'dialog.bmp'
+          $banBmp = Join-Path $assets 'banner.bmp'
+          if ($canary) {
+            if (Test-Path (Join-Path $assets 'dialog_c.bmp')) { $dlgBmp = Join-Path $assets 'dialog_c.bmp' }
+            if (Test-Path (Join-Path $assets 'banner_c.bmp')) { $banBmp = Join-Path $assets 'banner_c.bmp' }
           }
-          New-Bmp $dlgBmp 493 312 {
-            param($g)
-            $rect = New-Object System.Drawing.Rectangle(0, 0, 164, 312)
-            $grad = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, (& $hex '#0B1220'), (& $hex '#1D5185'), 70.0)
-            $g.FillRectangle($grad, $rect)
-            $g.DrawImage($logo, 34, 64, 96, 96)
-            $center = New-Object System.Drawing.StringFormat
-            $center.Alignment = 'Center'
-            $title = New-Object System.Drawing.Font('Segoe UI Semibold', $(if ($canary) { 14 } else { 17 }), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
-            $sub = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
-            $g.DrawString($brand, $title, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF(0, 172, 164, 34)), $center)
-            $g.FillRectangle((New-Object System.Drawing.SolidBrush((& $hex '#58B9FF'))), 70, 212, 24, 3)
-            $g.DrawString("Games, movies, anime,`nbooks and more", $sub, (New-Object System.Drawing.SolidBrush((& $hex '#A9C3DD'))), (New-Object System.Drawing.RectangleF(0, 224, 164, 40)), $center)
+          foreach ($b in @($dlgBmp, $banBmp)) {
+            if (-not (Test-Path $b)) { Write-Error "Missing installer art: $b"; exit 1 }
           }
-          New-Bmp $banBmp 493 58 {
-            param($g)
-            $g.DrawImage($logo, 493 - 52, 9, 40, 40)
-          }
-          $logo.Dispose()
           $msiName = "$slug-${{ needs.version.outputs.tag }}-Windows-x64.msi"
           $msi = Join-Path $env:GITHUB_WORKSPACE "package/$msiName"
           wix extension add -g WixToolset.UI.wixext/5.0.2
@@ -206,14 +179,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           REPO="${{ github.repository }}"
-          SINCE=$(gh api "repos/$REPO/releases?per_page=1" --jq '.[0].published_at // empty')
-          PRS=$(gh pr list --repo "$REPO" --base main --state merged --limit 50 \
-                  ${SINCE:+--search "merged:>$SINCE"} --json number,title,body,mergedAt \
-                | jq -r 'sort_by(.mergedAt)[] | "### \(.title) (#\(.number))\n" + ((.body // "") | gsub("\r";"") | gsub("(?s)<!--.*?-->";"") | sub("^\\s+";"") | sub("\\s+$";"") | .[0:1500]) + "\n"')
+          TAG="${{ needs.version.outputs.tag }}"
+          PREV=$(gh api "repos/$REPO/releases?per_page=1" --jq '.[0].tag_name // empty')
+          FULL=$(gh api "repos/$REPO/commits/${{ github.sha }}" --jq '.commit.message' | tr -d '\r')
+          MSG=$(printf '%s\n' "$FULL" | sed '1,/^$/d' | sed '1{/^#[[:space:]]/d}' | sed '/./,$!d')
+          [ -z "$MSG" ] && MSG=$(printf '%s\n' "$FULL" | sed '1{/^#[[:space:]]/d}' | sed '/./,$!d')
+          [ -z "$MSG" ] && MSG="${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.version }} (Windows x64)."
           {
-            echo "${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.version }} (Windows x64)."
-            echo
-            [ -n "$PRS" ] && printf '%s\n\n' "$PRS"
+            printf '%s\n\n' "$MSG"
+            [ -n "$PREV" ] && printf '**Full Changelog:** https://github.com/%s/compare/%s...%s\n\n' "$REPO" "$PREV" "$TAG"
             cat <<'EOF'
           **Install:** download the MSI and run it. Choose the install location in the setup wizard. It installs for the current user with a Start Menu shortcut, no admin prompt, and no forced file associations.
           **Portable:** download the ZIP, extract it, and run `${{ needs.version.outputs.app_name }}.exe`. The ZIP `.sha256` file contains the checksum used by the built-in updater; the MSI `.sha256` verifies the installer.
@@ -225,7 +199,7 @@ jobs:
           tag_name: ${{ needs.version.outputs.tag }}
           name: "${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.display }}"
           body_path: notes.md
-          generate_release_notes: true
+          generate_release_notes: false
           prerelease: ${{ needs.version.outputs.canary == '1' }}
           make_latest: ${{ needs.version.outputs.canary != '1' }}
           fail_on_unmatched_files: true

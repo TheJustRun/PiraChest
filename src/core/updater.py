@@ -39,7 +39,8 @@ def _app_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-class UpdateCancelled(Exception):    pass
+class UpdateCancelled(Exception):
+    pass
 
 
 class ChecksumMismatch(RuntimeError):
@@ -47,21 +48,23 @@ class ChecksumMismatch(RuntimeError):
 
 
 def _parse_version(tag: str) -> tuple:
-    text = str(tag or "").strip().lower().lstrip("v")
+    text = re.sub(r"\(.*?\)", " ", str(tag or "")).strip().lower()
+    text = (text.split() or [""])[0].lstrip("v")
     core, _, pre = text.partition("-")
     numbers = []
-    for part in core.split(".")[:3]:
+    for part in core.split("+")[0].split(".")[:3]:
         match = re.match(r"\d+", part)
         numbers.append(int(match.group()) if match else 0)
     while len(numbers) < 3:
         numbers.append(0)
+    pre = pre.split("+")[0]
     if not pre:
         return (numbers[0], numbers[1], numbers[2], 4, 0)
-    label = re.split(r"[.\-+_]", pre)[0]
+    label = (re.match(r"[a-z]+", pre) or re.match(r"", pre)).group()
     stage = {"dev": 0, "canary": 0, "nightly": 0, "alpha": 1, "a": 1,
              "beta": 2, "b": 2, "pre": 2, "preview": 2, "rc": 3,
              "stable": 4, "release": 4, "ga": 4}.get(label, 2)
-    match = re.search(r"(\d+)", pre)
+    match = re.match(r"[a-z]*[.\-_]?(\d+)", pre)
     return (numbers[0], numbers[1], numbers[2], stage, int(match.group(1)) if match else 0)
 
 
@@ -368,8 +371,11 @@ def _download_parallel(url: str, dest: str, total: int, expected: str | None, on
         with ThreadPoolExecutor(len(ranges)) as pool:
             futures = [pool.submit(segment, a, b) for a, b in ranges]
             done, _pending = wait(futures, return_when=FIRST_EXCEPTION)
-            if any(f.exception() for f in done):
+            failed = [f.exception() for f in done if f.exception()]
+            if failed:
                 abort.set()
+                real = next((e for e in failed if not isinstance(e, UpdateCancelled)), failed[0])
+                raise real
             for f in futures:
                 f.result()
         if on_progress:
@@ -595,7 +601,7 @@ goto waitloop
 
 :apply
 del /q "%TASKS%" >NUL 2>NUL
-robocopy "%SRC%" "%DST%" /E /IS /MT:16 /R:10 /W:1 /NFL /NDL /NJH /NJS /NP /XD data >NUL 2>&1
+robocopy "%SRC%" "%DST%" /E /IS /MT:16 /R:10 /W:1 /NFL /NDL /NJH /NJS /NP /XD "%DST%\\data" "%SRC%\\data" >NUL 2>&1
 if errorlevel 8 set FAILED=1
 if defined FAILED goto done
 if exist "%DEL%" for /f "usebackq tokens=* delims=" %%F in ("%DEL%") do del /f /q "%DST%\\%%F" >NUL 2>NUL

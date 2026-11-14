@@ -3,6 +3,7 @@ import asyncio
 import datetime as _dt
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -22,6 +23,7 @@ import httpx
 from PySide6.QtCore import (
     Qt, QSize, Signal, QTimer, QEvent, QUrl, QObject, QVariantAnimation, QEasingCurve,
 )
+from PySide6.QtWidgets import QGraphicsDropShadowEffect
 from PySide6.QtGui import QIcon, QFont, QColor, QPixmap, QDesktopServices, QBrush
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -692,6 +694,11 @@ class _StreamRowDelegate(TableItemDelegate):
         painter.restore()
 
 
+def _show_picker(dialog) -> None:
+    dialog.setWindowModality(Qt.WindowModality.NonModal)
+    dialog.show()
+
+
 class _StreamPickerDialog(MessageBoxBase):
     _COLUMNS = (
         ("tv.stream.col_name", "Name", 0),
@@ -1220,7 +1227,7 @@ class _ChannelDelegate(QStyledItemDelegate):
 
 
         self._c_play = QColor(96, 205, 255, 42)
-        self._c_play_bar = QColor(96, 205, 255)
+        self._c_play_bar = QColor(_accent())
 
     def setHoverRow(self, *_a) -> None: pass
     def setPressedRow(self, *_a) -> None: pass
@@ -1918,6 +1925,8 @@ class _ChannelsTab(QWidget):
             return
         self._prompting = True
         dlg = _CountrySelectionDialog(self.window())
+        if self._player is not None and self._player.has_media():
+            self._player.hide()
         task: dict = {"id": None}
 
         def _cancel() -> None:
@@ -1951,6 +1960,8 @@ class _ChannelsTab(QWidget):
         def _finished(code: int) -> None:
             _cancel()
             self._prompting = False
+            if self._player is not None:
+                self._player.show()
             codes = dlg.selected_codes() if code == QDialog.DialogCode.Accepted else []
             dlg.deleteLater()
             if codes:
@@ -2189,8 +2200,15 @@ class _ChannelsTab(QWidget):
         m.exec(b.mapToGlobal(QPoint(0, b.height())))
 
     def _on_add_source(self) -> None:
+        if self._player is not None and self._player.has_media():
+            self._player.hide()
         dialog = _AddSourceDialog(self.window())
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            if self._player is not None:
+                self._player.show()
+        if accepted:
             source = dialog.result_source()
             if source is not None:
                 InfoBar.success(title=tr("tv.channels.source_added", default="Source added"),
@@ -2199,8 +2217,14 @@ class _ChannelsTab(QWidget):
                     self._load_channels(use_cache=False)
 
     def _on_manage_sources(self) -> None:
+        if self._player is not None and self._player.has_media():
+            self._player.hide()
         dialog = _ManageSourcesDialog(self.window())
-        dialog.exec()
+        try:
+            dialog.exec()
+        finally:
+            if self._player is not None:
+                self._player.show()
         if dialog.changed and self._state != "idle":
             self._load_channels(use_cache=True)
 
@@ -2656,14 +2680,8 @@ class _MediaDetailsView(_DetailsChrome, QWidget):
         top_row.addLayout(info_col, 1)
         content_layout.addLayout(top_row)
 
-        self._player_widget = AnimePlayerWidget(content)
-        self._player_widget.alt_stream_requested.connect(self._on_alt_stream)
-        self._player_widget.playback_error.connect(self._on_player_error)
-        self._player_widget.ended.connect(self._on_player_ended)
-        self._player_widget.next_requested.connect(self._play_next)
-        self._player_widget.close_requested.connect(self._close_media_player)
-        self._player_widget.set_closable(True)
-        self._player_widget.hide()
+        self._player_host = (content, content_layout)
+        self._player_widget = self._make_player(content)
         content_layout.addWidget(self._player_widget, 0, Qt.AlignmentFlag.AlignHCenter)
 
         self._episodes_section = QWidget(content)
@@ -3190,9 +3208,19 @@ class _MediaDetailsView(_DetailsChrome, QWidget):
                                 content=tr("tv.stream.none_body", default="No playable sources were found for this title."),
                                 duration=5000, parent=self)
                 return
-            dialog = _StreamPickerDialog(sources, label, self.window(), action="download")
-            if dialog.exec() == QDialog.DialogCode.Accepted and dialog.chosen() is not None:
-                self._download_source(dialog.chosen(), label, sn, number)
+            def _pick() -> None:
+                window = self.window()
+                window.activateWindow()
+                dialog = _StreamPickerDialog(sources, label, window, action="download")
+
+                def _fin(result: int) -> None:
+                    chosen = dialog.chosen()
+                    dialog.deleteLater()
+                    if result == QDialog.DialogCode.Accepted and chosen is not None:
+                        self._download_source(chosen, label, sn, number)
+                dialog.finished.connect(_fin)
+                _show_picker(dialog)
+            QTimer.singleShot(0, _pick)
 
         self._set_streaming(True, tr("tv.download.searching", default="Looking for sources to download..."))
         self._download_task_id = _worker_module.submit_coro(
@@ -3502,7 +3530,7 @@ class _MediaDetailsView(_DetailsChrome, QWidget):
             dialog.deleteLater()
         dialog.accepted.connect(_accepted)
         dialog.finished.connect(_finished)
-        QTimer.singleShot(0, dialog.open)
+        QTimer.singleShot(0, lambda: _show_picker(dialog))
 
     def _play_source(self, source, auto: bool = False) -> None:
         if self._play_task_id is not None:
@@ -3796,9 +3824,40 @@ class _MediaDetailsView(_DetailsChrome, QWidget):
         self._stream_status.setText(text)
         self._watch_btn.setEnabled(not on)
 
+    def _make_player(self, parent: QWidget) -> "AnimePlayerWidget":
+        pl = AnimePlayerWidget(parent)
+        pl.alt_stream_requested.connect(self._on_alt_stream)
+        pl.playback_error.connect(self._on_player_error)
+        pl.ended.connect(self._on_player_ended)
+        pl.next_requested.connect(self._play_next)
+        pl.close_requested.connect(self._close_media_player)
+        pl.set_closable(True)
+        pl.hide()
+        return pl
+
+    def _replace_player(self) -> None:
+        content, layout = self._player_host
+        old = self._player_widget
+        index = layout.indexOf(old)
+        with suppress(RuntimeError, TypeError):
+            old.shutdown()
+        layout.removeWidget(old)
+        old.hide()
+        old.setParent(None)
+        old.deleteLater()
+        new = self._player_widget = self._make_player(content)
+        layout.insertWidget(max(index, 0), new, 0, Qt.AlignmentFlag.AlignHCenter)
+
     def _close_media_player(self) -> None:
+        p = getattr(self, "_picker", None)
+        if p is not None and _qt_is_valid(p):
+            p.close()
         self._stop_playback()
         self._player_widget.release()
+        QTimer.singleShot(0, self._replace_player)
+        w = self.window()
+        if w is not None:
+            w.activateWindow()
 
     def _stop_playback(self, wait: bool = False) -> None:
         self._play_gen += 1
@@ -4990,6 +5049,24 @@ class _RelayServer(ThreadingHTTPServer):
         pass
 
 
+def _single_variant(text: str) -> str:
+    lines = text.splitlines()
+    pairs = [(i, lines[i]) for i in range(len(lines) - 1) if lines[i].startswith("#EXT-X-STREAM-INF")]
+    if len(pairs) < 2:
+        return text
+
+    def rank(item) -> tuple:
+        attrs = item[1]
+        res = re.search(r"RESOLUTION=\d+x(\d+)", attrs)
+        bw = re.search(r"(?<!AVERAGE-)BANDWIDTH=(\d+)", attrs)
+        height = int(res.group(1)) if res else 0
+        return (height <= 1080, height if height <= 1080 else -height, int(bw.group(1)) if bw else 0)
+
+    keep = max(pairs, key=rank)[0]
+    drop = {i for i, _l in pairs if i != keep} | {i + 1 for i, _l in pairs if i != keep}
+    return "\n".join(l for i, l in enumerate(lines) if i not in drop)
+
+
 class HlsRelayServer:
     PREFETCH_AHEAD = 6
     CACHE_MAX_BYTES = 96 << 20
@@ -5208,7 +5285,7 @@ class HlsRelayServer:
         return text
 
     def playlist(self, url: str) -> str:
-        return self.rewrite_playlist(self.fetch_text(url), url)
+        return self.rewrite_playlist(_single_variant(self.fetch_text(url)), url)
 
 
     def segment(self, path: str) -> tuple[bytes, str]:
@@ -5530,6 +5607,34 @@ QMenu::item:selected{background:rgba(255,255,255,36);}
 """
 
 
+def _accent() -> str:
+    return palette().get("accent") or "#60cdff"
+
+
+def _bg_color() -> QColor:
+    return QColor(palette().get("dialog_bg") or palette().get("card_bg") or palette().get("page_bg") or "#202020")
+
+
+def _fg_color() -> QColor:
+    return QColor(17, 17, 17) if _bg_color().lightness() > 150 else QColor(255, 255, 255)
+
+
+def _themed(qss: str, bg_old: str = "") -> str:
+    f = _fg_color()
+    rgb = f"{f.red()},{f.green()},{f.blue()},"
+    out = qss.replace("rgba(255,255,255,", f"rgba({rgb}").replace("#fff", f.name()).replace("white", f.name())
+    return out.replace(bg_old, _bg_color().name()) if bg_old else out
+
+
+def _bar_qss() -> str:
+    return _themed(_BAR_QSS.replace("#60cdff", _accent()))
+
+
+def _menu_qss() -> str:
+    c = QColor(_accent())
+    return _themed(_MENU_QSS.replace("rgba(255,255,255,36)", f"rgba({c.red()},{c.green()},{c.blue()},90)"), "#2c2c31")
+
+
 def _wicon(name: str, fallback=FluentIcon.PLAY) -> QIcon:
     return getattr(FluentIcon, name, fallback).icon(_Theme.DARK)
 
@@ -5640,12 +5745,18 @@ class _Bar(QWidget):
         p = QPainter(self)
         if self.floating:
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            p.setBrush(QColor(28, 28, 34, 228))
-            p.setPen(QColor(255, 255, 255, 40))
+            bg = _bg_color()
+            bg.setAlpha(232)
+            fg = _fg_color()
+            fg.setAlpha(40)
+            p.setBrush(bg)
+            p.setPen(fg)
             p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 12, 12)
         else:
-            p.fillRect(self.rect(), QColor(32, 32, 38))
-            p.fillRect(0, 0, self.width(), 1, QColor(255, 255, 255, 28))
+            fg = _fg_color()
+            fg.setAlpha(28)
+            p.fillRect(self.rect(), _bg_color())
+            p.fillRect(0, 0, self.width(), 1, fg)
 
 
 class _Spinner(QWidget):
@@ -5683,7 +5794,7 @@ class _Spinner(QWidget):
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(QColor(96, 205, 255), 2.4)
+        pen = QPen(QColor(_accent()), 2.4)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         p.setPen(pen)
         p.drawArc(QRectF(3, 3, 14, 14), -self._angle * 16, -110 * 16)
@@ -5813,10 +5924,224 @@ class _SkipBubble(QWidget):
         self.move(tl.x() + v.width() - self.width() - 24, tl.y() + v.height() - self.height() - lift)
         if not self.isVisible():
             self.show()
-        self.raise_()
+            self.raise_()
+
+
+class _SubOverlay(QWidget):
+    _COLORS = ("#ffffff", "#ffe34d", "#7dffb0", "#7fd8ff")
+    _FONTS = ("Segoe UI", "Arial", "Verdana", "Georgia", "Trebuchet MS", "Consolas")
+    _STROKES = (0.0, 0.10, 0.17, 0.26)
+
+    def __init__(self, player: "AnimePlayerWidget", owner: Optional[QWidget] = None) -> None:
+        super().__init__(owner or player, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowDoesNotAcceptFocus | Qt.WindowType.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip(tr("anime.sub_drag_hint", default="Drag to move, scroll to resize"))
+        self._p = player
+        self._raw = ""
+        self._pix: Optional[QPixmap] = None
+        self._drag: Optional[QPoint] = None
+        self._geo: Optional[tuple] = None
+        qs = QSettings("PiraChest", "Subs")
+
+        def num(key: str, default, lo, hi):
+            try:
+                return max(lo, min(hi, float(qs.value(key, default))))
+            except (TypeError, ValueError):
+                return default
+        self._scale = num("scale3", 1.0, 0.5, 3.0)
+        self._color = int(num("color3", 0, 0, 3))
+        self._font = int(num("font3", 0, 0, 5))
+        self._outline = int(num("outline3", 2, 0, 3))
+        self._bg = int(num("bg3", 0, 0, 2))
+        self._fx = num("fx3", 0.5, 0.0, 1.0)
+        self._fy = num("fy3", 0.86, 0.0, 1.0)
+        self._base: Optional[tuple] = None
+        self._native = QSize()
+        self._settle = QTimer(self)
+        self._settle.setSingleShot(True)
+        self._settle.setInterval(90)
+        self._settle.timeout.connect(self._settled)
+        self._timer = QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._follow)
+
+    def _settled(self) -> None:
+        if self._raw:
+            self._style()
+            self._place()
+
+    def text(self) -> str:
+        return self._raw
+
+    def set_text(self, text: str) -> None:
+        self._raw = text or ""
+        if not self._raw:
+            self._timer.stop()
+            self.hide()
+            return
+        self._style()
+        self._timer.start()
+        self._follow()
+
+    def _lines(self, fm: QFontMetrics, maxw: int) -> list[str]:
+        out: list[str] = []
+        for para in self._raw.split("\n"):
+            cur = ""
+            for word in para.split():
+                t = f"{cur} {word}".strip()
+                if cur and fm.horizontalAdvance(t) > maxw:
+                    out.append(cur)
+                    cur = word
+                else:
+                    cur = t
+            if cur:
+                out.append(cur)
+        return out or [""]
+
+    def _style(self, live: bool = False) -> None:
+        v = self._p._vid()
+        dpr = self.devicePixelRatioF()
+        px = max(17, int(v.height() * 0.042 * self._scale))
+        font = QFont(self._FONTS[self._font])
+        font.setPixelSize(px)
+        font.setBold(True)
+        fm = QFontMetrics(font)
+        lines = self._lines(fm, int(v.width() * 0.88))
+        base = self._base
+        if live and base is not None and base[3] == lines:
+            k = px / base[2]
+            self.setFixedSize(max(1, round(base[0] * k)), max(1, round(base[1] * k)))
+            self.update()
+            self._settle.start()
+            return
+        self._settle.stop()
+        stroke = self._STROKES[self._outline] * px
+        pad = px * 0.3 if self._bg else 0
+        m = int(stroke + 4 + pad)
+        lh = fm.lineSpacing()
+        w = max(fm.horizontalAdvance(l) for l in lines) + 2 * m
+        h = lh * len(lines) + 2 * m
+        pix = QPixmap(int(w * dpr), int(h * dpr))
+        pix.setDevicePixelRatio(dpr)
+        pix.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._bg:
+            c = QColor(_accent()) if self._bg == 2 else QColor(0, 0, 0)
+            c.setAlpha(215 if self._bg == 2 else 150)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(c)
+            p.drawRoundedRect(QRectF(0, 0, w, h), px * 0.3, px * 0.3)
+        pen = QPen(QColor(0, 0, 0, 235), stroke * 1.7)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        for i, line in enumerate(lines):
+            path = QPainterPath()
+            path.addText((w - fm.horizontalAdvance(line)) / 2, m + i * lh + fm.ascent(), font, line)
+            if not self._bg:
+                p.save()
+                p.translate(0, px * 0.07)
+                p.fillPath(path, QColor(0, 0, 0, 120))
+                p.restore()
+                if stroke:
+                    p.strokePath(path, pen)
+            p.fillPath(path, QColor(self._COLORS[self._color]))
+        p.end()
+        self._pix = pix
+        self._base = (w, h, px, lines)
+        self._native = QSize(int(w), int(h))
+        self.setFixedSize(self._native)
+        self.update()
+
+    def _place(self) -> None:
+        v = self._p._vid()
+        tl = v.mapToGlobal(QPoint(0, 0))
+        x = tl.x() + int(self._fx * v.width()) - self.width() // 2
+        y = tl.y() + int(self._fy * v.height()) - self.height() // 2
+        low = tl.y() + v.height() - self.height()
+        bar = self._p._bar
+        if self._drag is None and bar.isVisible():
+            low = min(low, bar.mapToGlobal(QPoint(0, 0)).y() - self.height() - 8)
+        self.move(max(tl.x(), min(x, tl.x() + v.width() - self.width())), max(tl.y(), min(y, low)))
+
+    def _follow(self, live: bool = False) -> None:
+        if not self._raw or self._drag is not None:
+            return
+        v = self._p._vid()
+        if not v.isVisible() or v.visibleRegion().isEmpty():
+            self.hide()
+            return
+        geo = (v.mapToGlobal(QPoint(0, 0)), v.size())
+        if geo != self._geo:
+            if self._geo is None or self._geo[1] != geo[1]:
+                self._style(live and self._geo is not None)
+            self._geo = geo
+            self._place()
+        if not self.isVisible():
+            self._place()
+            self.show()
+            self.raise_()
+
+    def _save(self) -> None:
+        qs = QSettings("PiraChest", "Subs")
+        for k, val in (("scale3", self._scale), ("color3", self._color), ("font3", self._font),
+                       ("outline3", self._outline), ("bg3", self._bg), ("fx3", self._fx), ("fy3", self._fy)):
+            qs.setValue(k, val)
+
+    def restyle(self, scale: float = 0.0, reset: bool = False) -> None:
+        if scale:
+            self._scale = max(0.5, min(3.0, self._scale * scale))
+        if reset:
+            self._fx, self._fy, self._scale = 0.5, 0.86, 1.0
+        self._save()
+        if self._raw:
+            self._geo = None
+            self._style()
+            self._follow()
+
+    def paintEvent(self, _e) -> None:
+        if self._pix is None:
+            return
+        p = QPainter(self)
+        if self.size() == self._native:
+            p.drawPixmap(0, 0, self._pix)
+        else:
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            p.drawPixmap(self.rect(), self._pix)
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag = e.globalPosition().toPoint() - self.pos()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, e) -> None:
+        if self._drag is None:
+            return
+        v = self._p._vid()
+        tl = v.mapToGlobal(QPoint(0, 0))
+        pos = e.globalPosition().toPoint() - self._drag
+        x = max(tl.x(), min(pos.x(), tl.x() + v.width() - self.width()))
+        y = max(tl.y(), min(pos.y(), tl.y() + v.height() - self.height()))
+        self.move(x, y)
+        self._fx = (x + self.width() / 2 - tl.x()) / max(1, v.width())
+        self._fy = (y + self.height() / 2 - tl.y()) / max(1, v.height())
+
+    def mouseReleaseEvent(self, e) -> None:
+        if self._drag is not None:
+            self._drag = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self._save()
+
+    def wheelEvent(self, e) -> None:
+        self.restyle(scale=1.06 if e.angleDelta().y() > 0 else 1 / 1.06)
 
 
 class _PipWindow(QWidget):
+    _MIN_W = 240
+    _MIN_VH = 135
+    _SNAP = 16
 
     def __init__(self, player: "AnimePlayerWidget") -> None:
         super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
@@ -5826,11 +6151,17 @@ class _PipWindow(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         self._player = player
+        self._rs = None
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(350)
         self._save_timer.timeout.connect(self.save_geometry)
-        self.setMinimumSize(240, 135 + AnimePlayerWidget._BAR_H)
+        self.setMinimumSize(self._MIN_W, self._MIN_VH + AnimePlayerWidget._BAR_H)
+        player._video_widget.videoSink().videoSizeChanged.connect(self._on_video_size)
+
+    @property
+    def resizing(self) -> bool:
+        return self._rs is not None
 
     def set_always_on_top(self, on: bool) -> None:
         if bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint) == bool(on):
@@ -5840,16 +6171,42 @@ class _PipWindow(QWidget):
         if visible:
             self.show()
 
+    def _aspect(self) -> float:
+        size = self._player._video_widget.videoSink().videoSize()
+        return size.width() / size.height() if size.isValid() and size.height() > 0 else 16 / 9
+
+    def _min_w(self, aspect: float) -> int:
+        return max(self._MIN_W, math.ceil(self._MIN_VH * aspect))
+
+    def _fitted(self, rect: QRect) -> QRect:
+        a, bar = self._aspect(), AnimePlayerWidget._BAR_H
+        avail = _avail_for(rect)
+        lo = self._min_w(a)
+        hi = max(lo, min(avail.width(), int((avail.height() - bar) * a)))
+        w = max(lo, min(rect.width(), hi))
+        h = round(w / a) + bar
+        x = max(avail.left(), min(rect.x(), avail.right() - w + 1))
+        y = max(avail.top(), min(rect.y(), avail.bottom() - h + 1))
+        return QRect(x, y, w, h)
+
+    def fit_aspect(self) -> None:
+        rect = self._fitted(self.geometry())
+        if rect != self.geometry():
+            self.setGeometry(rect)
+
+    def _on_video_size(self) -> None:
+        if self.isVisible() and self._rs is None:
+            self.fit_aspect()
+
     def restore_geometry(self) -> None:
-        qs = QSettings("PiraChest", "PiP")
-        rect = qs.value("geometry")
+        rect = QSettings("PiraChest", "PiP").value("geometry")
         if not isinstance(rect, QRect) or not rect.isValid():
             screen = self.screen() or QGuiApplication.primaryScreen()
             avail = screen.availableGeometry() if screen is not None else QRect(0, 0, 1280, 720)
             w = max(320, min(480, avail.width() - 48))
-            h = max(200, int(w * 9 / 16) + AnimePlayerWidget._BAR_H)
+            h = int(w * 9 / 16) + AnimePlayerWidget._BAR_H
             rect = QRect(avail.right() - w - 24, avail.bottom() - h - 24, w, h)
-        self.setGeometry(_clamp_rect(rect, 240, 135 + AnimePlayerWidget._BAR_H))
+        self.setGeometry(self._fitted(rect))
 
     def save_geometry(self) -> None:
         if not self.isVisible():
@@ -5861,13 +6218,63 @@ class _PipWindow(QWidget):
         except Exception:
             logger.debug("Could not save PiP geometry", exc_info=True)
 
+    def snapped(self, pos: QPoint) -> QPoint:
+        w, h = self.width(), self.height()
+        avail = _avail_for(QRect(pos, self.size()))
+        x, y = pos.x(), pos.y()
+        if abs(x - avail.left()) < self._SNAP:
+            x = avail.left()
+        elif abs(x + w - 1 - avail.right()) < self._SNAP:
+            x = avail.right() - w + 1
+        if abs(y - avail.top()) < self._SNAP:
+            y = avail.top()
+        elif abs(y + h - 1 - avail.bottom()) < self._SNAP:
+            y = avail.bottom() - h + 1
+        return QPoint(x, y)
+
+    def begin_resize(self, edge: Qt.Edge, gpos: QPoint) -> None:
+        rect = self.geometry()
+        self._rs = (edge, gpos, rect, _avail_for(rect), self._aspect())
+
+    def update_resize(self, gpos: QPoint) -> None:
+        if self._rs is None:
+            return
+        if not (QGuiApplication.mouseButtons() & Qt.MouseButton.LeftButton):
+            self.end_resize()
+            return
+        edge, g0, r, avail, a = self._rs
+        bar = AnimePlayerWidget._BAR_H
+        d = gpos - g0
+        left, top = bool(edge & Qt.Edge.LeftEdge), bool(edge & Qt.Edge.TopEdge)
+        cand = []
+        if edge & (Qt.Edge.LeftEdge | Qt.Edge.RightEdge):
+            cand.append(r.width() + (-d.x() if left else d.x()))
+        if edge & (Qt.Edge.TopEdge | Qt.Edge.BottomEdge):
+            cand.append(round((r.height() - bar + (-d.y() if top else d.y())) * a))
+        w = max(cand, key=lambda c: abs(c - r.width()))
+        lo = self._min_w(a)
+        xlim = r.x() + r.width() - avail.left() if left else avail.right() + 1 - r.x()
+        ylim = r.y() + r.height() - avail.top() if top else avail.bottom() + 1 - r.y()
+        w = max(lo, min(w, max(r.width(), min(xlim, int((ylim - bar) * a)))))
+        h = round(w / a) + bar
+        rect = QRect(r.x() + r.width() - w if left else r.x(), r.y() + r.height() - h if top else r.y(), w, h)
+        if rect != self.geometry():
+            self.setGeometry(rect)
+
+    def end_resize(self) -> None:
+        if self._rs is not None:
+            self._rs = None
+            self._save_timer.start()
+
     def moveEvent(self, event) -> None:
         self._save_timer.start()
         super().moveEvent(event)
+        self._player.pip_geometry_changed()
 
     def resizeEvent(self, event) -> None:
         self._save_timer.start()
         super().resizeEvent(event)
+        self._player.pip_geometry_changed()
 
     def closeEvent(self, event) -> None:
         if self._player._pip_active:
@@ -5878,23 +6285,14 @@ class _PipWindow(QWidget):
         super().closeEvent(event)
 
 
-def _clamp_rect(rect: QRect, min_w: int, min_h: int) -> QRect:
-    screens = QGuiApplication.screens()
-    if not screens:
-        return rect
-    best, best_area = None, 0
-    for screen in screens:
-        area = screen.availableGeometry().intersected(rect)
-        size = area.width() * area.height()
-        if size > best_area:
-            best, best_area = screen, size
-    screen = best or QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
-    avail = screen.availableGeometry().adjusted(8, 8, -8, -8)
-    w = max(min_w, min(rect.width(), avail.width()))
-    h = max(min_h, min(rect.height(), avail.height()))
-    x = min(max(rect.x(), avail.left()), avail.right() - w + 1)
-    y = min(max(rect.y(), avail.top()), avail.bottom() - h + 1)
-    return QRect(x, y, w, h)
+def _avail_for(rect: QRect) -> QRect:
+    def area(screen) -> int:
+        r = screen.availableGeometry().intersected(rect)
+        return max(0, r.width()) * max(0, r.height())
+    best = max(QGuiApplication.screens(), key=area, default=None)
+    if best is None or area(best) == 0:
+        best = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+    return best.availableGeometry().adjusted(8, 8, -8, -8) if best is not None else QRect(0, 0, 1280, 720)
 
 
 class AnimePlayerWidget(QWidget):
@@ -5968,7 +6366,7 @@ class AnimePlayerWidget(QWidget):
         self._alt_opts: list = []
         self._quality_label = ""
         self._sub_gen = 0
-        self._sub_pref: Optional[str] = None
+        self._sub_pref: Optional[str] = ""
         self._stream_gen = 0
         self._vod_retries = 0
         self._failed_sent = False
@@ -6011,7 +6409,7 @@ class AnimePlayerWidget(QWidget):
         self._status_lbl.hide()
 
         bar = self._bar = _Bar(self)
-        bar.setStyleSheet(_BAR_QSS)
+        bar.setStyleSheet(_bar_qss())
         bar.setMouseTracking(True)
         bar.setFixedHeight(self._BAR_H)
         v = QVBoxLayout(bar)
@@ -6092,7 +6490,7 @@ class AnimePlayerWidget(QWidget):
         for b in (self._speed_btn, self._quality_btn, self._sub_btn):
             b.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
             m = QMenu(b)
-            m.setStyleSheet(_MENU_QSS)
+            m.setStyleSheet(_menu_qss())
             b.setMenu(m)
         self._fill_menu(self._speed_btn, [(f"{s:g}x", s) for s in _SPEEDS], _SPEEDS.index(1.0), self._set_speed)
 
@@ -6119,7 +6517,11 @@ class AnimePlayerWidget(QWidget):
 
         self._bubble = _SkipBubble(self)
         self._loader = _LoadingOverlay(self)
+        self._subs = _SubOverlay(self)
         self._delay_popup = _SubDelayPopup(self)
+        self._cue_timer = QTimer(self)
+        self._cue_timer.setInterval(40)
+        self._cue_timer.timeout.connect(self._tick_cues)
         self._delay_popup.changed.connect(self._set_sub_delay)
 
         self._hide_timer = QTimer(self)
@@ -6251,10 +6653,17 @@ class AnimePlayerWidget(QWidget):
                 self._reveal_controls()
         self._loader.set_active(on)
 
+    def _apply_theme(self) -> None:
+        self._bar.setStyleSheet(_bar_qss())
+        self._bar.update()
+        for b in (self._speed_btn, self._quality_btn, self._sub_btn):
+            b.menu().setStyleSheet(_menu_qss())
+
     def play_stream(self, url: str, referer: Optional[str] = None, headers: Optional[dict] = None,
                     title: str = "", subtitles: Optional[list[dict]] = None, start_ms: int = 0,
                     alt_streams: Optional[list[tuple[str, dict]]] = None, quality_label: str = "",
                     _reconnect: bool = False) -> None:
+        self._apply_theme()
         if _is_local_stream_url(url):
             logger.warning("Refused a local stream url: %r", (url or "")[:120])
             self._set_status(tr("anime.no_stream_found", default="No playable stream was returned."))
@@ -6337,9 +6746,12 @@ class AnimePlayerWidget(QWidget):
         self._pip_layout, self._pip_index = layout, index
         self._pip_align, self._pip_placeholder = align, placeholder
         self._pip_active = True
+        self._bar.setMouseTracking(True)
+        self._video_widget.setMouseTracking(True)
         self._pip_drag = None
         self._pip_dragging = False
         self._suppress_hide = True
+        self._set_hfw(False)
         try:
             self.setMinimumSize(240, 135 + self._BAR_H)
             self.setMaximumWidth(_QWIDGETSIZE_MAX)
@@ -6362,6 +6774,8 @@ class AnimePlayerWidget(QWidget):
         if not self._pip_active:
             return
         self._pip_active = False
+        self._bar.unsetCursor()
+        self._video_widget.unsetCursor()
         self._pip_drag = None
         self._pip_dragging = False
         self._suppress_hide = True
@@ -6369,6 +6783,7 @@ class AnimePlayerWidget(QWidget):
         layout = self._pip_layout
         try:
             if win is not None and _qt_is_valid(win):
+                win.end_resize()
                 win.save_geometry()
                 win.layout().removeWidget(self)
                 win.hide()
@@ -6385,6 +6800,7 @@ class AnimePlayerWidget(QWidget):
                 self.setMinimumSize(240, 135 + self._BAR_H)
                 self.setMaximumHeight(_QWIDGETSIZE_MAX)
                 width = max(240, min(self.width(), self.MAX_WIDTH))
+                self._set_hfw(True)
                 layout.insertWidget(self._pip_index, self, 0, self._pip_align)
                 self.resize(width, self.heightForWidth(width))
                 self.setFixedHeight(self.heightForWidth(width))
@@ -6401,6 +6817,19 @@ class AnimePlayerWidget(QWidget):
         self._update_pip_button()
         if restore:
             self.setFocus()
+
+    def _set_hfw(self, on: bool) -> None:
+        sp = self.sizePolicy()
+        sp.setHeightForWidth(on)
+        self.setSizePolicy(sp)
+
+    def pip_geometry_changed(self) -> None:
+        if not self._pip_active:
+            return
+        self._subs._follow(True)
+        self._bubble.reposition()
+        if self._loader._active:
+            self._loader._tick()
 
     def _update_pip_button(self) -> None:
         active = self._pip_active
@@ -6423,6 +6852,12 @@ class AnimePlayerWidget(QWidget):
         self._stream_gen += 1
         self.stop()
         self._set_status("")
+        self._bubble.hide()
+        self._loader.set_active(False)
+        for win in (self._fs_bar_win, self._fs_win, self._pip_win):
+            if win is not None:
+                with suppress(RuntimeError, TypeError):
+                    win.hide()
         try:
             get_relay().stop()
         except Exception:
@@ -6541,7 +6976,18 @@ class AnimePlayerWidget(QWidget):
         base = self._seek_target if time.monotonic() < self._seek_until else self._player.position()
         self._seek_to(base + delta_ms)
 
+    def _tick_cues(self) -> None:
+        if self._cues:
+            self._update_subtitle(self._player.position())
+
+    def _sync_cue_timer(self) -> None:
+        if self._cues and self._playing():
+            self._cue_timer.start()
+        else:
+            self._cue_timer.stop()
+
     def _on_state_changed(self, _state) -> None:
+        self._sync_cue_timer()
         if self._playing():
             self._play_btn.setIcon(_wicon("PAUSE", FluentIcon.PAUSE))
             self._hide_timer.start()
@@ -6756,12 +7202,16 @@ class AnimePlayerWidget(QWidget):
 
     def _clear_cues(self) -> None:
         self._cues = []
+        if hasattr(self, "_cue_timer"):
+            self._cue_timer.stop()
         self._cue_starts = []
         self._cue_text = ""
         self._show_sub_text("")
 
     def _show_sub_text(self, text: str) -> None:
-        self._video_widget.videoSink().setSubtitleText(text)
+        subs = getattr(self, "_subs", None)
+        if subs is not None:
+            subs.set_text(text)
 
     def _on_manifest_subs_ready(self, subs: list) -> None:
         if self._external_subs:
@@ -6777,6 +7227,7 @@ class AnimePlayerWidget(QWidget):
         self._show_sub_text("")
         if cues:
             self._update_subtitle(self._player.position())
+        self._sync_cue_timer()
 
     def _set_sub_delay(self, ms: int) -> None:
         self._sub_delay_ms = ms
@@ -6877,9 +7328,33 @@ class AnimePlayerWidget(QWidget):
             grp.addAction(act)
             act.triggered.connect(partial(self._on_subtitle_picked, i))
         menu.addSeparator()
-        delay = menu.addAction(tr("anime.sub_delay_menu", default="Subtitle delay\u2026"))
-        delay.setEnabled(bool(self._cues))
+        delay = menu.addAction(tr("anime.sub_delay_menu", default="Delay\u2026"))
         delay.triggered.connect(self._show_delay_popup)
+        style = menu.addMenu(tr("anime.sub_style", default="Style"))
+        style.setStyleSheet(_menu_qss())
+        for title, attr, opts in (
+                (tr("anime.sub_size", default="Size"), "_scale", (("S", 0.8), ("M", 1.0), ("L", 1.4), ("XL", 1.8))),
+                (tr("anime.sub_color_menu", default="Color"), "_color", (("White", 0), ("Yellow", 1), ("Green", 2), ("Cyan", 3))),
+                (tr("anime.sub_font", default="Font"), "_font", tuple((f, i) for i, f in enumerate(_SubOverlay._FONTS))),
+                (tr("anime.sub_outline", default="Outline"), "_outline", (("None", 0), ("Thin", 1), ("Normal", 2), ("Thick", 3))),
+                (tr("anime.sub_bg_menu", default="Background"), "_bg", (("None", 0), ("Dark", 1), ("Blue", 2)))):
+            sub = style.addMenu(title)
+            sub.setStyleSheet(_menu_qss())
+            group = QActionGroup(sub)
+            for label, val in opts:
+                act = sub.addAction(label)
+                act.setCheckable(True)
+                act.setChecked(abs(getattr(self._subs, attr) - val) < 0.05)
+                group.addAction(act)
+                act.triggered.connect(partial(self._set_sub_style, attr, val))
+        style.addSeparator()
+        style.addAction(tr("anime.sub_reset_style", default="Reset position")).triggered.connect(
+            lambda: self._subs.restyle(reset=True))
+
+    def _set_sub_style(self, attr: str, val, _checked: bool = False) -> None:
+        setattr(self._subs, attr, val)
+        self._subs._style()
+        self._subs.restyle()
 
     def _populate_subtitle_options(self) -> None:
         self._sub_entries = [("off", -1, "")]
@@ -6974,28 +7449,70 @@ class AnimePlayerWidget(QWidget):
     def _pip_edge(self, pos) -> Qt.Edge:
         if not self._pip_active:
             return Qt.Edge(0)
+        w, h, x, y = self.width(), self.height(), pos.x(), pos.y()
+        m, c = 8, 18
         edge = Qt.Edge(0)
-        margin = 6
-        if pos.x() <= margin:
+        if x <= m or (x <= c and (y <= c or y >= h - c)):
             edge |= Qt.Edge.LeftEdge
-        elif pos.x() >= self.width() - margin:
+        elif x >= w - m or (x >= w - c and (y <= c or y >= h - c)):
             edge |= Qt.Edge.RightEdge
-        if pos.y() <= margin:
+        if y <= m or (y <= c and (x <= c or x >= w - c)):
             edge |= Qt.Edge.TopEdge
-        elif pos.y() >= self.height() - margin:
+        elif y >= h - m or (y >= h - c and (x <= c or x >= w - c)):
             edge |= Qt.Edge.BottomEdge
         return edge
 
-    def _pip_resize(self, source: QWidget, pos) -> bool:
-        if not self._pip_active:
-            return False
-        edge = self._pip_edge(source.mapTo(self, pos))
-        if not edge:
-            return False
-        handle = self.window().windowHandle()
-        if handle is not None:
-            handle.startSystemResize(edge)
-            return True
+    def _pip_cursor(self, obj: QWidget, edge: Qt.Edge) -> None:
+        horiz = bool(edge & (Qt.Edge.LeftEdge | Qt.Edge.RightEdge))
+        vert = bool(edge & (Qt.Edge.TopEdge | Qt.Edge.BottomEdge))
+        if horiz and vert:
+            diag = bool(edge & Qt.Edge.LeftEdge) == bool(edge & Qt.Edge.TopEdge)
+            obj.setCursor(Qt.CursorShape.SizeFDiagCursor if diag else Qt.CursorShape.SizeBDiagCursor)
+        elif horiz:
+            obj.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif vert:
+            obj.setCursor(Qt.CursorShape.SizeVerCursor)
+        else:
+            obj.unsetCursor()
+
+    def _pip_mouse(self, obj: QWidget, event, t) -> bool:
+        win = self._pip_win
+        left = Qt.MouseButton.LeftButton
+        if t == QEvent.Type.MouseMove:
+            gp = event.globalPosition().toPoint()
+            if win.resizing:
+                win.update_resize(gp)
+                return True
+            if self._pip_drag is not None and (event.buttons() & left):
+                origin, start = self._pip_drag
+                delta = gp - origin
+                if self._pip_dragging or delta.manhattanLength() > 4:
+                    self._pip_dragging = True
+                    self._click_timer.stop()
+                    win.move(win.snapped(start + delta))
+                return True
+            self._pip_cursor(obj, self._pip_edge(obj.mapTo(self, event.position().toPoint())))
+        elif t == QEvent.Type.MouseButtonPress and event.button() == left:
+            edge = self._pip_edge(obj.mapTo(self, event.position().toPoint()))
+            gp = event.globalPosition().toPoint()
+            if edge:
+                self._click_timer.stop()
+                win.begin_resize(edge, gp)
+                return True
+            self._pip_drag = (gp, win.pos())
+            self._pip_dragging = False
+            return obj is self._bar
+        elif t == QEvent.Type.MouseButtonRelease and event.button() == left:
+            if win.resizing:
+                win.end_resize()
+                return True
+            if self._pip_drag is not None:
+                dragged = self._pip_dragging
+                self._pip_drag = None
+                self._pip_dragging = False
+                return dragged or obj is self._bar
+        elif t == QEvent.Type.MouseButtonDblClick:
+            return bool(self._pip_edge(obj.mapTo(self, event.position().toPoint())))
         return False
 
     def _ensure_fs(self) -> None:
@@ -7023,6 +7540,11 @@ class AnimePlayerWidget(QWidget):
         self._loader.set_active(False)
         self._loader.deleteLater()
         self._loader = _LoadingOverlay(self, owner)
+        old, text = self._subs, self._subs.text()
+        old.set_text("")
+        old.deleteLater()
+        self._subs = _SubOverlay(self, owner)
+        self._subs.set_text(text)
         self._loader.set_active(self._busy_on)
 
     def enter_fullscreen(self) -> None:
@@ -7118,41 +7640,16 @@ class AnimePlayerWidget(QWidget):
         if obj is self._fs_win and t == QEvent.Type.KeyPress:
             self.keyPressEvent(event)
             return True
-        if obj is self._bar and self._pip_active and t == QEvent.Type.MouseButtonPress \
-                and event.button() == Qt.MouseButton.LeftButton:
-            if self._pip_resize(obj, event.position().toPoint()):
-                return True
-            handle = self.window().windowHandle()
-            if handle is not None:
-                handle.startSystemMove()
-                return True
+        if self._pip_active and obj in (self._bar, self._video_widget) and self._pip_mouse(obj, event, t):
+            return True
         if obj is self._video_widget:
-            if t == QEvent.Type.MouseMove and self._pip_active:
-                if self._pip_drag is not None and (event.buttons() & Qt.MouseButton.LeftButton):
-                    origin, win_pos = self._pip_drag
-                    delta = event.globalPosition().toPoint() - origin
-                    if self._pip_dragging or delta.manhattanLength() > 4:
-                        self._pip_dragging = True
-                        self._click_timer.stop()
-                        self.window().move(win_pos + delta)
-                    return True
-            elif t == QEvent.Type.MouseMove and fs:
+            if t == QEvent.Type.MouseMove and fs:
                 in_zone = event.position().y() >= obj.height() - (self._BAR_H + 70)
                 self._reveal_controls(zone=in_zone)
             elif t == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-                if self._pip_resize(obj, event.position().toPoint()):
-                    return True
-                if self._pip_active:
-                    self._pip_drag = (event.globalPosition().toPoint(), self.window().pos())
-                    self._pip_dragging = False
                 from PySide6.QtWidgets import QApplication
                 self._click_timer.start(min(QApplication.doubleClickInterval(), 300))
                 return True
-            elif t == QEvent.Type.MouseButtonRelease and self._pip_active and self._pip_drag is not None:
-                self._pip_drag = None
-                if self._pip_dragging:
-                    self._pip_dragging = False
-                    return True
             elif t == QEvent.Type.Wheel:
                 self._volume_slider.setValue(max(0, min(100, self._volume_slider.value() + (5 if event.angleDelta().y() > 0 else -5))))
                 self._osd(tr("anime.volume_pct", default="Volume {v}%").format(v=self._volume_slider.value()))

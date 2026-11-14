@@ -209,7 +209,7 @@ GRID, LIST = 'grid', 'list'
 
 def play_sfx(name: str) -> None:
     try:
-        from .settings_page import get_sound_manager
+        from ..settings_page import get_sound_manager
         get_sound_manager().play(name)
     except Exception:
         pass

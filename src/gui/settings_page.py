@@ -2038,6 +2038,7 @@ class _SectionReorder(QObject):
         if kind == QEvent.Type.MouseButtonRelease:
             if event.button() == Qt.MouseButton.LeftButton:
                 self._end(commit=True)
+                return False
             return True
         if kind == QEvent.Type.MouseButtonPress:
             self._end(commit=False)
@@ -2110,6 +2111,7 @@ class _SectionReorder(QObject):
         QApplication.instance().removeEventFilter(self)
         while QApplication.overrideCursor() is not None:
             QApplication.restoreOverrideCursor()
+        QCursor.setPos(QCursor.pos())
         if self._scroll is not None:
             with suppress(Exception):
                 self._scroll.verticalScrollBar().valueChanged.disconnect(self._refresh)
