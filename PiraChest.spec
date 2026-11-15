@@ -1,4 +1,5 @@
 import os
+import platform
 import re
 import sys
 
@@ -12,7 +13,6 @@ IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 
 def _assets(source, target):
-    """Copy runtime assets only: Python sources already live in the PYZ."""
     items = []
     for root, dirs, names in os.walk(source):
         dirs[:] = [d for d in dirs if d != '__pycache__']
@@ -26,10 +26,6 @@ def _assets(source, target):
 
 
 datas = [
-    # src/core includes the Node bridge scripts and the vendored Vyla SDK.
-    # Node.js itself is provisioned on demand into the user data folder
-    # (runtime/node), and npm dependencies are installed next to
-    # integrations/vyla so the SDK resolves them from an ancestor folder.
     ('VERSION', '.'),
     ('LICENSE', '.'),
 ]
@@ -152,6 +148,7 @@ if IS_MAC:
     bundle_id = 'com.justrun.pirachest.canary' if SLUG.endswith('Canary') else 'com.justrun.pirachest'
     match = re.match(r'\d+(?:\.\d+){0,2}', VERSION)
     short_version = match.group(0) if match else '0.0.0'
+    min_macos = '15.0' if platform.machine().lower() in ('x86_64', 'amd64') else '14.4'
     app = BUNDLE(
         coll,
         name=f'{APP_NAME}.app',
@@ -163,7 +160,7 @@ if IS_MAC:
             'CFBundleShortVersionString': short_version,
             'CFBundleVersion': short_version,
             'NSHighResolutionCapable': True,
-            'LSMinimumSystemVersion': '11.0',
+            'LSMinimumSystemVersion': min_macos,
             'NSRequiresAquaSystemAppearance': False,
         },
     )

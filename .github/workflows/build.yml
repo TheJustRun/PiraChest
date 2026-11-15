@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       base: ${{ steps.ver.outputs.base }}
+      build: ${{ steps.ver.outputs.build }}
+      base_build: ${{ steps.ver.outputs.base_build }}
       nickname: ${{ steps.ver.outputs.nickname }}
       version: ${{ steps.ver.outputs.version }}
       tag: ${{ steps.ver.outputs.tag }}
@@ -23,7 +25,7 @@ jobs:
       display: ${{ steps.ver.outputs.display }}
       app_name: ${{ steps.ver.outputs.app_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - id: ver
         env:
           GH_TOKEN: ${{ github.token }}
@@ -35,10 +37,12 @@ jobs:
           if not lines:
               raise SystemExit('VERSION is empty')
           first = lines[0]
-          match = re.match(r'(\d+\.\d+\.\d+)', first)
+          match = re.match(r'(\d+\.\d+\.\d+)(?:[.-](\d+))?', first)
           if not match:
               raise SystemExit(f'Invalid VERSION: must start with X.Y.Z (got: {first})')
           base = match.group(1)
+          build = match.group(2) or ''
+          build_part = f'-{build}' if build else ''
           legacy = re.search(r'\(([^)]+)\)', first)
           nickname = legacy.group(1).strip() if legacy else ''
           canary = bool(re.search(r'(?:^|[-_.])canary(?:$|[-_.\s])', first, re.I))
@@ -55,9 +59,11 @@ jobs:
                   nickname = line
           nick_slug = re.sub(r'[^a-z0-9]+', '-', nickname.lower()).strip('-')
           channel = 'canary' if canary else 'stable'
-          version = f'{base}-{channel}' + (f'-{nick_slug}' if nick_slug else '')
-          display = f'{base}-{channel}' + (f' ({nickname})' if nickname else '')
+          version = f'{base}-{channel}{build_part}' + (f'-{nick_slug}' if nick_slug else '')
+          display = f'{base}-{channel}{build_part}' + (f' ({nickname})' if nickname else '')
           print(f'base={base}')
+          print(f'build={build}')
+          print(f'base_build={base}{build_part}')
           print(f'nickname={nickname}')
           print(f'version={version}')
           print(f'display={display}')
@@ -78,9 +84,9 @@ jobs:
     needs: version
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
@@ -89,7 +95,7 @@ jobs:
       - name: Write version file
         shell: pwsh
         env:
-          VERSION_BASE: ${{ needs.version.outputs.base }}
+          VERSION_BASE: ${{ needs.version.outputs.base_build }}
           VERSION_NICK: ${{ needs.version.outputs.nickname }}
           VERSION_CANARY: ${{ needs.version.outputs.canary }}
         run: |
@@ -195,9 +201,9 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
@@ -206,7 +212,7 @@ jobs:
       - name: Write version file
         shell: bash
         env:
-          VERSION_BASE: ${{ needs.version.outputs.base }}
+          VERSION_BASE: ${{ needs.version.outputs.base_build }}
           VERSION_NICK: ${{ needs.version.outputs.nickname }}
           VERSION_CANARY: ${{ needs.version.outputs.canary }}
         run: |
@@ -248,14 +254,14 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: macos-14
+            runner: macos-15
           - arch: x64
             runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
@@ -264,7 +270,7 @@ jobs:
       - name: Write version file
         shell: bash
         env:
-          VERSION_BASE: ${{ needs.version.outputs.base }}
+          VERSION_BASE: ${{ needs.version.outputs.base_build }}
           VERSION_NICK: ${{ needs.version.outputs.nickname }}
           VERSION_CANARY: ${{ needs.version.outputs.canary }}
         run: |
@@ -393,6 +399,9 @@ jobs:
           **Windows portable:** download the Windows ZIP, extract it, and run `${{ needs.version.outputs.app_name }}.exe`. The ZIP `.sha256` file contains the checksum used by the built-in updater; the MSI `.sha256` verifies the installer.
           **Linux:** download the tarball for your CPU (`x64` or `arm64`), extract it, and run `PiraChest`.
           **macOS:** download the ZIP for your Mac (`arm64` for Apple Silicon, `x64` for Intel), extract it, and move `PiraChest.app` to Applications.
+          **Windows requirements:** Windows 10 or 11, 64-bit (Intel or AMD x64).
+          **Linux requirements:** x64 or arm64 with glibc 2.39 or newer (Ubuntu 24.04+, Debian 13+, Fedora 40+). Needs `libegl1`, `libgl1`, `libxkbcommon-x11-0`, `libdbus-1-3` and `libxcb-cursor0` installed.
+          **macOS requirements:** Apple Silicon (`arm64`) needs macOS 14.4 or newer; Intel (`x64`) needs macOS 15 or newer.
           `update-manifest.json` lists every asset with its OS, architecture, format, and SHA-256 used by the built-in updater.
           EOF
           } > notes.md
@@ -462,6 +471,8 @@ jobs:
         shell: pwsh
         run: |
           $ver = "${{ needs.version.outputs.base }}"
+          $build = "${{ needs.version.outputs.build }}"
+          if ($build) { $ver = "$ver.$build" }
           $tag = "${{ needs.version.outputs.tag }}"
           $repo = "${{ github.repository }}"
           $owner = "${{ github.repository_owner }}"

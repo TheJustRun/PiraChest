@@ -17,10 +17,11 @@ from src.core import system as host
 logger = logging.getLogger(__name__)
 
 
-def _parse_version_lines(lines: list[str]) -> tuple[str, str, bool]:
+def _parse_version_lines(lines: list[str]) -> tuple[str, str, bool, str]:
     first = lines[0]
-    match = re.match(r'\d+\.\d+\.\d+', first)
-    version = match.group(0) if match else (first.split()[0] if first.split() else '0.0.0')
+    match = re.match(r'(\d+\.\d+\.\d+)(?:[.-](\d+))?', first)
+    version = match.group(1) if match else (first.split()[0] if first.split() else '0.0.0')
+    build = (match.group(2) or '') if match else ''
     legacy = re.search(r'\(([^)]+)\)', first)
     nickname = legacy.group(1).strip() if legacy else ''
     canary = bool(re.search(r'(?:^|[-_.])canary(?:$|[-_.\s])', first, re.I))
@@ -35,10 +36,10 @@ def _parse_version_lines(lines: list[str]) -> tuple[str, str, bool]:
             canary = line == '1'
         elif not nickname:
             nickname = line
-    return version, nickname, canary
+    return version, nickname, canary, build
 
 
-def _read_app_version() -> tuple[str, str, bool]:
+def _read_app_version() -> tuple[str, str, bool, str]:
     bases = [getattr(sys, '_MEIPASS', ''), os.path.dirname(os.path.abspath(__file__))]
     if getattr(sys, 'frozen', False):
         bases.insert(0, os.path.dirname(os.path.abspath(sys.executable)))
@@ -58,10 +59,10 @@ def _read_app_version() -> tuple[str, str, bool]:
             if parent == current:
                 break
             current = parent
-    return '0.0.0', '', False
+    return '0.0.0', '', False, ''
 
 
-VERSION, NICKNAME, IS_CANARY = _read_app_version()
+VERSION, NICKNAME, IS_CANARY, BUILD = _read_app_version()
 if os.environ.get('PIRACHEST_CANARY', '').strip().lower() in ('1', 'true', 'yes', 'on'):
     IS_CANARY = True
 APP_NAME = 'PiraChest Canary' if IS_CANARY else 'PiraChest'
@@ -69,8 +70,8 @@ COMPANY_NAME = 'JustRun'
 SLUG = 'PiraChest-Canary' if IS_CANARY else 'PiraChest'
 CHANNEL = 'canary' if IS_CANARY else 'stable'
 _NICKNAME_SLUG = re.sub(r'[^a-z0-9]+', '-', NICKNAME.lower()).strip('-')
-VERSION_TAG = f'{VERSION}-{CHANNEL}' + (f'-{_NICKNAME_SLUG}' if _NICKNAME_SLUG else '')
-VERSION_LABEL = f'{VERSION}-{CHANNEL}' + (f' ({NICKNAME})' if NICKNAME else '')
+VERSION_TAG = f'{VERSION}-{CHANNEL}' + (f'-{BUILD}' if BUILD else '') + (f'-{_NICKNAME_SLUG}' if _NICKNAME_SLUG else '')
+VERSION_LABEL = f'{VERSION}-{CHANNEL}' + (f'-{BUILD}' if BUILD else '') + (f' ({NICKNAME})' if NICKNAME else '')
 EXE_NAME = f'{APP_NAME}.exe'
 ICON_FILE = 'icon_c.ico' if IS_CANARY else 'icon.ico'
 LOGO_FILE = 'logo_c.ico' if IS_CANARY else 'logo.ico'

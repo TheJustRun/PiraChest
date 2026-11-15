@@ -20,7 +20,7 @@ from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from contextlib import suppress
 
 from src.core import system as host
-from src.core.config import APP_NAME, IS_CANARY, VERSION
+from src.core.config import APP_NAME, IS_CANARY, VERSION_TAG
 
 logger = logging.getLogger(__name__)
 
@@ -218,8 +218,12 @@ def _tag_label(tag: str) -> str:
     parts = [part for part in rest.split("-") if part]
     channel = parts[0].lower() if parts and parts[0].lower() in (
         "stable", "canary", "beta", "alpha", "rc", "preview", "nightly") else ""
-    nick = " ".join(parts[1:]).title() if len(parts) > 1 else ""
+    tail = parts[1:]
+    build = tail.pop(0) if tail and tail[0].isdigit() else ""
+    nick = " ".join(tail).title()
     label = f"{core}-{channel}" if channel else core
+    if build:
+        label = f"{label}-{build}"
     return f"{label} ({nick})" if nick else label
 
 
@@ -257,7 +261,7 @@ def check_for_update(include_prereleases: bool = True, channel: str | None = Non
                 continue
             if channel == "stable" and canary:
                 continue
-            if _parse_version(tag) <= _parse_version(VERSION):
+            if _parse_version(tag) <= _parse_version(VERSION_TAG):
                 break
             assets = data.get("assets") or []
             picked = _pick_asset(assets, canary)
