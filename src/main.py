@@ -45,8 +45,8 @@ def _cleanup_stale_temp() -> None:
 
 def _log_startup_environment() -> None:
     import platform
-    from src.core.config import VERSION, paths
-    version = VERSION
+    from src.core.config import VERSION_LABEL, paths
+    version = VERSION_LABEL
     try:
         import PySide6
         pyside = PySide6.__version__

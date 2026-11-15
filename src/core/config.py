@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -12,10 +13,32 @@ from contextlib import suppress
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from PySide6.QtCore import QObject, Signal
+from src.core import system as host
 logger = logging.getLogger(__name__)
 
 
-def _read_app_version() -> tuple[str, bool]:
+def _parse_version_lines(lines: list[str]) -> tuple[str, str, bool]:
+    first = lines[0]
+    match = re.match(r'\d+\.\d+\.\d+', first)
+    version = match.group(0) if match else (first.split()[0] if first.split() else '0.0.0')
+    legacy = re.search(r'\(([^)]+)\)', first)
+    nickname = legacy.group(1).strip() if legacy else ''
+    canary = bool(re.search(r'(?:^|[-_.])canary(?:$|[-_.\s])', first, re.I))
+    for line in lines[1:]:
+        key, sep, value = line.partition('=')
+        name = key.strip().lower()
+        if sep and name in ('canary', 'is_canary'):
+            canary = value.strip().lower() in ('1', 'true', 'yes', 'on')
+        elif sep and name in ('nickname', 'name'):
+            nickname = value.strip()
+        elif line in ('0', '1'):
+            canary = line == '1'
+        elif not nickname:
+            nickname = line
+    return version, nickname, canary
+
+
+def _read_app_version() -> tuple[str, str, bool]:
     bases = [getattr(sys, '_MEIPASS', ''), os.path.dirname(os.path.abspath(__file__))]
     if getattr(sys, 'frozen', False):
         bases.insert(0, os.path.dirname(os.path.abspath(sys.executable)))
@@ -26,33 +49,28 @@ def _read_app_version() -> tuple[str, bool]:
         for _ in range(4):
             try:
                 with open(os.path.join(current, 'VERSION'), encoding='utf-8') as fh:
-                    lines = [line.strip() for line in fh.read().splitlines()]
+                    lines = [line.strip() for line in fh.read().splitlines() if line.strip()]
             except OSError:
                 lines = []
             if lines:
-                version = lines[0] or '0.0.0-dev'
-                flag = False
-                for line in lines[1:]:
-                    if line in ('0', '1'):
-                        flag = line == '1'
-                        continue
-                    key, _, value = line.partition('=')
-                    if key.strip().lower() in ('canary', 'is_canary'):
-                        flag = value.strip().lower() in ('1', 'true', 'yes', 'on')
-                return version, flag
+                return _parse_version_lines(lines)
             parent = os.path.dirname(current)
             if parent == current:
                 break
             current = parent
-    return '0.0.0-dev', False
+    return '0.0.0', '', False
 
 
-VERSION, IS_CANARY = _read_app_version()
+VERSION, NICKNAME, IS_CANARY = _read_app_version()
 if os.environ.get('PIRACHEST_CANARY', '').strip().lower() in ('1', 'true', 'yes', 'on'):
     IS_CANARY = True
 APP_NAME = 'PiraChest Canary' if IS_CANARY else 'PiraChest'
 COMPANY_NAME = 'JustRun'
 SLUG = 'PiraChest-Canary' if IS_CANARY else 'PiraChest'
+CHANNEL = 'canary' if IS_CANARY else 'stable'
+_NICKNAME_SLUG = re.sub(r'[^a-z0-9]+', '-', NICKNAME.lower()).strip('-')
+VERSION_TAG = f'{VERSION}-{CHANNEL}' + (f'-{_NICKNAME_SLUG}' if _NICKNAME_SLUG else '')
+VERSION_LABEL = f'{VERSION}-{CHANNEL}' + (f' ({NICKNAME})' if NICKNAME else '')
 EXE_NAME = f'{APP_NAME}.exe'
 ICON_FILE = 'icon_c.ico' if IS_CANARY else 'icon.ico'
 LOGO_FILE = 'logo_c.ico' if IS_CANARY else 'logo.ico'
@@ -65,14 +83,20 @@ def _detect_app_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def _detect_user_data_root() -> str:
+    override = os.environ.get('PIRACHEST_DATA_DIR')
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
     appimage_path = os.environ.get('APPIMAGE')
     if appimage_path:
         base = os.path.dirname(os.path.abspath(appimage_path))
-    elif getattr(sys, 'frozen', False):
-        base = os.path.dirname(os.path.abspath(sys.executable))
+        return os.path.join(base, 'data')
+    if not getattr(sys, 'frozen', False) or host.WINDOWS:
+        return os.path.join(_detect_app_root(), 'data')
+    if host.MACOS:
+        base = os.path.expanduser('~/Library/Application Support')
     else:
-        base = _detect_app_root()
-    return os.path.join(base, 'data')
+        base = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+    return os.path.join(base, SLUG)
 
 _ADMIN_CACHE: bool | None = None
 
@@ -99,6 +123,11 @@ def _startup_command() -> str:
         return f'"{os.path.abspath(sys.executable)}"'
     return f'"{os.path.abspath(sys.executable)}" "{os.path.abspath(sys.argv[0])}"'
 
+def _startup_command_list() -> list[str]:
+    if getattr(sys, 'frozen', False):
+        return [os.path.abspath(sys.executable)]
+    return [os.path.abspath(sys.executable), os.path.abspath(sys.argv[0])]
+
 def _startup_approved_disabled() -> bool:
     try:
         import winreg
@@ -109,8 +138,8 @@ def _startup_approved_disabled() -> bool:
         return False
 
 def get_launch_at_startup() -> bool:
-    if sys.platform != 'win32':
-        return False
+    if not host.WINDOWS:
+        return host.startup_enabled(APP_NAME)
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_RUN_KEY_PATH, 0, winreg.KEY_QUERY_VALUE) as key:
@@ -120,8 +149,8 @@ def get_launch_at_startup() -> bool:
     return bool(value) and not _startup_approved_disabled()
 
 def set_launch_at_startup(enabled: bool) -> bool:
-    if sys.platform != 'win32':
-        return False
+    if not host.WINDOWS:
+        return host.set_startup(APP_NAME, _startup_command_list(), enabled)
     import winreg
     try:
         if enabled:
@@ -157,8 +186,7 @@ def relaunch_as_admin() -> bool:
 def relaunch_app() -> bool:
     cmd = [sys.executable] if getattr(sys, 'frozen', False) else [sys.executable, os.path.abspath(sys.argv[0])]
     try:
-        subprocess.Popen(cmd + sys.argv[1:], env={**os.environ, _RESTART_ENV: '1'}, close_fds=True,
-                         **({'creationflags': 0x00000008 | 0x00000200} if sys.platform == 'win32' else {'start_new_session': True}))
+        subprocess.Popen(cmd + sys.argv[1:], env={**os.environ, _RESTART_ENV: '1'}, **host.detached_kwargs())
         return True
     except OSError as exc:
         logger.warning('Failed to relaunch: %s', exc)
@@ -492,11 +520,14 @@ def _coerce(value, default):
 def _legacy_os_app_data_dir() -> str:
     if sys.platform == 'win32':
         base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~\\AppData\\Local')
+        name = 'PiraChest'
     elif sys.platform == 'darwin':
         base = os.path.expanduser('~/Library/Application Support')
+        name = SLUG
     else:
         base = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
-    return os.path.join(base, 'PiraChest')
+        name = SLUG
+    return os.path.join(base, name)
 
 def _migrate_legacy_app_data(paths: Paths) -> None:
     if os.path.isdir(paths.app_data_dir) and os.listdir(paths.app_data_dir):

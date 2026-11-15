@@ -3,8 +3,6 @@ from __future__ import annotations
 import logging
 import math
 import os
-import subprocess
-import sys
 import time
 from contextlib import suppress
 from functools import lru_cache
@@ -21,6 +19,7 @@ from qfluentwidgets import (
     PushButton, RoundMenu, StrongBodyLabel, SubtitleLabel, TransparentPushButton, qconfig,
 )
 
+from src.core import system as host
 from src.core.downloader import (
     DLState, DownloadItem, DownloadManager, human_bytes, human_duration, human_speed, is_risky_file, parse_checksum,
 )
@@ -155,14 +154,7 @@ def _blit(p: QPainter, name: str, x: float, y: float, px: int, color: QColor, dp
 
 
 def _reveal(path: str, select: bool = False) -> None:
-
-    select = select or os.path.isfile(path)
-    if sys.platform.startswith("win"):
-        subprocess.Popen(["explorer", "/select,", os.path.normpath(path)] if select else ["explorer", path])
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", "-R", path] if select else ["open", path])
-    else:
-        subprocess.Popen(["xdg-open", os.path.dirname(path) if select else path])
+    host.reveal_path(path, select or os.path.isfile(path))
 
 
 def _toast(parent, kind: str, title: str, content: str = "", duration: int = 2500) -> None:

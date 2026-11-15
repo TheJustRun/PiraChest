@@ -2,11 +2,11 @@ PySide6==6.12.0
 PySide6-Fluent-Widgets==1.11.3
 PySideSix-Frameless-Window==0.8.2
 
-winrt-runtime==4.0.3
-winrt-Windows.Foundation==4!10.0.28000.2705
-winrt-Windows.Media==4!10.0.28000.2705
-winrt-Windows.Media.Playback==4!10.0.28000.2705
-winrt-Windows.Storage.Streams==4!10.0.28000.2705
+winrt-runtime==4.0.3; sys_platform == "win32"
+winrt-Windows.Foundation==4!10.0.28000.2705; sys_platform == "win32"
+winrt-Windows.Media==4!10.0.28000.2705; sys_platform == "win32"
+winrt-Windows.Media.Playback==4!10.0.28000.2705; sys_platform == "win32"
+winrt-Windows.Storage.Streams==4!10.0.28000.2705; sys_platform == "win32"
 
 httpx==0.28.1
 requests==2.34.2

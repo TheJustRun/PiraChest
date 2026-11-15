@@ -147,6 +147,7 @@ from shiboken6 import (
     isValid as _qt_is_valid,
 )
 
+from src.core import system as host
 from src.core.config import (
     APP_NAME,
     apply_settings,
@@ -4195,9 +4196,8 @@ class _WizardState:
             'tray': bool(settings.close_to_tray),
             'notify': bool(settings.notify_on_download_complete),
             'external': bool(settings.external_torrent_client),
+            'startup': bool(get_launch_at_startup()),
         }
-        if sys.platform == 'win32':
-            prefs['startup'] = bool(get_launch_at_startup())
         volumes = {'sfx': int(settings.sfx_volume), 'ambiance': int(settings.ambiance_volume)}
         return cls(language=language, theme=theme, features=features, prefs=prefs, volumes=volumes)
 
@@ -4692,8 +4692,6 @@ class _PrefsPage(_Page):
             ('external', FluentIcon.SEND),
         )
         for pref_id, icon in specs:
-            if pref_id == 'startup' and sys.platform != 'win32':
-                continue
             card = _ToggleCard(themed_icon(None, icon, size=metrics.icon_px), '', '', metrics, grid)
             card.setChecked(bool(state.prefs.get(pref_id, False)))
             card.toggled.connect(lambda checked, p=pref_id: self.pref_changed.emit(p, checked))
@@ -6302,7 +6300,7 @@ class MainWindow(FluentWindow):
             if args:
                 subprocess.Popen(f'"{exe}" {args}', cwd=cwd)
             else:
-                os.startfile(exe)
+                host.open_path(exe)
         except Exception as exc:
             logger.exception('Could not launch installed game %s', exe)
             InfoBar.error(
@@ -7469,12 +7467,7 @@ class MainWindow(FluentWindow):
         path = paths.app_data_dir
         try:
             os.makedirs(path, exist_ok=True)
-            if sys.platform.startswith('win'):
-                os.startfile(path)
-            elif sys.platform == 'darwin':
-                subprocess.Popen(['open', path])
-            else:
-                subprocess.Popen(['xdg-open', path])
+            host.open_path(path)
         except Exception:
             logger.exception('Failed to open data folder %s', path)
 

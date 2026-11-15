@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -16,7 +17,9 @@ import urllib.request
 import zipfile
 import zlib
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+from contextlib import suppress
 
+from src.core import system as host
 from src.core.config import APP_NAME, IS_CANARY, VERSION
 
 logger = logging.getLogger(__name__)
@@ -27,10 +30,29 @@ _API_URL_ALL = f"https://api.github.com/repos/{_REPO}/releases?per_page=100"
 _HEADERS = {"Accept": "application/vnd.github+json", "User-Agent": f"{APP_NAME}-Updater"}
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _ZIP_RE = re.compile(r"^pirachest.*windows.*x64\.zip$", re.I)
-_EXE_RE = re.compile(r"^pirachest(?:[ -]canary)?\.exe$", re.I)
 _CANARY_RE = re.compile(r"canary|nightly|unstable|experimental", re.I)
+_MANIFEST_NAME = "update-manifest.json"
 _CACHE: dict[str, tuple[float, object]] = {}
 _CACHE_TTL = 300.0
+
+
+def _exe_name() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.basename(sys.executable)
+    return "PiraChest.exe" if host.WINDOWS else "PiraChest"
+
+
+def _format_of(name: str) -> str:
+    low = name.lower()
+    if low.endswith(".zip"):
+        return "zip"
+    if low.endswith((".tar.gz", ".tgz")):
+        return "tar.gz"
+    if low.endswith((".tar.xz", ".txz")):
+        return "tar.xz"
+    if low.endswith((".tar.bz2", ".tbz2")):
+        return "tar.bz2"
+    return ""
 
 
 def _app_dir() -> str:
@@ -111,26 +133,94 @@ def _fetch_releases(include_prereleases: bool) -> list[dict]:
     return releases
 
 
-def _pick_zip(assets: list, canary: bool) -> dict | None:
-    zips = [
+def _archive_assets(assets: list) -> list[dict]:
+    return [
         a for a in assets
-        if isinstance(a, dict) and a.get("name", "").lower().endswith(".zip")
-        and "sha256" not in a.get("name", "").lower()
+        if isinstance(a, dict) and _format_of(str(a.get("name") or ""))
+        and "sha256" not in str(a.get("name") or "").lower()
+        and "checksum" not in str(a.get("name") or "").lower()
     ]
+
+
+def _manifest_choice(manifest: dict, assets: list, canary: bool) -> dict | None:
+    entries = manifest.get("assets") if isinstance(manifest, dict) else None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("os") or "").lower() != host.os_key():
+            continue
+        entry_arch = str(entry.get("arch") or "").lower()
+        if entry_arch and entry_arch != host.arch():
+            continue
+        name = str(entry.get("name") or "")
+        asset = next((a for a in assets if a.get("name") == name), None)
+        if asset is None:
+            continue
+        if canary and not _CANARY_RE.search(name):
+            continue
+        if not canary and _CANARY_RE.search(name):
+            continue
+        return {
+            "asset": asset,
+            "format": str(entry.get("format") or _format_of(name)),
+            "kind": str(entry.get("kind") or ""),
+            "sha256": str(entry.get("sha256") or "").lower(),
+        }
+    return None
+
+
+def _pick_asset(assets: list, canary: bool) -> dict | None:
+    manifest_asset = next(
+        (a for a in assets if isinstance(a, dict) and a.get("name") == _MANIFEST_NAME),
+        None,
+    )
+    if manifest_asset is not None:
+        try:
+            manifest = _get_json(manifest_asset["browser_download_url"])
+            chosen = _manifest_choice(manifest, assets, canary)
+            if chosen is not None:
+                return chosen
+        except Exception as exc:
+            logger.info("Update manifest unavailable: %s", exc)
+    candidates = _archive_assets(assets)
     if canary:
-        zips = [a for a in zips if _CANARY_RE.search(a.get("name", ""))]
-        if not zips:
-            return None
+        candidates = [a for a in candidates if _CANARY_RE.search(a.get("name", ""))]
     else:
-        plain = [a for a in zips if not _CANARY_RE.search(a.get("name", ""))]
-        zips = plain or zips
-    preferred = [a for a in zips if _ZIP_RE.match(a.get("name", ""))]
-    if preferred:
-        return preferred[0]
-    windows = [a for a in zips if "windows" in a.get("name", "").lower() or "win" in a.get("name", "").lower()]
-    if windows:
-        return windows[0]
-    return zips[0] if len(zips) == 1 else None
+        plain = [a for a in candidates if not _CANARY_RE.search(a.get("name", ""))]
+        candidates = plain or candidates
+    if not candidates:
+        return None
+    target_os, target_arch = host.os_key(), host.arch()
+    matched = [a for a in candidates if host.name_matches_platform(a.get("name", ""), target_os, target_arch)]
+    if host.WINDOWS:
+        preferred = [a for a in matched if _ZIP_RE.match(a.get("name", ""))]
+        matched = preferred or matched
+        if not matched:
+            loose = [a for a in candidates if "windows" in a.get("name", "").lower() or "win" in a.get("name", "").lower()]
+            matched = loose
+    if not matched:
+        return None
+    asset = matched[0]
+    name = str(asset.get("name") or "")
+    return {
+        "asset": asset,
+        "format": _format_of(name),
+        "kind": "bundle" if host.MACOS else "onedir",
+        "sha256": "",
+    }
+
+
+def _tag_label(tag: str) -> str:
+    text = str(tag or "").strip().lstrip("vV")
+    core, _, rest = text.partition("-")
+    parts = [part for part in rest.split("-") if part]
+    channel = parts[0].lower() if parts and parts[0].lower() in (
+        "stable", "canary", "beta", "alpha", "rc", "preview", "nightly") else ""
+    nick = " ".join(parts[1:]).title() if len(parts) > 1 else ""
+    label = f"{core}-{channel}" if channel else core
+    return f"{label} ({nick})" if nick else label
 
 
 def _checksum_asset(assets: list, asset_name: str) -> dict | None:
@@ -143,7 +233,7 @@ def _checksum_asset(assets: list, asset_name: str) -> dict | None:
 
 
 def _is_choco_install() -> bool:
-    if not getattr(sys, "frozen", False):
+    if not host.WINDOWS or not getattr(sys, "frozen", False):
         return False
     app = _app_dir()
     if os.path.isfile(os.path.join(app, ".pirachest-choco")):
@@ -169,23 +259,32 @@ def check_for_update(include_prereleases: bool = True, channel: str | None = Non
                 continue
             if _parse_version(tag) <= _parse_version(VERSION):
                 break
-            asset = _pick_zip(data.get("assets") or [], canary)
-            if asset is None:
+            assets = data.get("assets") or []
+            picked = _pick_asset(assets, canary)
+            if picked is None:
                 continue
-            digest = str(asset.get("digest") or "")
-            digest = digest.split(":", 1)[1].lower() if digest.lower().startswith("sha256:") else ""
-            checksum = _checksum_asset(data.get("assets") or [], asset["name"])
+            asset = picked["asset"]
+            digest = str(picked.get("sha256") or asset.get("digest") or "")
+            digest = digest.split(":", 1)[1].lower() if digest.lower().startswith("sha256:") else digest.lower()
+            if not _HASH_RE.match(digest):
+                digest = ""
+            checksum = _checksum_asset(assets, asset["name"])
             if not digest and checksum is None:
                 logger.warning("Release %s has no SHA-256 checksum; skipping", tag)
                 continue
             return {
                 "tag": tag,
+                "label": _tag_label(tag),
                 "version": _parse_version(tag),
                 "download_url": asset["browser_download_url"],
                 "asset_name": asset["name"],
                 "asset_size": int(asset.get("size") or 0),
                 "checksum_url": checksum["browser_download_url"] if checksum else "",
                 "checksum_sha256": digest,
+                "format": picked.get("format") or _format_of(asset["name"]),
+                "kind": picked.get("kind") or ("bundle" if host.MACOS else "onedir"),
+                "os": host.os_key(),
+                "arch": host.arch(),
                 "notes": data.get("body", ""),
                 "prerelease": bool(data.get("prerelease")),
                 "canary": canary,
@@ -427,10 +526,6 @@ def _download_with_retries(url: str, dest: str, expected: str | None, on_progres
             time.sleep(1.0 + attempt)
 
 
-def _workers() -> int:
-    return max(2, min(8, os.cpu_count() or 4))
-
-
 def _unchanged(path: str, info: zipfile.ZipInfo) -> bool:
     try:
         if os.stat(path).st_size != info.file_size:
@@ -444,87 +539,150 @@ def _unchanged(path: str, info: zipfile.ZipInfo) -> bool:
         return False
 
 
-def _extract_batch(zip_path: str, batch: list, is_cancelled) -> None:
-    with zipfile.ZipFile(zip_path) as zf:
-        for name, target in batch:
-            if is_cancelled is not None and is_cancelled():
-                raise UpdateCancelled()
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            with zf.open(name) as src, open(target, "wb", buffering=1 << 20) as dst:
-                shutil.copyfileobj(src, dst, 1 << 20)
+def _safe_name(name: str) -> str:
+    name = (name or "").replace("\\", "/").strip("/")
+    if not name or name.startswith("/") or re.match(r"^[a-zA-Z]:", name) or ".." in name.split("/"):
+        raise RuntimeError("Update archive contains an unsafe path")
+    return name
 
 
-def _partition(items: list, count: int) -> list[list]:
-    buckets: list[list] = [[] for _ in range(count)]
-    loads = [0] * count
-    for item in sorted(items, key=lambda x: x[2], reverse=True):
-        i = loads.index(min(loads))
-        buckets[i].append((item[0], item[1]))
-        loads[i] += item[2] + 1
-    return [b for b in buckets if b]
+def _link_target(name: str, target: str) -> str:
+    target = (target or "").replace("\\", "/")
+    base = name.rsplit("/", 1)[0] if "/" in name else ""
+    resolved = os.path.normpath(os.path.join(base, target)).replace("\\", "/")
+    if not target or target.startswith("/") or re.match(r"^[a-zA-Z]:", target) or resolved.startswith(".."):
+        raise RuntimeError("Update archive contains an unsafe symbolic link")
+    return target
 
 
-def _stale_files(install_dir: str, keep: set[str]) -> list[str]:
+def _open_archive(path: str):
+    if _format_of(os.path.basename(path)) == "zip":
+        handle = zipfile.ZipFile(path)
+        entries = []
+        for info in handle.infolist():
+            mode = (info.external_attr >> 16) & 0o777
+            link = ""
+            if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                link = _link_target(_safe_name(info.filename), handle.read(info).decode("utf-8", "replace"))
+            entries.append((_safe_name(info.filename), info.file_size, info.is_dir(), mode, info, link))
+        return "zip", handle, entries
+    handle = tarfile.open(path, "r:*")
+    entries = []
+    for member in handle.getmembers():
+        link = ""
+        if member.issym() or member.islnk():
+            link = _link_target(_safe_name(member.name), member.linkname)
+        entries.append((_safe_name(member.name), member.size, member.isdir(), member.mode & 0o777, member, link))
+    return "tar", handle, entries
+
+
+def _extract_one(kind: str, handle, ref, target: str, mode: int, link: str = "") -> None:
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    if link:
+        if not host.WINDOWS:
+            with suppress(OSError):
+                os.remove(target)
+            os.symlink(link, target)
+        return
+    if kind == "zip":
+        with handle.open(ref) as src, open(target, "wb", buffering=1 << 20) as dst:
+            shutil.copyfileobj(src, dst, 1 << 20)
+    else:
+        src = handle.extractfile(ref)
+        if src is None:
+            return
+        with src, open(target, "wb", buffering=1 << 20) as dst:
+            shutil.copyfileobj(src, dst, 1 << 20)
+    if mode and not host.WINDOWS:
+        try:
+            os.chmod(target, mode | 0o600)
+        except OSError:
+            pass
+
+
+def _archive_prefix(files: list, exe_name: str, bundle: bool) -> str:
+    if bundle:
+        for name, *_rest in files:
+            parts = name.split("/")
+            for index, part in enumerate(parts[:-1]):
+                if part.endswith(".app"):
+                    return "/".join(parts[: index + 1]) + "/"
+        raise RuntimeError("Application bundle not found in update archive")
+    for name, *_rest in files:
+        if name.rsplit("/", 1)[-1] == exe_name:
+            head = name.rsplit("/", 1)[0]
+            return head + "/" if head else ""
+    raise RuntimeError(f"{exe_name} not found in update archive")
+
+
+def _stale_files(install_dir: str, keep: set[str], skip_data: bool = True) -> list[str]:
     stale = []
-    for current, _dirs, files in os.walk(os.path.join(install_dir, "_internal")):
+    for current, dirs, files in os.walk(install_dir):
+        if skip_data and os.path.abspath(current) == os.path.abspath(install_dir):
+            dirs[:] = [d for d in dirs if d.lower() != "data"]
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
         for name in files:
+            if name.endswith(".pyc"):
+                continue
             rel = os.path.relpath(os.path.join(current, name), install_dir).replace("\\", "/")
             if rel.lower() not in keep:
-                stale.append(rel.replace("/", "\\"))
+                stale.append(rel)
     return stale
 
 
-def _stage_delta(zip_path: str, out_dir: str, exe_name: str, install_dir: str | None, is_cancelled) -> None:
-    with zipfile.ZipFile(zip_path) as zf:
-        infos = zf.infolist()
-    exe_lower = exe_name.lower()
-    names = []
-    for info in infos:
-        name = info.filename.replace("\\", "/")
-        if not name or name.startswith("/") or re.match(r"^[a-zA-Z]:", name) or ".." in name.split("/"):
-            raise RuntimeError("Update archive contains an unsafe path")
-        if (info.external_attr >> 16) & 0o170000 == 0o120000:
-            raise RuntimeError("Update archive contains a symbolic link")
-        names.append(name)
-    roots = [n for n in names if not n.endswith("/") and _EXE_RE.match(n.rsplit("/", 1)[-1])]
-    if not roots:
-        raise RuntimeError(f"{exe_name} not found in update archive")
-    root = min(roots, key=len)
-    prefix = root[: -len(root.rsplit("/", 1)[-1])]
-    files = []
-    for info, name in zip(infos, names):
-        if info.is_dir() or name.endswith("/") or not name.startswith(prefix):
-            continue
-        rel = name[len(prefix):]
-        if rel.split("/", 1)[0].lower() == "data":
-            continue
-        if _EXE_RE.match(rel.rsplit("/", 1)[-1]):
-            rel = exe_name
-        files.append((info, rel))
-    if install_dir is None:
-        changed = files
-    else:
-        def differs(item) -> bool:
+def _stage_delta(archive_path: str, out_dir: str, exe_name: str, install_dir: str | None,
+                 is_cancelled, kind: str = "onedir") -> None:
+    bundle = kind == "bundle"
+    archive_kind, handle, entries = _open_archive(archive_path)
+    try:
+        files = [entry for entry in entries if not entry[2]]
+        prefix = _archive_prefix(files, exe_name, bundle)
+        exe_lower = exe_name.lower()
+        items = []
+        for name, size, _is_dir, mode, ref, link in files:
+            if not name.startswith(prefix):
+                continue
+            rel = name[len(prefix):]
+            if not rel or rel.split("/", 1)[0].lower() == "__macosx":
+                continue
+            if not bundle and rel.split("/", 1)[0].lower() == "data":
+                continue
+            items.append((rel, size, mode, ref, link))
+        if install_dir is None:
+            changed = items
+        else:
+            changed = []
+            for rel, size, mode, ref, link in items:
+                if is_cancelled is not None and is_cancelled():
+                    raise UpdateCancelled()
+                if link or rel.lower() == exe_lower or archive_kind != "zip":
+                    changed.append((rel, size, mode, ref, link))
+                    continue
+                if not _unchanged(os.path.join(install_dir, *rel.split("/")), ref):
+                    changed.append((rel, size, mode, ref, link))
+        os.makedirs(out_dir, exist_ok=True)
+        for rel, _size, mode, ref, link in changed:
             if is_cancelled is not None and is_cancelled():
                 raise UpdateCancelled()
-            info, rel = item
-            if rel.lower() == exe_lower:
-                return True
-            return not _unchanged(os.path.join(install_dir, *rel.split("/")), info)
-        with ThreadPoolExecutor(_workers()) as pool:
-            flags = list(pool.map(differs, files))
-        changed = [item for item, flag in zip(files, flags) if flag]
-    os.makedirs(out_dir, exist_ok=True)
-    work = [(info.filename, os.path.join(out_dir, *rel.split("/")), info.file_size) for info, rel in changed]
-    batches = _partition(work, _workers())
-    if batches:
-        with ThreadPoolExecutor(len(batches)) as pool:
-            for future in [pool.submit(_extract_batch, zip_path, b, is_cancelled) for b in batches]:
-                future.result()
+            _extract_one(archive_kind, handle, ref, os.path.join(out_dir, *rel.split("/")), mode, link)
+    finally:
+        handle.close()
     if install_dir is not None:
-        keep = {rel.lower() for _info, rel in files}
-        with open(os.path.join(os.path.dirname(out_dir), "delete.lst"), "w", encoding="utf-8", newline="\r\n") as fh:
-            fh.write("".join(f"{p}\n" for p in _stale_files(install_dir, keep)))
+        keep = {rel.lower() for rel, *_rest in items}
+        stale = _stale_files(install_dir, keep, skip_data=not bundle)
+        sep = "\\" if host.WINDOWS else "/"
+        with open(os.path.join(os.path.dirname(out_dir), "delete.lst"), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("".join(f"{path.replace('/', sep)}\n" for path in stale))
+
+
+def _install_root() -> str:
+    exe = os.path.abspath(sys.executable)
+    if host.MACOS:
+        parts = exe.split(os.sep)
+        for index in range(len(parts) - 1, 0, -1):
+            if parts[index].endswith(".app"):
+                return os.sep.join(parts[: index + 1])
+    return os.path.dirname(exe)
 
 
 def download_and_verify_update(update_info: dict, on_progress=None, is_cancelled=None, on_stage=None) -> str:
@@ -543,21 +701,23 @@ def download_and_verify_update(update_info: dict, on_progress=None, is_cancelled
             raise RuntimeError("Not enough free disk space to download the update")
     except OSError:
         pass
-    zip_path = os.path.join(staging, "update.zip")
+    fmt = str(update_info.get("format") or _format_of(str(update_info.get("asset_name") or "")))
+    suffix = {"zip": ".zip", "tar.xz": ".tar.xz", "tar.bz2": ".tar.bz2"}.get(fmt, ".tar.gz")
+    archive_path = os.path.join(staging, f"update{suffix}")
     out_dir = os.path.join(staging, "new")
     shutil.rmtree(out_dir, ignore_errors=True)
     frozen = bool(getattr(sys, "frozen", False))
-    exe_name = os.path.basename(sys.executable) if frozen else "PiraChest.exe"
     try:
         if on_stage:
             on_stage("download")
-        _fetch_archive(update_info["download_url"], zip_path, expected, on_progress, is_cancelled, on_stage)
+        _fetch_archive(update_info["download_url"], archive_path, expected, on_progress, is_cancelled, on_stage)
         if on_stage:
             on_stage("extract")
-        _stage_delta(zip_path, out_dir, exe_name, _app_dir() if frozen else None, is_cancelled)
+        _stage_delta(archive_path, out_dir, _exe_name(), _install_root() if frozen else None,
+                     is_cancelled, str(update_info.get("kind") or "onedir"))
     finally:
         try:
-            os.remove(zip_path)
+            os.remove(archive_path)
         except OSError:
             pass
     return out_dir
@@ -619,11 +779,80 @@ popd 2>NUL
 """
 
 
+_POSIX_UPDATE_SCRIPT = """#!/bin/sh
+PID="$1"
+SRC="$2"
+DST="$3"
+STAGE="$4"
+EXE="$5"
+DEL="$6"
+KIND="$7"
+i=0
+while kill -0 "$PID" 2>/dev/null; do
+  i=$((i + 1))
+  if [ "$i" -ge 1200 ]; then break; fi
+  sleep 0.25
+done
+if [ "$KIND" = "bundle" ]; then
+  ditto "$SRC" "$DST" || exit 1
+else
+  cp -Rf "$SRC"/. "$DST"/ || exit 1
+fi
+if [ -f "$DEL" ]; then
+  while IFS= read -r f; do
+    if [ -n "$f" ]; then rm -f "$DST/$f"; fi
+  done < "$DEL"
+fi
+chmod +x "$EXE" 2>/dev/null || true
+rm -rf "$STAGE"
+if [ "$KIND" = "bundle" ]; then
+  codesign --force --deep --sign - "$DST" >/dev/null 2>&1 || true
+  open "$DST" >/dev/null 2>&1
+else
+  cd "$(dirname "$EXE")" 2>/dev/null || cd /
+  "$EXE" >/dev/null 2>&1 &
+fi
+"""
+
+
+def _apply_update_posix(new_app_dir: str) -> None:
+    current_exe = os.path.abspath(sys.executable)
+    exe_name = os.path.basename(current_exe)
+    install_root = _install_root()
+    new_app_dir = os.path.abspath(new_app_dir)
+    kind = "bundle" if host.MACOS and install_root.endswith(".app") else "onedir"
+    marker = os.path.join(new_app_dir, "Contents", "MacOS", exe_name) if kind == "bundle" else os.path.join(new_app_dir, exe_name)
+    if not os.path.isfile(marker):
+        raise RuntimeError("The downloaded update is incomplete")
+    if not _can_write(install_root):
+        raise RuntimeError("PiraChest cannot write to its install folder. Move the app somewhere writable or reinstall it.")
+    staging = _update_staging_dir()
+    temp = tempfile.gettempdir()
+    script_path = os.path.join(temp, "pirachest_update.sh")
+    with open(script_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(_POSIX_UPDATE_SCRIPT)
+    try:
+        os.chmod(script_path, 0o700)
+    except OSError:
+        pass
+    env = os.environ.copy()
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    subprocess.Popen(
+        ["/bin/sh", script_path, str(os.getpid()), new_app_dir, install_root, staging,
+         current_exe, os.path.join(staging, "delete.lst"), kind],
+        cwd=temp,
+        env=env,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
 def apply_update_and_restart(new_app_dir: str) -> None:
-    if sys.platform != "win32":
-        raise RuntimeError("Self-update is only supported on Windows")
     if not getattr(sys, "frozen", False):
         raise RuntimeError("Self-update requires a frozen (built) executable")
+    if not host.WINDOWS:
+        _apply_update_posix(new_app_dir)
+        return
     current_exe = os.path.abspath(sys.executable)
     exe_name = os.path.basename(current_exe)
     install_dir = os.path.dirname(current_exe)

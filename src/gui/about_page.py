@@ -40,7 +40,7 @@ from src.core.theme import (
     to_color,
 )
 from src.core.translations import register_locale_refresh, tr
-from src.core.config import APP_NAME, ICON_FILE, LOGO_FILE, VERSION
+from src.core.config import APP_NAME, ICON_FILE, LOGO_FILE, VERSION_LABEL
 DISCORD_URL = 'https://discord.gg/j7dBxTZMDE'
 _GUI_DIR = Path(__file__).resolve().parent
 _PHOTO_ROOTS = tuple(dict.fromkeys(
@@ -546,7 +546,7 @@ class AboutPage(QWidget):
         layout.setContentsMargins(24, 20, 28, 24)
         layout.setSpacing(12)
 
-        self._about_version = VERSION
+        self._about_version = VERSION_LABEL
 
         self._hero_card = self._build_hero_card()
         layout.addWidget(self._hero_card)

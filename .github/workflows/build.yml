@@ -1,4 +1,4 @@
-name: Build PiraChest (Windows x64)
+name: Build PiraChest (Windows, Linux, macOS)
 
 on:
   push:
@@ -13,6 +13,8 @@ jobs:
     name: Read version
     runs-on: ubuntu-latest
     outputs:
+      base: ${{ steps.ver.outputs.base }}
+      nickname: ${{ steps.ver.outputs.nickname }}
       version: ${{ steps.ver.outputs.version }}
       tag: ${{ steps.ver.outputs.tag }}
       is_new: ${{ steps.ver.outputs.is_new }}
@@ -26,25 +28,46 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          RAW=$(sed -n '1p' VERSION | tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
-          C=$(sed -n '2,$p' VERSION | tr -d '[:space:]')
-          if ! [[ "$RAW" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(.*)$ ]]; then
-            echo "Invalid VERSION: must start with X.Y.Z (got: $RAW)" >&2
-            exit 1
-          fi
-          SAFE=$(printf '%s' "${BASH_REMATCH[2]}" | sed -E 's/[^0-9A-Za-z.]+/-/g; s/^[-.]+//; s/[-.]+$//')
-          V="${BASH_REMATCH[1]}${SAFE:+-$SAFE}"
-          case "$C" in
-            1|canary=1|is_canary=1) CANARY=1; SLUG=PiraChest-Canary; APP="PiraChest Canary" ;;
-            *) CANARY=0; SLUG=PiraChest; APP="PiraChest" ;;
-          esac
-          echo "version=$V" >> "$GITHUB_OUTPUT"
-          echo "display=$RAW" >> "$GITHUB_OUTPUT"
-          echo "tag=v$V" >> "$GITHUB_OUTPUT"
-          echo "canary=$CANARY" >> "$GITHUB_OUTPUT"
-          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
-          echo "app_name=$APP" >> "$GITHUB_OUTPUT"
-          if gh release view "v$V" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re
+
+          lines = [line.strip() for line in open('VERSION', encoding='utf-8').read().splitlines() if line.strip()]
+          if not lines:
+              raise SystemExit('VERSION is empty')
+          first = lines[0]
+          match = re.match(r'(\d+\.\d+\.\d+)', first)
+          if not match:
+              raise SystemExit(f'Invalid VERSION: must start with X.Y.Z (got: {first})')
+          base = match.group(1)
+          legacy = re.search(r'\(([^)]+)\)', first)
+          nickname = legacy.group(1).strip() if legacy else ''
+          canary = bool(re.search(r'(?:^|[-_.])canary(?:$|[-_.\s])', first, re.I))
+          for line in lines[1:]:
+              key, sep, value = line.partition('=')
+              name = key.strip().lower()
+              if sep and name in ('canary', 'is_canary'):
+                  canary = value.strip().lower() in ('1', 'true', 'yes', 'on')
+              elif sep and name in ('nickname', 'name'):
+                  nickname = value.strip()
+              elif line in ('0', '1'):
+                  canary = line == '1'
+              elif not nickname:
+                  nickname = line
+          nick_slug = re.sub(r'[^a-z0-9]+', '-', nickname.lower()).strip('-')
+          channel = 'canary' if canary else 'stable'
+          version = f'{base}-{channel}' + (f'-{nick_slug}' if nick_slug else '')
+          display = f'{base}-{channel}' + (f' ({nickname})' if nickname else '')
+          print(f'base={base}')
+          print(f'nickname={nickname}')
+          print(f'version={version}')
+          print(f'display={display}')
+          print(f'tag=v{version}')
+          print(f'canary={1 if canary else 0}')
+          print(f'slug={"PiraChest-Canary" if canary else "PiraChest"}')
+          print(f'app_name={"PiraChest Canary" if canary else "PiraChest"}')
+          PY
+          TAG=$(sed -n 's/^tag=//p' "$GITHUB_OUTPUT" | tail -n1)
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "is_new=false" >> "$GITHUB_OUTPUT"
           else
             echo "is_new=true" >> "$GITHUB_OUTPUT"
@@ -65,13 +88,12 @@ jobs:
 
       - name: Write version file
         shell: pwsh
+        env:
+          VERSION_BASE: ${{ needs.version.outputs.base }}
+          VERSION_NICK: ${{ needs.version.outputs.nickname }}
+          VERSION_CANARY: ${{ needs.version.outputs.canary }}
         run: |
-          $v = "${{ needs.version.outputs.version }}"
-          if ("${{ needs.version.outputs.canary }}" -eq "1") {
-            Set-Content -Path VERSION -Value @($v, "1")
-          } else {
-            Set-Content -Path VERSION -Value $v -NoNewline
-          }
+          Set-Content -Path VERSION -Value @($env:VERSION_BASE, $env:VERSION_NICK, $env:VERSION_CANARY)
 
       - name: Install WiX Toolset
         shell: pwsh
@@ -160,9 +182,187 @@ jobs:
           path: package/*
           if-no-files-found: error
 
+  build-linux:
+    name: PyInstaller (Linux ${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Write version file
+        shell: bash
+        env:
+          VERSION_BASE: ${{ needs.version.outputs.base }}
+          VERSION_NICK: ${{ needs.version.outputs.nickname }}
+          VERSION_CANARY: ${{ needs.version.outputs.canary }}
+        run: |
+          printf '%s\n%s\n%s\n' "$VERSION_BASE" "$VERSION_NICK" "$VERSION_CANARY" > VERSION
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libdbus-1-3 libxcb-cursor0 zstd
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller==6.22.2 pyinstaller-hooks-contrib==2026.9
+
+      - name: Build with PyInstaller
+        env:
+          SKIP_MSI: "1"
+        run: python -m PyInstaller --noconfirm PiraChest.spec
+
+      - name: Package + checksum
+        shell: bash
+        run: |
+          slug="${{ needs.version.outputs.slug }}"
+          name="$slug-${{ needs.version.outputs.tag }}-Linux-${{ matrix.arch }}.tar.gz"
+          mkdir -p package
+          tar -czf "package/$name" -C dist "$slug"
+          cd package
+          sha256sum "$name" > "$name.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}-package
+          path: package/*
+          if-no-files-found: error
+
+  build-macos:
+    name: PyInstaller (macOS ${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Write version file
+        shell: bash
+        env:
+          VERSION_BASE: ${{ needs.version.outputs.base }}
+          VERSION_NICK: ${{ needs.version.outputs.nickname }}
+          VERSION_CANARY: ${{ needs.version.outputs.canary }}
+        run: |
+          printf '%s\n%s\n%s\n' "$VERSION_BASE" "$VERSION_NICK" "$VERSION_CANARY" > VERSION
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller==6.22.2 pyinstaller-hooks-contrib==2026.9
+
+      - name: Build with PyInstaller
+        env:
+          SKIP_MSI: "1"
+        run: python -m PyInstaller --noconfirm PiraChest.spec
+
+      - name: Package + checksum
+        shell: bash
+        run: |
+          slug="${{ needs.version.outputs.slug }}"
+          app="${{ needs.version.outputs.app_name }}.app"
+          name="$slug-${{ needs.version.outputs.tag }}-macOS-${{ matrix.arch }}.zip"
+          mkdir -p package
+          ditto -c -k --sequesterRsrc --keepParent "dist/$app" "package/$name"
+          cd package
+          shasum -a 256 "$name" > "$name.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}-package
+          path: package/*
+          if-no-files-found: error
+
+  manifest:
+    name: Update manifest
+    needs: [ version, build-windows, build-linux, build-macos ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Build update-manifest.json
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import os
+
+          root = pathlib.Path('artifacts')
+          assets = []
+          for path in sorted(root.rglob('*')):
+              if not path.is_file():
+                  continue
+              name = path.name
+              low = name.lower()
+              if low.endswith('.sha256') or low.endswith('.msi') or name == 'update-manifest.json':
+                  continue
+              if 'windows' in low:
+                  target_os, arch, fmt, kind = 'windows', 'x64', 'zip', 'onedir'
+              elif 'linux' in low:
+                  arch = 'arm64' if ('arm64' in low or 'aarch64' in low) else 'x64'
+                  fmt = 'tar.gz' if low.endswith('.tar.gz') else 'zip'
+                  target_os, kind = 'linux', 'onedir'
+              elif 'macos' in low:
+                  arch = 'arm64' if 'arm64' in low else 'x64'
+                  target_os, fmt, kind = 'macos', 'zip', 'bundle'
+              else:
+                  continue
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              assets.append({
+                  'os': target_os,
+                  'arch': arch,
+                  'name': name,
+                  'format': fmt,
+                  'kind': kind,
+                  'sha256': digest,
+                  'size': path.stat().st_size,
+              })
+          payload = {
+              'version': '${{ needs.version.outputs.version }}',
+              'tag': '${{ needs.version.outputs.tag }}',
+              'assets': assets,
+          }
+          out = pathlib.Path('artifacts/update-manifest.json')
+          out.write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
+          print(json.dumps(payload, indent=2))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: update-manifest
+          path: artifacts/update-manifest.json
+          if-no-files-found: error
+
   release:
     name: GitHub Release
-    needs: [ version, build-windows ]
+    needs: [ version, build-windows, build-linux, build-macos, manifest ]
     if: needs.version.outputs.is_new == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -171,8 +371,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: windows-package
           path: release-files
+          merge-multiple: true
 
       - name: Build release notes
         env:
@@ -184,13 +384,16 @@ jobs:
           FULL=$(gh api "repos/$REPO/commits/${{ github.sha }}" --jq '.commit.message' | tr -d '\r')
           MSG=$(printf '%s\n' "$FULL" | sed '1,/^$/d' | sed '1{/^#[[:space:]]/d}' | sed '/./,$!d')
           [ -z "$MSG" ] && MSG=$(printf '%s\n' "$FULL" | sed '1{/^#[[:space:]]/d}' | sed '/./,$!d')
-          [ -z "$MSG" ] && MSG="${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.version }} (Windows x64)."
+          [ -z "$MSG" ] && MSG="${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.display }}."
           {
             printf '%s\n\n' "$MSG"
             [ -n "$PREV" ] && printf '**Full Changelog:** https://github.com/%s/compare/%s...%s\n\n' "$REPO" "$PREV" "$TAG"
             cat <<'EOF'
-          **Install:** download the MSI and run it. Choose the install location in the setup wizard. It installs for the current user with a Start Menu shortcut, no admin prompt, and no forced file associations.
-          **Portable:** download the ZIP, extract it, and run `${{ needs.version.outputs.app_name }}.exe`. The ZIP `.sha256` file contains the checksum used by the built-in updater; the MSI `.sha256` verifies the installer.
+          **Windows install:** download the MSI and run it. Choose the install location in the setup wizard. It installs for the current user with a Start Menu shortcut, no admin prompt, and no forced file associations.
+          **Windows portable:** download the Windows ZIP, extract it, and run `${{ needs.version.outputs.app_name }}.exe`. The ZIP `.sha256` file contains the checksum used by the built-in updater; the MSI `.sha256` verifies the installer.
+          **Linux:** download the tarball for your CPU (`x64` or `arm64`), extract it, and run `PiraChest`.
+          **macOS:** download the ZIP for your Mac (`arm64` for Apple Silicon, `x64` for Intel), extract it, and move `PiraChest.app` to Applications.
+          `update-manifest.json` lists every asset with its OS, architecture, format, and SHA-256 used by the built-in updater.
           EOF
           } > notes.md
 
@@ -226,11 +429,11 @@ jobs:
             exit 1
           fi
           JSON=$(gh release view "$TAG" --repo "$REPO" --json body,url,isPrerelease,assets)
-          BODY=$(jq -r '.body' <<< "$JSON" | grep -v '^\*\*\(Install\|Portable\):\*\*' | sed -E 's/^#{2,3} (.*)$/**\1**/' | head -c 3800)
+          BODY=$(jq -r '.body' <<< "$JSON" | grep -vi '^\*\*\(install\|portable\|windows\|linux\|macos\|update-manifest\)' | grep -v '^`update-manifest' | sed -E 's/^#{2,3} (.*)$/**\1**/' | head -c 3800)
           URL=$(jq -r '.url' <<< "$JSON")
           MSI=$(jq -r '[.assets[].url | select(endswith(".msi"))][0] // empty' <<< "$JSON")
-          ZIP=$(jq -r '[.assets[].url | select(endswith(".zip"))][0] // empty' <<< "$JSON")
-          jq -n --arg role "<@&1548027542353477743>" --arg title "${{ needs.version.outputs.app_name }} $TAG" --arg url "$URL" \
+          ZIP=$(jq -r '[.assets[].url | select(contains("Windows") and endswith(".zip"))][0] // empty' <<< "$JSON")
+          jq -n --arg role "<@&1548027542353477743>" --arg title "${{ needs.version.outputs.display }}" --arg url "$URL" \
                 --arg body "$BODY" --arg msi "$MSI" --arg zip "$ZIP" --arg repo "$REPO" --arg app "${{ needs.version.outputs.app_name }}" '
             {username: "GitHub",
              avatar_url: "https://github.com/\($repo | split("/")[0]).png",
@@ -258,7 +461,7 @@ jobs:
         if: env.CHOCO_KEY != ''
         shell: pwsh
         run: |
-          $ver = "${{ needs.version.outputs.version }}"
+          $ver = "${{ needs.version.outputs.base }}"
           $tag = "${{ needs.version.outputs.tag }}"
           $repo = "${{ github.repository }}"
           $owner = "${{ github.repository_owner }}"

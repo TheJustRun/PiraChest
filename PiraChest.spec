@@ -1,11 +1,15 @@
 import os
+import re
 import sys
 
 from PyInstaller.utils.hooks import collect_data_files
 
 sys.path.insert(0, os.path.abspath(os.getcwd()))
-from src.core.config import APP_NAME, ICON_FILE, SLUG
+from src.core.config import APP_NAME, ICON_FILE, SLUG, VERSION
 from tools.version_info import write_version_file
+
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
 
 def _assets(source, target):
     """Copy runtime assets only: Python sources already live in the PYZ."""
@@ -109,6 +113,12 @@ a.datas = [
 
 pyz = PYZ(a.pure)
 
+icon_path = os.path.join('src', 'gui', 'photos', ICON_FILE)
+icns_path = None
+if IS_MAC:
+    from tools.make_icns import build_icns
+    icns_path = build_icns(os.path.join(SPECPATH, 'build', f'{SLUG}.icns'), icon_path)
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -125,8 +135,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=[f'src/gui/photos/{ICON_FILE}'],
-    version=write_version_file(os.path.join(SPECPATH, 'build', 'version_info.txt')),
+    icon=[icns_path] if (IS_MAC and icns_path) else ([icon_path] if IS_WIN else []),
+    version=write_version_file(os.path.join(SPECPATH, 'build', 'version_info.txt')) if IS_WIN else None,
 )
 coll = COLLECT(
     exe,
@@ -137,3 +147,23 @@ coll = COLLECT(
     upx_exclude=[],
     name=SLUG,
 )
+
+if IS_MAC:
+    bundle_id = 'com.justrun.pirachest.canary' if SLUG.endswith('Canary') else 'com.justrun.pirachest'
+    match = re.match(r'\d+(?:\.\d+){0,2}', VERSION)
+    short_version = match.group(0) if match else '0.0.0'
+    app = BUNDLE(
+        coll,
+        name=f'{APP_NAME}.app',
+        icon=icns_path,
+        bundle_identifier=bundle_id,
+        info_plist={
+            'CFBundleDisplayName': APP_NAME,
+            'CFBundleName': APP_NAME,
+            'CFBundleShortVersionString': short_version,
+            'CFBundleVersion': short_version,
+            'NSHighResolutionCapable': True,
+            'LSMinimumSystemVersion': '11.0',
+            'NSRequiresAquaSystemAppearance': False,
+        },
+    )

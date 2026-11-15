@@ -65,6 +65,7 @@ from qfluentwidgets import (
 )
 
 from src.core.debrid import PROVIDER_INFO, PROVIDER_ORDER, PROVIDERS, token_store
+from src.core import system as host
 from src.core.config import (
     APP_ACCENT_COLOR,
     APP_NAME,
@@ -92,7 +93,7 @@ from src.core.config import (
     paths,
     SLUG,
     ThemeMode,
-    VERSION,
+    VERSION_LABEL,
     wipe_all_app_data,
     write_settings_backup,
 )
@@ -264,7 +265,7 @@ class UpdateController(QObject):
 update_controller = UpdateController()
 
 
-_CL_SKIP = re.compile(r'^(?:\*{0,2}(?:Install|Portable):\*{0,2}.*|.+\(Windows x64\)\.?|-{3,}|\*{3,})$', re.I)
+_CL_SKIP = re.compile(r'^(?:\*{0,2}(?:Install|Portable|Windows install|Windows portable|Linux|macOS):\*{0,2}.*|`update-manifest\.json`.*|.+\(Windows x64\)\.?|-{3,}|\*{3,})$', re.I)
 _CL_HEAD = re.compile(r'^(#{1,6})\s+(.*?)\s*#*$')
 _CL_ITEM = re.compile(r'^(\s*)(?:[*+-]|\d+\.)\s+(.*)$')
 _CL_REF = re.compile(r'\s*\(#(\d+)\)$')
@@ -428,7 +429,7 @@ def show_update_dialog(parent: QWidget, result: dict, allow_skip: bool = True) -
     layout = QVBoxLayout()
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(0)
-    title = QLabel(tr('update.available_title', tag=result['tag']))
+    title = QLabel(tr('update.available_title', tag=result.get('label') or result['tag']))
     title.setWordWrap(True)
     title.setStyleSheet(f'QLabel {{ background: transparent; color: {strong.name()}; font-size: 17px; font-weight: 600; }}')
     layout.addWidget(title)
@@ -4509,6 +4510,8 @@ class SettingsPage(QWidget):
             group, 'settings.admin_mode', FluentIcon.DEVELOPER_TOOLS,
             'settings.admin_mode_title', None, 'settings.admin_mode_content', None,
             attr='admin_mode', on_change=self._on_admin_mode_toggled)
+        if not host.WINDOWS:
+            self._chk_admin_mode.setVisible(False)
         self._chk_show_console = self._switch_card(
             group, 'settings.show_console', FluentIcon.CODE,
             'settings.show_console_title', None, 'settings.show_console_content', None,
@@ -4549,7 +4552,7 @@ class SettingsPage(QWidget):
             attr='canary_updates')
         yield
 
-        self._app_version = VERSION
+        self._app_version = VERSION_LABEL
         self._update_status_lbl = CaptionLabel('')
         self._btn_check_update = PushButton(self._t('settings.check_for_updates'))
         self._bind(self._btn_check_update.setText, 'settings.check_for_updates')
@@ -5202,7 +5205,7 @@ class SettingsPage(QWidget):
         if result is None:
             self._update_status_lbl.setText(tr('update.up_to_date'))
             return
-        self._update_status_lbl.setText(tr('update.available', tag=result['tag']))
+        self._update_status_lbl.setText(tr('update.available', tag=result.get('label') or result['tag']))
         if show_update_dialog(self.window(), result, allow_skip=True) == 'update':
             self._start_update_download(result)
 

@@ -53,14 +53,14 @@ _TEMPLATE = """VSVersionInfo(
 
 def write_version_file(destination) -> str:
     from src.core.config import (APP_NAME, COMPANY_NAME, EXE_NAME, IS_CANARY,
-                                 SLUG, VERSION)
+                                 SLUG, VERSION, VERSION_LABEL)
     numeric = _numeric_version(VERSION)
     values = {
         'filevers': numeric,
         'prodvers': numeric,
         'company': _quote(COMPANY_NAME),
         'description': _quote(APP_NAME),
-        'version': _quote(VERSION),
+        'version': _quote(VERSION_LABEL),
         'internal': _quote(SLUG),
         'copyright': _quote(f'Copyright (c) {COMPANY_NAME}'),
         'exe': _quote(EXE_NAME),

@@ -6329,6 +6329,7 @@ class AnimePlayerWidget(QWidget):
         self._muted = False
         self._pre_mute_volume = self._load_volume()
         self._is_fullscreen = False
+        self._hfw = True
         self._fs_win = self._fs_bar_win = None
         self._pip_active = False
         self._pip_win = None
@@ -6627,16 +6628,14 @@ class AnimePlayerWidget(QWidget):
         return max(1, int(width * _ASPECT_H / _ASPECT_W)) + self._BAR_H
 
     def sizeHint(self):
-        pw = self.parentWidget().width() if self.parentWidget() else self.MAX_WIDTH
-        w = max(240, min(self.MAX_WIDTH, pw))
-        return QSize(w, self.heightForWidth(w))
+        return QSize(self.MAX_WIDTH, self.heightForWidth(self.MAX_WIDTH))
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self._is_fullscreen or self._pip_active:
+        if self._is_fullscreen or self._pip_active or not self._hfw:
             return
         h = self.heightForWidth(self.width())
-        if self.height() != h:
+        if self.minimumHeight() != h or self.maximumHeight() != h:
             self.setFixedHeight(h)
 
     def _set_status(self, text: str) -> None:
@@ -6819,6 +6818,7 @@ class AnimePlayerWidget(QWidget):
             self.setFocus()
 
     def _set_hfw(self, on: bool) -> None:
+        self._hfw = on
         sp = self.sizePolicy()
         sp.setHeightForWidth(on)
         self.setSizePolicy(sp)
@@ -7665,6 +7665,9 @@ class AnimePlayerWidget(QWidget):
 
     def hideEvent(self, event) -> None:
         self._bubble.set_state(None, None)
+        if not self._suppress_hide and not self._is_fullscreen and not self._pip_active:
+            self.setMinimumHeight(135 + self._BAR_H)
+            self.setMaximumHeight(_QWIDGETSIZE_MAX)
         if not self._suppress_hide and not self._pip_active and self._playing():
             self._player.pause()
             self._auto_paused = True
@@ -7675,6 +7678,10 @@ class AnimePlayerWidget(QWidget):
             self._player.play()
             self._auto_paused = False
         super().showEvent(event)
+        if not self._is_fullscreen and not self._pip_active and self._hfw:
+            h = self.heightForWidth(self.width())
+            if self.minimumHeight() != h or self.maximumHeight() != h:
+                self.setFixedHeight(h)
 
     def keyPressEvent(self, event) -> None:
         key = event.key()

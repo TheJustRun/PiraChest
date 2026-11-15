@@ -48,7 +48,11 @@ if not defined SLUG set "SLUG=PiraChest"
 for /d /r "src" %%d in (__pycache__) do @if exist "%%d" rd /s /q "%%d" 2>nul
 if exist build rmdir /s /q build
 if exist "dist\%SLUG%" rmdir /s /q "dist\%SLUG%"
-if not exist VERSION echo 0.1.0-beta> VERSION
+if not exist VERSION (
+    echo 0.1.0> VERSION
+    echo.>> VERSION
+    echo 0>> VERSION
+)
 
 echo [build] Running PyInstaller...
 python -m PyInstaller --noconfirm --clean PiraChest.spec
@@ -77,7 +81,7 @@ if errorlevel 1 (
 
 echo [build] Reading app info...
 set "BRAND="
-for /f "usebackq tokens=1-6 delims=|" %%A in (`python -c "import re,sys;sys.path.insert(0,'.');from src.core.config import APP_NAME,COMPANY_NAME,EXE_NAME,UPGRADE_CODE;v=open('VERSION').read().splitlines()[0].strip();m=re.match(r'(\d+)\.(\d+)\.(\d+)',v);print('|'.join([APP_NAME,EXE_NAME,COMPANY_NAME,UPGRADE_CODE,'.'.join(m.groups()),v]))"`) do (
+for /f "usebackq tokens=1-6 delims=|" %%A in (`python -c "import sys;sys.path.insert(0,'.');from src.core.config import APP_NAME,COMPANY_NAME,EXE_NAME,UPGRADE_CODE,VERSION,VERSION_TAG;print('|'.join([APP_NAME,EXE_NAME,COMPANY_NAME,UPGRADE_CODE,VERSION,VERSION_TAG]))"`) do (
     set "BRAND=%%A"
     set "EXENAME=%%B"
     set "COMPANY=%%C"

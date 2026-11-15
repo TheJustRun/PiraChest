@@ -9,7 +9,6 @@ import sys
 import threading
 import time
 from contextlib import suppress
-from ctypes import wintypes
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -18,9 +17,11 @@ _FILE_NAME = "debrid_tokens.json"
 _VERSION = 1
 _CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
+if sys.platform == "win32":
+    from ctypes import wintypes
 
-class _DataBlob(ctypes.Structure):
-    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    class _DataBlob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
 
 
 def _dpapi_available() -> bool:

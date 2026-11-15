@@ -42,7 +42,14 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 _EXE = ".exe" if os.name == "nt" else ""
 _ASSET_BASE = "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/"
 _YTDLP_ASSET = {"win32": "yt-dlp.exe", "darwin": "yt-dlp_macos"}.get(sys.platform, "yt-dlp")
-_FFMPEG_ZIP = "https://github.com/zackees/ffmpeg_bins/raw/main/v8.0/" + {"win32": "win32", "darwin": "macos"}.get(sys.platform, "linux64") + ".zip"
+_MACHINE = platform.machine().lower()
+if sys.platform == "win32":
+    _FFMPEG_ASSET = "win32"
+elif sys.platform == "darwin":
+    _FFMPEG_ASSET = "darwin_arm64" if _MACHINE in ("arm64", "aarch64") else "darwin"
+else:
+    _FFMPEG_ASSET = "linux_arm64" if _MACHINE in ("arm64", "aarch64") else "linux"
+_FFMPEG_ZIP = f"https://github.com/zackees/ffmpeg_bins/raw/main/v8.0/{_FFMPEG_ASSET}.zip"
 
 
 class YtError(Exception):
