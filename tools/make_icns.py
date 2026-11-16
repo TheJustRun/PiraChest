@@ -78,6 +78,16 @@ def _read_ico(path: str) -> dict[int, bytes]:
     return frames
 
 
+def build_png(destination: str, source: str) -> str | None:
+    frames = _read_ico(source)
+    if not frames:
+        return None
+    target = Path(destination)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(frames[max(frames)])
+    return str(target)
+
+
 def build_icns(destination: str, source: str) -> str | None:
     frames = _read_ico(source)
     chunks = []

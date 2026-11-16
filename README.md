@@ -11,11 +11,11 @@
   <img src="https://img.shields.io/github/stars/TheJustRun/PiraChest?label=Stars" alt="Stars">
   <img src="https://img.shields.io/github/issues/TheJustRun/PiraChest?label=Issues" alt="Issues">
   <img src="https://img.shields.io/badge/Status-Stable-green" alt="Stable">
-  <img src="https://img.shields.io/badge/Platform-Windows-blue" alt="Windows">
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue" alt="Windows, Linux and macOS">
   <img src="https://img.shields.io/badge/License-PolyForm%20Noncommercial-lightgrey" alt="License">
 </p>
 
-**PiraChest is an all-in-one Windows app for games, ROMs, music, anime, manga, movies, TV, downloads, torrents, and a whole lot of customization.**
+**PiraChest is an all-in-one app for Windows, Linux and macOS: games, ROMs, music, anime, manga, movies, TV, downloads, torrents, and a whole lot of customization.**
 
 The idea is simple: stop jumping between a million different apps and websites when you can have the stuff you actually use in one place.
 
@@ -28,6 +28,20 @@ And yes, you can customize the hell out of it.
 Get the latest build from [GitHub Releases](https://github.com/TheJustRun/PiraChest/releases).
 
 [![Download](https://img.shields.io/badge/Download-Latest%20Release-brightgreen?style=for-the-badge)](https://github.com/TheJustRun/PiraChest/releases)
+
+| Platform | Formats |
+| --- | --- |
+| Windows (x64) | Installer (`.msi`), Portable (`.zip`), Chocolatey |
+| Linux (x64, arm64) | Debian package (`.deb`), Portable (`.tar.gz`) |
+| macOS (Apple Silicon, Intel) | Disk image (`.dmg`), Portable (`.zip`) |
+
+Linux `.deb` packages install under `/opt` and are managed by your package manager (they do not self-update). Extracted `.tar.gz` builds, portable ZIPs, DMGs and the Windows portable build keep the built-in updater.
+
+macOS builds are ad-hoc signed, not notarized. On first launch, allow the app in **System Settings → Privacy & Security → Open Anyway**, or run:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/PiraChest.app
+```
 
 Chocolatey support is out, installing it is as simple as:
 For pre-releases (Canary)

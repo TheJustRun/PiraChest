@@ -14,25 +14,33 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from contextlib import suppress
+from urllib.parse import quote
 
 from src.core import system as host
-from src.core.config import APP_NAME, IS_CANARY, VERSION_TAG
+from src.core.config import IS_CANARY, VERSION_TAG
 
 logger = logging.getLogger(__name__)
 
-_REPO = "TheJustRun/PiraChest"
-_API_URL = f"https://api.github.com/repos/{_REPO}/releases/latest"
-_API_URL_ALL = f"https://api.github.com/repos/{_REPO}/releases?per_page=100"
-_HEADERS = {"Accept": "application/vnd.github+json", "User-Agent": f"{APP_NAME}-Updater"}
+_GITHUB = "TheJustRun/PiraChest"
+_GITLAB = "TheJustRun%2FPiraChest"
+_SOURCEFORGE = "pirachest"
+_SF_DOWNLOADS = f"https://downloads.sourceforge.net/project/{_SOURCEFORGE}/"
+_MIRRORS = (
+    f"https://github.com/{_GITHUB}/releases/download/{{tag}}/{{name}}",
+    f"https://gitlab.com/api/v4/projects/{_GITLAB}/packages/generic/PiraChest/{{tag}}/{{name}}",
+    _SF_DOWNLOADS + "{tag}/{name}",
+)
+_HEADERS = {"User-Agent": "PiraChest-Updater", "Accept-Encoding": "identity"}
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _ZIP_RE = re.compile(r"^pirachest.*windows.*x64\.zip$", re.I)
 _CANARY_RE = re.compile(r"canary|nightly|unstable|experimental", re.I)
 _MANIFEST_NAME = "update-manifest.json"
-_CACHE: dict[str, tuple[float, object]] = {}
+_CACHE: dict[str, tuple[float, bytes]] = {}
 _CACHE_TTL = 300.0
 
 
@@ -90,126 +98,102 @@ def _parse_version(tag: str) -> tuple:
     return (numbers[0], numbers[1], numbers[2], stage, int(match.group(1)) if match else 0)
 
 
-def _get_json(url: str):
-    now = time.monotonic()
+def _get(url: str) -> bytes:
     hit = _CACHE.get(url)
-    if hit is not None and now - hit[0] < _CACHE_TTL:
+    if hit and time.monotonic() - hit[0] < _CACHE_TTL:
         return hit[1]
-    for attempt in range(3):
+    for attempt in (0, 1):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=_HEADERS), timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                data = resp.read()
             break
-        except urllib.error.HTTPError as exc:
-            if exc.code in (403, 404, 429) or attempt == 2:
+        except OSError as exc:
+            if attempt or (isinstance(exc, urllib.error.HTTPError) and exc.code < 500):
                 raise
-            time.sleep(0.6 * (attempt + 1))
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-            if attempt == 2:
-                raise
-            time.sleep(0.6 * (attempt + 1))
-    _CACHE[url] = (now, data)
+            time.sleep(0.6)
+    _CACHE[url] = (time.monotonic(), data)
     return data
 
 
-def _release_is_canary(data: dict) -> bool:
-    if _CANARY_RE.search(str(data.get("tag_name") or "")):
-        return True
-    return any(_CANARY_RE.search(str(a.get("name") or "")) for a in (data.get("assets") or []) if isinstance(a, dict))
+def _get_json(url: str):
+    return json.loads(_get(url))
 
 
-def _fetch_releases(include_prereleases: bool) -> list[dict]:
-    if not include_prereleases:
-        data = _get_json(_API_URL)
-        return [data] if isinstance(data, dict) else []
-    data = _get_json(_API_URL_ALL)
-    if not isinstance(data, list):
-        return []
-    releases = [
-        r for r in data
-        if isinstance(r, dict) and not r.get("draft") and r.get("tag_name")
-    ]
-    releases.sort(key=lambda r: _parse_version(r.get("tag_name", "")), reverse=True)
-    return releases
-
-
-def _archive_assets(assets: list) -> list[dict]:
+def _github() -> list[dict]:
     return [
-        a for a in assets
-        if isinstance(a, dict) and _format_of(str(a.get("name") or ""))
-        and "sha256" not in str(a.get("name") or "").lower()
-        and "checksum" not in str(a.get("name") or "").lower()
+        {"tag": r["tag_name"], "body": r.get("body") or "",
+         "assets": [{"name": a["name"], "url": a["browser_download_url"],
+                     "size": a.get("size") or 0, "digest": a.get("digest") or ""}
+                    for a in r.get("assets") or ()]}
+        for r in _get_json(f"https://api.github.com/repos/{_GITHUB}/releases?per_page=100")
+        if r.get("tag_name") and not r.get("draft")
     ]
 
 
-def _manifest_choice(manifest: dict, assets: list, canary: bool) -> dict | None:
-    entries = manifest.get("assets") if isinstance(manifest, dict) else None
-    if not isinstance(entries, list):
-        return None
-    for entry in entries:
-        if not isinstance(entry, dict):
+def _gitlab() -> list[dict]:
+    return [
+        {"tag": r["tag_name"], "body": r.get("description") or "",
+         "assets": [{"name": a["name"], "url": a["url"], "size": 0, "digest": ""}
+                    for a in r["assets"]["links"]]}
+        for r in _get_json(f"https://gitlab.com/api/v4/projects/{_GITLAB}/releases?per_page=100")
+        if not r.get("upcoming_release")
+    ]
+
+
+def _sourceforge() -> list[dict]:
+    releases: dict[str, list[dict]] = {}
+    root = ET.fromstring(_get(f"https://sourceforge.net/projects/{_SOURCEFORGE}/rss?path=/&limit=500"))
+    for item in root.iter("item"):
+        path = item.findtext("title", "").strip().strip("/")
+        tag, _, name = path.partition("/")
+        if not name or "/" in name:
             continue
-        if str(entry.get("os") or "").lower() != host.os_key():
-            continue
-        entry_arch = str(entry.get("arch") or "").lower()
-        if entry_arch and entry_arch != host.arch():
-            continue
-        name = str(entry.get("name") or "")
-        asset = next((a for a in assets if a.get("name") == name), None)
-        if asset is None:
-            continue
-        if canary and not _CANARY_RE.search(name):
-            continue
-        if not canary and _CANARY_RE.search(name):
+        size = next((int(c.get("filesize") or 0) for c in item if c.tag.endswith("}content")), 0)
+        releases.setdefault(tag, []).append(
+            {"name": name, "url": _SF_DOWNLOADS + quote(path), "size": size, "digest": ""})
+    return [{"tag": tag, "body": "", "assets": assets} for tag, assets in releases.items()]
+
+
+_SOURCES = (_github, _gitlab, _sourceforge)
+
+
+def _urls(tag: str, asset: dict) -> list[str]:
+    fields = {"tag": quote(tag), "name": quote(asset["name"])}
+    return list(dict.fromkeys([asset["url"], *(m.format(**fields) for m in _MIRRORS)]))
+
+
+def _manifest_choice(manifest: dict, assets: list[dict]) -> dict | None:
+    by_name = {a["name"]: a for a in assets}
+    for entry in manifest["assets"]:
+        name = entry["name"]
+        if (name not in by_name
+                or entry.get("os", "").lower() != host.os_key()
+                or entry.get("arch", "").lower() not in ("", host.arch())):
             continue
         return {
-            "asset": asset,
-            "format": str(entry.get("format") or _format_of(name)),
-            "kind": str(entry.get("kind") or ""),
-            "sha256": str(entry.get("sha256") or "").lower(),
+            "asset": by_name[name],
+            "format": entry.get("format") or _format_of(name),
+            "kind": entry.get("kind") or "",
+            "sha256": entry.get("sha256", "").lower(),
+            "size": int(entry.get("size") or 0),
         }
     return None
 
 
-def _pick_asset(assets: list, canary: bool) -> dict | None:
-    manifest_asset = next(
-        (a for a in assets if isinstance(a, dict) and a.get("name") == _MANIFEST_NAME),
-        None,
-    )
-    if manifest_asset is not None:
+def _pick_asset(assets: list[dict]) -> dict | None:
+    manifest = next((a for a in assets if a["name"] == _MANIFEST_NAME), None)
+    if manifest:
         try:
-            manifest = _get_json(manifest_asset["browser_download_url"])
-            chosen = _manifest_choice(manifest, assets, canary)
-            if chosen is not None:
+            chosen = _manifest_choice(_get_json(manifest["url"]), assets)
+            if chosen:
                 return chosen
         except Exception as exc:
             logger.info("Update manifest unavailable: %s", exc)
-    candidates = _archive_assets(assets)
-    if canary:
-        candidates = [a for a in candidates if _CANARY_RE.search(a.get("name", ""))]
-    else:
-        plain = [a for a in candidates if not _CANARY_RE.search(a.get("name", ""))]
-        candidates = plain or candidates
-    if not candidates:
-        return None
-    target_os, target_arch = host.os_key(), host.arch()
-    matched = [a for a in candidates if host.name_matches_platform(a.get("name", ""), target_os, target_arch)]
+    matched = [a for a in assets
+               if _format_of(a["name"]) and host.name_matches_platform(a["name"], host.os_key(), host.arch())]
     if host.WINDOWS:
-        preferred = [a for a in matched if _ZIP_RE.match(a.get("name", ""))]
-        matched = preferred or matched
-        if not matched:
-            loose = [a for a in candidates if "windows" in a.get("name", "").lower() or "win" in a.get("name", "").lower()]
-            matched = loose
-    if not matched:
-        return None
-    asset = matched[0]
-    name = str(asset.get("name") or "")
-    return {
-        "asset": asset,
-        "format": _format_of(name),
-        "kind": "bundle" if host.MACOS else "onedir",
-        "sha256": "",
-    }
+        matched = [a for a in matched if _ZIP_RE.match(a["name"])] or matched
+    return {"asset": matched[0]} if matched else None
 
 
 def _tag_label(tag: str) -> str:
@@ -227,13 +211,9 @@ def _tag_label(tag: str) -> str:
     return f"{label} ({nick})" if nick else label
 
 
-def _checksum_asset(assets: list, asset_name: str) -> dict | None:
-    names = (f"{asset_name}.sha256", "SHA256SUMS", "checksums.txt", "SHA256SUMS.txt")
-    for name in names:
-        found = next((a for a in assets if isinstance(a, dict) and a.get("name") == name), None)
-        if found:
-            return found
-    return None
+def _checksum_asset(assets: list[dict], asset_name: str) -> dict | None:
+    wanted = (f"{asset_name}.sha256", "SHA256SUMS", "checksums.txt", "SHA256SUMS.txt")
+    return next((a for name in wanted for a in assets if a["name"] == name), None)
 
 
 def _is_choco_install() -> bool:
@@ -245,57 +225,85 @@ def _is_choco_install() -> bool:
     return "\\chocolatey\\lib\\" in app.lower()
 
 
-def check_for_update(include_prereleases: bool = True, channel: str | None = None) -> dict | None:
-    if _is_choco_install():
+_MANAGED_PREFIXES = ("/usr/", "/snap/", "/var/lib/flatpak/")
+
+
+def _is_package_managed() -> bool:
+    if not getattr(sys, "frozen", False):
+        return False
+    if host.WINDOWS:
+        return _is_choco_install()
+    if not host.LINUX:
+        return False
+    root = os.path.realpath(_install_root()).replace(os.sep, "/") + "/"
+    if root.startswith(_MANAGED_PREFIXES):
+        return True
+    if not root.startswith("/opt/"):
+        return False
+    for bindir in ("/usr/bin", "/usr/local/bin"):
+        try:
+            names = os.listdir(bindir)
+        except OSError:
+            continue
+        for name in names:
+            link = os.path.join(bindir, name)
+            if os.path.islink(link) and os.path.realpath(link).startswith(root):
+                return True
+    return False
+
+
+def _newest(releases: list[dict], channel: str) -> dict | None:
+    current = _parse_version(VERSION_TAG)
+    for release in sorted(releases, key=lambda r: _parse_version(r["tag"]), reverse=True):
+        tag, assets = release["tag"], release["assets"]
+        canary = bool(_CANARY_RE.search(tag)) or any(_CANARY_RE.search(a["name"]) for a in assets)
+        if channel != "auto" and canary != (channel == "canary"):
+            continue
+        version = _parse_version(tag)
+        if version <= current:
+            return None
+        picked = _pick_asset(assets)
+        if picked is None:
+            continue
+        asset = picked["asset"]
+        digest = (picked.get("sha256") or asset["digest"]).lower().removeprefix("sha256:")
+        if not _HASH_RE.match(digest):
+            digest = ""
+        checksum = _checksum_asset(assets, asset["name"])
+        if not digest and checksum is None:
+            logger.warning("Release %s has no SHA-256 checksum; skipping", tag)
+            continue
+        return {
+            "tag": tag,
+            "label": _tag_label(tag),
+            "version": version,
+            "download_urls": _urls(tag, asset),
+            "asset_name": asset["name"],
+            "asset_size": int(asset["size"] or picked.get("size") or 0),
+            "checksum_urls": _urls(tag, checksum) if checksum else [],
+            "checksum_sha256": digest,
+            "format": picked.get("format") or _format_of(asset["name"]),
+            "kind": picked.get("kind") or ("bundle" if host.MACOS else "onedir"),
+            "os": host.os_key(),
+            "arch": host.arch(),
+            "notes": release["body"],
+            "canary": canary,
+            "channel": "canary" if canary else "stable",
+        }
+    return None
+
+
+def check_for_update(channel: str | None = None) -> dict | None:
+    if _is_package_managed():
         return None
     channel = (channel or ("auto" if IS_CANARY else "stable")).lower()
     if channel not in ("auto", "stable", "canary"):
         channel = "stable"
-    try:
-        for data in _fetch_releases(include_prereleases):
-            tag = str(data.get("tag_name") or "")
-            if not tag:
-                continue
-            canary = _release_is_canary(data)
-            if channel == "canary" and not canary:
-                continue
-            if channel == "stable" and canary:
-                continue
-            if _parse_version(tag) <= _parse_version(VERSION_TAG):
-                break
-            assets = data.get("assets") or []
-            picked = _pick_asset(assets, canary)
-            if picked is None:
-                continue
-            asset = picked["asset"]
-            digest = str(picked.get("sha256") or asset.get("digest") or "")
-            digest = digest.split(":", 1)[1].lower() if digest.lower().startswith("sha256:") else digest.lower()
-            if not _HASH_RE.match(digest):
-                digest = ""
-            checksum = _checksum_asset(assets, asset["name"])
-            if not digest and checksum is None:
-                logger.warning("Release %s has no SHA-256 checksum; skipping", tag)
-                continue
-            return {
-                "tag": tag,
-                "label": _tag_label(tag),
-                "version": _parse_version(tag),
-                "download_url": asset["browser_download_url"],
-                "asset_name": asset["name"],
-                "asset_size": int(asset.get("size") or 0),
-                "checksum_url": checksum["browser_download_url"] if checksum else "",
-                "checksum_sha256": digest,
-                "format": picked.get("format") or _format_of(asset["name"]),
-                "kind": picked.get("kind") or ("bundle" if host.MACOS else "onedir"),
-                "os": host.os_key(),
-                "arch": host.arch(),
-                "notes": data.get("body", ""),
-                "prerelease": bool(data.get("prerelease")),
-                "canary": canary,
-                "channel": "canary" if canary else "stable",
-            }
-    except Exception as exc:
-        logger.warning("Update check failed: %s", exc)
+    for source in _SOURCES:
+        try:
+            return _newest(source(), channel)
+        except Exception as exc:
+            logger.warning("Update source %s failed: %s", source.__name__.lstrip("_"), exc)
     return None
 
 
@@ -309,7 +317,7 @@ def _update_staging_dir() -> str:
     return base
 
 
-def cleanup_update_staging(_unused: str | None = None) -> None:
+def cleanup_update_staging(_path: str | None = None) -> None:
     try:
         shutil.rmtree(_update_staging_dir(), ignore_errors=True)
     except Exception:
@@ -319,7 +327,7 @@ def cleanup_update_staging(_unused: str | None = None) -> None:
 def fetch_expected_checksum(checksum_url: str, asset_name: str) -> str | None:
     if not checksum_url or not asset_name:
         return None
-    req = urllib.request.Request(checksum_url, headers={"User-Agent": "PiraChest-Updater"})
+    req = urllib.request.Request(checksum_url, headers=_HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             text = resp.read().decode("utf-8-sig", errors="replace")
@@ -342,7 +350,7 @@ def fetch_expected_checksum(checksum_url: str, asset_name: str) -> str | None:
 
 
 def _download(url: str, dest: str, expected_sha256: str | None, on_progress, is_cancelled) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": "PiraChest-Updater", "Accept-Encoding": "identity"})
+    req = urllib.request.Request(url, headers=_HEADERS)
     hasher = hashlib.sha256() if expected_sha256 else None
     downloaded = 0
     last_emit = 0.0
@@ -382,11 +390,10 @@ def _download(url: str, dest: str, expected_sha256: str | None, on_progress, is_
 
 
 _SEG_MIN = 8 << 20
-_BASE_HEADERS = {"User-Agent": "PiraChest-Updater", "Accept-Encoding": "identity"}
 
 
 def _probe_ranges(url: str) -> tuple[int, bool]:
-    req = urllib.request.Request(url, headers={**_BASE_HEADERS, "Range": "bytes=0-0"})
+    req = urllib.request.Request(url, headers={**_HEADERS, "Range": "bytes=0-0"})
     with urllib.request.urlopen(req, timeout=20) as resp:
         resp.read(1)
         content_range = resp.headers.get("Content-Range", "")
@@ -444,7 +451,7 @@ def _download_parallel(url: str, dest: str, total: int, expected: str | None, on
                 if cancelled():
                     raise UpdateCancelled()
                 try:
-                    req = urllib.request.Request(url, headers={**_BASE_HEADERS, "Range": f"bytes={pos}-{end}"})
+                    req = urllib.request.Request(url, headers={**_HEADERS, "Range": f"bytes={pos}-{end}"})
                     with urllib.request.urlopen(req, timeout=30) as resp:
                         if getattr(resp, "status", 206) != 206:
                             raise RuntimeError("Server ignored the range request")
@@ -692,10 +699,9 @@ def _install_root() -> str:
 def download_and_verify_update(update_info: dict, on_progress=None, is_cancelled=None, on_stage=None) -> str:
     expected = str(update_info.get("checksum_sha256") or "").strip().lower()
     if not _HASH_RE.match(expected):
-        checksum_url = update_info.get("checksum_url")
-        if not checksum_url:
-            raise RuntimeError("Release is missing its SHA-256 checksum")
-        expected = fetch_expected_checksum(checksum_url, update_info.get("asset_name", ""))
+        name = update_info.get("asset_name", "")
+        expected = next(filter(None, (fetch_expected_checksum(url, name)
+                                      for url in update_info.get("checksum_urls", ()))), "")
     if not expected:
         raise RuntimeError("Could not verify the update checksum")
     staging = _update_staging_dir()
@@ -714,7 +720,18 @@ def download_and_verify_update(update_info: dict, on_progress=None, is_cancelled
     try:
         if on_stage:
             on_stage("download")
-        _fetch_archive(update_info["download_url"], archive_path, expected, on_progress, is_cancelled, on_stage)
+        failure = RuntimeError("No download source available")
+        for url in update_info["download_urls"]:
+            try:
+                _fetch_archive(url, archive_path, expected, on_progress, is_cancelled, on_stage)
+                break
+            except UpdateCancelled:
+                raise
+            except Exception as exc:
+                logger.warning("Download from %s failed: %s", url, exc)
+                failure = exc
+        else:
+            raise failure
         if on_stage:
             on_stage("extract")
         _stage_delta(archive_path, out_dir, _exe_name(), _install_root() if frozen else None,

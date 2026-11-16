@@ -300,6 +300,7 @@ def _cl_inline(text: str) -> str:
 
 
 def _changelog_markdown_to_html(text: str) -> str:
+    text = text.split('<!-- downloads -->', 1)[0]
     pal = palette()
     muted = _pal('muted', '#888888').name()
     heads = (
@@ -3185,11 +3186,15 @@ class SettingsPage(QWidget):
             QColor(palette()['accent']), self._t('settings.accent_color_title'), self, enableAlpha=False)
         self._bind(lambda text: setattr(self._accent_color_btn, 'title', text), 'settings.accent_color_title')
         self._accent_color_btn.colorChanged.connect(self._on_accent_color_changed)
-        self._default_accent_btn = PushButton(self._t('settings.default_accent'))
-        self._bind(self._default_accent_btn.setText, 'settings.default_accent')
+        accent_key = 'settings.default_accent_canary' if IS_CANARY else 'settings.default_accent'
+        accent_fallback = 'Default Gold' if IS_CANARY else None
+        self._default_accent_btn = PushButton(self._t(accent_key, accent_fallback))
+        self._bind(self._default_accent_btn.setText, accent_key, accent_fallback)
         self._default_accent_btn.clicked.connect(self._on_default_accent_color)
-        self._reset_accent_btn = PushButton(self._t('settings.use_windows_accent'))
-        self._bind(self._reset_accent_btn.setText, 'settings.use_windows_accent')
+        accent_reset_key = 'settings.use_windows_accent' if host.WINDOWS else 'settings.use_system_accent'
+        accent_reset_fallback = None if host.WINDOWS else 'Use system accent color'
+        self._reset_accent_btn = PushButton(self._t(accent_reset_key, accent_reset_fallback))
+        self._bind(self._reset_accent_btn.setText, accent_reset_key, accent_reset_fallback)
         self._reset_accent_btn.clicked.connect(self._on_reset_accent_color)
         self._accent_card = self._plain_card(
             group, 'settings.accent_color', FluentIcon.PALETTE,

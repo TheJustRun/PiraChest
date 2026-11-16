@@ -21,7 +21,7 @@ from qfluentwidgets import (
 
 from src.core import system as host
 from src.core.downloader import (
-    DLState, DownloadItem, DownloadManager, human_bytes, human_duration, human_speed, is_risky_file, parse_checksum,
+    DLState, DownloadItem, DownloadManager, human_bytes, human_duration, human_speed, parse_checksum,
 )
 from src.core.theme import palette, scroll_area_qss
 from src.core.translations import register_locale_refresh, tr
@@ -702,21 +702,46 @@ class TorrentSettingsDialog(MessageBoxBase):
 
 class _DropZone(QWidget):
     files_dropped = Signal(list)
+    browse_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedHeight(112)
-        self._active = False
+        self._active = self._hover = False
 
     def paintEvent(self, _e):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(QPen(_pal("accent", .9) if self._active else _pal("primary_text", .22), 1, Qt.PenStyle.DashLine))
-        p.setBrush(_pal("accent", .06) if self._active else Qt.BrushStyle.NoBrush)
+        lit = self._active or self._hover
+        p.setPen(QPen(_pal("accent", .9) if lit else _pal("primary_text", .22), 1, Qt.PenStyle.DashLine))
+        p.setBrush(_pal("accent", .06) if lit else Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(QRectF(self.rect()).adjusted(.5, .5, -.5, -.5), 8, 8)
-        _blit(p, "download", self.width() / 2 - 11, 26, 22, _pal("accent") if self._active else _pal("muted"), self.devicePixelRatioF(), 1.6)
-        _text(p, QRectF(0, 62, self.width(), 22), tr("download.drop_hint"), _font(self.font(), 12), _pal("muted"), _HCENTER)
+        _blit(p, "download", self.width() / 2 - 11, 26, 22, _pal("accent") if lit else _pal("muted"), self.devicePixelRatioF(), 1.6)
+        lead = tr("download.drop_hint_lead", default="Drag and drop torrent file here or") + " "
+        link = tr("download.drop_hint_link", default="browse to find it")
+        plain, accent = _font(self.font(), 12), _font(self.font(), 12, QFont.Weight.DemiBold)
+        accent.setUnderline(self._hover)
+        lead_w, link_w = (QFontMetrics(f).horizontalAdvance(t) + 2 for f, t in ((plain, lead), (accent, link)))
+        x = max(8.0, (self.width() - lead_w - link_w) / 2)
+        _text(p, QRectF(x, 62, lead_w, 22), lead, plain, _pal("muted"))
+        _text(p, QRectF(x + lead_w, 62, link_w, 22), link, accent, _pal("accent"))
+
+    def enterEvent(self, e) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(e)
+
+    def mouseReleaseEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.browse_requested.emit()
+        super().mouseReleaseEvent(e)
 
     def dragEnterEvent(self, e: QDragEnterEvent) -> None:
         if e.mimeData().hasUrls():
@@ -747,14 +772,8 @@ class AddTorrentDialog(MessageBoxBase):
         self.viewLayout.addWidget(SubtitleLabel(tr("download.add_torrent"), self))
         zone = _DropZone(self)
         zone.files_dropped.connect(lambda paths: self._choose(paths[0]))
+        zone.browse_requested.connect(self._browse)
         self.viewLayout.addWidget(zone)
-        browse = PushButton(tr("download.browse_torrent_file"))
-        browse.clicked.connect(self._browse)
-        row = QHBoxLayout()
-        row.addStretch(1)
-        row.addWidget(browse)
-        row.addStretch(1)
-        self.viewLayout.addLayout(row)
         self.viewLayout.addSpacing(6)
         hint = CaptionLabel(tr("download.link_hint"))
         hint.setStyleSheet(f"color: {palette()['muted']};")
@@ -2038,7 +2057,7 @@ class DownloadManagerPage(QWidget):
         names = [p for p, _ in files]
         entries = build_selective_entries_from_torrent(names, [s for _, s in files])
         dialog = SelectiveDownloadDialog(entries, parent=self.window(), subtitle=name,
-                                         space=lambda: self._manager.usable_space("repacks", tr("download.unknown")))
+                                         space=lambda folder=None: self._manager.usable_space("repacks", tr("download.unknown"), folder))
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._queue(source, resolve_selective_file_indices(entries, dialog.selected_labels(), names) or None, name, label)

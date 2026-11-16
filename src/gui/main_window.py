@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import struct
 import subprocess
 import sys
@@ -6298,7 +6299,8 @@ class MainWindow(FluentWindow):
             args = str(record.get('args') or '').strip()
             cwd = str(record.get('cwd') or os.path.dirname(exe))
             if args:
-                subprocess.Popen(f'"{exe}" {args}', cwd=cwd)
+                command = f'"{exe}" {args}' if sys.platform == 'win32' else [exe, *shlex.split(args)]
+                subprocess.Popen(command, cwd=cwd, env=host.clean_env())
             else:
                 host.open_path(exe)
         except Exception as exc:
@@ -8515,6 +8517,19 @@ def _build_app_font() -> QFont:
     font.setWeight(QFont.Weight.Normal)
     return font
 
+def _install_clean_url_opener() -> None:
+    try:
+        original = QDesktopServices.openUrl
+
+        def _open_url(url) -> bool:
+            target = url.toLocalFile() if url.isLocalFile() else url.toString()
+            return host.open_external(target) or original(url)
+
+        QDesktopServices.openUrl = _open_url
+    except Exception:
+        logger.warning('Could not install the external link opener', exc_info=True)
+
+
 def create_application(argv: list | None=None):
     setTheme(Theme.DARK)
     if sys.platform == 'win32':
@@ -8527,6 +8542,8 @@ def create_application(argv: list | None=None):
     surface_format.setSamples(0)
     QSurfaceFormat.setDefaultFormat(surface_format)
     app = QApplication(argv if argv is not None else sys.argv)
+    if host.LINUX and getattr(sys, 'frozen', False):
+        _install_clean_url_opener()
     app.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)

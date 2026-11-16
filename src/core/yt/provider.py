@@ -40,15 +40,21 @@ _ERROR_HINTS = (
 )
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 _EXE = ".exe" if os.name == "nt" else ""
-_ASSET_BASE = "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/"
-_YTDLP_ASSET = {"win32": "yt-dlp.exe", "darwin": "yt-dlp_macos"}.get(sys.platform, "yt-dlp")
 _MACHINE = platform.machine().lower()
+_ARM = _MACHINE in ("arm64", "aarch64")
+_ASSET_BASE = "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/"
+if sys.platform == "win32":
+    _YTDLP_ASSET = "yt-dlp_arm64.exe" if _ARM else "yt-dlp.exe"
+elif sys.platform == "darwin":
+    _YTDLP_ASSET = "yt-dlp_macos"
+else:
+    _YTDLP_ASSET = "yt-dlp_linux_aarch64" if _ARM else "yt-dlp_linux"
 if sys.platform == "win32":
     _FFMPEG_ASSET = "win32"
 elif sys.platform == "darwin":
-    _FFMPEG_ASSET = "darwin_arm64" if _MACHINE in ("arm64", "aarch64") else "darwin"
+    _FFMPEG_ASSET = "darwin_arm64" if _ARM else "darwin"
 else:
-    _FFMPEG_ASSET = "linux_arm64" if _MACHINE in ("arm64", "aarch64") else "linux"
+    _FFMPEG_ASSET = "linux_arm64" if _ARM else "linux"
 _FFMPEG_ZIP = f"https://github.com/zackees/ffmpeg_bins/raw/main/v8.0/{_FFMPEG_ASSET}.zip"
 
 

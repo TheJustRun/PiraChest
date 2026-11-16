@@ -7,7 +7,11 @@ import os
 import re
 import subprocess
 import time
-from ctypes import wintypes
+
+if os.name == 'nt':
+    from ctypes import wintypes
+else:
+    wintypes = None
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
 
@@ -27,14 +31,17 @@ STILL_ACTIVE = 259
 ERROR_CANCELLED = 1223
 
 
-class _SHELLEXECUTEINFOW(ctypes.Structure):
-    _fields_ = [
-        ('cbSize', wintypes.DWORD), ('fMask', ctypes.c_ulong), ('hwnd', wintypes.HWND),
-        ('lpVerb', wintypes.LPCWSTR), ('lpFile', wintypes.LPCWSTR), ('lpParameters', wintypes.LPCWSTR),
-        ('lpDirectory', wintypes.LPCWSTR), ('nShow', ctypes.c_int), ('hInstApp', wintypes.HINSTANCE),
-        ('lpIDList', ctypes.c_void_p), ('lpClass', wintypes.LPCWSTR), ('hkeyClass', wintypes.HKEY),
-        ('dwHotKey', wintypes.DWORD), ('hIcon', wintypes.HANDLE), ('hProcess', wintypes.HANDLE),
-    ]
+if os.name == 'nt':
+    class _SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ('cbSize', wintypes.DWORD), ('fMask', ctypes.c_ulong), ('hwnd', wintypes.HWND),
+            ('lpVerb', wintypes.LPCWSTR), ('lpFile', wintypes.LPCWSTR), ('lpParameters', wintypes.LPCWSTR),
+            ('lpDirectory', wintypes.LPCWSTR), ('nShow', ctypes.c_int), ('hInstApp', wintypes.HINSTANCE),
+            ('lpIDList', ctypes.c_void_p), ('lpClass', wintypes.LPCWSTR), ('hkeyClass', wintypes.HKEY),
+            ('dwHotKey', wintypes.DWORD), ('hIcon', wintypes.HANDLE), ('hProcess', wintypes.HANDLE),
+        ]
+else:
+    _SHELLEXECUTEINFOW = None
 
 
 class ElevationCancelled(Exception):
@@ -1097,6 +1104,13 @@ class InstallCoordinator(QObject):
         self._launch(spec, roots)
 
     def _launch(self, spec: dict, roots: list):
+        if os.name != 'nt':
+            self.install_failed.emit(
+                spec.get('title') or 'Game',
+                'Repack installation is only supported on Windows. Download and extract the archive manually.',
+            )
+            QTimer.singleShot(0, self._start_next)
+            return
         try:
             remember_install_dir(os.path.dirname(spec['install_dir']))
         except Exception:

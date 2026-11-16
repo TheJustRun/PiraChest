@@ -3929,13 +3929,12 @@ def _draw_text(p: QPainter, font: QFont, rect: QRectF, text: str, color: QColor,
 
 
 _CANARY_SUFFIX = " Canary"
-_CANARY_BADGE = QColor("#F0D068")
-_CANARY_BADGE_TEXT = QColor("#231A08")
+_CANARY_LABEL = "CANARY"
 
 
 def _title_parts(text: str) -> tuple[str, str]:
     if IS_CANARY and text.endswith(_CANARY_SUFFIX):
-        return text[: -len(_CANARY_SUFFIX)], "Canary"
+        return text[: -len(_CANARY_SUFFIX)], _CANARY_LABEL
     return text, ""
 
 
@@ -3966,21 +3965,21 @@ class ChromeTitleLabel(QLabel):
     def _badge_font(self) -> QFont:
         font = QFont(self._font)
         font.setBold(True)
-        if font.pointSizeF() > 0:
-            font.setPointSizeF(max(7.0, font.pointSizeF() * 0.74))
-        else:
-            font.setPixelSize(max(9, int(font.pixelSize() * 0.74)))
+        base = self._font.pixelSize()
+        if base <= 0:
+            base = round(self._font.pointSizeF() * 96.0 / 72.0)
+        font.setPixelSize(max(11, round(base * 0.86)))
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.2)
         return font
 
     def sizeHint(self) -> QSize:
         metrics = QFontMetrics(self._font)
         pad = self._padding()
         name, badge = _title_parts(self.text())
-        if not badge:
-            return QSize(metrics.horizontalAdvance(name) + pad * 2, metrics.height() + pad)
-        badge_metrics = QFontMetrics(self._badge_font())
-        width = metrics.horizontalAdvance(name) + 7 + badge_metrics.horizontalAdvance(badge) + 16 + pad * 2
-        return QSize(width, max(metrics.height(), badge_metrics.height() + 6) + pad)
+        width = metrics.horizontalAdvance(name)
+        if badge:
+            width += 8 + QFontMetrics(self._badge_font()).horizontalAdvance(badge)
+        return QSize(width + pad * 2, metrics.height() + pad)
 
     def minimumSizeHint(self) -> QSize:
         return self.sizeHint()
@@ -4003,20 +4002,10 @@ class ChromeTitleLabel(QLabel):
         _draw_text(p, self._font, QRectF(pad, 0, name_width + 1, self.height()), name,
                    self._color, self._glow, self._glow_radius, elide=False)
         if badge:
-            badge_font = self._badge_font()
-            badge_metrics = QFontMetrics(badge_font)
-            x = pad + name_width + 7
-            width = min(badge_metrics.horizontalAdvance(badge) + 16, max(0, self.width() - x - 2))
-            height = min(self.height() - 4, badge_metrics.height() + 6)
-            if width > 0 and height > 0:
-                rect = QRectF(x, (self.height() - height) / 2.0, width, height)
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(_CANARY_BADGE)
-                p.drawRoundedRect(rect, height / 2.0, height / 2.0)
-                p.setFont(badge_font)
-                p.setPen(_CANARY_BADGE_TEXT)
-                p.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), badge)
-
+            p.setFont(self._badge_font())
+            p.setPen(QColor("#F0D068") if self._color.lightness() > 128 else QColor("#9A6B00"))
+            baseline = (self.height() - metrics.height()) / 2.0 + metrics.ascent()
+            p.drawText(QPointF(pad + name_width + 8, baseline), badge)
 
 
 class ChromeButton(TitleBarButton):
@@ -5102,6 +5091,14 @@ class WindowChrome(QObject):
         titlebar.resize(max(0, window.width() - left), titlebar.height())
         titlebar.raise_()
 
+    def refresh(self) -> None:
+        self._relayout()
+        titlebar = getattr(self._window, "titleBar", None)
+        if titlebar is not None:
+            titlebar.syncMaxState(self._maximized())
+            titlebar.raise_()
+        self._window.update()
+
     def eventFilter(self, obj, event) -> bool:
         if obj is self._window:
             kind = event.type()
@@ -5114,6 +5111,7 @@ class WindowChrome(QObject):
                     self._window.titleBar.restyle()
                     self.refresh_nav()
                     self._window.update()
+                QTimer.singleShot(0, self.sync_geometry)
             elif kind == QEvent.Type.WindowStateChange:
                 QTimer.singleShot(0, self._on_state)
             elif kind == QEvent.Type.Show and not self._shown:

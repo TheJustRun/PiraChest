@@ -21,6 +21,7 @@ jobs:
       tag: ${{ steps.ver.outputs.tag }}
       is_new: ${{ steps.ver.outputs.is_new }}
       canary: ${{ steps.ver.outputs.canary }}
+      channel: ${{ steps.ver.outputs.channel }}
       slug: ${{ steps.ver.outputs.slug }}
       display: ${{ steps.ver.outputs.display }}
       app_name: ${{ steps.ver.outputs.app_name }}
@@ -69,6 +70,7 @@ jobs:
           print(f'display={display}')
           print(f'tag=v{version}')
           print(f'canary={1 if canary else 0}')
+          print(f'channel={channel}')
           print(f'slug={"PiraChest-Canary" if canary else "PiraChest"}')
           print(f'app_name={"PiraChest Canary" if canary else "PiraChest"}')
           PY
@@ -149,7 +151,7 @@ jobs:
           foreach ($b in @($dlgBmp, $banBmp)) {
             if (-not (Test-Path $b)) { Write-Error "Missing installer art: $b"; exit 1 }
           }
-          $msiName = "$slug-${{ needs.version.outputs.tag }}-Windows-x64.msi"
+          $msiName = "$slug-${{ needs.version.outputs.base_build }}-Windows-x64.msi"
           $msi = Join-Path $env:GITHUB_WORKSPACE "package/$msiName"
           wix extension add -g WixToolset.UI.wixext/5.0.2
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -166,7 +168,7 @@ jobs:
         shell: pwsh
         run: |
           $slug = "${{ needs.version.outputs.slug }}"
-          $name = "$slug-${{ needs.version.outputs.tag }}-Windows-x64.zip"
+          $name = "$slug-${{ needs.version.outputs.base_build }}-Windows-x64.zip"
           $out = Join-Path $env:GITHUB_WORKSPACE "package/$name"
           Push-Location "dist/$slug"
           if (Get-Command 7z -ErrorAction SilentlyContinue) {
@@ -234,11 +236,67 @@ jobs:
         shell: bash
         run: |
           slug="${{ needs.version.outputs.slug }}"
-          name="$slug-${{ needs.version.outputs.tag }}-Linux-${{ matrix.arch }}.tar.gz"
+          app="${{ needs.version.outputs.app_name }}"
+          base="${{ needs.version.outputs.base_build }}"
+          channel="${{ needs.version.outputs.channel }}"
+          name="$slug-$base-Linux-${{ matrix.arch }}.tar.gz"
           mkdir -p package
           tar -czf "package/$name" -C dist "$slug"
+
+          pkg="build/deb"
+          pkgname=$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')
+          rm -rf "$pkg"
+          mkdir -p "$pkg/DEBIAN" "$pkg/opt/$pkgname" \
+                   "$pkg/usr/bin" "$pkg/usr/share/applications" \
+                   "$pkg/usr/share/icons/hicolor/256x256/apps"
+          cp -a "dist/$slug/." "$pkg/opt/$pkgname/"
+          ln -sf "/opt/$pkgname/$app" "$pkg/usr/bin/$pkgname"
+          python - "$pkg/usr/share/icons/hicolor/256x256/apps/$pkgname.png" <<'PY'
+          import sys
+          sys.path.insert(0, '.')
+          from tools.make_icns import build_png
+
+          icon = 'src/gui/photos/icon_c.ico' if '{{ needs.version.outputs.canary }}' == '1' else 'src/gui/photos/icon.ico'
+          if not build_png(sys.argv[1], icon):
+              raise SystemExit('Could not read application icon')
+          PY
+          cat > "$pkg/usr/share/applications/$pkgname.desktop" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=$app
+          Comment=Stream, download and organize your media
+          Exec="/opt/$pkgname/$app" %U
+          Icon=$pkgname
+          Terminal=false
+          Categories=AudioVideo;Network;Utility;
+          StartupNotify=true
+          StartupWMClass=$app
+          EOF
+          debarch=${{ matrix.arch }}
+          [ "$debarch" = "x64" ] && debarch=amd64
+          size=$(du -sk "$pkg" | cut -f1)
+          debver="$base"
+          [ "$channel" = "canary" ] && debver="$base~canary"
+          cat > "$pkg/DEBIAN/control" <<EOF
+          Package=$pkgname
+          Version=$debver
+          Architecture=$debarch
+          Installed-Size=$size
+          Maintainer=JustRun <noreply@github.com>
+          Section=video
+          Priority=optional
+          Depends: libegl1, libgl1, libxkbcommon-x11-0, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-render-util0, libxcb-shape0, libxcb-xkb1, libdbus-1-3, libpulse0
+          Description: $app
+           Stream, download and organize movies, shows, music, torrents and YouTube media.
+          Homepage: https://github.com/${{ github.repository }}
+          EOF
+          debname="$slug-$base-Linux-${{ matrix.arch }}.deb"
+          dpkg-deb --build --root-owner-group "$pkg" "package/$debname"
+
           cd package
-          sha256sum "$name" > "$name.sha256"
+          for f in *.tar.gz *.deb; do
+            sha256sum "$f" > "$f.sha256"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
@@ -291,11 +349,22 @@ jobs:
         run: |
           slug="${{ needs.version.outputs.slug }}"
           app="${{ needs.version.outputs.app_name }}.app"
-          name="$slug-${{ needs.version.outputs.tag }}-macOS-${{ matrix.arch }}.zip"
+          base="${{ needs.version.outputs.base_build }}"
           mkdir -p package
+          codesign --force --deep --sign - "dist/$app"
+          name="$slug-$base-macOS-${{ matrix.arch }}.zip"
           ditto -c -k --sequesterRsrc --keepParent "dist/$app" "package/$name"
+          rm -rf build/dmg
+          mkdir -p build/dmg
+          cp -R "dist/$app" "build/dmg/$app"
+          ln -s /Applications build/dmg/Applications
+          dmg="$slug-$base-macOS-${{ matrix.arch }}.dmg"
+          hdiutil create -quiet -volname "${{ needs.version.outputs.app_name }}" \
+            -srcfolder build/dmg -ov -format UDZO "package/$dmg"
           cd package
-          shasum -a 256 "$name" > "$name.sha256"
+          for f in *.zip *.dmg; do
+            shasum -a 256 "$f" > "$f.sha256"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
@@ -328,6 +397,8 @@ jobs:
               name = path.name
               low = name.lower()
               if low.endswith('.sha256') or low.endswith('.msi') or name == 'update-manifest.json':
+                  continue
+              if low.endswith(('.dmg', '.deb', '.rpm', '.appimage', '.pkg', '.exe', '.flatpak', '.snap')):
                   continue
               if 'windows' in low:
                   target_os, arch, fmt, kind = 'windows', 'x64', 'zip', 'onedir'
@@ -391,20 +462,62 @@ jobs:
           MSG=$(printf '%s\n' "$FULL" | sed '1,/^$/d' | sed '1{/^#[[:space:]]/d}' | sed '/./,$!d')
           [ -z "$MSG" ] && MSG=$(printf '%s\n' "$FULL" | sed '1{/^#[[:space:]]/d}' | sed '/./,$!d')
           [ -z "$MSG" ] && MSG="${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.display }}."
+          SLUG="${{ needs.version.outputs.slug }}"
+          APP="${{ needs.version.outputs.app_name }}"
+          BASE="https://github.com/$REPO/releases/download/$TAG/$SLUG-${{ needs.version.outputs.base_build }}"
           {
             printf '%s\n\n' "$MSG"
-            [ -n "$PREV" ] && printf '**Full Changelog:** https://github.com/%s/compare/%s...%s\n\n' "$REPO" "$PREV" "$TAG"
             cat <<'EOF'
-          **Windows install:** download the MSI and run it. Choose the install location in the setup wizard. It installs for the current user with a Start Menu shortcut, no admin prompt, and no forced file associations.
-          **Windows portable:** download the Windows ZIP, extract it, and run `${{ needs.version.outputs.app_name }}.exe`. The ZIP `.sha256` file contains the checksum used by the built-in updater; the MSI `.sha256` verifies the installer.
-          **Linux:** download the tarball for your CPU (`x64` or `arm64`), extract it, and run `PiraChest`.
-          **macOS:** download the ZIP for your Mac (`arm64` for Apple Silicon, `x64` for Intel), extract it, and move `PiraChest.app` to Applications.
-          **Windows requirements:** Windows 10 or 11, 64-bit (Intel or AMD x64).
-          **Linux requirements:** x64 or arm64 with glibc 2.39 or newer (Ubuntu 24.04+, Debian 13+, Fedora 40+). Needs `libegl1`, `libgl1`, `libxkbcommon-x11-0`, `libdbus-1-3` and `libxcb-cursor0` installed.
-          **macOS requirements:** Apple Silicon (`arm64`) needs macOS 14.4 or newer; Intel (`x64`) needs macOS 15 or newer.
-          `update-manifest.json` lists every asset with its OS, architecture, format, and SHA-256 used by the built-in updater.
+          <!-- downloads -->
+          ## Downloads
+
+          | Platform | Architecture | Download |
+          | --- | --- | --- |
+          | **Windows** | x64 | [Installer (.msi)](@@BASE@@-Windows-x64.msi) · [Portable (.zip)](@@BASE@@-Windows-x64.zip) |
+          | **macOS** | Apple Silicon (arm64) | [Disk image (.dmg)](@@BASE@@-macOS-arm64.dmg) · [Archive (.zip)](@@BASE@@-macOS-arm64.zip) |
+          | **macOS** | Intel (x64) | [Disk image (.dmg)](@@BASE@@-macOS-x64.dmg) · [Archive (.zip)](@@BASE@@-macOS-x64.zip) |
+          | **Linux** | x64 | [Package (.deb)](@@BASE@@-Linux-x64.deb) · [Archive (.tar.gz)](@@BASE@@-Linux-x64.tar.gz) |
+          | **Linux** | arm64 | [Package (.deb)](@@BASE@@-Linux-arm64.deb) · [Archive (.tar.gz)](@@BASE@@-Linux-arm64.tar.gz) |
+
+          ## Installation
+
+          **Windows**
+
+          - **Installer:** run the MSI and choose an install location in the setup wizard. It installs for the current user with a Start Menu shortcut, with no admin prompt and no forced file associations.
+          - **Portable:** extract the ZIP and run `@@APP@@.exe`.
+
+          **macOS**
+
+          - **Disk image:** open the DMG and drag `@@APP@@.app` onto the Applications shortcut.
+          - **Archive:** extract the ZIP and move `@@APP@@.app` to your Applications folder.
+          - The builds are ad-hoc signed, not notarized. On first launch, if macOS blocks the app, right-click it and choose **Open**, or allow it in **System Settings → Privacy & Security**.
+
+          **Linux**
+
+          - **Debian/Ubuntu:** install with `sudo apt install ./@@BASE@@-Linux-x64.deb`, then launch `pirachest` from your app menu.
+          - **Archive:** extract the archive and run the `@@APP@@` executable inside the extracted folder.
+          - Package installs update through the package manager; portable archives update themselves in-app.
+
+          ## System requirements
+
+          | Platform | Requirements |
+          | --- | --- |
+          | **Windows** | Windows 10 or 11, 64-bit (Intel or AMD) |
+          | **macOS (Apple Silicon)** | macOS 14.4 or newer |
+          | **macOS (Intel)** | macOS 15 or newer |
+          | **Linux** | x64 or arm64 with glibc 2.39 or newer (Ubuntu 24.04+, Debian 13+, Fedora 40+). The `.deb` pulls in the required Qt/X11 libraries; archive users need `libegl1`, `libgl1`, `libxkbcommon-x11-0`, `libxcb-cursor0`, `libxcb-icccm4`, `libxcb-image0`, `libxcb-keysyms1`, `libxcb-render-util0`, `libxcb-shape0`, `libxcb-xkb1`, `libdbus-1-3` and `libpulse0`. |
+
+          <details>
+          <summary>Checksums and auto-updates</summary>
+
+          Every download has a matching `.sha256` file. The built-in updater reads `update-manifest.json`, which lists each asset with its operating system, architecture, format and SHA-256 checksum, then picks only the build that matches your OS and CPU. Downloads fall back to the GitLab and SourceForge mirrors when GitHub is unavailable.
+
+          </details>
           EOF
-          } > notes.md
+            if [ -n "$PREV" ]; then
+              printf '\n**Full Changelog:** https://github.com/%s/compare/%s...%s\n' "$REPO" "$PREV" "$TAG"
+            fi
+          } | sed -e "s|@@BASE@@|$BASE|g" -e "s|@@APP@@|$APP|g" > notes.md
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -416,6 +529,99 @@ jobs:
           make_latest: ${{ needs.version.outputs.canary != '1' }}
           fail_on_unmatched_files: true
           files: release-files/*
+
+  gitlab-release:
+    name: Publish GitLab Release
+    needs: [ version, build-windows, build-linux, build-macos, manifest, release ]
+    if: needs.version.outputs.is_new == 'true' && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: Upload assets and create GitLab release
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GITLAB_PROJECT: TheJustRun%2FPiraChest
+          TAG: ${{ needs.version.outputs.tag }}
+          RELEASE_NAME: ${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.display }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$GITLAB_TOKEN" ]; then
+            echo "::error::GITLAB_TOKEN secret is missing. Add a GitLab project access token with the api scope."
+            exit 1
+          fi
+
+          API="https://gitlab.com/api/v4/projects/$GITLAB_PROJECT"
+          PACKAGE_BASE="$API/packages/generic/PiraChest/$TAG"
+          LINKS='[]'
+
+          # Upload serially: GitLab recommends sequential uploads for files in one package version.
+          for file in release-files/*; do
+            [ -f "$file" ] || continue
+            filename="$(basename "$file")"
+            echo "Uploading $filename to GitLab..."
+            curl --fail-with-body --silent --show-error \
+              --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+              --upload-file "$file" \
+              "$PACKAGE_BASE/$filename"
+
+            asset_url="$PACKAGE_BASE/$filename"
+            LINKS="$(jq -c --arg name "$filename" --arg url "$asset_url" \
+              '. + [{name: $name, url: $url, link_type: "package"}]' <<< "$LINKS")"
+          done
+
+          # Reuse the exact release notes generated for the GitHub release,
+          # but point download links at the GitLab-hosted copies.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
+          sed -i "s|https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/|$PACKAGE_BASE/|g" notes.md
+
+          jq -n \
+            --arg tag "$TAG" \
+            --arg name "$RELEASE_NAME" \
+            --arg ref "$GITHUB_SHA" \
+            --rawfile description notes.md \
+            --argjson links "$LINKS" \
+            '{tag_name: $tag, name: $name, ref: $ref, description: $description, assets: {links: $links}}' \
+            > gitlab-release.json
+
+          echo "Creating GitLab release $TAG..."
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data-binary @gitlab-release.json \
+            "$API/releases"
+
+  sourceforge-release:
+    name: Publish SourceForge Release
+    needs: [ version, release ]
+    if: needs.version.outputs.is_new == 'true' && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: Upload to SourceForge
+        env:
+          SF_KEY: ${{ secrets.SOURCEFORGE_SSH_KEY }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SF_KEY" ]; then
+            echo "::error::SOURCEFORGE_SSH_KEY secret is missing. Add the private key registered on your SourceForge account."
+            exit 1
+          fi
+          install -m 600 /dev/null sf_key
+          printf '%s\n' "$SF_KEY" > sf_key
+          rsync -e "ssh -i sf_key -o StrictHostKeyChecking=accept-new" --mkpath release-files/* \
+            "justrun@frs.sourceforge.net:/home/frs/project/pirachest/$TAG/"
 
   discord:
     name: Announce on Discord
@@ -438,7 +644,7 @@ jobs:
             exit 1
           fi
           JSON=$(gh release view "$TAG" --repo "$REPO" --json body,url,isPrerelease,assets)
-          BODY=$(jq -r '.body' <<< "$JSON" | grep -vi '^\*\*\(install\|portable\|windows\|linux\|macos\|update-manifest\)' | grep -v '^`update-manifest' | sed -E 's/^#{2,3} (.*)$/**\1**/' | head -c 3800)
+          BODY=$(jq -r '.body' <<< "$JSON" | sed '/<!-- downloads -->/,$d' | sed -E 's/^#{2,3} (.*)$/**\1**/' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' | head -c 3800)
           URL=$(jq -r '.url' <<< "$JSON")
           MSI=$(jq -r '[.assets[].url | select(endswith(".msi"))][0] // empty' <<< "$JSON")
           ZIP=$(jq -r '[.assets[].url | select(contains("Windows") and endswith(".zip"))][0] // empty' <<< "$JSON")
@@ -476,7 +682,7 @@ jobs:
           $tag = "${{ needs.version.outputs.tag }}"
           $repo = "${{ github.repository }}"
           $owner = "${{ github.repository_owner }}"
-          $msi = "PiraChest-$tag-Windows-x64.msi"
+          $msi = "PiraChest-${{ needs.version.outputs.base_build }}-Windows-x64.msi"
           $sha = (Get-Content "release-files/$msi.sha256").Split()[0]
           $url = "https://github.com/$repo/releases/download/$tag/$msi"
           $iconUrl = "https://github.com/$repo/releases/download/$tag/PiraChest-icon.png"

@@ -196,7 +196,8 @@ def relaunch_app() -> bool:
 _RESTART_ENV = 'PIRACHEST_RESTART'
 
 
-APP_ACCENT_COLOR = '#0295fe'
+_STABLE_ACCENT_COLOR = '#0295fe'
+APP_ACCENT_COLOR = '#F0D068' if IS_CANARY else _STABLE_ACCENT_COLOR
 
 def detect_windows_accent_color() -> str:
     fallback = APP_ACCENT_COLOR
@@ -618,6 +619,8 @@ def load_settings() -> Settings:
         _backup_corrupt(path)
         return Settings(onboarding_completed=True)
     loaded = Settings.from_dict(data)
+    if IS_CANARY and str(loaded.accent_color).strip().lower() == _STABLE_ACCENT_COLOR:
+        loaded.accent_color = APP_ACCENT_COLOR
     if 'onboarding_completed' not in data:
         loaded.onboarding_completed = True
     for attr in ('download_dir_repacks', 'download_dir_minerva'):

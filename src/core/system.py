@@ -73,6 +73,22 @@ def open_path(path: str) -> None:
         subprocess.Popen(["xdg-open", path])
 
 
+def open_external(target: str) -> bool:
+    target = str(target or "").strip()
+    if not target:
+        return False
+    try:
+        if WINDOWS:
+            os.startfile(target)
+        elif MACOS:
+            subprocess.Popen(["open", target])
+        else:
+            subprocess.Popen(["xdg-open", target])
+        return True
+    except OSError:
+        return False
+
+
 def reveal_path(path: str, select: bool = False) -> None:
     path = os.path.abspath(path)
     if WINDOWS:
@@ -91,6 +107,19 @@ def detached_kwargs() -> dict:
     if WINDOWS:
         return {"creationflags": 0x00000008 | 0x00000200, "close_fds": True}
     return {"start_new_session": True, "close_fds": True}
+
+
+def clean_env() -> dict:
+    env = dict(os.environ)
+    for name in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "_MEIPASS",
+                 "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH"):
+        env.pop(name, None)
+    if MACOS:
+        for name in ("DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_INSERT_LIBRARIES"):
+            env.pop(name, None)
+    elif LINUX:
+        env.pop("LD_LIBRARY_PATH", None)
+    return env
 
 
 def _autostart_paths(name: str) -> tuple[str, str]:
