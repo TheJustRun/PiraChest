@@ -216,9 +216,11 @@ jobs:
       matrix:
         include:
           - arch: x64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
+            glibc: "2.35"
           - arch: arm64
             runner: ubuntu-24.04-arm
+            glibc: "2.39"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -250,6 +252,19 @@ jobs:
         env:
           SKIP_MSI: "1"
         run: python -m PyInstaller --noconfirm PiraChest.spec
+
+      - name: Verify glibc floor
+        env:
+          LIMIT: ${{ matrix.glibc }}
+        run: |
+          max=$(find dist -type f \( -name '*.so*' -o -perm -u+x \) -print0 \
+            | xargs -0 -r objdump -T 2>/dev/null \
+            | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -n1)
+          echo "Highest glibc symbol required: ${max:-none}" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -n "$max" ] && [ "$(printf '%s\n%s\n' "$max" "$LIMIT" | sort -V | tail -n1)" != "$LIMIT" ]; then
+            echo "::error::Linux build needs glibc $max, above the $LIMIT limit."
+            exit 1
+          fi
 
       - name: Package + checksum
         shell: bash
@@ -304,7 +319,7 @@ jobs:
           Maintainer: JustRun <noreply@github.com>
           Section: video
           Priority: optional
-          Depends: libegl1, libgl1, libxkbcommon-x11-0, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-render-util0, libxcb-shape0, libxcb-xkb1, libdbus-1-3, libpulse0
+          Depends: libc6 (>= ${{ matrix.glibc }}), libegl1, libgl1, libxkbcommon-x11-0, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-render-util0, libxcb-shape0, libxcb-xkb1, libdbus-1-3, libpulse0
           Description: $app
            Stream, download and organize movies, shows, music, torrents and YouTube media.
           Homepage: https://github.com/${{ github.repository }}
@@ -333,10 +348,16 @@ jobs:
         include:
           - arch: arm64
             runner: macos-15
+            target: "11.0"
+            machine: arm64
           - arch: x64
             runner: macos-15-intel
+            target: "10.15"
+            machine: x86_64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v5
 
@@ -365,6 +386,27 @@ jobs:
           SKIP_MSI: "1"
         run: python -m PyInstaller --noconfirm PiraChest.spec
 
+      - name: Measure and set minimum macOS version
+        env:
+          MACHINE: ${{ matrix.machine }}
+        run: |
+          app="dist/${{ needs.version.outputs.app_name }}.app"
+          floor=0
+          while IFS= read -r -d '' f; do
+            file -b "$f" | grep -q 'Mach-O' || continue
+            v=$(otool -arch "$MACHINE" -l "$f" 2>/dev/null \
+              | awk '$1=="minos"{print $2} $1=="cmd"&&$2=="LC_VERSION_MIN_MACOSX"{m=1} m&&$1=="version"{print $2; m=0}' \
+              | sort -V | tail -n1)
+            [ -n "$v" ] || continue
+            [ "$(printf '%s\n%s\n' "$v" "$floor" | sort -V | tail -n1)" = "$v" ] && floor="$v"
+          done < <(find "$app" -type f \( -name '*.so' -o -name '*.dylib' -o -perm -u+x \) -print0)
+          [ "$floor" != "0" ] || { echo "::error::Could not measure the macOS minimum version."; exit 1; }
+          plist="$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Delete :LSMinimumSystemVersion" "$plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string $floor" "$plist"
+          echo "$floor" > "minos-${{ matrix.arch }}.txt"
+          echo "macOS ${{ matrix.arch }} minimum version: $floor" | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Package + checksum
         shell: bash
         run: |
@@ -391,6 +433,13 @@ jobs:
         with:
           name: macos-${{ matrix.arch }}-package
           path: package/*
+          if-no-files-found: error
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}-minos
+          path: minos-${{ matrix.arch }}.txt
           if-no-files-found: error
           retention-days: 3
 
@@ -478,6 +527,7 @@ jobs:
 
       - name: Combined checksums
         run: |
+          mv release-files/minos-*.txt .
           cd release-files
           sha256sum $(ls | grep -v -e '\.sha256$' -e '^SHA256SUMS.txt$') > SHA256SUMS.txt
 
@@ -487,6 +537,8 @@ jobs:
         run: |
           REPO="${{ github.repository }}"
           TAG="${{ needs.version.outputs.tag }}"
+          MACARM=$(cat minos-arm64.txt)
+          MACX64=$(cat minos-x64.txt)
           PREV=$(gh api "repos/$REPO/releases?per_page=1" --jq '.[0].tag_name // empty')
           NOTES_SHA="${{ github.sha }}"
           PARENTS=$(gh api "repos/$REPO/commits/$NOTES_SHA" --jq '.parents | length')
@@ -540,9 +592,9 @@ jobs:
           | Platform | Requirements |
           | --- | --- |
           | **Windows** | Windows 10 or 11, 64-bit (Intel or AMD) |
-          | **macOS (Apple Silicon)** | macOS 14.4 or newer |
-          | **macOS (Intel)** | macOS 15 or newer |
-          | **Linux** | x64 or arm64 with glibc 2.39 or newer (Ubuntu 24.04+, Debian 13+, Fedora 40+). The `.deb` pulls in the required Qt/X11 libraries; archive users need `libegl1`, `libgl1`, `libxkbcommon-x11-0`, `libxcb-cursor0`, `libxcb-icccm4`, `libxcb-image0`, `libxcb-keysyms1`, `libxcb-render-util0`, `libxcb-shape0`, `libxcb-xkb1`, `libdbus-1-3` and `libpulse0`. |
+          | **macOS (Apple Silicon)** | macOS @@MACARM@@ or newer |
+          | **macOS (Intel)** | macOS @@MACX64@@ or newer |
+          | **Linux** | x64 with glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Linux Mint 21+, Fedora 36+); arm64 with glibc 2.39 or newer (Ubuntu 24.04+, Debian 13+, Fedora 40+). The `.deb` pulls in the required Qt/X11 libraries; archive users need `libegl1`, `libgl1`, `libxkbcommon-x11-0`, `libxcb-cursor0`, `libxcb-icccm4`, `libxcb-image0`, `libxcb-keysyms1`, `libxcb-render-util0`, `libxcb-shape0`, `libxcb-xkb1`, `libdbus-1-3` and `libpulse0`. |
 
           <details>
           <summary>Checksums and auto-updates</summary>
@@ -554,7 +606,7 @@ jobs:
             if [ -n "$PREV" ]; then
               printf '\n**Full Changelog:** https://github.com/%s/compare/%s...%s\n' "$REPO" "$PREV" "$TAG"
             fi
-          } | sed -e "s|@@BASE@@|$BASE|g" -e "s|@@APP@@|$APP|g" > notes.md
+          } | sed -e "s|@@BASE@@|$BASE|g" -e "s|@@APP@@|$APP|g" -e "s|@@MACARM@@|$MACARM|g" -e "s|@@MACX64@@|$MACX64|g" > notes.md
 
       - id: release
         uses: softprops/action-gh-release@v2
