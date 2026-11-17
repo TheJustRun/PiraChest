@@ -63,7 +63,6 @@ jobs:
           SSH="ssh -i sf_key -o StrictHostKeyChecking=accept-new"
           HOST="$SF_USER@frs.sourceforge.net"
 
-          # Assets plus the README.md we add (SourceForge shows it as the release notes).
           assets="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
           if [ "$assets" -eq 0 ]; then
             echo "$TAG has no assets on GitHub; nothing to upload."
@@ -92,16 +91,11 @@ jobs:
               | sed "s|https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/|https://sourceforge.net/projects/$SF_PROJECT/files/$TAG/|g"
           } > "$dir/README.md"
 
-          # Send the whole folder (no trailing slash): rsync creates "$TAG" under the
-          # project dir by itself, so no remote shell command is needed (SourceForge's
-          # login shell prints warnings that break rsync when a remote command is used).
-          # --size-only skips files that are already there.
           rsync -e "$SSH" -r --size-only "$dir" "$HOST:$SF_PROJECT_DIR/"
           rm -rf "$dir" "work/$TAG.json"
           SCRIPT
           chmod +x upload_one.sh
 
-          # Oldest first: SourceForge sorts folders by date, so newest ends up on top.
           gh release list --repo "$GITHUB_REPOSITORY" --limit "$LIMIT" --exclude-drafts \
             --json tagName,publishedAt --jq 'sort_by(.publishedAt) | .[].tagName' > tags.txt
 
@@ -112,7 +106,6 @@ jobs:
             if ! ./upload_one.sh "$TAG" 2>&1 | tee upload.log; then
               FAILED=1
               echo "::endgroup::"
-              # Print the reason outside the collapsed group so it is visible.
               echo "::error::Failed to upload $TAG to SourceForge. Last output:"
               tail -n 15 upload.log
               continue
@@ -120,16 +113,13 @@ jobs:
             echo "::endgroup::"
           done < tags.txt
 
-          # Make the newest STABLE release the default download. Canary builds are
-          # pre-releases and never become the default. Needs the optional
-          # SOURCEFORGE_API_KEY secret (SourceForge account > Services > Release API Key).
           if [ -n "$SF_API_KEY" ] && [ "$DRY_RUN" != "true" ]; then
             STABLE="$(gh release list --repo "$GITHUB_REPOSITORY" --limit "$LIMIT" --exclude-drafts \
               --json tagName,isPrerelease,publishedAt \
               --jq '[.[] | select(.isPrerelease | not)] | sort_by(.publishedAt) | last | .tagName // empty')"
             if [ -n "$STABLE" ]; then
               names="$(gh release view "$STABLE" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
-              set_default() { # <os> <filename regex>
+              set_default() {
                 f="$(grep -E "$2" <<< "$names" | head -n1 || true)"
                 [ -n "$f" ] || return 0
                 curl --silent --show-error --fail-with-body --request PUT \

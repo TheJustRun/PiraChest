@@ -1,9 +1,5 @@
 name: Update README
 
-# Reusable: called by pipeline.yml with the release tag. Can also be run on its own.
-# Rewrites the block between the <!-- latest:start --> and <!-- latest:end -->
-# markers in README.md on the default branch. GitLab receives the same commit
-# through mirror-gitlab.yml, which force-pushes main.
 on:
   workflow_call:
     inputs:
@@ -48,7 +44,6 @@ jobs:
             exit 0
           fi
 
-          # Derive the asset prefix (e.g. PiraChest-1.1.0-2) from the MSI on the release.
           MSI="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '[.assets[].name | select(endswith("-Windows-x64.msi"))][0] // empty')"
           [ -n "$MSI" ] || { echo "::error::No Windows MSI found on $TAG."; exit 1; }
           PREFIX="${MSI%-Windows-x64.msi}"
@@ -70,7 +65,6 @@ jobs:
           Mirrors: [GitLab](https://gitlab.com/TheJustRun/PiraChest/-/releases) · [SourceForge](https://sourceforge.net/projects/pirachest/files/)
           <!-- latest:end -->
           EOF
-          # Strip the heredoc indentation from the YAML block scalar.
           sed -i 's/^          //' block.md
 
           python3 - <<'PY'

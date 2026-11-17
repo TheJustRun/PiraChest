@@ -1,6 +1,5 @@
 name: Announce on Discord
 
-# Reusable: called by pipeline.yml with the release tag. Can also be run on its own.
 on:
   workflow_call:
     inputs:

@@ -1,7 +1,5 @@
 name: Mirror to GitLab
 
-# Reusable: called by pipeline.yml after the build. Also runs daily as a safety net and on demand.
-# GitHub is the source of truth: GitLab gets the same commits, tags and releases.
 on:
   workflow_call:
     inputs:
@@ -77,13 +75,16 @@ jobs:
           dir="work/$TAG"
           rm -rf "$dir"; mkdir -p "$dir"
 
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$dir"
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')" -gt 0 ]; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$dir"
+          else
+            echo "$TAG has no assets on GitHub; creating the release without files."
+          fi
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
             --json name,body,publishedAt,isPrerelease > "$dir.json"
           pre="$(jq -r '.isPrerelease' "$dir.json")"
 
           LINKS='[]'
-          # Serial uploads: GitLab recommends this for files in one package version.
           for file in "$dir"/*; do
             [ -f "$file" ] || continue
             filename="$(basename "$file")"
@@ -95,7 +96,6 @@ jobs:
               '. + [{name: $name, url: $url, link_type: "package"}]' <<< "$LINKS")"
           done
 
-          # Same notes as GitHub, with download links pointing at GitLab.
           jq -r '.body' "$dir.json" > "$dir.md"
           sed -i "s|https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/|$PACKAGE_BASE/|g" "$dir.md"
           {
@@ -105,7 +105,6 @@ jobs:
             cat "$dir.md"
           } > "$dir.desc.md"
 
-          # GitLab has no pre-release flag, so mark it in the name as well.
           jq -n --arg tag "$TAG" --arg pre "$pre" \
             --slurpfile meta "$dir.json" --rawfile description "$dir.desc.md" \
             --argjson links "$LINKS" \
@@ -123,8 +122,6 @@ jobs:
           SCRIPT
           chmod +x publish_one.sh
 
-          # Oldest first, with released_at set to the GitHub publish date, so GitLab
-          # lists the newest release at the top and the oldest at the bottom.
           gh release list --repo "$GITHUB_REPOSITORY" --limit "$LIMIT" --exclude-drafts \
             --json tagName,publishedAt --jq 'sort_by(.publishedAt) | .[].tagName' > tags.txt
 

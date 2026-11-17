@@ -1,30 +1,54 @@
 name: Release pipeline
 
-# One run, in order: build + GitHub release -> README -> GitLab / SourceForge / Chocolatey -> Discord.
-# Every stage lives in its own workflow file and can also be run on its own.
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
 
-# Called workflows can only use permissions granted here.
 permissions:
   contents: write
   pull-requests: read
 
-# One pipeline at a time so two quick pushes never race on the version/release check.
 concurrency:
   group: release-pipeline
   cancel-in-progress: false
 
 jobs:
+  gate:
+    name: Check skip flag
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MSG: ${{ github.event.head_commit.message }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != "push" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA" --jq '.parents | length')" -gt 1 ]; then
+            MSG="$(gh api "repos/$GITHUB_REPOSITORY/commits?sha=$SHA&per_page=30" \
+              --jq '[.[] | select((.parents | length) == 1)][0].commit.message // ""')"
+          fi
+          if grep -qiE '(^|[[:space:]])/n([[:space:]]|$)' <<< "$MSG"; then
+            echo "Commit message contains /n; skipping the pipeline."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build and release
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     uses: ./.github/workflows/build.yml
     secrets: inherit
 
-  # Updates README.md on main for a new stable release. Runs before the GitLab
-  # mirror so GitLab receives the exact same commit (and the exact same README).
   readme:
     name: README
     needs: build
@@ -34,8 +58,6 @@ jobs:
       tag: ${{ needs.build.outputs.tag }}
     secrets: inherit
 
-  # Mirrors run on every pipeline run (not only for new versions) so they also
-  # catch up on anything they missed. A failure here never blocks the other stages.
   gitlab:
     name: GitLab
     needs: [ build, readme ]
@@ -58,8 +80,6 @@ jobs:
       tag: ${{ needs.build.outputs.tag }}
     secrets: inherit
 
-  # Announce last, once everything else has finished, whether or not a mirror
-  # failed. Only for a brand-new release.
   discord:
     name: Discord
     needs: [ build, readme, gitlab, sourceforge, chocolatey ]

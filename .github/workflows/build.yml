@@ -1,6 +1,5 @@
 name: Build PiraChest (Windows, Linux, macOS)
 
-# Reusable: called by pipeline.yml. Can also be run on its own via "Run workflow".
 on:
   workflow_call:
     outputs:
@@ -474,7 +473,14 @@ jobs:
           REPO="${{ github.repository }}"
           TAG="${{ needs.version.outputs.tag }}"
           PREV=$(gh api "repos/$REPO/releases?per_page=1" --jq '.[0].tag_name // empty')
-          FULL=$(gh api "repos/$REPO/commits/${{ github.sha }}" --jq '.commit.message' | tr -d '\r')
+          NOTES_SHA="${{ github.sha }}"
+          PARENTS=$(gh api "repos/$REPO/commits/$NOTES_SHA" --jq '.parents | length')
+          if [ "$PARENTS" -gt 1 ]; then
+            REAL=$(gh api "repos/$REPO/commits?sha=$NOTES_SHA&per_page=30" \
+              --jq '[.[] | select((.parents | length) == 1)][0].sha // empty')
+            [ -n "$REAL" ] && NOTES_SHA="$REAL"
+          fi
+          FULL=$(gh api "repos/$REPO/commits/$NOTES_SHA" --jq '.commit.message' | tr -d '\r')
           MSG=$(printf '%s\n' "$FULL" | sed '1,/^$/d' | sed '1{/^#[[:space:]]/d}' | sed '/./,$!d')
           [ -z "$MSG" ] && MSG=$(printf '%s\n' "$FULL" | sed '1{/^#[[:space:]]/d}' | sed '/./,$!d')
           [ -z "$MSG" ] && MSG="${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.display }}."

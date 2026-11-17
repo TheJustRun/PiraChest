@@ -1,6 +1,5 @@
 name: Publish to Chocolatey
 
-# Reusable: called by pipeline.yml with the release tag. Can also be run on its own.
 on:
   workflow_call:
     inputs:
@@ -54,7 +53,6 @@ jobs:
           $owner = "${{ github.repository_owner }}"
           $tag = $env:TAG
 
-          # Everything is derived from the GitHub release, so this works standalone too.
           $shaFile = Get-ChildItem release-files -Filter '*-Windows-x64.msi.sha256' | Select-Object -First 1
           if (-not $shaFile) { throw "No Windows MSI checksum found on release $tag." }
           $msi = $shaFile.Name -replace '\.sha256$', ''
