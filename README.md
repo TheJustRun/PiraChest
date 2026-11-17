@@ -6,8 +6,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/github/v/release/TheJustRun/PiraChest?include_prereleases&label=Latest%20Release" alt="Latest Release">
-  <img src="https://img.shields.io/github/downloads/TheJustRun/PiraChest/total?label=Downloads" alt="Downloads">
+  <img src="https://img.shields.io/github/v/release/TheJustRun/PiraChest?label=Stable" alt="Stable Release">
+  <img src="https://img.shields.io/github/v/release/TheJustRun/PiraChest?include_prereleases&label=Canary" alt="Canary Release">
   <img src="https://img.shields.io/github/stars/TheJustRun/PiraChest?label=Stars" alt="Stars">
   <img src="https://img.shields.io/github/issues/TheJustRun/PiraChest?label=Issues" alt="Issues">
   <img src="https://img.shields.io/badge/Status-Stable-green" alt="Stable">
