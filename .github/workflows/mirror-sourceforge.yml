@@ -65,6 +65,10 @@ jobs:
 
           # Assets plus the README.md we add (SourceForge shows it as the release notes).
           assets="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
+          if [ "$assets" -eq 0 ]; then
+            echo "$TAG has no assets on GitHub; nothing to upload."
+            exit 0
+          fi
           expected=$((assets + 1))
           listing="$(rsync -e "$SSH" --list-only "$HOST:$dest/" 2>/dev/null || true)"
           have="$(grep -c '^-' <<< "$listing" || true)"
@@ -88,11 +92,11 @@ jobs:
               | sed "s|https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/|https://sourceforge.net/projects/$SF_PROJECT/files/$TAG/|g"
           } > "$dir/README.md"
 
-          # --mkpath needs rsync >= 3.2.3 on the server (SourceForge runs 3.1.x),
-          # so create the folder on the remote side. --size-only skips files already there.
-          rsync -e "$SSH" --size-only \
-            --rsync-path="mkdir -p $dest && rsync" \
-            "$dir"/* "$HOST:$dest/"
+          # Send the whole folder (no trailing slash): rsync creates "$TAG" under the
+          # project dir by itself, so no remote shell command is needed (SourceForge's
+          # login shell prints warnings that break rsync when a remote command is used).
+          # --size-only skips files that are already there.
+          rsync -e "$SSH" -r --size-only "$dir" "$HOST:$SF_PROJECT_DIR/"
           rm -rf "$dir" "work/$TAG.json"
           SCRIPT
           chmod +x upload_one.sh
@@ -105,7 +109,14 @@ jobs:
           while read -r TAG; do
             [ -n "$TAG" ] || continue
             echo "::group::$TAG"
-            ./upload_one.sh "$TAG" || { echo "::error::Failed to upload $TAG to SourceForge."; FAILED=1; }
+            if ! ./upload_one.sh "$TAG" 2>&1 | tee upload.log; then
+              FAILED=1
+              echo "::endgroup::"
+              # Print the reason outside the collapsed group so it is visible.
+              echo "::error::Failed to upload $TAG to SourceForge. Last output:"
+              tail -n 15 upload.log
+              continue
+            fi
             echo "::endgroup::"
           done < tags.txt
 
