@@ -37,6 +37,7 @@ jobs:
   discord:
     name: Announce on Discord
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
       GH_TOKEN: ${{ github.token }}
@@ -49,7 +50,7 @@ jobs:
         run: |
           REPO="${{ github.repository }}"
           EXPECTED_CHANNEL="1548012719779749910"
-          ACTUAL_CHANNEL=$(curl -fsS "$WEBHOOK_URL" | jq -r '.channel_id')
+          ACTUAL_CHANNEL=$(curl -fsS --retry 3 --retry-all-errors "$WEBHOOK_URL" | jq -r '.channel_id')
           if [ "$ACTUAL_CHANNEL" != "$EXPECTED_CHANNEL" ]; then
             echo "::error::Webhook posts to channel $ACTUAL_CHANNEL, expected $EXPECTED_CHANNEL"
             exit 1
@@ -59,17 +60,27 @@ jobs:
           [ -n "$APP" ] || APP="${REPO#*/}"
           BODY=$(jq -r '.body' <<< "$JSON" | sed '/<!-- downloads -->/,$d' | sed -E 's/^#{2,3} (.*)$/**\1**/' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' | head -c 3800)
           URL=$(jq -r '.url' <<< "$JSON")
-          MSI=$(jq -r '[.assets[].url | select(endswith(".msi"))][0] // empty' <<< "$JSON")
-          ZIP=$(jq -r '[.assets[].url | select(contains("Windows") and endswith(".zip"))][0] // empty' <<< "$JSON")
+          COLOR=3447003
+          [ "$(jq -r '.isPrerelease' <<< "$JSON")" = "true" ] && COLOR=16705372
+          LINKS=$(jq -r '
+            def link($label; $re):
+              ([.assets[].url | select(test($re))][0]) as $u
+              | if $u then "[\($label)](\($u))" else empty end;
+            [ link("Windows installer"; "Windows-x64\\.msi$"),
+              link("Windows portable"; "Windows-x64\\.zip$"),
+              link("macOS (Apple Silicon)"; "macOS-arm64\\.dmg$"),
+              link("macOS (Intel)"; "macOS-x64\\.dmg$"),
+              link("Linux (.deb)"; "Linux-x64\\.deb$") ] | join(" | ")' <<< "$JSON")
           jq -n --arg role "<@&1548027542353477743>" --arg title "$TITLE" --arg url "$URL" \
-                --arg body "$BODY" --arg msi "$MSI" --arg zip "$ZIP" --arg app "$APP" '
+                --arg body "$BODY" --arg links "$LINKS" --arg app "$APP" --argjson color "$COLOR" '
             {username: "GitHub",
              content: $role,
              allowed_mentions: {parse: [], roles: ["1548027542353477743"]},
-             embeds: [{title: $title, url: $url, color: 5814783,
-                       description: ($body + "\n\n[Installer (MSI)](\($msi)) | [Portable (ZIP)](\($zip))"),
+             embeds: [{title: $title, url: $url, color: $color,
+                       description: ($body + (if $links != "" then "\n\n" + $links else "" end)),
+                       timestamp: (now | todate),
                        footer: {text: "\($app) Changelog"}}]}' > payload.json
-          curl -fsS -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL"
+          curl -fsS --retry 3 --retry-all-errors -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL"
 
       - name: Skip Discord
         if: env.WEBHOOK_URL == ''

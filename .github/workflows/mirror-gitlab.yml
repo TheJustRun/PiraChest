@@ -11,6 +11,10 @@ on:
         description: "Only report what would be done"
         type: boolean
         default: false
+      code_only:
+        description: "Only push code and tags, skip releases"
+        type: boolean
+        default: false
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
@@ -20,6 +24,10 @@ on:
         default: "100"
       dry_run:
         description: "Only report what would be pushed or created"
+        type: boolean
+        default: false
+      code_only:
+        description: "Only push code and tags, skip releases"
         type: boolean
         default: false
 
@@ -41,6 +49,7 @@ jobs:
       GITLAB_PROJECT: TheJustRun%2FPiraChest
       LIMIT: ${{ inputs.limit || '100' }}
       DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+      CODE_ONLY: ${{ inputs.code_only && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -62,6 +71,7 @@ jobs:
           git push $FLAGS "$GIT_URL" --tags
 
       - name: Create missing releases (oldest first, newest ends up on top)
+        if: env.CODE_ONLY != 'true'
         run: |
           set -euo pipefail
           API="https://gitlab.com/api/v4/projects/${GITLAB_PROJECT}"

@@ -27,6 +27,7 @@ jobs:
   version:
     name: Read version
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       base: ${{ steps.ver.outputs.base }}
       build: ${{ steps.ver.outputs.build }}
@@ -100,6 +101,7 @@ jobs:
     name: PyInstaller (Windows x64, onedir)
     needs: version
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -204,6 +206,7 @@ jobs:
           name: windows-package
           path: package/*
           if-no-files-found: error
+          retention-days: 3
 
   build-linux:
     name: PyInstaller (Linux ${{ matrix.arch }})
@@ -217,6 +220,7 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -318,6 +322,7 @@ jobs:
           name: linux-${{ matrix.arch }}-package
           path: package/*
           if-no-files-found: error
+          retention-days: 3
 
   build-macos:
     name: PyInstaller (macOS ${{ matrix.arch }})
@@ -331,6 +336,7 @@ jobs:
           - arch: x64
             runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -386,11 +392,13 @@ jobs:
           name: macos-${{ matrix.arch }}-package
           path: package/*
           if-no-files-found: error
+          retention-days: 3
 
   manifest:
     name: Update manifest
     needs: [ version, build-windows, build-linux, build-macos ]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -451,12 +459,14 @@ jobs:
           name: update-manifest
           path: artifacts/update-manifest.json
           if-no-files-found: error
+          retention-days: 3
 
   release:
     name: GitHub Release
     needs: [ version, build-windows, build-linux, build-macos, manifest ]
     if: needs.version.outputs.is_new == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
       pull-requests: read
@@ -465,6 +475,11 @@ jobs:
         with:
           path: release-files
           merge-multiple: true
+
+      - name: Combined checksums
+        run: |
+          cd release-files
+          sha256sum $(ls | grep -v -e '\.sha256$' -e '^SHA256SUMS.txt$') > SHA256SUMS.txt
 
       - name: Build release notes
         env:
@@ -541,7 +556,8 @@ jobs:
             fi
           } | sed -e "s|@@BASE@@|$BASE|g" -e "s|@@APP@@|$APP|g" > notes.md
 
-      - uses: softprops/action-gh-release@v2
+      - id: release
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: "${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.display }}"
@@ -551,3 +567,15 @@ jobs:
           make_latest: ${{ needs.version.outputs.canary != '1' }}
           fail_on_unmatched_files: true
           files: release-files/*
+
+      - name: Summary
+        run: |
+          {
+            echo "### Released [${{ needs.version.outputs.tag }}](${{ steps.release.outputs.url }})"
+            echo
+            echo "| File | Size |"
+            echo "| --- | --- |"
+            for f in release-files/*; do
+              printf '| %s | %s |\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,6 +1,10 @@
 name: Update README
 
 on:
+  push:
+    branches: [ main ]
+    paths:
+      - README.md
   workflow_call:
     inputs:
       tag:
@@ -18,9 +22,19 @@ permissions:
   contents: write
 
 jobs:
+  gitlab:
+    name: GitLab (code only)
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/mirror-gitlab.yml
+    with:
+      code_only: true
+    secrets: inherit
+
   readme:
     name: Update README
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.tag }}

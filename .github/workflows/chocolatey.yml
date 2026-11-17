@@ -21,6 +21,7 @@ jobs:
   chocolatey:
     name: Publish to Chocolatey
     runs-on: windows-latest
+    timeout-minutes: 20
     env:
       CHOCO_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
       GH_TOKEN: ${{ github.token }}
@@ -119,8 +120,14 @@ jobs:
 
           choco pack pkg/pirachest.nuspec --output-directory pkg
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          choco push "pkg/pirachest.$ver.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCO_KEY
-          exit $LASTEXITCODE
+          choco push "pkg/pirachest.$ver.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCO_KEY 2>&1 | Tee-Object -Variable pushLog
+          if ($LASTEXITCODE -ne 0) {
+            if (($pushLog | Out-String) -match 'already exists') {
+              Write-Warning "pirachest $ver is already on Chocolatey; nothing to do."
+              exit 0
+            }
+            exit $LASTEXITCODE
+          }
 
 
       - name: Skip Chocolatey
