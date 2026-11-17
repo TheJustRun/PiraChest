@@ -1,0 +1,77 @@
+name: Announce on Discord
+
+# Reusable: called by pipeline.yml with the release tag. Can also be run on its own.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to announce"
+        type: string
+        required: true
+      title:
+        description: "Embed title (defaults to the release name)"
+        type: string
+        default: ""
+      app_name:
+        description: "Footer name (defaults to the repository name)"
+        type: string
+        default: ""
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to announce (e.g. v1.1.0-stable-2)"
+        type: string
+        required: true
+      title:
+        description: "Embed title (optional)"
+        type: string
+        default: ""
+      app_name:
+        description: "Footer name (optional)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  discord:
+    name: Announce on Discord
+    runs-on: ubuntu-latest
+    env:
+      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      TITLE: ${{ inputs.title }}
+      APP: ${{ inputs.app_name }}
+    steps:
+      - name: Post release to Discord
+        if: env.WEBHOOK_URL != ''
+        run: |
+          REPO="${{ github.repository }}"
+          EXPECTED_CHANNEL="1548012719779749910"
+          ACTUAL_CHANNEL=$(curl -fsS "$WEBHOOK_URL" | jq -r '.channel_id')
+          if [ "$ACTUAL_CHANNEL" != "$EXPECTED_CHANNEL" ]; then
+            echo "::error::Webhook posts to channel $ACTUAL_CHANNEL, expected $EXPECTED_CHANNEL"
+            exit 1
+          fi
+          JSON=$(gh release view "$TAG" --repo "$REPO" --json name,body,url,isPrerelease,assets)
+          [ -n "$TITLE" ] || TITLE=$(jq -r '.name' <<< "$JSON")
+          [ -n "$APP" ] || APP="${REPO#*/}"
+          BODY=$(jq -r '.body' <<< "$JSON" | sed '/<!-- downloads -->/,$d' | sed -E 's/^#{2,3} (.*)$/**\1**/' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' | head -c 3800)
+          URL=$(jq -r '.url' <<< "$JSON")
+          MSI=$(jq -r '[.assets[].url | select(endswith(".msi"))][0] // empty' <<< "$JSON")
+          ZIP=$(jq -r '[.assets[].url | select(contains("Windows") and endswith(".zip"))][0] // empty' <<< "$JSON")
+          jq -n --arg role "<@&1548027542353477743>" --arg title "$TITLE" --arg url "$URL" \
+                --arg body "$BODY" --arg msi "$MSI" --arg zip "$ZIP" --arg app "$APP" '
+            {username: "GitHub",
+             content: $role,
+             allowed_mentions: {parse: [], roles: ["1548027542353477743"]},
+             embeds: [{title: $title, url: $url, color: 5814783,
+                       description: ($body + "\n\n[Installer (MSI)](\($msi)) | [Portable (ZIP)](\($zip))"),
+                       footer: {text: "\($app) Changelog"}}]}' > payload.json
+          curl -fsS -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL"
+
+      - name: Skip Discord
+        if: env.WEBHOOK_URL == ''
+        run: echo "::warning::WEBHOOK_URL is not set; skipping Discord announcement."

@@ -1,8 +1,24 @@
 name: Build PiraChest (Windows, Linux, macOS)
 
+# Reusable: called by pipeline.yml. Can also be run on its own via "Run workflow".
 on:
-  push:
-    branches: [ main ]
+  workflow_call:
+    outputs:
+      tag:
+        description: "Git tag of this version"
+        value: ${{ jobs.version.outputs.tag }}
+      is_new:
+        description: "'true' when a new GitHub release was created"
+        value: ${{ jobs.version.outputs.is_new }}
+      canary:
+        description: "'1' for canary builds"
+        value: ${{ jobs.version.outputs.canary }}
+      display:
+        description: "Human readable version"
+        value: ${{ jobs.version.outputs.display }}
+      app_name:
+        description: "Application name"
+        value: ${{ jobs.version.outputs.app_name }}
   workflow_dispatch:
 
 permissions:
@@ -529,225 +545,3 @@ jobs:
           make_latest: ${{ needs.version.outputs.canary != '1' }}
           fail_on_unmatched_files: true
           files: release-files/*
-
-  gitlab-release:
-    name: Publish GitLab Release
-    needs: [ version, build-windows, build-linux, build-macos, manifest, release ]
-    if: needs.version.outputs.is_new == 'true' && needs.release.result == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: release-files
-          merge-multiple: true
-
-      - name: Upload assets and create GitLab release
-        env:
-          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
-          GH_TOKEN: ${{ github.token }}
-          GITLAB_PROJECT: TheJustRun%2FPiraChest
-          TAG: ${{ needs.version.outputs.tag }}
-          RELEASE_NAME: ${{ needs.version.outputs.app_name }} ${{ needs.version.outputs.display }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "$GITLAB_TOKEN" ]; then
-            echo "::error::GITLAB_TOKEN secret is missing. Add a GitLab project access token with the api scope."
-            exit 1
-          fi
-
-          API="https://gitlab.com/api/v4/projects/$GITLAB_PROJECT"
-          PACKAGE_BASE="$API/packages/generic/PiraChest/$TAG"
-          LINKS='[]'
-
-          # Upload serially: GitLab recommends sequential uploads for files in one package version.
-          for file in release-files/*; do
-            [ -f "$file" ] || continue
-            filename="$(basename "$file")"
-            echo "Uploading $filename to GitLab..."
-            curl --fail-with-body --silent --show-error \
-              --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-              --upload-file "$file" \
-              "$PACKAGE_BASE/$filename"
-
-            asset_url="$PACKAGE_BASE/$filename"
-            LINKS="$(jq -c --arg name "$filename" --arg url "$asset_url" \
-              '. + [{name: $name, url: $url, link_type: "package"}]' <<< "$LINKS")"
-          done
-
-          # Reuse the exact release notes generated for the GitHub release,
-          # but point download links at the GitLab-hosted copies.
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
-          sed -i "s|https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/|$PACKAGE_BASE/|g" notes.md
-
-          jq -n \
-            --arg tag "$TAG" \
-            --arg name "$RELEASE_NAME" \
-            --arg ref "$GITHUB_SHA" \
-            --rawfile description notes.md \
-            --argjson links "$LINKS" \
-            '{tag_name: $tag, name: $name, ref: $ref, description: $description, assets: {links: $links}}' \
-            > gitlab-release.json
-
-          echo "Creating GitLab release $TAG..."
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-            --header "Content-Type: application/json" \
-            --data-binary @gitlab-release.json \
-            "$API/releases"
-
-  sourceforge-release:
-    name: Publish SourceForge Release
-    needs: [ version, release ]
-    if: needs.version.outputs.is_new == 'true' && needs.release.result == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: release-files
-          merge-multiple: true
-
-      - name: Upload to SourceForge
-        env:
-          SF_KEY: ${{ secrets.SOURCEFORGE_SSH_KEY }}
-          TAG: ${{ needs.version.outputs.tag }}
-        run: |
-          set -euo pipefail
-          if [ -z "$SF_KEY" ]; then
-            echo "::error::SOURCEFORGE_SSH_KEY secret is missing. Add the private key registered on your SourceForge account."
-            exit 1
-          fi
-          install -m 600 /dev/null sf_key
-          printf '%s\n' "$SF_KEY" > sf_key
-          rsync -e "ssh -i sf_key -o StrictHostKeyChecking=accept-new" --mkpath release-files/* \
-            "justrun@frs.sourceforge.net:/home/frs/project/pirachest/$TAG/"
-
-  discord:
-    name: Announce on Discord
-    needs: [ version, release ]
-    if: needs.version.outputs.is_new == 'true'
-    runs-on: ubuntu-latest
-    env:
-      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Post release to Discord
-        if: env.WEBHOOK_URL != ''
-        run: |
-          TAG="${{ needs.version.outputs.tag }}"
-          REPO="${{ github.repository }}"
-          EXPECTED_CHANNEL="1548012719779749910"
-          ACTUAL_CHANNEL=$(curl -fsS "$WEBHOOK_URL" | jq -r '.channel_id')
-          if [ "$ACTUAL_CHANNEL" != "$EXPECTED_CHANNEL" ]; then
-            echo "::error::Webhook posts to channel $ACTUAL_CHANNEL, expected $EXPECTED_CHANNEL"
-            exit 1
-          fi
-          JSON=$(gh release view "$TAG" --repo "$REPO" --json body,url,isPrerelease,assets)
-          BODY=$(jq -r '.body' <<< "$JSON" | sed '/<!-- downloads -->/,$d' | sed -E 's/^#{2,3} (.*)$/**\1**/' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' | head -c 3800)
-          URL=$(jq -r '.url' <<< "$JSON")
-          MSI=$(jq -r '[.assets[].url | select(endswith(".msi"))][0] // empty' <<< "$JSON")
-          ZIP=$(jq -r '[.assets[].url | select(contains("Windows") and endswith(".zip"))][0] // empty' <<< "$JSON")
-          jq -n --arg role "<@&1548027542353477743>" --arg title "${{ needs.version.outputs.display }}" --arg url "$URL" \
-                --arg body "$BODY" --arg msi "$MSI" --arg zip "$ZIP" --arg repo "$REPO" --arg app "${{ needs.version.outputs.app_name }}" '
-            {username: "GitHub",
-             avatar_url: "https://github.com/\($repo | split("/")[0]).png",
-             content: $role,
-             allowed_mentions: {parse: [], roles: ["1548027542353477743"]},
-             embeds: [{title: $title, url: $url, color: 5814783,
-                       description: ($body + "\n\n[Installer (MSI)](\($msi)) | [Portable (ZIP)](\($zip))"),
-                       footer: {text: "\($app) Changelog"}}]}' > payload.json
-          curl -fsS -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL"
-
-  chocolatey:
-    name: Publish to Chocolatey
-    needs: [ version, release ]
-    if: needs.version.outputs.is_new == 'true' && needs.version.outputs.canary != '1'
-    runs-on: windows-latest
-    env:
-      CHOCO_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: windows-package
-          path: release-files
-
-      - name: Package and push (skipped without API key)
-        if: env.CHOCO_KEY != ''
-        shell: pwsh
-        run: |
-          $ver = "${{ needs.version.outputs.base }}"
-          $build = "${{ needs.version.outputs.build }}"
-          if ($build) { $ver = "$ver.$build" }
-          $tag = "${{ needs.version.outputs.tag }}"
-          $repo = "${{ github.repository }}"
-          $owner = "${{ github.repository_owner }}"
-          $msi = "PiraChest-${{ needs.version.outputs.base_build }}-Windows-x64.msi"
-          $sha = (Get-Content "release-files/$msi.sha256").Split()[0]
-          $url = "https://github.com/$repo/releases/download/$tag/$msi"
-          $iconUrl = "https://github.com/$repo/releases/download/$tag/PiraChest-icon.png"
-
-          New-Item -ItemType Directory -Force pkg/tools | Out-Null
-
-          @'
-          $ErrorActionPreference = 'Stop'
-          if (-not [Environment]::Is64BitOperatingSystem) { throw 'PiraChest is x64 only.' }
-          Install-ChocolateyPackage `
-            -PackageName $env:ChocolateyPackageName `
-            -FileType 'msi' `
-            -SilentArgs '/qn /norestart' `
-            -Url64bit '__URL__' `
-            -Checksum64 '__CHECKSUM__' `
-            -ChecksumType64 'sha256' `
-            -ValidExitCodes @(0, 3010)
-          $dir = Join-Path $env:LOCALAPPDATA 'Programs\PiraChest'
-          $exe = Join-Path $dir 'PiraChest.exe'
-          if (-not (Test-Path $exe)) { throw "PiraChest.exe missing at $exe after install." }
-          Set-Content -Path (Join-Path $dir '.pirachest-choco') -Value '1' -Encoding ascii
-          Install-BinFile -Name 'pirachest' -Path $exe
-          '@.Replace('__URL__', $url).Replace('__CHECKSUM__', $sha) | Set-Content pkg/tools/chocolateyinstall.ps1 -Encoding utf8NoBOM
-
-          @'
-          $ErrorActionPreference = 'Stop'
-          Uninstall-BinFile -Name 'pirachest'
-          $keys = Get-UninstallRegistryKey -SoftwareName 'PiraChest*'
-          foreach ($key in $keys) {
-            Start-ChocolateyProcessAsAdmin -Statements "/x $($key.PSChildName) /qn /norestart" -ExeToRun 'msiexec.exe' -ValidExitCodes @(0, 3010, 1605, 1614, 1641)
-          }
-          '@ | Set-Content pkg/tools/chocolateyuninstall.ps1 -Encoding utf8NoBOM
-
-          @"
-          <?xml version="1.0" encoding="utf-8"?>
-          <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
-            <metadata>
-              <id>pirachest</id>
-              <version>$ver</version>
-              <title>PiraChest</title>
-              <iconUrl>$iconUrl</iconUrl>
-              <authors>$owner</authors>
-              <projectUrl>https://github.com/$repo</projectUrl>
-              <projectSourceUrl>https://github.com/$repo</projectSourceUrl>
-              <packageSourceUrl>https://github.com/$repo</packageSourceUrl>
-              <bugTrackerUrl>https://github.com/$repo/issues</bugTrackerUrl>
-              <licenseUrl>https://github.com/$repo/blob/main/LICENSE</licenseUrl>
-              <requireLicenseAcceptance>false</requireLicenseAcceptance>
-              <releaseNotes>https://github.com/$repo/releases/tag/$tag</releaseNotes>
-              <tags>pirachest windows desktop</tags>
-              <summary>PiraChest for Windows (x64).</summary>
-              <description>PiraChest is a Windows desktop application for games, movies, TV, anime, manga, books, and ROMs.</description>
-            </metadata>
-            <files>
-              <file src="tools\**" target="tools" />
-            </files>
-          </package>
-          "@ | Set-Content pkg/pirachest.nuspec -Encoding utf8NoBOM
-
-          choco pack pkg/pirachest.nuspec --output-directory pkg
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          choco push "pkg/pirachest.$ver.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCO_KEY
-          exit $LASTEXITCODE
-
-      - name: Skip Chocolatey
-        if: env.CHOCO_KEY == ''
-        shell: pwsh
-        run: Write-Warning 'CHOCOLATEY_API_KEY is not set; skipping Chocolatey publish.'

@@ -1003,7 +1003,7 @@ class HomePage(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.applicationStateChanged.connect(self._on_app_state_changed)
-        QTimer.singleShot(2500, self._end_boot)
+        QTimer.singleShot(1200, self._end_boot)
 
     def _end_boot(self) -> None:
         self._booting = False
@@ -1019,7 +1019,7 @@ class HomePage(QWidget):
         super().showEvent(event)
         self._rot_timer.start()
         if self._features_timer.isActive():
-            self._features_timer.start(300)
+            self._features_timer.start(0)
         self.refresh()
         self._splash_timer.start()
 
@@ -1125,7 +1125,7 @@ class HomePage(QWidget):
             self.refresh()
 
     _UPDATES = ('_fetch_repacks', '_fetch_tv', '_fetch_anime', '_fetch_manga', '_refresh_playlists', 'refresh')
-    _STAGGER_MS = (0, 260, 520, 780, 180, 120)
+    _STAGGER_MS = (0, 120, 240, 360, 60, 0)
 
     def on_features_changed(self, *_args) -> None:
         self._gen += 1

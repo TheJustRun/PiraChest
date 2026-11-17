@@ -9,13 +9,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from io import TextIOWrapper
 from typing import Iterator, Optional
 
 from .console_mapper import _CONSOLE_CANONICAL, _normalize_db_console, classify_torrent_name
 from .console_variants import guess_variant
-from .database import init_db, replace_roms_streaming
+from .database import count_roms, get_meta, init_db, replace_roms_streaming, set_meta
 from ..config import network
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 INDEX_ZIP_URL = "https://github.com/Caprico1/Minerva-archive-ids/archive/refs/heads/main.zip"
 TORRENTS_URL = network.cdn_base.rstrip("/") + "/"
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
+SHA_URL = "https://api.github.com/repos/Caprico1/Minerva-archive-ids/commits/main"
 
 _SKIP_PROVIDERS = frozenset({
     "bitsavers", "Internet Archive", "Laserdisc Collection", "Hardware Target Game Database",
@@ -53,17 +55,32 @@ def _fetch_torrent_names() -> dict[str, str]:
     return {_torrent_key(n): n for n in names}
 
 
+def _remote_sha() -> Optional[str]:
+    try:
+        req = urllib.request.Request(SHA_URL, headers={**_HEADERS, "Accept": "application/vnd.github.sha"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read().decode("ascii", errors="replace").strip() or None
+    except (urllib.error.URLError, OSError):
+        return None
+
+
 def _download_index():
     logger.info("Downloading index from %s", INDEX_ZIP_URL)
-    tmp = tempfile.TemporaryFile()
-    try:
-        req = urllib.request.Request(INDEX_ZIP_URL, headers=_HEADERS)
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            shutil.copyfileobj(resp, tmp, 1 << 20)
-    except (urllib.error.URLError, OSError) as exc:
-        tmp.close()
-        raise RuntimeError(f"Failed to download index ZIP: {exc}") from exc
-    return tmp
+    last: Exception | None = None
+    for _ in range(3):
+        tmp = tempfile.TemporaryFile()
+        try:
+            req = urllib.request.Request(INDEX_ZIP_URL, headers=_HEADERS)
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                shutil.copyfileobj(resp, tmp, 1 << 20)
+            tmp.seek(0)
+            if not zipfile.is_zipfile(tmp):
+                raise OSError("downloaded file is not a valid ZIP")
+            return tmp
+        except (urllib.error.URLError, OSError) as exc:
+            tmp.close()
+            last = exc
+    raise RuntimeError(f"Failed to download index ZIP: {last}") from last
 
 
 @lru_cache(maxsize=None)
@@ -151,14 +168,25 @@ def sync_index(
     db_path: Optional[str] = None,
     batch_size: int = 2000,
     on_progress=None,
+    force: bool = False,
 ) -> int:
     init_db(db_path)
-    with _download_index() as tmp, zipfile.ZipFile(tmp) as zf:
-        total = replace_roms_streaming(
-            _iter_rows(zf, _fetch_torrent_names()),
-            db_path,
-            batch_size=batch_size,
-            on_batch=on_progress,
-        )
+    sha = _remote_sha()
+    if sha and not force and sha == get_meta("index_sha", db_path):
+        total = count_roms(db_path=db_path)
+        if total:
+            logger.info("Index unchanged upstream — %d ROMs already in database.", total)
+            return total
+    with ThreadPoolExecutor(1) as pool:
+        names = pool.submit(_fetch_torrent_names)
+        with _download_index() as tmp, zipfile.ZipFile(tmp) as zf:
+            total = replace_roms_streaming(
+                _iter_rows(zf, names.result()),
+                db_path,
+                batch_size=batch_size,
+                on_batch=on_progress,
+            )
+    if sha:
+        set_meta("index_sha", sha, db_path)
     logger.info("Sync complete. %d ROMs in database.", total)
     return total

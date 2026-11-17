@@ -1,0 +1,131 @@
+name: Publish to Chocolatey
+
+# Reusable: called by pipeline.yml with the release tag. Can also be run on its own.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to publish"
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v1.1.0-stable-2)"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  chocolatey:
+    name: Publish to Chocolatey
+    runs-on: windows-latest
+    env:
+      CHOCO_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check release is stable
+        id: gate
+        shell: pwsh
+        run: |
+          $rel = gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json isPrerelease | ConvertFrom-Json
+          if ($rel.isPrerelease) {
+            Write-Warning "$env:TAG is a pre-release; Chocolatey only gets stable builds."
+            "skip=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "skip=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Download MSI checksum from the release
+        if: steps.gate.outputs.skip != 'true' && env.CHOCO_KEY != ''
+        shell: pwsh
+        run: |
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern '*-Windows-x64.msi.sha256' --dir release-files
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package and push
+        if: steps.gate.outputs.skip != 'true' && env.CHOCO_KEY != ''
+        shell: pwsh
+        run: |
+          $repo = "${{ github.repository }}"
+          $owner = "${{ github.repository_owner }}"
+          $tag = $env:TAG
+
+          # Everything is derived from the GitHub release, so this works standalone too.
+          $shaFile = Get-ChildItem release-files -Filter '*-Windows-x64.msi.sha256' | Select-Object -First 1
+          if (-not $shaFile) { throw "No Windows MSI checksum found on release $tag." }
+          $msi = $shaFile.Name -replace '\.sha256$', ''
+          $baseBuild = $msi -replace '^PiraChest-', '' -replace '-Windows-x64\.msi$', ''
+          $ver = $baseBuild -replace '-', '.'
+          $sha = (Get-Content $shaFile.FullName).Split()[0]
+          $url = "https://github.com/$repo/releases/download/$tag/$msi"
+          $iconUrl = "https://github.com/$repo/releases/download/$tag/PiraChest-icon.png"
+
+          New-Item -ItemType Directory -Force pkg/tools | Out-Null
+
+          @'
+          $ErrorActionPreference = 'Stop'
+          if (-not [Environment]::Is64BitOperatingSystem) { throw 'PiraChest is x64 only.' }
+          Install-ChocolateyPackage `
+            -PackageName $env:ChocolateyPackageName `
+            -FileType 'msi' `
+            -SilentArgs '/qn /norestart' `
+            -Url64bit '__URL__' `
+            -Checksum64 '__CHECKSUM__' `
+            -ChecksumType64 'sha256' `
+            -ValidExitCodes @(0, 3010)
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\PiraChest'
+          $exe = Join-Path $dir 'PiraChest.exe'
+          if (-not (Test-Path $exe)) { throw "PiraChest.exe missing at $exe after install." }
+          Set-Content -Path (Join-Path $dir '.pirachest-choco') -Value '1' -Encoding ascii
+          Install-BinFile -Name 'pirachest' -Path $exe
+          '@.Replace('__URL__', $url).Replace('__CHECKSUM__', $sha) | Set-Content pkg/tools/chocolateyinstall.ps1 -Encoding utf8NoBOM
+
+          @'
+          $ErrorActionPreference = 'Stop'
+          Uninstall-BinFile -Name 'pirachest'
+          $keys = Get-UninstallRegistryKey -SoftwareName 'PiraChest*'
+          foreach ($key in $keys) {
+            Start-ChocolateyProcessAsAdmin -Statements "/x $($key.PSChildName) /qn /norestart" -ExeToRun 'msiexec.exe' -ValidExitCodes @(0, 3010, 1605, 1614, 1641)
+          }
+          '@ | Set-Content pkg/tools/chocolateyuninstall.ps1 -Encoding utf8NoBOM
+
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+            <metadata>
+              <id>pirachest</id>
+              <version>$ver</version>
+              <title>PiraChest</title>
+              <iconUrl>$iconUrl</iconUrl>
+              <authors>$owner</authors>
+              <projectUrl>https://github.com/$repo</projectUrl>
+              <projectSourceUrl>https://github.com/$repo</projectSourceUrl>
+              <packageSourceUrl>https://github.com/$repo</packageSourceUrl>
+              <bugTrackerUrl>https://github.com/$repo/issues</bugTrackerUrl>
+              <licenseUrl>https://github.com/$repo/blob/main/LICENSE</licenseUrl>
+              <requireLicenseAcceptance>false</requireLicenseAcceptance>
+              <releaseNotes>https://github.com/$repo/releases/tag/$tag</releaseNotes>
+              <tags>pirachest windows desktop</tags>
+              <summary>PiraChest for Windows (x64).</summary>
+              <description>PiraChest is a Windows desktop application for games, movies, TV, anime, manga, books, and ROMs.</description>
+            </metadata>
+            <files>
+              <file src="tools\**" target="tools" />
+            </files>
+          </package>
+          "@ | Set-Content pkg/pirachest.nuspec -Encoding utf8NoBOM
+
+          choco pack pkg/pirachest.nuspec --output-directory pkg
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          choco push "pkg/pirachest.$ver.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCO_KEY
+          exit $LASTEXITCODE
+
+
+      - name: Skip Chocolatey
+        if: steps.gate.outputs.skip != 'true' && env.CHOCO_KEY == ''
+        shell: pwsh
+        run: Write-Warning 'CHOCOLATEY_API_KEY is not set; skipping Chocolatey publish.'

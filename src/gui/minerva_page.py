@@ -6,12 +6,12 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFontMetrics, QGuiApplication, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QSizePolicy, QSplitter, QStackedWidget,
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QSizePolicy, QStackedWidget,
                                QVBoxLayout, QWidget)
-from qfluentwidgets import (BodyLabel, CardWidget, CaptionLabel, CheckBox, ComboBox, FluentIcon,
+from qfluentwidgets import (CardWidget, CaptionLabel, CheckBox, ComboBox, FluentIcon,
                             IconWidget, IndeterminateProgressBar, LineEdit, PrimaryPushButton,
                             PrimaryToolButton, PushButton, SearchLineEdit,
-                            StrongBodyLabel, SubtitleLabel, ToolButton, TransparentToolButton)
+                            StrongBodyLabel, TransparentToolButton)
 from qfluentwidgets.components.widgets.combo_box import ComboBoxMenu
 
 from src.core.minerva import console_variants
@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 30
 SEARCH_DEBOUNCE_MS = 350
-DETAILS_WIDTH = 340
 
 
 def _clean_query(text: str) -> str:
@@ -98,25 +97,24 @@ def make_elided_label() -> _ElidedLabel:
 
 
 class RomCardWidget(CardWidget):
-    rom_selected = Signal(dict)
     download_clicked = Signal(dict)
     selection_toggled = Signal(dict, bool)
 
     def __init__(self, rom: dict, parent=None):
         super().__init__(parent)
         self._rom = rom
-        self.setFixedHeight(60)
+        self.setFixedHeight(46)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setProperty('active', False)
+        self.setProperty('selected', False)
         row = QHBoxLayout(self)
-        row.setContentsMargins(12, 6, 10, 6)
-        row.setSpacing(10)
+        row.setContentsMargins(10, 4, 8, 4)
+        row.setSpacing(8)
         self._select_chk = CheckBox()
         self._select_chk.setFixedWidth(20)
-        self._select_chk.toggled.connect(lambda checked: self.selection_toggled.emit(self._rom, checked))
+        self._select_chk.toggled.connect(self._on_toggled)
         row.addWidget(self._select_chk, 0, Qt.AlignmentFlag.AlignVCenter)
         text = QVBoxLayout()
-        text.setSpacing(1)
+        text.setSpacing(0)
         text.setContentsMargins(0, 0, 0, 0)
         self._title_lbl = make_elided_label()
         self._sub_lbl = CaptionLabel('')
@@ -128,7 +126,7 @@ class RomCardWidget(CardWidget):
         text.addStretch(1)
         row.addLayout(text, 1)
         self._dl_btn = PrimaryToolButton(accent_icon('minerva.tile_download', FluentIcon.DOWNLOAD), self)
-        self._dl_btn.setFixedSize(34, 34)
+        self._dl_btn.setFixedSize(28, 28)
         self._dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._dl_btn.clicked.connect(lambda _=False: self.download_clicked.emit(self._rom))
         row.addWidget(self._dl_btn, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -141,149 +139,91 @@ class RomCardWidget(CardWidget):
     def _render(self) -> None:
         rom = self._rom
         self._title_lbl.set_full_text(str(rom.get('title', '—') or '—'))
-        parts = [str(p) for p in (rom.get('console'), rom.get('source'), rom.get('file_size')) if p]
+        parts = [str(p) for p in (rom.get('console'), rom.get('source')) if p]
         self._sub_lbl.setText('  •  '.join(parts) if parts else tr('home.unknown'))
 
     @property
     def rom(self) -> dict:
         return self._rom
 
-    def set_rom(self, rom: dict, checked: bool = False, active: bool = False) -> None:
+    def set_rom(self, rom: dict, checked: bool = False) -> None:
         self._rom = rom
         self._render()
         self.set_checked(checked)
-        self.set_active(active)
+
+    def _mark(self, checked: bool) -> None:
+        self.setProperty('selected', checked)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._mark(checked)
+        self.selection_toggled.emit(self._rom, checked)
 
     def set_checked(self, checked: bool) -> None:
         self._select_chk.blockSignals(True)
         self._select_chk.setChecked(checked)
         self._select_chk.blockSignals(False)
-
-    def set_active(self, active: bool) -> None:
-        if bool(self.property('active')) == active:
-            return
-        self.setProperty('active', active)
-        self.style().unpolish(self)
-        self.style().polish(self)
-        self.update()
+        self._mark(checked)
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
         if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
-            self.rom_selected.emit(self._rom)
+            self._select_chk.toggle()
 
 
-class DetailsPanel(QWidget):
-    download_clicked = Signal(dict)
-    closed = Signal()
+class _Pager(QWidget):
+    go = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._rom: dict = {}
-        self.setMinimumWidth(280)
-        self.setMaximumWidth(400)
-        root = QVBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 12)
-        root.setSpacing(8)
+        self._page = 0
+        self._pages = 1
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
+        self._first, self._prev, self._next, self._last = (TransparentToolButton(FluentIcon.LEFT_ARROW, self) for _ in range(4))
+        for btn in (self._first, self._prev, self._next, self._last):
+            btn.setFixedSize(26, 26)
+        self._first.clicked.connect(lambda: self.go.emit(0))
+        self._prev.clicked.connect(lambda: self.go.emit(self._page - 1))
+        self._next.clicked.connect(lambda: self.go.emit(self._page + 1))
+        self._last.clicked.connect(lambda: self.go.emit(1 << 30))
+        self._input = LineEdit()
+        self._input.setMaxLength(6)
+        self._input.setFixedSize(76, 26)
+        self._input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._input.returnPressed.connect(self._jump)
+        self._total = CaptionLabel('')
+        for w in (self._first, self._prev, self._input, self._total, self._next, self._last):
+            row.addWidget(w, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        head = QHBoxLayout()
-        head.setSpacing(4)
-        self._title_lbl = SubtitleLabel('')
-        self._title_lbl.setWordWrap(True)
-        self._title_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        head.addWidget(self._title_lbl, 1, Qt.AlignmentFlag.AlignTop)
-        self._close_btn = TransparentToolButton(_icon('CLOSE', FluentIcon.CANCEL), self)
-        self._close_btn.setFixedSize(28, 28)
-        self._close_btn.clicked.connect(self.closed.emit)
-        head.addWidget(self._close_btn, 0, Qt.AlignmentFlag.AlignTop)
-        root.addLayout(head)
+    def _jump(self) -> None:
+        try:
+            self.go.emit(int(self._input.text()) - 1)
+        except ValueError:
+            self.set_state(self._page, self._pages)
 
-        self._info_lbls = [CaptionLabel('') for _ in range(7)]
-        for lbl in self._info_lbls:
-            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            lbl.setWordWrap(True)
-            root.addWidget(lbl)
+    def set_state(self, page: int, pages: int) -> None:
+        self._page, self._pages = page, pages
+        self._first.setEnabled(page > 0)
+        self._prev.setEnabled(page > 0)
+        self._next.setEnabled(page < pages - 1)
+        self._last.setEnabled(page < pages - 1)
+        self._input.setText(str(page + 1))
+        self._total.setText(tr('home.page_of_total', default='/ {pages}', pages=f'{pages:,}'))
 
-        self._desc_title_lbl = StrongBodyLabel('')
-        root.addSpacing(4)
-        root.addWidget(self._desc_title_lbl)
-        scroll = make_smooth_scroll_area()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet('QScrollArea { background: transparent; border: none; }')
-        scroll.viewport().setStyleSheet('background: transparent;')
-        body = QWidget()
-        body.setStyleSheet('background: transparent;')
-        body_l = QVBoxLayout(body)
-        body_l.setContentsMargins(0, 0, 4, 0)
-        self._desc_lbl = BodyLabel('')
-        self._desc_lbl.setWordWrap(True)
-        self._desc_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._desc_lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        body_l.addWidget(self._desc_lbl)
-        body_l.addStretch(1)
-        scroll.setWidget(body)
-        root.addWidget(scroll, 1)
-
-        self._copy_btn = PushButton(_icon('COPY', FluentIcon.DOCUMENT), '')
-        self._copy_btn.clicked.connect(self._copy_title)
-        root.addWidget(self._copy_btn)
-        self._dl_btn = PrimaryPushButton(accent_icon('minerva.detail_download', FluentIcon.DOWNLOAD), '')
-        self._dl_btn.setEnabled(False)
-        self._dl_btn.clicked.connect(self._on_download)
-        root.addWidget(self._dl_btn)
-        register_locale_refresh(self, self._apply_locale)
-        register_theme_refresh(self, self._apply_theme)
-
-    def _apply_theme(self, *_args) -> None:
-        self._dl_btn.setIcon(accent_icon('minerva.detail_download', FluentIcon.DOWNLOAD))
-
-    def _apply_locale(self) -> None:
-        self._dl_btn.setText(tr('home.download_rom'))
-        self._copy_btn.setText(tr('home.copy_title', default='Copy title'))
-        self._close_btn.setToolTip(tr('home.close_details', default='Close details'))
-        self._render()
-
-    def _render(self) -> None:
-        rom = self._rom
-        self._desc_title_lbl.setText(tr('rom_details.description_title'))
-        if not rom:
-            self._title_lbl.setText(tr('home.select_a_rom'))
-            for lbl in self._info_lbls:
-                lbl.setText('')
-                lbl.setVisible(False)
-            self._desc_lbl.setText(tr('rom_details.no_description'))
-            return
-        self._title_lbl.setText(str(rom.get('title', '—') or '—'))
-        size_val = rom.get('file_size') or rom.get('file_size_bytes')
-        lines = [
-            tr('rom_details.console', value=rom.get('console') or '—'),
-            tr('rom_details.author', value=rom['author']) if rom.get('author') else '',
-            tr('rom_details.size', value=size_val) if size_val else tr('rom_details.size_unknown'),
-            tr('rom_details.source', value=rom.get('source') or '—'),
-            tr('rom_details.region', value=rom['region']) if rom.get('region') else '',
-            tr('rom_details.language', value=rom['lang']) if rom.get('lang') else '',
-            tr('rom_details.date', value=rom['date']) if rom.get('date') else '',
-        ]
-        for lbl, text in zip(self._info_lbls, lines, strict=True):
-            lbl.setText(text)
-            lbl.setVisible(bool(text))
-        desc = rom.get('description')
-        self._desc_lbl.setText(str(desc) if desc and desc != 'None' else tr('rom_details.no_description'))
-
-    def select_rom(self, rom: dict) -> None:
-        self._rom = rom if isinstance(rom, dict) and rom else {}
-        self._dl_btn.setEnabled(bool(self._rom))
-        self._copy_btn.setEnabled(bool(self._rom))
-        self._render()
-
-    def _copy_title(self) -> None:
-        if self._rom:
-            QGuiApplication.clipboard().setText(str(self._rom.get('title', '') or ''))
-
-    def _on_download(self) -> None:
-        if self._rom:
-            self.download_clicked.emit(self._rom)
+    def retranslate(self, rtl: bool) -> None:
+        back, fwd = (FluentIcon.RIGHT_ARROW, FluentIcon.LEFT_ARROW) if rtl else (FluentIcon.LEFT_ARROW, FluentIcon.RIGHT_ARROW)
+        first, last = (_icon('PAGE_RIGHT', back), _icon('PAGE_LEFT', fwd)) if rtl else (_icon('PAGE_LEFT', back), _icon('PAGE_RIGHT', fwd))
+        for btn, icon, tip in ((self._first, first, tr('home.first_page', default='First page')),
+                               (self._prev, back, tr('home.prev_page', default='Previous page')),
+                               (self._next, fwd, tr('home.next_page', default='Next page')),
+                               (self._last, last, tr('home.last_page', default='Last page'))):
+            btn.setIcon(icon)
+            btn.setToolTip(tip)
+        self._input.setToolTip(tr('home.page_jump_tooltip', default='Go to page'))
 
 
 class _BoundedComboBoxMenu(ComboBoxMenu):
@@ -367,7 +307,6 @@ class MinervaPage(QWidget):
         super().__init__(parent)
         self.setStyleSheet('background: transparent;')
         self._selected_roms: dict[str, dict] = {}
-        self._active_key: Optional[str] = None
         self._current_query = ''
         self._current_console: Optional[str] = None
         self._current_variant: Optional[str] = None
@@ -380,9 +319,6 @@ class MinervaPage(QWidget):
         self._sync_total = 0
         self._unloaded = False
         self._card_pool: list[RomCardWidget] = []
-        self._details = DetailsPanel()
-        self._details.download_clicked.connect(self._on_download)
-        self._details.closed.connect(self._close_details)
         self._ui_ready = False
         self._pending_calls: list[tuple[str, tuple, dict]] = []
         self._search_timer = QTimer(self)
@@ -424,15 +360,16 @@ class MinervaPage(QWidget):
 
 
         bar = QWidget()
-        bar.setStyleSheet('background: transparent;')
+        bar.setObjectName('minervaBar')
+        bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         bar_l = QVBoxLayout(bar)
-        bar_l.setContentsMargins(12, 10, 12, 4)
-        bar_l.setSpacing(8)
+        bar_l.setContentsMargins(10, 8, 10, 8)
+        bar_l.setSpacing(6)
 
         row1 = QHBoxLayout()
-        row1.setSpacing(8)
+        row1.setSpacing(6)
         self._search_input = SearchLineEdit()
-        self._search_input.setFixedHeight(32)
+        self._search_input.setFixedHeight(30)
         self._search_input.setClearButtonEnabled(True)
         self._search_input.setMinimumWidth(120)
         self._search_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -446,67 +383,70 @@ class MinervaPage(QWidget):
         self._console_filter = ConsoleComboBox()
         self._variant_filter = ComboBox()
         self._sort_combo = ComboBox()
-        for combo, stretch in ((self._source_filter, 1), (self._console_filter, 1), (self._variant_filter, 1), (self._sort_combo, 1)):
-            combo.setFixedHeight(32)
+        for combo in (self._source_filter, self._console_filter, self._variant_filter, self._sort_combo):
+            combo.setFixedHeight(30)
             combo.setMinimumWidth(90)
-            row1.addWidget(combo, stretch)
+            row1.addWidget(combo, 1)
         self._source_filter.currentIndexChanged.connect(self._on_source_change)
         self._console_filter.currentIndexChanged.connect(self._on_console_change)
         self._variant_filter.currentIndexChanged.connect(self._on_filter_change)
         self._variant_filter.setVisible(False)
         self._sort_combo.currentIndexChanged.connect(self._on_filter_change)
-        bar_l.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        row2.setSpacing(8)
-        self._summary_lbl = CaptionLabel('')
-        row2.addWidget(self._summary_lbl)
-        self._reset_btn = TransparentToolButton(_icon('CANCEL', FluentIcon.CLOSE), self)
-        self._reset_btn.setFixedSize(26, 26)
-        self._reset_btn.clicked.connect(self._reset_filters)
-        self._reset_btn.setVisible(False)
-        row2.addWidget(self._reset_btn)
-        row2.addStretch(1)
-        self._status_lbl = CaptionLabel('')
-        row2.addWidget(self._status_lbl)
         self._btn_download_selected = PushButton(themed_icon('minerva.download_selected', FluentIcon.DOWNLOAD), '')
         self._btn_download_selected.setFixedHeight(30)
-        self._btn_download_selected.setMinimumWidth(110)
+        self._btn_download_selected.setMinimumWidth(96)
         self._btn_download_selected.setEnabled(False)
         self._btn_download_selected.clicked.connect(self._on_download_selected)
-        row2.addWidget(self._btn_download_selected)
+        row1.addWidget(self._btn_download_selected)
         self._sync_btn = PrimaryPushButton(accent_icon('minerva.sync', FluentIcon.SYNC), '')
         self._sync_btn.setFixedHeight(30)
-        self._sync_btn.setMinimumWidth(130)
+        self._sync_btn.setMinimumWidth(110)
         self._sync_btn.clicked.connect(self.run_sync)
-        row2.addWidget(self._sync_btn)
-        bar_l.addLayout(row2)
-        main.addWidget(bar)
+        row1.addWidget(self._sync_btn)
+        bar_l.addLayout(row1)
 
+        wrap = QWidget()
+        wrap.setStyleSheet('background: transparent;')
+        wrap_l = QVBoxLayout(wrap)
+        wrap_l.setContentsMargins(12, 8, 12, 0)
+        wrap_l.addWidget(bar)
+        main.addWidget(wrap)
 
-        self._splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._splitter.setHandleWidth(3)
-        self._splitter.setChildrenCollapsible(False)
-        left = QWidget()
-        left.setStyleSheet('background: transparent;')
-        left_l = QVBoxLayout(left)
-        left_l.setContentsMargins(12, 2, 12, 8)
-        left_l.setSpacing(6)
-
-        sel_row = QHBoxLayout()
-        sel_row.setSpacing(8)
+        head = QWidget()
+        head.setStyleSheet('background: transparent;')
+        head_l = QHBoxLayout(head)
+        head_l.setContentsMargins(16, 6, 12, 0)
+        head_l.setSpacing(6)
         self._select_all_chk = CheckBox('')
+        self._select_all_chk.setFixedWidth(20)
         self._select_all_chk.clicked.connect(self._on_select_all_clicked)
-        sel_row.addWidget(self._select_all_chk)
+        head_l.addWidget(self._select_all_chk)
         self._selected_lbl = CaptionLabel('')
-        sel_row.addWidget(self._selected_lbl)
+        head_l.addWidget(self._selected_lbl)
         self._clear_sel_btn = TransparentToolButton(_icon('CLOSE', FluentIcon.CANCEL), self)
-        self._clear_sel_btn.setFixedSize(24, 24)
+        self._clear_sel_btn.setFixedSize(22, 22)
         self._clear_sel_btn.clicked.connect(self._clear_selection)
         self._clear_sel_btn.setVisible(False)
-        sel_row.addWidget(self._clear_sel_btn)
-        sel_row.addStretch(1)
-        left_l.addLayout(sel_row)
+        head_l.addWidget(self._clear_sel_btn)
+        self._summary_lbl = CaptionLabel('')
+        head_l.addWidget(self._summary_lbl)
+        self._reset_btn = TransparentToolButton(_icon('CANCEL', FluentIcon.CLOSE), self)
+        self._reset_btn.setFixedSize(22, 22)
+        self._reset_btn.clicked.connect(self._reset_filters)
+        self._reset_btn.setVisible(False)
+        head_l.addWidget(self._reset_btn)
+        self._status_lbl = CaptionLabel('')
+        head_l.addWidget(self._status_lbl)
+        head_l.addStretch(1)
+        self._top_pager = _Pager()
+        head_l.addWidget(self._top_pager)
+        main.addWidget(head)
+
+        body = QWidget()
+        body.setStyleSheet('background: transparent;')
+        body_l = QVBoxLayout(body)
+        body_l.setContentsMargins(12, 6, 12, 0)
+        body_l.setSpacing(6)
 
         self._stack = QStackedWidget()
         scroll = make_smooth_scroll_area()
@@ -517,47 +457,18 @@ class MinervaPage(QWidget):
         self._cards_container = QWidget()
         self._cards_container.setObjectName('romListContainer')
         self._cards_layout = QVBoxLayout(self._cards_container)
-        self._cards_layout.setContentsMargins(0, 2, 0, 2)
-        self._cards_layout.setSpacing(4)
+        self._cards_layout.setContentsMargins(0, 0, 6, 0)
+        self._cards_layout.setSpacing(3)
         self._cards_layout.addStretch()
         scroll.setWidget(self._cards_container)
         self._list_surface = scroll
         self._empty = _EmptyState()
         self._stack.addWidget(scroll)
         self._stack.addWidget(self._empty)
-        left_l.addWidget(self._stack, 1)
+        body_l.addWidget(self._stack, 1)
 
-        pag = QHBoxLayout()
-        pag.setSpacing(4)
-        pag.addStretch(1)
-        self._btn_first = ToolButton(_icon('PAGE_LEFT', FluentIcon.LEFT_ARROW))
-        self._btn_prev = ToolButton(FluentIcon.LEFT_ARROW)
-        self._btn_next = ToolButton(FluentIcon.RIGHT_ARROW)
-        self._btn_last = ToolButton(_icon('PAGE_RIGHT', FluentIcon.RIGHT_ARROW))
-        for btn in (self._btn_first, self._btn_prev, self._btn_next, self._btn_last):
-            btn.setFixedSize(30, 28)
-        self._btn_first.clicked.connect(lambda: self._go_to(0))
-        self._btn_prev.clicked.connect(lambda: self._go_to(self._current_page - 1))
-        self._btn_next.clicked.connect(lambda: self._go_to(self._current_page + 1))
-        self._btn_last.clicked.connect(lambda: self._go_to(self._total_pages() - 1))
-        self._page_input = LineEdit()
-        self._page_input.setMaxLength(6)
-        self._page_input.setFixedWidth(52)
-        self._page_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._page_input.returnPressed.connect(self._on_jump_page)
-        self._page_total_lbl = CaptionLabel('')
-        for w in (self._btn_first, self._btn_prev, self._page_input, self._page_total_lbl, self._btn_next, self._btn_last):
-            pag.addWidget(w)
-        pag.addStretch(1)
-        left_l.addLayout(pag)
-
-        self._splitter.addWidget(left)
-        self._splitter.addWidget(self._details)
-        self._splitter.setStretchFactor(0, 1)
-        self._splitter.setStretchFactor(1, 0)
-        self._details.setVisible(False)
-        main.addWidget(self._splitter, 1)
-
+        main.addWidget(body, 1)
+        self._top_pager.go.connect(self._on_pager_go)
 
         self._shortcuts = []
         for seq, handler in (('Ctrl+F', self._focus_search), ('Esc', self._on_escape),
@@ -583,14 +494,17 @@ class MinervaPage(QWidget):
         for card in self._cards_container.findChildren(RomCardWidget):
             card.refresh_theme()
         self._list_surface.setStyleSheet(
-            'QScrollArea#romListScroll {{ background-color: {bg}; border: none; border-radius: 8px; }}'
+            'QScrollArea#romListScroll {{ background-color: transparent; border: none; }}'
             'QScrollArea#romListScroll > QWidget > QWidget {{ background-color: transparent; }}'
-            '#romListContainer {{ background-color: transparent; }}'.format(bg=c['list_bg']))
+            '#romListContainer {{ background-color: transparent; }}')
         self._cards_container.setStyleSheet(
-            'RomCardWidget {{ background-color: {bg}; border: 1px solid {bd}; border-radius: 6px; }}'
+            'RomCardWidget {{ background-color: {bg}; border: 1px solid {bd}; border-radius: 8px; }}'
             'RomCardWidget:hover {{ background-color: {hv}; }}'
-            'RomCardWidget[active="true"] {{ border: 1px solid {ac}; }}'.format(
+            'RomCardWidget[selected="true"] {{ background-color: {hv}; border: 1px solid {ac}; }}'.format(
                 bg=c['card_bg'], bd=c['card_border'], hv=c['card_hover'], ac=accent))
+        self.findChild(QWidget, 'minervaBar').setStyleSheet(
+            '#minervaBar {{ background-color: {bg}; border: 1px solid {bd}; border-radius: 10px; }}'.format(
+                bg=c['card_bg'], bd=c['card_border']))
         self._summary_lbl.setStyleSheet('color: {};'.format(c['muted']))
         self._status_lbl.setStyleSheet('color: {};'.format(c['muted']))
 
@@ -611,22 +525,11 @@ class MinervaPage(QWidget):
         self._reload_source_filter()
         self._reload_console_filter()
         self._reload_variant_filter()
-        self._select_all_chk.setText(tr('home.select_page', default='Select all on this page'))
+        self._select_all_chk.setToolTip(tr('home.select_page', default='Select all on this page'))
         self._reset_btn.setToolTip(tr('home.reset_filters', default='Reset filters'))
         self._clear_sel_btn.setToolTip(tr('home.clear_selection', default='Clear selection'))
-        self._btn_first.setToolTip(tr('home.first_page', default='First page'))
-        self._btn_prev.setToolTip(tr('home.prev_page', default='Previous page'))
-        self._btn_next.setToolTip(tr('home.next_page', default='Next page'))
-        self._btn_last.setToolTip(tr('home.last_page', default='Last page'))
-        self._page_input.setToolTip(tr('home.page_jump_tooltip', default='Go to page'))
-
         rtl = self.isRightToLeft() or QGuiApplication.layoutDirection() == Qt.LayoutDirection.RightToLeft
-        back, fwd = (FluentIcon.RIGHT_ARROW, FluentIcon.LEFT_ARROW) if rtl else (FluentIcon.LEFT_ARROW, FluentIcon.RIGHT_ARROW)
-        first, last = (_icon('PAGE_RIGHT', back), _icon('PAGE_LEFT', fwd)) if rtl else (_icon('PAGE_LEFT', back), _icon('PAGE_RIGHT', fwd))
-        self._btn_first.setIcon(first)
-        self._btn_prev.setIcon(back)
-        self._btn_next.setIcon(fwd)
-        self._btn_last.setIcon(last)
+        self._top_pager.retranslate(rtl)
         self._update_sync_button()
         self._update_selection_ui()
         self._update_pagination_ui()
@@ -784,12 +687,11 @@ class MinervaPage(QWidget):
                 card = pool[idx]
             else:
                 card = RomCardWidget(rom)
-                card.rom_selected.connect(self._on_card_selected)
                 card.download_clicked.connect(self._on_download)
                 card.selection_toggled.connect(self._on_card_selection_toggled)
                 pool.append(card)
                 layout.insertWidget(layout.count() - 1, card)
-            card.set_rom(rom, checked=key in self._selected_roms, active=key == self._active_key)
+            card.set_rom(rom, checked=key in self._selected_roms)
             card.setVisible(True)
         for card in pool[len(roms):]:
             card.setVisible(False)
@@ -857,14 +759,7 @@ class MinervaPage(QWidget):
         self._reset_btn.setVisible(self._filters_active())
 
     def _update_pagination_ui(self) -> None:
-        pages = self._total_pages()
-        page = self._current_page
-        self._btn_first.setEnabled(page > 0)
-        self._btn_prev.setEnabled(page > 0)
-        self._btn_next.setEnabled(page < pages - 1)
-        self._btn_last.setEnabled(page < pages - 1)
-        self._page_input.setText(str(page + 1))
-        self._page_total_lbl.setText(tr('home.page_of_total', default='/ {pages}', pages=f'{pages:,}'))
+        self._top_pager.set_state(self._current_page, self._total_pages())
 
     def _go_to(self, page: int) -> None:
         if not self._ui_ready:
@@ -874,12 +769,7 @@ class MinervaPage(QWidget):
             self._current_page = page
             self.sync_model()
 
-    def _on_jump_page(self) -> None:
-        try:
-            page = int(self._page_input.text()) - 1
-        except ValueError:
-            self._update_pagination_ui()
-            return
+    def _on_pager_go(self, page: int) -> None:
         self._go_to(page)
         self._update_pagination_ui()
 
@@ -894,7 +784,7 @@ class MinervaPage(QWidget):
         self._update_select_all_state()
 
     def _visible_cards(self) -> list[RomCardWidget]:
-        return [c for c in self._card_pool if c.isVisibleTo(self)]
+        return [c for c in self._card_pool if not c.isHidden()]
 
     def _on_select_all_clicked(self, checked: bool) -> None:
         for card in self._visible_cards():
@@ -926,6 +816,7 @@ class MinervaPage(QWidget):
             return
         count = len(self._selected_roms)
         self._selected_lbl.setText(tr('home.selected_count', default='{count} selected', count=count) if count else '')
+        self._selected_lbl.setVisible(count > 0)
         self._clear_sel_btn.setVisible(count > 0)
         self._btn_download_selected.setText(tr('home.download_count', count=count) if count else tr('home.download'))
         self._btn_download_selected.setEnabled(count > 0)
@@ -937,27 +828,8 @@ class MinervaPage(QWidget):
             return
         if self._defer_until_ui_ready('open_rom', dict(rom)):
             return
-        self._on_card_selected(dict(rom))
-
-    def _on_card_selected(self, rom: dict) -> None:
-        try:
-            self._active_key = rom_key(rom)
-            self._details.select_rom(rom)
-            if not self._details.isVisible():
-                self._details.setVisible(True)
-                width = max(self._splitter.width(), DETAILS_WIDTH * 2)
-                QTimer.singleShot(0, lambda: self._splitter.setSizes([width - DETAILS_WIDTH, DETAILS_WIDTH]))
-            for card in self._card_pool:
-                card.set_active(card.isVisibleTo(self) and rom_key(card.rom) == self._active_key)
-        except Exception:
-            logger.exception('Card selection error')
-
-    def _close_details(self) -> None:
-        self._active_key = None
-        self._details.select_rom({})
-        self._details.setVisible(False)
-        for card in self._card_pool:
-            card.set_active(False)
+        self._search_input.setText(str(rom.get('title') or ''))
+        self._on_search_now()
 
     def _get_download_panel(self):
         return getattr(self.window(), 'download_page', None)
@@ -998,8 +870,6 @@ class MinervaPage(QWidget):
     def _on_escape(self) -> None:
         if self._search_input.hasFocus() and self._search_input.text():
             self._search_input.clear()
-        elif self._details.isVisible():
-            self._close_details()
         elif self._selected_roms:
             self._clear_selection()
 

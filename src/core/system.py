@@ -185,3 +185,30 @@ def set_startup(name: str, command: list[str], enabled: bool) -> bool:
         return True
     except OSError:
         return False
+
+
+def release_input_state() -> None:
+    if WINDOWS:
+        try:
+            import ctypes
+            ctypes.windll.user32.ReleaseCapture()
+        except Exception:
+            pass
+    try:
+        from PySide6.QtWidgets import QApplication, QWidget
+    except Exception:
+        return
+    app = QApplication.instance()
+    if app is None:
+        return
+    try:
+        if QWidget.mouseGrabber() is not None:
+            QWidget.mouseGrabber().releaseMouse()
+        if QWidget.keyboardGrabber() is not None:
+            QWidget.keyboardGrabber().releaseKeyboard()
+    except Exception:
+        pass
+    for _ in range(8):
+        if app.overrideCursor() is None:
+            break
+        app.restoreOverrideCursor()

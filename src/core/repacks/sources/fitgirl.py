@@ -21,6 +21,7 @@ from ..base import (
     submit_ctx,
     load_page,
     save_page,
+    drop_pages,
     load_details,
     save_details,
 )
@@ -28,18 +29,21 @@ import importlib.util
 logger = logging.getLogger(__name__)
 _PARSER = 'lxml' if importlib.util.find_spec('lxml') else 'html.parser'
 from concurrent.futures import ThreadPoolExecutor
-_POSTER_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix='fitgirl-posters')
+_POSTER_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix='fitgirl-posters')
+_DETAILS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix='fitgirl-details')
 
 
 def shutdown_executor(wait: bool = True) -> None:
-    try:
-        _POSTER_EXECUTOR.shutdown(wait=wait, cancel_futures=True)
-    except Exception:
-        logger.warning('Failed to shut down FitGirl poster executor', exc_info=True)
+    for executor in (_POSTER_EXECUTOR, _DETAILS_EXECUTOR):
+        try:
+            executor.shutdown(wait=wait, cancel_futures=True)
+        except Exception:
+            logger.warning('Failed to shut down FitGirl executor', exc_info=True)
 _BASE_URL = 'https://fitgirl-repacks.site'
 _API_POSTS_URL = f'{_BASE_URL}/wp-json/wp/v2/posts'
 _API_TAGS_URL = f'{_BASE_URL}/wp-json/wp/v2/tags'
 _TAG_FIELDS = 'slug,link,title,tags,jetpack_featured_media_url'
+_LIST_FIELDS = 'slug,link,title,date_gmt,jetpack_featured_media_url,yoast_head_json'
 _TAG_SPAN = 3
 _TAG_ALL_KEY = '__tag_all__'
 _TAG_MAP_TTL_S = 30 * 86400
@@ -106,6 +110,9 @@ def _cut_top_level_plus(text: str) -> str:
 def _page_key(page: int) -> str:
     return f'p{_PER_PAGE}-{page}'
 _HOMEPAGE_TTL_S = 30.0
+_FEED_TTL_S = 600
+_GEN_TTL_S = 45.0
+_GEN_KEY = '__feed_gen__'
 _MENU_KEY = '__menu_urls__'
 _BADGES_KEY = '__badges_v3__'
 _LIST_ALT = {'switch': '/switch-emulated-repacks/', 'ns2': '/all-switch-2-emulated-repacks-a-z/'}
@@ -157,7 +164,7 @@ _SIZE_RANGE = (
     rf'|{_SIZE_NUM}(?:\s*(?:~|～|–|—|-|to)\s*{_SIZE_NUM})?\s*{_SIZE_UNIT})'
 )
 _BARE_SIZE_FRAGMENT_RE = re.compile(
-    rf'^(?:\[\s*)?(?:from\s+)?{_SIZE_RANGE}(?:\s*/\s*{_SIZE_RANGE})?'
+    rf'^(?:\[\s*)?(?:from\s+)?(?:{_SIZE_NUM}\s*/\s*)?{_SIZE_RANGE}(?:\s*/\s*{_SIZE_RANGE})?'
     rf'(?:\s*{_SIZE_UNIT})?'
     rf'(?:\s*\[?\s*Selective\s+Download\s*\]?)?\s*\]?\.?$',
     re.IGNORECASE,
@@ -169,11 +176,6 @@ def _clean_fragment(text: str) -> str:
     value = (text or '').replace('\x00', ' ')
     value = re.sub(r'\s+', ' ', value).strip()
     return value.lstrip('•-* ').strip()
-
-
-def _is_bare_size_fragment(text: str) -> bool:
-    candidate = _clean_fragment(text)
-    return bool(candidate and _BARE_SIZE_FRAGMENT_RE.match(candidate))
 
 
 def _is_metadata_noise(text: str) -> bool:
@@ -379,6 +381,8 @@ class FitGirlSource(RepackSource):
         self._tag_load_lock = threading.Lock()
         self._tag_retry_at = 0.0
         self._post_total: tuple[float, int] | None = None
+        self._gen_memo: tuple[float, str] | None = None
+        self._gen_lock = threading.Lock()
 
     def _homepage(self) -> dict:
         with self._home_lock:
@@ -403,7 +407,7 @@ class FitGirlSource(RepackSource):
 
     def _homepage_entries(self, which: str, cache_key: str, use_cache: bool) -> list[RepackEntry]:
         if use_cache:
-            cached = load_page(self.key, cache_key, ttl_seconds=self._ttl_seconds)
+            cached = load_page(self.key, cache_key, ttl_seconds=_FEED_TTL_S)
             if cached is not None:
                 return [RepackEntry.from_dict(e) for e in cached['entries']]
         try:
@@ -420,7 +424,7 @@ class FitGirlSource(RepackSource):
 
     def fetch_upcoming_repacks(self, use_cache: bool=True) -> RepackDetails | None:
         if use_cache:
-            cached = load_details(self.key, _UPCOMING_KEY, ttl_seconds=self._ttl_seconds)
+            cached = load_details(self.key, _UPCOMING_KEY, ttl_seconds=_FEED_TTL_S)
             if cached is not None:
                 return RepackDetails.from_dict(cached)
         try:
@@ -429,13 +433,38 @@ class FitGirlSource(RepackSource):
             logger.warning('FitGirl upcoming-repacks request failed: %s', exc)
             return None
 
+    def _gen_tag(self, force: bool = False) -> str:
+        memo = self._gen_memo
+        if not force and memo is not None and time.monotonic() - memo[0] < _GEN_TTL_S:
+            return memo[1]
+        with self._gen_lock:
+            memo = self._gen_memo
+            if not force and memo is not None and time.monotonic() - memo[0] < _GEN_TTL_S:
+                return memo[1]
+            tag = memo[1] if memo else (load_details(self.key, _GEN_KEY, ttl_seconds=None) or {}).get('tag', '')
+            try:
+                _status, posts, total = self._api_posts({'per_page': 1, 'page': 1, '_fields': 'id,date_gmt'})
+                if posts:
+                    head = posts[0]
+                    fresh = re.sub(r'\W', '', f"@{head.get('id')}.{head.get('date_gmt', '')}.{total or 0}")
+                    if fresh != tag:
+                        drop_pages(self.key, '')
+                        save_details(self.key, _GEN_KEY, {'tag': fresh})
+                        tag = fresh
+            except Exception:
+                logger.debug('Feed generation check failed', exc_info=True)
+            self._gen_memo = (time.monotonic(), tag)
+            return tag
+
+    def _feed_cache_key(self, page: int, suffix: str = '', gen: str | None = None) -> str:
+        return _page_key(page) + suffix + (self._gen_tag() if gen is None else gen)
+
     def fetch_page(self, page: int, use_cache: bool=True, exclude=None) -> RepackPage:
         excl_names = [t.strip() for t in re.split(r'[,;]+', exclude or '') if t.strip()] if exclude else []
         excl_infos, _missing = self._resolve_many(excl_names) if excl_names else ([], [])
         exclude_ids = [i['id'] for i in excl_infos]
-        cache_key = _page_key(page)
-        if exclude_ids:
-            cache_key += '-x-' + '+'.join(str(i) for i in sorted(exclude_ids))
+        suffix = '-x-' + '+'.join(str(i) for i in sorted(exclude_ids)) if exclude_ids else ''
+        cache_key = self._feed_cache_key(page, suffix, self._gen_tag(force=not use_cache))
         if use_cache:
             cached = load_page(self.key, cache_key, ttl_seconds=self._ttl_seconds)
             if cached is not None:
@@ -588,7 +617,7 @@ class FitGirlSource(RepackSource):
 
         _status, posts, total_pages = self._api_posts({
             'search': _search_param(query), 'search_columns[]': 'post_title',
-            'page': page, 'per_page': _PER_PAGE})
+            'page': page, 'per_page': _PER_PAGE, '_fields': _LIST_FIELDS})
         if posts is None:
             raise RuntimeError('FitGirl search is unavailable')
         scored: list[tuple[int, RepackEntry]] = []
@@ -631,7 +660,7 @@ class FitGirlSource(RepackSource):
         scored: list[tuple[int, RepackEntry]] = []
         seen_urls: set[str] = set()
         for page_num in range(1, max_pages + 1):
-            cached = load_page(self.key, _page_key(page_num), ttl_seconds=self._ttl_seconds)
+            cached = load_page(self.key, self._feed_cache_key(page_num), ttl_seconds=self._ttl_seconds)
             if cached is None:
                 break
             for entry_dict in cached.get('entries', []):
@@ -648,6 +677,8 @@ class FitGirlSource(RepackSource):
         return [entry for _, entry in scored]
 
     def _api_posts(self, params: dict, timeout: int = 10):
+        if 'slug' not in params and 'id' not in params:
+            params = {'orderby': 'date', 'order': 'desc', **params}
         try:
             resp = _get(_API_POSTS_URL, params=params, timeout=timeout)
         except Exception as exc:
@@ -678,9 +709,11 @@ class FitGirlSource(RepackSource):
             entry = RepackEntry(source=self.key, title=self._clean_title(title), url=url,
                                 poster_url=self._extract_featured_image(post),
                                 slug=post.get('slug') or _slug_from_url(url))
+            if post.get('date_gmt'):
+                entry.extra['date'] = post['date_gmt']
             entries.append(entry)
             if (post.get('content') or {}).get('rendered'):
-                submit_ctx(_POSTER_EXECUTOR, self._cache_post_details, entry, post)
+                submit_ctx(_DETAILS_EXECUTOR, self._cache_post_details, entry, post)
         return entries
 
     def _cache_post_details(self, entry: RepackEntry, post: dict) -> None:
@@ -699,13 +732,16 @@ class FitGirlSource(RepackSource):
             logger.debug('Details pre-cache failed for %s', entry.url, exc_info=True)
 
     def _fetch_via_api(self, page: int, exclude_ids=None):
-        params = {'page': page, 'per_page': _PER_PAGE}
+        params = {'page': page, 'per_page': _PER_PAGE, '_fields': _LIST_FIELDS}
         if exclude_ids:
             params['tags_exclude'] = list(exclude_ids)
         _status, posts, total_pages = self._api_posts(params)
         if posts is None:
             return (None, False)
-        return (self._posts_to_entries(posts), total_pages is None or page < total_pages)
+        entries = self._posts_to_entries(posts)
+        if all(e.extra.get('date') for e in entries):
+            entries.sort(key=lambda e: e.extra['date'], reverse=True)
+        return (entries, total_pages is None or page < total_pages)
 
     def fetch_details(self, entry: RepackEntry, use_cache: bool=True) -> RepackDetails:
         slug = entry.slug or _slug_from_url(entry.url)
@@ -855,7 +891,7 @@ class FitGirlSource(RepackSource):
             if value and key not in metadata:
                 metadata[key] = value
         return metadata
-    _VALUE_PATTERNS = {'genres': "(?:(?!\\bREQUIRES\\b)[A-Za-z0-9'\\(\\)\\-/ ])+(?:\\s*,\\s*(?:(?!\\bREQUIRES\\b)[A-Za-z0-9'\\(\\)\\-/ ])+)*", 'company': '[A-Za-z0-9][A-Za-z0-9 &\\-\\.]*(?:\\s*,\\s*[A-Za-z0-9][A-Za-z0-9 &\\-\\.]*)*', 'languages': '[A-Za-z0-9/]+(?:\\s*,\\s*[A-Za-z0-9/]+)*', 'original_size': '[\\d.]+\\s*(?:GB|MB|TB)', 'repack_size': '(?:from\\s+)?[\\d.]+(?:\\s*/\\s*[\\d.]+)?\\s*(?:GB|MB|TB)(?:\\s*\\[\\s*Selective Download\\s*\\])?'}
+    _VALUE_PATTERNS = {'genres': "(?:(?!\\bREQUIRES\\b)[A-Za-z0-9'\\(\\)\\-/ ])+(?:\\s*,\\s*(?:(?!\\bREQUIRES\\b)[A-Za-z0-9'\\(\\)\\-/ ])+)*", 'company': '[^\\s,][^\\n,]*(?:\\s*,\\s*[^\\s,][^\\n,]*)*', 'languages': '[A-Za-z0-9/]+(?:\\s*,\\s*[A-Za-z0-9/]+)*', 'original_size': '[\\d.]+\\s*(?:GB|MB|TB)', 'repack_size': '(?:from\\s+)?[\\d.]+(?:\\s*/\\s*[\\d.]+)?\\s*(?:GB|MB|TB)(?:\\s*\\[\\s*Selective Download\\s*\\])?'}
 
     _FEATURE_PHRASE_SPLIT_RE = re.compile(
         r'(?=\b(?:Game version|100%\s*Lossless(?:\s*&\s*MD5)?|NOTHING ripped|'
@@ -944,7 +980,7 @@ class FitGirlSource(RepackSource):
         remainder = (text[:chain_start] + ' ' + text[chain_end:]).strip()
         remainder = re.sub(r'(?i)\s*\bgame\s+REQUIRES\s+Windows\s+[\d./]+\s*', ' ', remainder).strip()
         remainder = re.sub(r'(?i)^\s*[•\-\*]*\s*\[\s*Selective Download\s*\]\s*', '', remainder).strip()
-        remainder = re.sub(r'(?i)^\s*[•\-\*]*\s*(?:from\s+)?[\d.]+\s*(?:GB|MB|TB)\s*(?:\[\s*Selective Download\s*\])?\s*$', '', remainder).strip()
+        remainder = re.sub(r'(?i)^\s*[•\-\*]*\s*(?:from\s+)?[\d.]+(?:\s*/\s*[\d.]+)?\s*(?:GB|MB|TB)\s*(?:\[\s*Selective Download\s*\])?\s*$', '', remainder).strip()
         remainder = re.sub(r'^[•\-\*]+\s*$', '', remainder).strip()
         return remainder
 
@@ -1515,11 +1551,21 @@ class FitGirlSource(RepackSource):
         todo = [e for e in entries if not e.poster_url and e.slug and not e.extra.get('poster_tried')]
         if not todo:
             return False
-        for start in range(0, len(todo), 40):
-            chunk = {e.slug: e for e in todo[start:start + 40]}
-            _status, posts, _pages = self._api_posts({
+        chunks = [{e.slug: e for e in todo[start:start + 40]} for start in range(0, len(todo), 40)]
+
+        def lookup(chunk: dict):
+            return chunk, self._api_posts({
                 'slug': ','.join(chunk), 'per_page': len(chunk),
-                '_fields': 'slug,jetpack_featured_media_url,yoast_head_json'})
+                '_fields': 'slug,jetpack_featured_media_url,yoast_head_json'})[1]
+
+        if len(chunks) == 1:
+            results = [lookup(chunks[0])]
+        else:
+            results = []
+            for future in [submit_ctx(_POSTER_EXECUTOR, lookup, c) for c in chunks]:
+                with suppress(Exception):
+                    results.append(future.result(timeout=15))
+        for chunk, posts in results:
             for post in posts or ():
                 entry = chunk.get(post.get('slug'))
                 if entry is not None:
@@ -1538,9 +1584,9 @@ class FitGirlSource(RepackSource):
         if list_key not in _LIST_PAGES:
             raise ValueError(f'unknown FitGirl list: {list_key}')
         page = max(1, int(page))
-        cache_key = f'list-{list_key}-{page}'
+        cache_key = f'list-{list_key}-{page}{self._gen_tag(force=not use_cache)}'
         if use_cache:
-            cached = load_page(self.key, cache_key, ttl_seconds=self._ttl_seconds)
+            cached = load_page(self.key, cache_key, ttl_seconds=_FEED_TTL_S)
             if cached is not None:
                 entries = [RepackEntry.from_dict(e) for e in cached['entries']]
                 if self._fill_list_posters(entries):
@@ -1750,7 +1796,7 @@ class FitGirlSource(RepackSource):
         cache_key = 'tag-' + '+'.join(sorted(self._tag_key(n) for n in names))
         if excl_names:
             cache_key += '-x-' + '+'.join(sorted(self._tag_key(n) for n in excl_names))
-        cache_key += f'-{page}'
+        cache_key += f'-{page}{self._gen_tag(force=not use_cache)}'
         if use_cache:
             cached = load_page(self.key, cache_key, ttl_seconds=self._ttl_seconds)
             if cached is not None:
@@ -1813,21 +1859,26 @@ class FitGirlSource(RepackSource):
             cached = load_details(self.key, _BADGES_KEY, ttl_seconds=7 * 86400)
             if cached is not None:
                 return {k: set(v) for k, v in (cached.get('lists') or {}).items()}
-        result: dict[str, set[str]] = {}
-        failed = False
-        for key in ('pink_paw', 'hypervisor', 'switch', 'ns2', 'ps3'):
+        keys = ('pink_paw', 'hypervisor', 'switch', 'ns2', 'ps3')
+
+        def collect(key: str) -> tuple[set[str], bool]:
             slugs: set[str] = set()
             for page in range(1, 41):
                 try:
                     entries, has_more = self._scrape_list(key, page, use_cache)
                 except Exception as exc:
                     logger.warning('FitGirl badge list %s failed: %s', key, exc)
-                    failed = True
-                    break
+                    return slugs, True
                 slugs.update(e.slug for e in entries if e.slug)
                 if not entries or not has_more:
                     break
-            result[key] = slugs
+            return slugs, False
+
+        with ThreadPoolExecutor(max_workers=len(keys), thread_name_prefix='fitgirl-badges') as pool:
+            futures = {key: submit_ctx(pool, collect, key) for key in keys}
+            outcomes = {key: future.result() for key, future in futures.items()}
+        result: dict[str, set[str]] = {key: outcomes[key][0] for key in keys}
+        failed = any(outcomes[key][1] for key in keys)
         if self._list_url('ns2') != self._list_url('switch'):
             result['switch'] = result.get('switch', set()) - result.get('ns2', set())
         if any(result.values()) and not failed:

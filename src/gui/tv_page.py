@@ -47,7 +47,7 @@ from src.core.tv import streams as stream_backend
 from src.core.tv import tmdb
 from src.core.tv.anime import anime_backend
 from src.core.config import settings
-from src.core.system import clean_env as _clean_env
+from src.core.system import clean_env as _clean_env, release_input_state
 
 import zlib
 from collections import OrderedDict
@@ -60,7 +60,7 @@ from src.core.translations import tr, register_locale_refresh
 from src.core.theme import to_color, palette, apply_pivot_theme, apply_tool_button_theme, apply_label_theme, count_badge_qss, register_theme_refresh, themed_icon, apply_slot_icon_theme
 from .home_page import MediaPageBase
 from .repacks_page import make_tag_chip, show_tag_menu, toggled_tags, bind_enter, split_tags, join_tags, partition_resolved
-from .stuff.vplayer import (
+from .stuff.video import (
     AnimePlayerWidget, _Spinner, _UA, _accent, _ad_hoc_client, _play_icon, _wicon, close_ad_hoc_client,
 )
 from .stuff.grid import PosterGrid, PosterStrip, ViewModeButton, attrs_subtitle, grid_colors as _grid_colors
@@ -3778,11 +3778,13 @@ class _MediaDetailsView(_DetailsChrome, QWidget):
     def _replace_player(self) -> None:
         content, layout = self._player_host
         old = self._player_widget
-        index = layout.indexOf(old)
+        index = max(layout.indexOf(old), 0)
         layout.removeWidget(old)
-        old.destroy()
+        old.hide()
         new = self._player_widget = self._make_player(content)
-        layout.insertWidget(max(index, 0), new, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.insertWidget(index, new, 0, Qt.AlignmentFlag.AlignHCenter)
+        old.destroy()
+        release_input_state()
 
     def _close_media_player(self) -> None:
         p = getattr(self, "_picker", None)
@@ -5876,11 +5878,13 @@ class AnimeDetailView(_DetailsChrome, QWidget):
     def _replace_player(self) -> None:
         content, layout = self._player_host
         old = self._player_widget
-        index = layout.indexOf(old)
+        index = max(layout.indexOf(old), 0)
         layout.removeWidget(old)
+        old.hide()
+        new = self._player_widget = self._make_player(content)
+        layout.insertWidget(index, new, 0, Qt.AlignmentFlag.AlignHCenter)
         old.destroy()
-        self._player_widget = self._make_player(content)
-        layout.insertWidget(max(index, 0), self._player_widget, 0, Qt.AlignmentFlag.AlignHCenter)
+        release_input_state()
 
     def _close_player(self) -> None:
         if self._stream_task_id is not None:
@@ -5895,6 +5899,7 @@ class AnimeDetailView(_DetailsChrome, QWidget):
         QTimer.singleShot(0, self._replace_player)
         window = self.window()
         window.activateWindow()
+        release_input_state()
         self._status_lbl.setText("")
         self._status_spinner.hide()
 

@@ -215,10 +215,10 @@ def _bookmark_icon(filled: bool=False) -> QIcon:
 from src.core.models import assess_source_files, classify_file
 from src.core.repacks.base import RepackEntry, RepackDetails, display_title, magnet_display_name, REPACK_LIST_MENUS
 from PySide6.QtWidgets import QAbstractItemView, QListWidgetItem
-from qfluentwidgets import MessageBox, Flyout, FlyoutAnimationType, FlyoutViewBase, ListWidget, SearchLineEdit
+from qfluentwidgets import Flyout, FlyoutAnimationType, FlyoutViewBase, ListWidget, SearchLineEdit
 from src.core.worker import fetch_all_tags_async, random_entry_async, resolve_tags_async, fetch_tag_async, fetch_pink_paw_async, fetch_list_async, fetch_page_async, fetch_details_async, fetch_upcoming_repacks_async, fetch_search_async, fetch_popular_repacks_async, cancel as cancel_task, Priority
 from src.core.downloader import DownloadManager, DLState, category_dir
-from src.core.theme import palette, to_color, register_theme_refresh, apply_pivot_theme, apply_tool_button_theme, branded_icon, count_badge_qss, icon_override_pixmap, themed_icon, apply_slot_icon_theme, ScrollingTextDelegate, animations_enabled
+from src.core.theme import palette, to_color, register_theme_refresh, apply_pivot_theme, apply_tool_button_theme, branded_icon, count_badge_qss, icon_override_pixmap, themed_icon, apply_slot_icon_theme, animations_enabled
 from .stuff.grid import PosterGrid, ViewModeButton, attrs_subtitle, play_sfx
 _source_subtitle = attrs_subtitle('source', labels={'fitgirl': 'FitGirl Repacks', 'gog': 'GOG Revived'})
 
@@ -869,6 +869,7 @@ class PosterCard(_AnimatedPosterMixin, QWidget):
         self._fallback_icon = None
         self._source_badge_lbl = None
         self._badge_lbls = []
+        self._badge_state = None
         self._init_poster_animations()
 
     def bind(self, entry) -> None:
@@ -891,11 +892,16 @@ class PosterCard(_AnimatedPosterMixin, QWidget):
             self.show_fallback_icon()
 
     def set_badges(self, keys) -> None:
+        offset = 26 if hasattr(self, '_remove_x') else 0
+        keys = tuple(k for k in keys if k != 'hypervisor')
+        state = (keys, offset)
+        if state == self._badge_state:
+            return
+        self._badge_state = state
         for lbl in self._badge_lbls:
             lbl.deleteLater()
         self._badge_lbls = []
-        offset = 26 if hasattr(self, '_remove_x') else 0
-        for i, key in enumerate(k for k in keys if k != 'hypervisor'):
+        for i, key in enumerate(keys):
             pix = _badge_pixmap(key, 22, True)
             if pix.isNull():
                 continue
@@ -1165,19 +1171,36 @@ class PopularCarousel(QWidget):
             return
         self._rendered_key = render_key
 
-        self._clear_cards()
         start = self._page * visible_count
         page_entries = self._entries[start:start + visible_count]
-        for entry in page_entries:
-            card = PosterCard(self)
+        pool = [c for c in self._cards if isinstance(c, PosterCard)]
+        for card in self._cards:
+            self._cards_row.removeWidget(card)
+            if not isinstance(card, PosterCard):
+                card.setVisible(False)
+                card.setParent(None)
+                card.deleteLater()
+        self._cards = []
+        for i, entry in enumerate(page_entries):
+            if i < len(pool):
+                card = pool[i]
+            else:
+                card = PosterCard(self)
+                card.clicked_poster.connect(self.poster_clicked.emit)
+                card.download_requested.connect(self.download_requested.emit)
+                card.hovered.connect(self.hovered)
+            _decorate_repack_entry(entry)
             card.bind(entry)
-            card.clicked_poster.connect(self.poster_clicked.emit)
-            card.download_requested.connect(self.download_requested.emit)
-            card.hovered.connect(self.hovered)
+            card.setVisible(True)
             self._cards_row.addWidget(card)
             self._cards.append(card)
             if entry.poster_url and not entry.poster_path:
                 card.set_poster_path(entry.poster_url)
+        for card in pool[len(page_entries):]:
+            card.unload_pixmap()
+            card.setVisible(False)
+            card.setParent(None)
+            card.deleteLater()
         for _ in range(visible_count - len(page_entries)):
             placeholder = QWidget(self)
             placeholder.setFixedSize(PosterCard.POSTER_WIDTH, self._card_h)
@@ -1187,6 +1210,13 @@ class PopularCarousel(QWidget):
         self.prev_btn.setEnabled(self._page > 0)
         self.next_btn.setEnabled(self._page < page_count - 1)
         self._rebuild_dots(page_count)
+
+    def refresh_badges(self, *_args) -> None:
+        for entry in self._entries:
+            _decorate_repack_entry(entry)
+        for card in self._cards:
+            if isinstance(card, PosterCard) and card._entry is not None:
+                card.set_badges(badges_for(card._entry))
 
     def _clear_cards(self) -> None:
         for card in self._cards:
@@ -5335,6 +5365,7 @@ class SourceTab(MediaPageBase):
             fallback_icon_fn=lambda: themed_icon('repacks.card_fallback', FluentIcon.GAME, size=48, color=_body_text_color()))
         self._caption_on = _titles_enabled()
         pink_paw_store().changed.connect(self._grid.viewport().update)
+        pink_paw_store().changed.connect(carousel.refresh_badges)
         register_theme_refresh(self, self._on_badge_theme)
         self._grid.context_requested.connect(self._show_grid_menu)
         self._grid.poster_clicked.connect(self._show_details)
@@ -5639,6 +5670,12 @@ class SourceTab(MediaPageBase):
 
     def _on_badge_theme(self) -> None:
         _badge_cache.clear()
+        carousel = getattr(self._grid, '_header', None)
+        if carousel is not None and hasattr(carousel, 'refresh_badges'):
+            for card in getattr(carousel, '_cards', ()):
+                if isinstance(card, PosterCard):
+                    card._badge_state = None
+            carousel.refresh_badges()
         self._grid.viewport().update()
 
     def _on_near_bottom(self) -> None:
@@ -5671,8 +5708,9 @@ class SourceTab(MediaPageBase):
             self._set_busy(True)
         next_page = self._current_page + 1
         key = self._list_key
-        done = lambda result, k=key: self._on_fetched(k, result)
-        err = lambda message, k=key: self._on_fetch_failed(k, message)
+        self._fetch_seq = getattr(self, '_fetch_seq', 0) + 1
+        done = lambda result, k=key, s=self._fetch_seq: self._on_fetched(k, result, s)
+        err = lambda message, k=key, s=self._fetch_seq: self._on_fetch_failed(k, message, s)
         inc = split_tags(key[4:].split(','))[0] if key and key.startswith('tag:') else []
         if inc:
             self._active_fetch_task_id = fetch_tag_async(
@@ -5757,13 +5795,13 @@ class SourceTab(MediaPageBase):
             self._grid.clear()
             self._grid.append_entries(kept)
 
-    def _on_fetched(self, list_key, result) -> None:
-        if list_key != self._list_key:
+    def _on_fetched(self, list_key, result, seq=None) -> None:
+        if list_key != self._list_key or (seq is not None and seq != self._fetch_seq):
             return
         self._on_page_loaded(result)
 
-    def _on_fetch_failed(self, list_key, message: str) -> None:
-        if list_key != self._list_key:
+    def _on_fetch_failed(self, list_key, message: str, seq=None) -> None:
+        if list_key != self._list_key or (seq is not None and seq != self._fetch_seq):
             return
         self._on_page_error(message)
 

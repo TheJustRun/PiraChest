@@ -1,0 +1,151 @@
+name: Mirror to GitLab
+
+# Reusable: called by pipeline.yml after the build. Also runs daily as a safety net and on demand.
+# GitHub is the source of truth: GitLab gets the same commits, tags and releases.
+on:
+  workflow_call:
+    inputs:
+      limit:
+        description: "How many of the newest GitHub releases to reconcile"
+        type: string
+        default: "100"
+      dry_run:
+        description: "Only report what would be done"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "How many of the newest GitHub releases to reconcile"
+        default: "100"
+      dry_run:
+        description: "Only report what would be pushed or created"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  gitlab:
+    name: Sync GitLab (code, tags, releases)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: mirror-gitlab
+      cancel-in-progress: false
+    env:
+      GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      GITLAB_PATH: TheJustRun/PiraChest
+      GITLAB_PROJECT: TheJustRun%2FPiraChest
+      LIMIT: ${{ inputs.limit || '100' }}
+      DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Mirror commits and tags
+        run: |
+          set -euo pipefail
+          if [ -z "$GITLAB_TOKEN" ]; then
+            echo "::error::GITLAB_TOKEN secret is missing. Use a project access token with api + write_repository scopes (Maintainer role)."
+            exit 1
+          fi
+          GIT_URL="https://oauth2:${GITLAB_TOKEN}@gitlab.com/${GITLAB_PATH}.git"
+          FLAGS="--force"
+          [ "$DRY_RUN" = "true" ] && FLAGS="--force --dry-run"
+          git push $FLAGS "$GIT_URL" "HEAD:refs/heads/main"
+          git push $FLAGS "$GIT_URL" --tags
+
+      - name: Create missing releases (oldest first, newest ends up on top)
+        run: |
+          set -euo pipefail
+          API="https://gitlab.com/api/v4/projects/${GITLAB_PROJECT}"
+
+          cat > publish_one.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          TAG="$1"
+          API="https://gitlab.com/api/v4/projects/${GITLAB_PROJECT}"
+          PACKAGE_BASE="$API/packages/generic/PiraChest/$TAG"
+          dir="work/$TAG"
+          rm -rf "$dir"; mkdir -p "$dir"
+
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$dir"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json name,body,publishedAt,isPrerelease > "$dir.json"
+          pre="$(jq -r '.isPrerelease' "$dir.json")"
+
+          LINKS='[]'
+          # Serial uploads: GitLab recommends this for files in one package version.
+          for file in "$dir"/*; do
+            [ -f "$file" ] || continue
+            filename="$(basename "$file")"
+            echo "Uploading $filename..."
+            curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+              --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+              --upload-file "$file" "$PACKAGE_BASE/$filename" > /dev/null
+            LINKS="$(jq -c --arg name "$filename" --arg url "$PACKAGE_BASE/$filename" \
+              '. + [{name: $name, url: $url, link_type: "package"}]' <<< "$LINKS")"
+          done
+
+          # Same notes as GitHub, with download links pointing at GitLab.
+          jq -r '.body' "$dir.json" > "$dir.md"
+          sed -i "s|https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/|$PACKAGE_BASE/|g" "$dir.md"
+          {
+            if [ "$pre" = "true" ]; then
+              printf '> **Pre-release (canary build).** It may be unstable. Stable builds are the releases without this notice.\n\n'
+            fi
+            cat "$dir.md"
+          } > "$dir.desc.md"
+
+          # GitLab has no pre-release flag, so mark it in the name as well.
+          jq -n --arg tag "$TAG" --arg pre "$pre" \
+            --slurpfile meta "$dir.json" --rawfile description "$dir.desc.md" \
+            --argjson links "$LINKS" \
+            '{tag_name: $tag,
+              name: ($meta[0].name + (if $pre == "true" then " [pre-release]" else "" end)),
+              description: $description,
+              released_at: $meta[0].publishedAt,
+              assets: {links: $links}}' > "$dir.release.json"
+
+          curl --fail-with-body --silent --show-error --request POST \
+            --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data-binary @"$dir.release.json" "$API/releases" > /dev/null
+          rm -rf "$dir" "$dir".*
+          SCRIPT
+          chmod +x publish_one.sh
+
+          # Oldest first, with released_at set to the GitHub publish date, so GitLab
+          # lists the newest release at the top and the oldest at the bottom.
+          gh release list --repo "$GITHUB_REPOSITORY" --limit "$LIMIT" --exclude-drafts \
+            --json tagName,publishedAt --jq 'sort_by(.publishedAt) | .[].tagName' > tags.txt
+
+          FAILED=0; CREATED=0; SKIPPED=0
+          while read -r TAG; do
+            [ -n "$TAG" ] || continue
+            enc="$(jq -rn --arg t "$TAG" '$t | @uri')"
+            code="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --header "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/releases/$enc")"
+            if [ "$code" = "200" ]; then SKIPPED=$((SKIPPED+1)); continue; fi
+            if [ "$code" != "404" ]; then
+              echo "::error::Unexpected HTTP $code checking $TAG on GitLab."
+              FAILED=1; continue
+            fi
+            if [ "$DRY_RUN" = "true" ]; then echo "[dry run] would create $TAG"; continue; fi
+            echo "::group::Creating $TAG"
+            if ./publish_one.sh "$TAG"; then CREATED=$((CREATED+1)); else
+              echo "::error::Failed to publish $TAG to GitLab."; FAILED=1
+            fi
+            echo "::endgroup::"
+          done < tags.txt
+
+          echo "GitLab sync: $CREATED created, $SKIPPED already present." | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$FAILED"

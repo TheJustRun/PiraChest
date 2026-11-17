@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import contextvars
 import html as _html
 import re
@@ -89,20 +90,25 @@ def _first_image(text: str, allow_img_tag: bool) -> str | None:
 
 def fetch_page_image(url: str, timeout: float = 5, max_bytes: int = 131072, scan_body: bool = False) -> str | None:
     check_cancelled()
+    decoder = codecs.getincrementaldecoder('utf-8')(errors='ignore')
     buf = ''
+    scanned = 0
+    total = 0
     try:
         with http_client.stream('GET', url, timeout=timeout) as resp:
             if resp.status_code != 200:
                 return None
-            total = 0
-            for chunk in resp.iter_bytes(8192):
+            for chunk in resp.iter_bytes(16384):
                 check_cancelled()
                 total += len(chunk)
-                buf += chunk.decode('utf-8', errors='ignore')
-                found = _first_image(buf, allow_img_tag=False)
+                buf += decoder.decode(chunk)
+                start = max(0, scanned - 1024)
+                tail = buf[start:]
+                scanned = len(buf)
+                found = _first_image(tail, allow_img_tag=False)
                 if found:
                     return found
-                if '</head>' in buf.lower():
+                if '</head>' in tail.lower():
                     if not scan_body:
                         break
                     found = _first_image(buf, allow_img_tag=True)
@@ -121,6 +127,10 @@ def load_page(source_key: str, page, ttl_seconds: int = DEFAULT_TTL_SECONDS):
 
 def save_page(source_key: str, page, entries: list, has_more: bool) -> None:
     _cache.save(f"repacks:{source_key}:pages", str(page), {"entries": entries, "has_more": has_more})
+
+
+def drop_pages(source_key: str, key_prefix: str) -> None:
+    _cache.delete_prefix(f"repacks:{source_key}:pages", key_prefix)
 
 
 def load_details(source_key: str, key: str, ttl_seconds: int = DEFAULT_TTL_SECONDS):

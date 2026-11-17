@@ -1,0 +1,136 @@
+name: Mirror to SourceForge
+
+on:
+  workflow_call:
+    inputs:
+      limit:
+        description: "How many of the newest GitHub releases to reconcile"
+        type: string
+        default: "100"
+      dry_run:
+        description: "Only report what would be done"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "How many of the newest GitHub releases to reconcile"
+        default: "100"
+      dry_run:
+        description: "Only report what would be uploaded"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  sourceforge:
+    name: Sync SourceForge (releases)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: mirror-sourceforge
+      cancel-in-progress: false
+    env:
+      SF_KEY: ${{ secrets.SOURCEFORGE_SSH_KEY }}
+      SF_API_KEY: ${{ secrets.SOURCEFORGE_API_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      SF_USER: justrun
+      SF_PROJECT: pirachest
+      SF_PROJECT_DIR: /home/frs/project/pirachest
+      LIMIT: ${{ inputs.limit || '100' }}
+      DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+    steps:
+      - name: Upload missing releases (oldest first, newest ends up on top)
+        run: |
+          set -euo pipefail
+          if [ -z "$SF_KEY" ]; then
+            echo "::error::SOURCEFORGE_SSH_KEY secret is missing. Add the private key registered on your SourceForge account."
+            exit 1
+          fi
+          install -m 600 /dev/null sf_key
+          printf '%s\n' "$SF_KEY" > sf_key
+          trap 'rm -f sf_key' EXIT
+
+          cat > upload_one.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          TAG="$1"
+          dest="$SF_PROJECT_DIR/$TAG"
+          SSH="ssh -i sf_key -o StrictHostKeyChecking=accept-new"
+          HOST="$SF_USER@frs.sourceforge.net"
+
+          # Assets plus the README.md we add (SourceForge shows it as the release notes).
+          assets="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
+          expected=$((assets + 1))
+          listing="$(rsync -e "$SSH" --list-only "$HOST:$dest/" 2>/dev/null || true)"
+          have="$(grep -c '^-' <<< "$listing" || true)"
+          if [ "$have" -ge "$expected" ]; then
+            echo "$TAG already on SourceForge ($have files)."
+            exit 0
+          fi
+          if [ "$DRY_RUN" = "true" ]; then echo "[dry run] would upload $TAG ($have/$expected files present)"; exit 0; fi
+
+          dir="work/$TAG"
+          rm -rf "$dir"; mkdir -p "$dir"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$dir"
+
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json name,body,isPrerelease > "work/$TAG.json"
+          {
+            printf '# %s\n\n' "$(jq -r '.name' "work/$TAG.json")"
+            if [ "$(jq -r '.isPrerelease' "work/$TAG.json")" = "true" ]; then
+              printf '**Pre-release (canary build).** It may be unstable. Stable builds are the releases without this notice.\n\n'
+            fi
+            jq -r '.body' "work/$TAG.json" \
+              | sed "s|https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/|https://sourceforge.net/projects/$SF_PROJECT/files/$TAG/|g"
+          } > "$dir/README.md"
+
+          # --mkpath needs rsync >= 3.2.3 on the server (SourceForge runs 3.1.x),
+          # so create the folder on the remote side. --size-only skips files already there.
+          rsync -e "$SSH" --size-only \
+            --rsync-path="mkdir -p $dest && rsync" \
+            "$dir"/* "$HOST:$dest/"
+          rm -rf "$dir" "work/$TAG.json"
+          SCRIPT
+          chmod +x upload_one.sh
+
+          # Oldest first: SourceForge sorts folders by date, so newest ends up on top.
+          gh release list --repo "$GITHUB_REPOSITORY" --limit "$LIMIT" --exclude-drafts \
+            --json tagName,publishedAt --jq 'sort_by(.publishedAt) | .[].tagName' > tags.txt
+
+          FAILED=0
+          while read -r TAG; do
+            [ -n "$TAG" ] || continue
+            echo "::group::$TAG"
+            ./upload_one.sh "$TAG" || { echo "::error::Failed to upload $TAG to SourceForge."; FAILED=1; }
+            echo "::endgroup::"
+          done < tags.txt
+
+          # Make the newest STABLE release the default download. Canary builds are
+          # pre-releases and never become the default. Needs the optional
+          # SOURCEFORGE_API_KEY secret (SourceForge account > Services > Release API Key).
+          if [ -n "$SF_API_KEY" ] && [ "$DRY_RUN" != "true" ]; then
+            STABLE="$(gh release list --repo "$GITHUB_REPOSITORY" --limit "$LIMIT" --exclude-drafts \
+              --json tagName,isPrerelease,publishedAt \
+              --jq '[.[] | select(.isPrerelease | not)] | sort_by(.publishedAt) | last | .tagName // empty')"
+            if [ -n "$STABLE" ]; then
+              names="$(gh release view "$STABLE" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+              set_default() { # <os> <filename regex>
+                f="$(grep -E "$2" <<< "$names" | head -n1 || true)"
+                [ -n "$f" ] || return 0
+                curl --silent --show-error --fail-with-body --request PUT \
+                  --data "default=$1" --data "api_key=$SF_API_KEY" \
+                  "https://sourceforge.net/projects/$SF_PROJECT/files/$STABLE/$f" > /dev/null \
+                  && echo "Default download for $1: $STABLE/$f" \
+                  || echo "::warning::Could not set the $1 default download."
+              }
+              set_default windows 'Windows-x64\.msi$'
+              set_default mac     'macOS-arm64\.dmg$'
+              set_default linux   'Linux-x64\.deb$'
+            fi
+          fi
+
+          exit "$FAILED"

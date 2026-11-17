@@ -178,6 +178,13 @@ def _highlight_spans(text: str, query: str) -> list[tuple[int, int]]:
     return merged
 
 
+@lru_cache(maxsize=16)
+def _rounded_path(w: float, h: float) -> QPainterPath:
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0, 0, w, h), _RADIUS, _RADIUS)
+    return path
+
+
 class _LazyImages:
     __slots__ = ('_target',)
 
@@ -365,44 +372,50 @@ class _PosterView(QAbstractScrollArea):
     def append_entries_ready(self, entries, on_done=None, preload: int = 24, timeout_ms: int = 2500) -> None:
         entries = list(entries)
         size = self._img_size()
-        gen = self._ready_gen = getattr(self, '_ready_gen', 0) + 1
-        ready = [True] * len(entries)
+        batch = {'entries': entries, 'ready': [True] * len(entries), 'ptr': 0, 'on_done': on_done}
         waiting: dict = {}
         for i, entry in enumerate(entries[:preload]):
             src = next((str(v) for v in (getattr(entry, a, None) for a in self._cover_attrs) if v), '')
             if src and images.peek(src, size) is None:
-                ready[i] = False
+                batch['ready'][i] = False
                 waiting.setdefault(src, []).append(i)
-        state = {'ptr': 0, 'done': False}
-
-        def flush() -> None:
-            if gen != getattr(self, '_ready_gen', 0):
-                return
-            end = state['ptr']
-            while end < len(entries) and ready[end]:
-                end += 1
-            if end > state['ptr']:
-                self.append_entries(entries[state['ptr']:end])
-                state['ptr'] = end
-            if state['ptr'] >= len(entries) and not state['done']:
-                state['done'] = True
-                if on_done is not None:
-                    on_done()
+        queue = self.__dict__.setdefault('_ready_queue', [])
+        queue.append(batch)
+        epoch = self._ready_gen = getattr(self, '_ready_gen', 0)
 
         def arrived(src, _pixmap=None) -> None:
             for i in waiting.get(src, ()):
-                ready[i] = True
-            flush()
+                batch['ready'][i] = True
+            self._pump_ready(epoch)
 
         def expire() -> None:
-            ready[:] = [True] * len(ready)
-            flush()
+            batch['ready'][:] = [True] * len(batch['ready'])
+            self._pump_ready(epoch)
 
         for src in waiting:
             images.get(src, size, partial(arrived, src), owner=self)
         if waiting:
             QTimer.singleShot(timeout_ms, expire)
-        flush()
+        self._pump_ready(epoch)
+
+    def _pump_ready(self, epoch: int) -> None:
+        if epoch != getattr(self, '_ready_gen', 0):
+            return
+        queue = self.__dict__.setdefault('_ready_queue', [])
+        while queue:
+            batch = queue[0]
+            items, ready = batch['entries'], batch['ready']
+            end = batch['ptr']
+            while end < len(items) and ready[end]:
+                end += 1
+            if end > batch['ptr']:
+                self.append_entries(items[batch['ptr']:end])
+                batch['ptr'] = end
+            if batch['ptr'] < len(items):
+                return
+            queue.pop(0)
+            if batch['on_done'] is not None:
+                batch['on_done']()
 
     def refresh_covers(self) -> None:
         self._failed.clear()
@@ -411,6 +424,7 @@ class _PosterView(QAbstractScrollArea):
 
     def clear(self) -> None:
         self._ready_gen = getattr(self, '_ready_gen', 0) + 1
+        self.__dict__['_ready_queue'] = []
         self._entries, self._lower, self._keys, self._query = [], [], set(), ''
         self._rebuild_rows()
 
@@ -820,22 +834,22 @@ class _PosterView(QAbstractScrollArea):
     def _paint_cover(self, p: QPainter, pos: int, rect: QRectF, icon_px: int, titled: bool) -> None:
         src = self._src(pos)
         pixmap = images.peek(src, self._img_size()) if src else None
-        path = QPainterPath()
-        path.addRoundedRect(rect, _RADIUS, _RADIUS)
+        w, h = rect.width(), rect.height()
         p.save()
-        p.setClipPath(path)
+        p.translate(rect.x(), rect.y())
+        p.setClipPath(_rounded_path(w, h))
+        local = QRectF(0, 0, w, h)
         if pixmap is not None and not pixmap.isNull():
-            p.drawPixmap(rect.toRect(), pixmap)
+            p.drawPixmap(local.toRect(), pixmap)
         else:
-            p.fillRect(rect, self._tint)
+            p.fillRect(local, self._tint)
             icon = self._icon(icon_px)
             if icon is not None:
-                p.drawPixmap(int(rect.center().x() - icon_px / 2),
-                             int(rect.center().y() - (icon_px if titled else icon_px / 2)), icon)
+                p.drawPixmap(int(w / 2 - icon_px / 2), int(h / 2 - (icon_px if titled else icon_px / 2)), icon)
             if titled:
                 p.setFont(self._f_small)
                 p.setPen(self._text)
-                p.drawText(QRectF(rect.x() + 10, rect.center().y() + 4, rect.width() - 20, 60),
+                p.drawText(QRectF(10, h / 2 + 4, w - 20, 60),
                            int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap),
                            self._title(pos))
         p.restore()

@@ -4476,6 +4476,7 @@ class WindowChrome(QObject):
         self._nav_last = weakref.WeakKeyDictionary()
         self._last_spec_id: tuple = ()
         self._laid_spec = None
+        self._settle_gen = 0
 
     @property
     def current(self) -> TitleBarSpec:
@@ -4486,6 +4487,7 @@ class WindowChrome(QObject):
         self._last_spec_id = ()
         self._frame_pixmap = None
         self._frame_key = ()
+        self.settle()
 
     def install(self) -> None:
         window = self._window
@@ -5078,6 +5080,7 @@ class WindowChrome(QObject):
         else:
             window.hBoxLayout.setContentsMargins(0, 0, 0, 0)
             window.widgetLayout.setContentsMargins(0, height, 0, 0)
+        window.widgetLayout.activate()
         window.hBoxLayout.activate()
         self.sync_geometry()
 
@@ -5086,9 +5089,11 @@ class WindowChrome(QObject):
         titlebar = getattr(window, "titleBar", None)
         if titlebar is None:
             return
-        left = self._spec.inset_left
-        titlebar.move(left, 0)
-        titlebar.resize(max(0, window.width() - left), titlebar.height())
+        left = min(max(0, int(self._spec.inset_left)), max(0, window.width()))
+        width = max(0, window.width() - left)
+        height = titlebar.height() or self._metrics()[1]
+        if titlebar.geometry() != QRect(left, 0, width, height):
+            titlebar.setGeometry(left, 0, width, height)
         titlebar.raise_()
 
     def refresh(self) -> None:
@@ -5098,6 +5103,23 @@ class WindowChrome(QObject):
             titlebar.syncMaxState(self._maximized())
             titlebar.raise_()
         self._window.update()
+
+    def settle(self, delays=(0, 60, 180, 360, 700)) -> None:
+        self._settle_gen += 1
+        gen = self._settle_gen
+        for delay in delays:
+            QTimer.singleShot(delay, lambda g=gen: self._settle_pass(g))
+
+    def _settle_pass(self, gen: int) -> None:
+        if gen != self._settle_gen:
+            return
+        window = self._window
+        try:
+            if not window.isVisible():
+                return
+            self.refresh()
+        except (RuntimeError, TypeError, AttributeError):
+            return
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self._window:
@@ -5114,15 +5136,18 @@ class WindowChrome(QObject):
                 QTimer.singleShot(0, self.sync_geometry)
             elif kind == QEvent.Type.WindowStateChange:
                 QTimer.singleShot(0, self._on_state)
+                self.settle()
             elif kind == QEvent.Type.Show and not self._shown:
                 self._shown = True
                 QTimer.singleShot(0, self.apply)
         return False
 
     def _on_state(self) -> None:
-        self._relayout()
-        self._window.titleBar.syncMaxState(self._maximized())
-        self._window.update()
+        try:
+            self.refresh()
+        except (RuntimeError, TypeError, AttributeError):
+            return
+        self.settle()
 
     def paint_layers(self, p: QPainter, rect: QRectF, bar: float, layers, ring=None, outer=None, client=None, content=None) -> None:
         clips = {"chrome": ring, "window": outer}
