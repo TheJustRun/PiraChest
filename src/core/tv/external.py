@@ -1,14 +1,3 @@
-"""Native Vyla provider integration.
-
-Vyla is a JavaScript project. PiraChest runs its code in a dedicated Node
-process instead of asking the user to install an SDK or a separate runtime:
-``vyla_bridge.mjs`` loads the vendored Vyla SDK and resolves TMDB titles.
-
-The Python side owns provisioning, caching, timeouts and the translation into
-:class:`~src.core.tv.streams.StreamSource`. A broken Node process is
-contained: the bridge is restarted and the rest of the stream search keeps
-working.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -70,16 +59,18 @@ _bridges: dict[str, "_Bridge"] = {}
 _bridges_lock = threading.Lock()
 
 
-# ---------------------------------------------------------------------------
-# Node runtime + dependency provisioning
-# ---------------------------------------------------------------------------
+
+
+
 
 def _creationflags() -> int:
     return 0x08000000 if os.name == "nt" else 0
 
 
-def _node_env() -> dict:
+def _node_env(node: str = "") -> dict:
     env = clean_env()
+    if node:
+        env["PATH"] = os.path.dirname(os.path.abspath(node)) + os.pathsep + env.get("PATH", "")
     env["NODE_NO_WARNINGS"] = "1"
     npm_cache = os.path.join(paths.app_data_dir, "cache", "npm")
     try:
@@ -224,12 +215,12 @@ def _download_node() -> Optional[str]:
                 candidate = os.path.join(root, name)
                 if not _valid_node(candidate):
                     continue
-                # Keep the runtime at a stable path so the next launch finds it
-                # without downloading again.
+
+
                 source_root = os.path.dirname(candidate)
                 if os.name != "nt" and os.path.basename(source_root) == "bin":
-                    # Unix tarballs keep node in bin/ and npm in lib/, so move
-                    # the whole archive root instead of only bin/.
+
+
                     source_root = os.path.dirname(source_root)
                 relative = os.path.relpath(candidate, source_root)
                 if os.path.abspath(source_root) != os.path.abspath(_RUNTIME_DIR):
@@ -325,7 +316,6 @@ def _read_sdk_version(path: str) -> str:
 
 
 def vyla_sdk_version() -> str:
-    """Installed SDK version, falling back to the bundled one."""
     return _read_sdk_version(_VYLA_DIR) or _read_sdk_version(_BUNDLED_VYLA)
 
 
@@ -356,7 +346,6 @@ def _download_file(url: str, target: str) -> None:
 
 
 def _merge_sdk_dependencies(package_dir: str) -> None:
-    """Keep the shared integration package in sync with the SDK's runtime deps."""
     try:
         with open(os.path.join(package_dir, "package.json"), encoding="utf-8") as fh:
             wanted = json.load(fh).get("dependencies") or {}
@@ -382,11 +371,6 @@ def _merge_sdk_dependencies(package_dir: str) -> None:
 
 
 def update_vyla_sdk() -> str:
-    """Download the latest published Vyla SDK and swap it in atomically.
-
-    Returns the new version string. Raises on network, validation or file
-    errors so the settings page can surface a useful message.
-    """
     if not _vyla_update_lock.acquire(blocking=False):
         raise RuntimeError("A Vyla SDK update is already running")
     staging = ""
@@ -512,7 +496,7 @@ def _install_deps(node: str, force: bool = False) -> None:
     for attempt in (0, 1):
         proc = subprocess.run(
             cmd, cwd=_INTEGRATIONS_DIR, capture_output=True, text=True, timeout=300,
-            env=_node_env(), creationflags=_creationflags(),
+            env=_node_env(node), creationflags=_creationflags(),
         )
         output = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
         if proc.returncode == 0:
@@ -552,7 +536,6 @@ def _provision_worker() -> None:
 
 
 def ensure_runtime(wait: bool = False, force: bool = False) -> bool:
-    """Start (or wait for) Node + npm dependency provisioning."""
     global _provision_thread, _provision_started
     if find_node() and _deps_ready():
         _sync_assets()
@@ -576,16 +559,16 @@ def ensure_runtime(wait: bool = False, force: bool = False) -> bool:
 def _ensure_ready_for_request() -> None:
     status = runtime_status()
     if status["ready"]:
-        # Deploy updated bridge assets even when the runtime was provisioned
-        # by an older build.
+
+
         _sync_assets()
         return
     if not getattr(settings, "tv_external_auto_setup", True):
         raise _BridgeUnavailable("The native provider runtime is not set up")
     ensure_runtime(wait=False)
-    # If Node is already present, a dependency install normally takes a few
-    # seconds. Give it a short window so the first search can still succeed
-    # without making the UI wait for a full Node download.
+
+
+
     if status["node"]:
         _provision_done.wait(7)
     if not (find_node() and _deps_ready()):
@@ -603,9 +586,9 @@ def shutdown_external() -> None:
 atexit.register(shutdown_external)
 
 
-# ---------------------------------------------------------------------------
-# Bridge process
-# ---------------------------------------------------------------------------
+
+
+
 
 class _BridgeError(RuntimeError):
     pass
@@ -634,7 +617,7 @@ class _Bridge:
         node = find_node()
         if not node:
             raise _BridgeUnavailable("Node.js runtime is not available")
-        env = _node_env()
+        env = _node_env(node)
         env["PIRACHEST_INTEGRATIONS_DIR"] = _INTEGRATIONS_DIR
         env["VYLA_SDK_PATH"] = _VYLA_DIR
         env["NODE_NO_WARNINGS"] = "1"
@@ -773,9 +756,9 @@ def _bridge(name: str) -> _Bridge:
         return bridge
 
 
-# ---------------------------------------------------------------------------
-# TTL cache
-# ---------------------------------------------------------------------------
+
+
+
 
 def _cache_get(key: str) -> Any:
     with _cache_lock:
@@ -796,9 +779,9 @@ def _cache_set(key: str, value: Any, ttl: float) -> None:
         _cache[key] = (time.monotonic() + ttl if ttl else 0.0, value)
 
 
-# ---------------------------------------------------------------------------
-# Vyla
-# ---------------------------------------------------------------------------
+
+
+
 
 def _subtitle_tracks(raw: Any) -> list[dict]:
     tracks: list[dict] = []
@@ -874,9 +857,9 @@ def _vyla_streams_sync(tmdb_id: int, media_type: str, season: Optional[int], epi
     if cached is not None:
         return list(cached)
     if quick:
-        # Quick watch only needs a playable direct source. A short deadline
-        # returns the sources that are ready instead of waiting for the long
-        # tail of slow providers.
+
+
+
         deadline_ms, concurrency, ttl = 2500, 16, 2 * 60
     else:
         timeout = max(_TIMEOUT_FLOOR, int(getattr(settings, "tv_external_timeout", 30)))
@@ -890,17 +873,17 @@ def _vyla_streams_sync(tmdb_id: int, media_type: str, season: Optional[int], epi
     if not items:
         _cache_set(key, [], 90)
         return []
-    # Subtitles are fetched lazily by the player, so a stream search never
-    # waits on the subtitle providers.
+
+
     sources = [source for item in items if (source := _vyla_source(item, [])) is not None]
     _cache_set(key, sources, ttl)
     logger.info("Vyla returned %s source(s) for %s %s", len(sources), media_type, tmdb_id)
     return sources
 
 
-# ---------------------------------------------------------------------------
-# Public entry points
-# ---------------------------------------------------------------------------
+
+
+
 
 async def external_stream_sources(*, tmdb_id: Optional[int] = None, imdb_id: str = "",
                                   media_type: str = "movie", season: Optional[int] = None,

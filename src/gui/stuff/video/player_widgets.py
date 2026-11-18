@@ -5,7 +5,7 @@ import math
 from typing import Optional
 
 from PySide6.QtCore import (
-    QElapsedTimer, QPoint, QRect, QRectF, QSettings, QSize, Qt, QTimer, Signal,
+    QElapsedTimer, QEvent, QPoint, QRect, QRectF, QSettings, QSize, Qt, QTimer, Signal,
 )
 from PySide6.QtGui import (
     QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap,
@@ -252,13 +252,13 @@ class _LoadingOverlay(QWidget):
     _SIZE = 68
     _DELAY_MS = 250
 
-    def __init__(self, player: "AnimePlayerWidget", owner: Optional[QWidget] = None) -> None:
-        super().__init__(owner or player, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowDoesNotAcceptFocus | Qt.WindowType.NoDropShadowWindowHint)
+    def __init__(self, player: "AnimePlayerWidget") -> None:
+        super().__init__(player._vid())
+        self.setStyleSheet("background:transparent;")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setFixedSize(self._SIZE, self._SIZE)
+        self.hide()
         self._p = player
         self._active = False
         self._clock = QElapsedTimer()
@@ -279,12 +279,11 @@ class _LoadingOverlay(QWidget):
 
     def _tick(self) -> None:
         v = self._p._vid()
-        if self._clock.elapsed() < self._DELAY_MS or not v.isVisible() or v.visibleRegion().isEmpty():
+        if self._clock.elapsed() < self._DELAY_MS:
             if self.isVisible():
                 self.hide()
             return
-        tl = v.mapToGlobal(QPoint(0, 0))
-        pos = QPoint(tl.x() + (v.width() - self.width()) // 2, tl.y() + (v.height() - self.height()) // 2)
+        pos = QPoint((v.width() - self.width()) // 2, (v.height() - self.height()) // 2)
         if pos != self.pos():
             self.move(pos)
         if not self.isVisible():
@@ -329,13 +328,14 @@ class _SkipBubble(QWidget):
             "border-radius:6px;padding:9px 22px;font:600 14px 'Segoe UI';}"
             "QPushButton:hover{background:white;color:black;}")
 
-    def __init__(self, player: "AnimePlayerWidget", owner: Optional[QWidget] = None) -> None:
-        super().__init__(owner or player, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowDoesNotAcceptFocus | Qt.WindowType.NoDropShadowWindowHint)
+    def __init__(self, player: "AnimePlayerWidget") -> None:
+        super().__init__(player._vid())
+        self.setStyleSheet("background:transparent;")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self._p = player
         self._want = False
+        player._vid().installEventFilter(self)
+        self.hide()
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(10)
@@ -350,6 +350,11 @@ class _SkipBubble(QWidget):
         self._skip.clicked.connect(lambda: player._do_skip())
         self._next.clicked.connect(lambda: player.next_requested.emit())
 
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.Resize:
+            self.reposition()
+        return False
+
     def set_state(self, skip: Optional[str], nxt: Optional[str]) -> None:
         for btn, text in ((self._skip, skip), (self._next, nxt)):
             if text:
@@ -363,13 +368,12 @@ class _SkipBubble(QWidget):
 
     def reposition(self) -> None:
         v = self._p._vid()
-        if not self._want or not v.isVisible() or v.visibleRegion().isEmpty():
+        if not self._want:
             self.hide()
             return
         self.adjustSize()
-        tl = v.mapToGlobal(QPoint(0, 0))
         lift = 96 if self._p._is_fullscreen else 18
-        self.move(tl.x() + v.width() - self.width() - 24, tl.y() + v.height() - self.height() - lift)
+        self.move(v.width() - self.width() - 24, v.height() - self.height() - lift)
         if not self.isVisible():
             self.show()
             self.raise_()
@@ -380,18 +384,16 @@ class _SubOverlay(QWidget):
     _FONTS = ("Segoe UI", "Arial", "Verdana", "Georgia", "Trebuchet MS", "Consolas")
     _STROKES = (0.0, 0.10, 0.17, 0.26)
 
-    def __init__(self, player: "AnimePlayerWidget", owner: Optional[QWidget] = None) -> None:
-        super().__init__(owner or player, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowDoesNotAcceptFocus | Qt.WindowType.NoDropShadowWindowHint)
+    def __init__(self, player: "AnimePlayerWidget") -> None:
+        super().__init__(player._vid())
+        self.setStyleSheet("background:transparent;")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.setToolTip(tr("anime.sub_drag_hint", default="Drag to move, scroll to resize"))
         self._p = player
         self._raw = ""
         self._pix: Optional[QPixmap] = None
         self._drag: Optional[QPoint] = None
-        self._geo: Optional[tuple] = None
         qs = QSettings("PiraChest", "Subs")
 
         def num(key: str, default, lo, hi):
@@ -412,9 +414,13 @@ class _SubOverlay(QWidget):
         self._settle.setSingleShot(True)
         self._settle.setInterval(90)
         self._settle.timeout.connect(self._settled)
-        self._timer = QTimer(self)
-        self._timer.setInterval(33)
-        self._timer.timeout.connect(self._follow)
+        player._vid().installEventFilter(self)
+        self.hide()
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.Resize:
+            self._follow(True)
+        return False
 
     def _settled(self) -> None:
         if self._raw:
@@ -427,12 +433,12 @@ class _SubOverlay(QWidget):
     def set_text(self, text: str) -> None:
         self._raw = text or ""
         if not self._raw:
-            self._timer.stop()
             self.hide()
             return
         self._style()
-        self._timer.start()
-        self._follow()
+        self._place()
+        self.show()
+        self.raise_()
 
     def _lines(self, fm: QFontMetrics, maxw: int) -> list[str]:
         out: list[str] = []
@@ -505,32 +511,19 @@ class _SubOverlay(QWidget):
 
     def _place(self) -> None:
         v = self._p._vid()
-        tl = v.mapToGlobal(QPoint(0, 0))
-        x = tl.x() + int(self._fx * v.width()) - self.width() // 2
-        y = tl.y() + int(self._fy * v.height()) - self.height() // 2
-        low = tl.y() + v.height() - self.height()
+        x = int(self._fx * v.width()) - self.width() // 2
+        y = int(self._fy * v.height()) - self.height() // 2
+        low = v.height() - self.height()
         bar = self._p._bar
-        if self._drag is None and bar.isVisible():
-            low = min(low, bar.mapToGlobal(QPoint(0, 0)).y() - self.height() - 8)
-        self.move(max(tl.x(), min(x, tl.x() + v.width() - self.width())), max(tl.y(), min(y, low)))
+        if self._drag is None and bar.isVisible() and bar.window() is v.window():
+            top = v.mapFrom(v.window(), bar.mapTo(v.window(), QPoint(0, 0))).y()
+            low = min(low, top - self.height() - 8)
+        self.move(max(0, min(x, v.width() - self.width())), max(0, min(y, low)))
 
     def _follow(self, live: bool = False) -> None:
-        if not self._raw or self._drag is not None:
-            return
-        v = self._p._vid()
-        if not v.isVisible() or v.visibleRegion().isEmpty():
-            self.hide()
-            return
-        geo = (v.mapToGlobal(QPoint(0, 0)), v.size())
-        if geo != self._geo:
-            if self._geo is None or self._geo[1] != geo[1]:
-                self._style(live and self._geo is not None)
-            self._geo = geo
+        if self._raw and self._drag is None:
+            self._style(live)
             self._place()
-        if not self.isVisible():
-            self._place()
-            self.show()
-            self.raise_()
 
     def _save(self) -> None:
         qs = QSettings("PiraChest", "Subs")
@@ -545,9 +538,8 @@ class _SubOverlay(QWidget):
             self._fx, self._fy, self._scale = 0.5, 0.86, 1.0
         self._save()
         if self._raw:
-            self._geo = None
             self._style()
-            self._follow()
+            self._place()
 
     def paintEvent(self, _e) -> None:
         if self._pix is None:
@@ -561,20 +553,19 @@ class _SubOverlay(QWidget):
 
     def mousePressEvent(self, e) -> None:
         if e.button() == Qt.MouseButton.LeftButton:
-            self._drag = e.globalPosition().toPoint() - self.pos()
+            self._drag = e.position().toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, e) -> None:
         if self._drag is None:
             return
         v = self._p._vid()
-        tl = v.mapToGlobal(QPoint(0, 0))
-        pos = e.globalPosition().toPoint() - self._drag
-        x = max(tl.x(), min(pos.x(), tl.x() + v.width() - self.width()))
-        y = max(tl.y(), min(pos.y(), tl.y() + v.height() - self.height()))
+        pos = self.mapToParent(e.position().toPoint()) - self._drag
+        x = max(0, min(pos.x(), v.width() - self.width()))
+        y = max(0, min(pos.y(), v.height() - self.height()))
         self.move(x, y)
-        self._fx = (x + self.width() / 2 - tl.x()) / max(1, v.width())
-        self._fy = (y + self.height() / 2 - tl.y()) / max(1, v.height())
+        self._fx = (x + self.width() / 2) / max(1, v.width())
+        self._fy = (y + self.height() / 2) / max(1, v.height())
 
     def mouseReleaseEvent(self, e) -> None:
         if self._drag is not None:
@@ -610,6 +601,26 @@ class _PipWindow(QWidget):
     @property
     def resizing(self) -> bool:
         return self._rs is not None
+
+    @staticmethod
+    def native_only() -> bool:
+        return QGuiApplication.platformName().startswith("wayland")
+
+    def system_move(self) -> bool:
+        handle = self.windowHandle()
+        return self.native_only() and handle is not None and handle.startSystemMove()
+
+    def system_resize(self, edge: Qt.Edge) -> bool:
+        handle = self.windowHandle()
+        return self.native_only() and handle is not None and handle.startSystemResize(edge)
+
+    def _lock_aspect(self, old: QSize, size: QSize) -> None:
+        a, bar = self._aspect(), self._player._BAR_H
+        w = size.width() if size.width() != old.width() else round((size.height() - bar) * a)
+        w = max(self._min_w(a), w)
+        want = QSize(w, round(w / a) + bar)
+        if want != size:
+            self.resize(want)
 
     def set_always_on_top(self, on: bool) -> None:
         if bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint) == bool(on):
@@ -722,6 +733,8 @@ class _PipWindow(QWidget):
     def resizeEvent(self, event) -> None:
         self._save_timer.start()
         super().resizeEvent(event)
+        if self.native_only() and self._rs is None and self.isVisible() and event.oldSize().isValid():
+            self._lock_aspect(event.oldSize(), event.size())
         self._player.pip_geometry_changed()
 
     def closeEvent(self, event) -> None:

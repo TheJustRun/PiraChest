@@ -218,9 +218,11 @@ jobs:
           - arch: x64
             runner: ubuntu-22.04
             glibc: "2.35"
+            machine: x86_64
           - arch: arm64
             runner: ubuntu-24.04-arm
             glibc: "2.39"
+            machine: aarch64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -285,13 +287,14 @@ jobs:
                    "$pkg/usr/share/icons/hicolor/256x256/apps"
           cp -a "dist/$slug/." "$pkg/opt/$pkgname/"
           ln -sf "/opt/$pkgname/$app" "$pkg/usr/bin/$pkgname"
-          python - "$pkg/usr/share/icons/hicolor/256x256/apps/$pkgname.png" <<'PY'
+          icon="src/gui/photos/icon.ico"
+          [ "${{ needs.version.outputs.canary }}" = "1" ] && [ -f src/gui/photos/icon_c.ico ] && icon="src/gui/photos/icon_c.ico"
+          python - "$pkg/usr/share/icons/hicolor/256x256/apps/$pkgname.png" "$icon" <<'PY'
           import sys
           sys.path.insert(0, '.')
           from tools.make_icns import build_png
 
-          icon = 'src/gui/photos/icon_c.ico' if '{{ needs.version.outputs.canary }}' == '1' else 'src/gui/photos/icon.ico'
-          if not build_png(sys.argv[1], icon):
+          if not build_png(sys.argv[1], sys.argv[2]):
               raise SystemExit('Could not read application icon')
           PY
           cat > "$pkg/usr/share/applications/$pkgname.desktop" <<EOF
@@ -327,8 +330,22 @@ jobs:
           debname="$slug-$base-Linux-${{ matrix.arch }}.deb"
           dpkg-deb --build --root-owner-group "$pkg" "package/$debname"
 
+          appdir="build/AppDir"
+          rm -rf "$appdir"
+          mkdir -p "$appdir"
+          cp -al "dist/$slug" "$appdir/app"
+          cp "$pkg/usr/share/icons/hicolor/256x256/apps/$pkgname.png" "$appdir/$pkgname.png"
+          sed 's|^Exec=.*|Exec=AppRun %U|' "$pkg/usr/share/applications/$pkgname.desktop" > "$appdir/$pkgname.desktop"
+          printf '#!/bin/sh\nexec "$(dirname "$(readlink -f "$0")")/app/%s" "$@"\n' "$app" > "$appdir/AppRun"
+          chmod +x "$appdir/AppRun"
+          curl -fsSL --retry 3 -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.machine }}.AppImage"
+          chmod +x appimagetool
+          ARCH=${{ matrix.machine }} ./appimagetool --appimage-extract-and-run --no-appstream \
+            "$appdir" "package/$slug-$base-Linux-${{ matrix.arch }}.AppImage"
+
           cd package
-          for f in *.tar.gz *.deb; do
+          for f in *.tar.gz *.deb *.AppImage; do
             sha256sum "$f" > "$f.sha256"
           done
 
@@ -336,6 +353,16 @@ jobs:
         with:
           name: linux-${{ matrix.arch }}-package
           path: package/*
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Record glibc floor for the release notes
+        run: echo "${{ matrix.glibc }}" > "glibc-${{ matrix.arch }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}-glibc
+          path: glibc-${{ matrix.arch }}.txt
           if-no-files-found: error
           retention-days: 3
 
@@ -348,12 +375,14 @@ jobs:
         include:
           - arch: arm64
             runner: macos-15
-            target: "11.0"
+            target: "14.0"
             machine: arm64
+            floor: "14.0"
           - arch: x64
             runner: macos-15-intel
-            target: "10.15"
+            target: "15.0"
             machine: x86_64
+            floor: "15.0"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
@@ -379,6 +408,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            python -m pip download --no-deps --only-binary=:all: \
+              --python-version 3.13 --implementation cp --abi cp313 \
+              --platform macosx_14_0_arm64 -d lowfloor \
+              libtorrent==2.1.1 orjson==3.13.0
+            python -m pip install lowfloor/*.whl
+          fi
           python -m pip install -r requirements.txt pyinstaller==6.22.2 pyinstaller-hooks-contrib==2026.9
 
       - name: Build with PyInstaller
@@ -389,6 +425,7 @@ jobs:
       - name: Measure and set minimum macOS version
         env:
           MACHINE: ${{ matrix.machine }}
+          LIMIT: ${{ matrix.floor }}
         run: |
           app="dist/${{ needs.version.outputs.app_name }}.app"
           floor=0
@@ -401,6 +438,10 @@ jobs:
             [ "$(printf '%s\n%s\n' "$v" "$floor" | sort -V | tail -n1)" = "$v" ] && floor="$v"
           done < <(find "$app" -type f \( -name '*.so' -o -name '*.dylib' -o -perm -u+x \) -print0)
           [ "$floor" != "0" ] || { echo "::error::Could not measure the macOS minimum version."; exit 1; }
+          if [ "$(printf '%s\n%s\n' "$floor" "$LIMIT" | sort -V | tail -n1)" != "$LIMIT" ]; then
+            echo "::error::macOS ${{ matrix.arch }} build needs macOS $floor, above the $LIMIT limit (a dependency wheel raised the floor)."
+            exit 1
+          fi
           plist="$app/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Delete :LSMinimumSystemVersion" "$plist" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string $floor" "$plist"
@@ -527,7 +568,7 @@ jobs:
 
       - name: Combined checksums
         run: |
-          mv release-files/minos-*.txt .
+          mv release-files/minos-*.txt release-files/glibc-*.txt .
           cd release-files
           sha256sum $(ls | grep -v -e '\.sha256$' -e '^SHA256SUMS.txt$') > SHA256SUMS.txt
 
@@ -539,6 +580,32 @@ jobs:
           TAG="${{ needs.version.outputs.tag }}"
           MACARM=$(cat minos-arm64.txt)
           MACX64=$(cat minos-x64.txt)
+          GLIBCX64=$(cat glibc-x64.txt)
+          GLIBCARM=$(cat glibc-arm64.txt)
+          distros() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          floor = tuple(int(x) for x in sys.argv[1].split('.'))
+          arch = sys.argv[2]
+          releases = [
+              ('Ubuntu', [('20.04', '2.31'), ('22.04', '2.35'), ('24.04', '2.39'), ('25.04', '2.41')], True),
+              ('Debian', [('11', '2.31'), ('12', '2.36'), ('13', '2.41')], True),
+              ('Linux Mint', [('20', '2.31'), ('21', '2.35'), ('22', '2.39')], False),
+              ('Fedora', [('36', '2.35'), ('37', '2.36'), ('38', '2.37'), ('39', '2.38'), ('40', '2.39')], True),
+          ]
+          out = []
+          for name, versions, has_arm in releases:
+              if arch == 'arm64' and not has_arm:
+                  continue
+              for version, glibc in versions:
+                  if tuple(int(x) for x in glibc.split('.')) >= floor:
+                      out.append(f'{name} {version}+')
+                      break
+          print(', '.join(out) or 'a current distribution')
+          PY
+          }
+          DISTROSX64=$(distros "$GLIBCX64" x64)
+          DISTROSARM=$(distros "$GLIBCARM" arm64)
           PREV=$(gh api "repos/$REPO/releases?per_page=1" --jq '.[0].tag_name // empty')
           NOTES_SHA="${{ github.sha }}"
           PARENTS=$(gh api "repos/$REPO/commits/$NOTES_SHA" --jq '.parents | length')
@@ -565,8 +632,8 @@ jobs:
           | **Windows** | x64 | [Installer (.msi)](@@BASE@@-Windows-x64.msi) · [Portable (.zip)](@@BASE@@-Windows-x64.zip) |
           | **macOS** | Apple Silicon (arm64) | [Disk image (.dmg)](@@BASE@@-macOS-arm64.dmg) · [Archive (.zip)](@@BASE@@-macOS-arm64.zip) |
           | **macOS** | Intel (x64) | [Disk image (.dmg)](@@BASE@@-macOS-x64.dmg) · [Archive (.zip)](@@BASE@@-macOS-x64.zip) |
-          | **Linux** | x64 | [Package (.deb)](@@BASE@@-Linux-x64.deb) · [Archive (.tar.gz)](@@BASE@@-Linux-x64.tar.gz) |
-          | **Linux** | arm64 | [Package (.deb)](@@BASE@@-Linux-arm64.deb) · [Archive (.tar.gz)](@@BASE@@-Linux-arm64.tar.gz) |
+          | **Linux** | x64 | [Package (.deb)](@@BASE@@-Linux-x64.deb) · [AppImage](@@BASE@@-Linux-x64.AppImage) · [Archive (.tar.gz)](@@BASE@@-Linux-x64.tar.gz) |
+          | **Linux** | arm64 | [Package (.deb)](@@BASE@@-Linux-arm64.deb) · [AppImage](@@BASE@@-Linux-arm64.AppImage) · [Archive (.tar.gz)](@@BASE@@-Linux-arm64.tar.gz) |
 
           ## Installation
 
@@ -584,17 +651,18 @@ jobs:
           **Linux**
 
           - **Debian/Ubuntu:** install with `sudo apt install ./@@BASE@@-Linux-x64.deb`, then launch `pirachest` from your app menu.
+          - **AppImage:** make it executable with `chmod +x` and run it. If it will not start because FUSE is missing, run it with `--appimage-extract-and-run`.
           - **Archive:** extract the archive and run the `@@APP@@` executable inside the extracted folder.
-          - Package installs update through the package manager; portable archives update themselves in-app.
+          - Package installs update through the package manager, portable archives update themselves in-app, and AppImages are updated by downloading the new file.
 
           ## System requirements
 
           | Platform | Requirements |
           | --- | --- |
-          | **Windows** | Windows 10 or 11, 64-bit (Intel or AMD) |
+          | **Windows** | Windows 10 (version 1809 or newer) or Windows 11, 64-bit (Intel or AMD) |
           | **macOS (Apple Silicon)** | macOS @@MACARM@@ or newer |
           | **macOS (Intel)** | macOS @@MACX64@@ or newer |
-          | **Linux** | x64 with glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Linux Mint 21+, Fedora 36+); arm64 with glibc 2.39 or newer (Ubuntu 24.04+, Debian 13+, Fedora 40+). The `.deb` pulls in the required Qt/X11 libraries; archive users need `libegl1`, `libgl1`, `libxkbcommon-x11-0`, `libxcb-cursor0`, `libxcb-icccm4`, `libxcb-image0`, `libxcb-keysyms1`, `libxcb-render-util0`, `libxcb-shape0`, `libxcb-xkb1`, `libdbus-1-3` and `libpulse0`. |
+          | **Linux** | x64 with glibc @@GLIBCX64@@ or newer (@@DISTROSX64@@); arm64 with glibc @@GLIBCARM@@ or newer (@@DISTROSARM@@). The `.deb` pulls in the required Qt/X11 libraries; archive and AppImage users need `libegl1`, `libgl1`, `libxkbcommon-x11-0`, `libxcb-cursor0`, `libxcb-icccm4`, `libxcb-image0`, `libxcb-keysyms1`, `libxcb-render-util0`, `libxcb-shape0`, `libxcb-xkb1`, `libdbus-1-3` and `libpulse0`. |
 
           <details>
           <summary>Checksums and auto-updates</summary>
@@ -606,7 +674,9 @@ jobs:
             if [ -n "$PREV" ]; then
               printf '\n**Full Changelog:** https://github.com/%s/compare/%s...%s\n' "$REPO" "$PREV" "$TAG"
             fi
-          } | sed -e "s|@@BASE@@|$BASE|g" -e "s|@@APP@@|$APP|g" -e "s|@@MACARM@@|$MACARM|g" -e "s|@@MACX64@@|$MACX64|g" > notes.md
+          } | sed -e "s|@@BASE@@|$BASE|g" -e "s|@@APP@@|$APP|g" -e "s|@@MACARM@@|$MACARM|g" -e "s|@@MACX64@@|$MACX64|g" \
+            -e "s|@@GLIBCX64@@|$GLIBCX64|g" -e "s|@@GLIBCARM@@|$GLIBCARM|g" \
+            -e "s|@@DISTROSX64@@|$DISTROSX64|g" -e "s|@@DISTROSARM@@|$DISTROSARM|g" > notes.md
 
       - id: release
         uses: softprops/action-gh-release@v2

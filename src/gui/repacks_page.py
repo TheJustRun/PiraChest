@@ -5380,6 +5380,9 @@ class SourceTab(MediaPageBase):
         self._busy_ring.setStrokeWidth(6)
         self._busy_ring.hide()
         self._grid.installEventFilter(self)
+        _vsb = self._grid.verticalScrollBar() if hasattr(self._grid, 'verticalScrollBar') else None
+        if _vsb is not None:
+            _vsb.valueChanged.connect(lambda _v: self._busy_ring.isVisible() and self._place_busy_ring())
         grid_page_layout.addWidget(grid_row, 1)
         self._retry_bar = QWidget()
         retry_bar_layout = QHBoxLayout(self._retry_bar)
@@ -5425,7 +5428,14 @@ class SourceTab(MediaPageBase):
 
     def _place_busy_ring(self) -> None:
         r, g = self._busy_ring, self._grid
-        r.move((g.width() - r.width()) // 2, max(0, (g.height() - r.height()) // 2 - 40))
+        header = getattr(g, '_header', None)
+        if header is not None and _qt_is_valid(header) and header.isVisible() and header.height() > 0:
+            top = max(0, header.mapTo(g, QPoint(0, header.height())).y())
+            avail = max(r.height(), g.height() - top)
+            y = top + max(12, (avail - r.height()) // 2 - 20)
+        else:
+            y = max(0, (g.height() - r.height()) // 2)
+        r.move((g.width() - r.width()) // 2, y)
 
     def _set_busy(self, on: bool) -> None:
         r = getattr(self, '_busy_ring', None)

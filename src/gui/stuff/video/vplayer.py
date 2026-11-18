@@ -689,7 +689,6 @@ class AnimePlayerWidget(QWidget):
             win.show()
             win.raise_()
             win.activateWindow()
-            self._swap_overlay(win)
             self.setFocus()
         finally:
             self._suppress_hide = False
@@ -729,7 +728,6 @@ class AnimePlayerWidget(QWidget):
                 layout.insertWidget(self._pip_index, self, 0, self._pip_align)
                 self.resize(width, self.heightForWidth(width))
                 self.setFixedHeight(self.heightForWidth(width))
-            self._swap_overlay(self)
             if restore:
                 self.show()
         except (RuntimeError, TypeError):
@@ -847,7 +845,7 @@ class AnimePlayerWidget(QWidget):
 
     def _hide_overlays(self) -> None:
         self._bubble.set_state(None, None)
-        for overlay in (self._loader, self._subs, self._delay_popup):
+        for overlay in (self._loader, self._delay_popup):
             overlay.hide()
 
     def _stop_relay(self) -> None:
@@ -1466,7 +1464,11 @@ class AnimePlayerWidget(QWidget):
                 if self._pip_dragging or delta.manhattanLength() > 4:
                     self._pip_dragging = True
                     self._click_timer.stop()
-                    win.move(win.snapped(start + delta))
+                    if win.system_move():
+                        self._pip_drag = None
+                        self._pip_dragging = False
+                    else:
+                        win.move(win.snapped(start + delta))
                 return True
             self._pip_cursor(obj, self._pip_edge(obj.mapTo(self, event.position().toPoint())))
         elif t == QEvent.Type.MouseButtonPress and event.button() == left:
@@ -1474,7 +1476,8 @@ class AnimePlayerWidget(QWidget):
             gp = event.globalPosition().toPoint()
             if edge:
                 self._click_timer.stop()
-                win.begin_resize(edge, gp)
+                if not win.system_resize(edge):
+                    win.begin_resize(edge, gp)
                 return True
             self._pip_drag = (gp, win.pos())
             self._pip_dragging = False
@@ -1510,21 +1513,6 @@ class AnimePlayerWidget(QWidget):
         bl.setContentsMargins(0, 0, 0, 0)
         self._fs_win, self._fs_bar_win = w, bw
 
-    def _swap_overlay(self, owner: QWidget) -> None:
-        self._bubble.hide()
-        self._bubble.deleteLater()
-        self._bubble = _SkipBubble(self, owner)
-        self._refresh_bubble()
-        self._loader.set_active(False)
-        self._loader.deleteLater()
-        self._loader = _LoadingOverlay(self, owner)
-        old, text = self._subs, self._subs.text()
-        old.set_text("")
-        old.deleteLater()
-        self._subs = _SubOverlay(self, owner)
-        self._subs.set_text(text)
-        self._loader.set_active(self._busy_on)
-
     def enter_fullscreen(self) -> None:
         if self._is_fullscreen:
             return
@@ -1548,7 +1536,6 @@ class AnimePlayerWidget(QWidget):
         self._bar.setFixedSize(self._fs_bar_w(), self._BAR_H)
         self._fs_bar_win.layout().addWidget(self._bar)
         self._bar.show()
-        self._swap_overlay(self._fs_win)
         self._fs_win.activateWindow()
         self._fs_win.setFocus()
         self._reveal_controls()
@@ -1575,7 +1562,6 @@ class AnimePlayerWidget(QWidget):
         self._fullscreen_btn.setIcon(_wicon("FULL_SCREEN", FluentIcon.VIEW))
         self._fs_win.hide()
         self._fs_win.unsetCursor()
-        self._swap_overlay(self)
         self.setFocus()
         self._restore_window()
 
