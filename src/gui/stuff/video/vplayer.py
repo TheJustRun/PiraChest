@@ -1501,10 +1501,11 @@ class AnimePlayerWidget(QWidget):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
         w.installEventFilter(self)
-        bw = QWidget(w, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
-                     | Qt.WindowType.WindowDoesNotAcceptFocus | Qt.WindowType.NoDropShadowWindowHint)
+        bw = QWidget(w)
         bw.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         bw.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        bw.setAttribute(Qt.WidgetAttribute.WA_NoMousePropagation)
+        bw.hide()
         bl = QVBoxLayout(bw)
         bl.setContentsMargins(0, 0, 0, 0)
         self._fs_win, self._fs_bar_win = w, bw
@@ -1613,9 +1614,17 @@ class AnimePlayerWidget(QWidget):
         if w is None or not self._is_fullscreen:
             return
         bw = self._fs_bar_w()
-        self._bar.setFixedSize(bw, self._BAR_H)
-        g = w.mapToGlobal(QPoint(0, 0))
-        self._fs_bar_win.setGeometry(g.x() + (w.width() - bw) // 2, g.y() + w.height() - self._BAR_H - 36, bw, self._BAR_H)
+        if self._bar.width() != bw or self._bar.height() != self._BAR_H:
+            self._bar.setFixedSize(bw, self._BAR_H)
+        target = QRect(
+            (w.width() - bw) // 2,
+            w.height() - self._BAR_H - 36,
+            bw,
+            self._BAR_H,
+        )
+        if self._fs_bar_win.geometry() != target:
+            self._fs_bar_win.setGeometry(target)
+        self._fs_bar_win.raise_()
 
 
     def _reveal_controls(self, zone: bool = True) -> None:
@@ -1623,9 +1632,10 @@ class AnimePlayerWidget(QWidget):
             return
         self._fs_win.unsetCursor()
         if zone:
+            self._place_fs_bar()
             if not self._fs_bar_win.isVisible():
-                self._place_fs_bar()
                 self._fs_bar_win.show()
+            self._fs_bar_win.raise_()
         if self._playing() or not zone:
             self._hide_timer.start(2500 if zone else 700)
         else:
@@ -1647,7 +1657,7 @@ class AnimePlayerWidget(QWidget):
             self.keyPressEvent(event)
             return True
         if obj is self._fs_win and t in (QEvent.Type.Resize, QEvent.Type.Move) and self._is_fullscreen:
-            if self._fs_bar_win is not None and self._fs_bar_win.isVisible():
+            if self._fs_bar_win is not None:
                 QTimer.singleShot(0, self._place_fs_bar)
         if self._pip_active and obj in (self._bar, self._video_widget) and self._pip_mouse(obj, event, t):
             return True

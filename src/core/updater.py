@@ -620,8 +620,8 @@ def _archive_prefix(files: list, exe_name: str, bundle: bool) -> str:
                     return "/".join(parts[: index + 1]) + "/"
         raise RuntimeError("Application bundle not found in update archive")
     for name, *_rest in files:
-        if name.rsplit("/", 1)[-1] == exe_name:
-            head = name.rsplit("/", 1)[0]
+        head, _sep, leaf = name.rpartition("/")
+        if leaf == exe_name:
             return head + "/" if head else ""
     raise RuntimeError(f"{exe_name} not found in update archive")
 
@@ -659,6 +659,8 @@ def _stage_delta(archive_path: str, out_dir: str, exe_name: str, install_dir: st
             if not bundle and rel.split("/", 1)[0].lower() == "data":
                 continue
             items.append((rel, size, mode, ref, link))
+        if not items:
+            raise RuntimeError(f"{exe_name} not found in update archive")
         if install_dir is None:
             changed = items
         else:
@@ -844,7 +846,7 @@ def _apply_update_posix(new_app_dir: str) -> None:
     kind = "bundle" if host.MACOS and install_root.endswith(".app") else "onedir"
     marker = os.path.join(new_app_dir, "Contents", "MacOS", exe_name) if kind == "bundle" else os.path.join(new_app_dir, exe_name)
     if not os.path.isfile(marker):
-        raise RuntimeError("The downloaded update is incomplete")
+        raise RuntimeError(f"The downloaded update is incomplete: {marker} is missing")
     if not _can_write(install_root):
         raise RuntimeError("PiraChest cannot write to its install folder. Move the app somewhere writable or reinstall it.")
     staging = _update_staging_dir()
@@ -879,7 +881,7 @@ def apply_update_and_restart(new_app_dir: str) -> None:
     install_dir = os.path.dirname(current_exe)
     new_app_dir = os.path.abspath(new_app_dir)
     if not os.path.isfile(os.path.join(new_app_dir, exe_name)):
-        raise RuntimeError("The downloaded update is incomplete")
+        raise RuntimeError(f"The downloaded update is incomplete: {os.path.join(new_app_dir, exe_name)} is missing")
     if not _can_write(install_dir):
         raise RuntimeError("PiraChest cannot write to its install folder. Run it as administrator or reinstall through Chocolatey.")
     staging = _update_staging_dir()

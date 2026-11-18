@@ -16,6 +16,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import shutil
 import ssl
 import subprocess
@@ -29,6 +30,7 @@ import zipfile
 from typing import Any, Optional
 
 from ..config import paths, settings
+from ..system import clean_env
 from .streams import StreamSource, quality_of
 
 logger = logging.getLogger(__name__)
@@ -76,6 +78,22 @@ def _creationflags() -> int:
     return 0x08000000 if os.name == "nt" else 0
 
 
+def _node_env() -> dict:
+    env = clean_env()
+    env["NODE_NO_WARNINGS"] = "1"
+    npm_cache = os.path.join(paths.app_data_dir, "cache", "npm")
+    try:
+        os.makedirs(npm_cache, exist_ok=True)
+    except OSError:
+        pass
+    env["npm_config_cache"] = npm_cache
+    env["npm_config_update_notifier"] = "false"
+    env["npm_config_fund"] = "false"
+    env["npm_config_audit"] = "false"
+    env["npm_config_progress"] = "false"
+    return env
+
+
 def _node_candidates() -> list[str]:
     candidates: list[str] = []
     configured = (getattr(settings, "tv_node_path", "") or "").strip().strip('"')
@@ -111,7 +129,7 @@ def _valid_node(path: str) -> bool:
     try:
         proc = subprocess.run(
             [path, "--version"], capture_output=True, text=True, timeout=4,
-            creationflags=_creationflags(),
+            env=_node_env(), creationflags=_creationflags(),
         )
         if proc.returncode != 0:
             return False
@@ -443,25 +461,75 @@ def _npm_command(node: str) -> Optional[list[str]]:
     return None
 
 
+def _npm_failure_detail(output: str, limit: int = 10) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    relevant = [line for line in lines if not line.startswith("npm notice")]
+    return " | ".join((relevant or lines)[-limit:])
+
+
+def _save_npm_log(output: str, append: bool = False) -> str:
+    target = os.path.join(_INTEGRATIONS_DIR, "npm-install.log")
+    try:
+        with open(target, "a" if append else "w", encoding="utf-8") as fh:
+            if append:
+                fh.write("\n\n=== retry ===\n")
+            fh.write(output)
+            match = re.search(
+                r"complete log of this run can be found in:?\s*(\S+)", output)
+            if match and os.path.isfile(match.group(1)):
+                try:
+                    with open(match.group(1), encoding="utf-8", errors="replace") as log:
+                        fh.write("\n\n--- npm debug log ---\n")
+                        fh.write("".join(log.readlines()[-80:]))
+                except OSError:
+                    pass
+    except OSError:
+        return ""
+    return target
+
+
+def _reset_deps() -> None:
+    shutil.rmtree(os.path.join(_INTEGRATIONS_DIR, "node_modules"), ignore_errors=True)
+    for name in ("package-lock.json", ".deps-ready"):
+        try:
+            os.remove(os.path.join(_INTEGRATIONS_DIR, name))
+        except OSError:
+            pass
+
+
 def _install_deps(node: str, force: bool = False) -> None:
     if not force and _deps_ready():
         return
     npm = _npm_command(node)
     if not npm:
         raise RuntimeError("npm was not found next to the Node.js runtime")
-    cmd = npm + ["install", "--omit=dev", "--no-audit", "--no-fund", "--loglevel=error"]
+    cmd = npm + ["install", "--omit=dev", "--no-audit", "--no-fund",
+                 "--progress=false", "--loglevel=error"]
     logger.info("Installing native provider dependencies in %s", _INTEGRATIONS_DIR)
-    proc = subprocess.run(
-        cmd, cwd=_INTEGRATIONS_DIR, capture_output=True, text=True, timeout=300,
-        creationflags=_creationflags(),
-    )
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        tail = " | ".join(detail[-4:]) if detail else f"exit {proc.returncode}"
+    output = ""
+    for attempt in (0, 1):
+        proc = subprocess.run(
+            cmd, cwd=_INTEGRATIONS_DIR, capture_output=True, text=True, timeout=300,
+            env=_node_env(), creationflags=_creationflags(),
+        )
+        output = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+        if proc.returncode == 0:
+            marker = os.path.join(_INTEGRATIONS_DIR, ".deps-ready")
+            with open(marker, "w", encoding="utf-8") as fh:
+                fh.write(_ASSET_VERSION)
+            return
+        detail = _npm_failure_detail(output)
+        log_path = _save_npm_log(output, append=bool(attempt))
+        if attempt == 0:
+            logger.warning("npm install failed, retrying with a clean tree: %s", detail)
+            _reset_deps()
+            continue
+        tail = detail or f"exit {proc.returncode}"
+        if log_path:
+            tail = f"{tail} (see {log_path})"
         raise RuntimeError(f"npm install failed: {tail}")
-    marker = os.path.join(_INTEGRATIONS_DIR, ".deps-ready")
-    with open(marker, "w", encoding="utf-8") as fh:
-        fh.write(_ASSET_VERSION)
 
 
 def _provision_worker() -> None:
@@ -566,7 +634,7 @@ class _Bridge:
         node = find_node()
         if not node:
             raise _BridgeUnavailable("Node.js runtime is not available")
-        env = os.environ.copy()
+        env = _node_env()
         env["PIRACHEST_INTEGRATIONS_DIR"] = _INTEGRATIONS_DIR
         env["VYLA_SDK_PATH"] = _VYLA_DIR
         env["NODE_NO_WARNINGS"] = "1"

@@ -66,10 +66,13 @@ excludes = [
     'PySide6.QtRemoteObjects', 'PySide6.QtSpatialAudio', 'PySide6.QtTextToSpeech',
     'PySide6.QtQuickControls2', 'PySide6.QtQuickTest', 'PySide6.QtStateMachine',
     'PySide6.QtPrintSupport', 'PySide6.QtConcurrent',
-    'PySide6.QtDBus',
     'PySide6.QtQml', 'PySide6.QtQuick', 'PySide6.QtQuickWidgets', 'PySide6.QtMultimediaQuick',
     'fake_useragent',
 ]
+
+if sys.platform.startswith('linux'):
+    excludes = [name for name in excludes if name != 'PySide6.QtDBus']
+    hiddenimports.append('PySide6.QtDBus')
 
 a = Analysis(
     ['src/main.py'],
@@ -102,6 +105,11 @@ _UNUSED_BINARIES = {
     'opengl32sw.dll',
 }
 a.binaries = [b for b in a.binaries if os.path.basename(b[0]).lower() not in _UNUSED_BINARIES]
+if sys.platform.startswith('linux'):
+    a.binaries = [
+        b for b in a.binaries
+        if not os.path.basename(b[0]).startswith('libqgtk3.so')
+    ]
 a.datas = [
     d for d in a.datas
     if '__pycache__' not in d[0].replace('\\', '/').lower() and not d[0].lower().endswith('.pyc')

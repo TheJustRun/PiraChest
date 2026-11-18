@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 import subprocess
 import sys
 
@@ -63,6 +64,39 @@ def name_matches_platform(name: str, target_os: str | None = None, target_arch: 
     return not arch_tokens or any(token in low for token in arch_tokens)
 
 
+_LINUX_OPENERS = ("gio", "xdg-open", "kde-open5", "gnome-open")
+
+
+def _launch(command: list[str]) -> bool:
+    try:
+        proc = subprocess.Popen(
+            command,
+            env=clean_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **detached_kwargs(),
+        )
+    except OSError:
+        return False
+    try:
+        code = proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        return True
+    return code == 0
+
+
+def _open_linux(target: str) -> bool:
+    for name in _LINUX_OPENERS:
+        exe = shutil.which(name)
+        if not exe:
+            continue
+        command = [exe, "open", target] if name == "gio" else [exe, target]
+        if _launch(command):
+            return True
+    return False
+
+
 def open_path(path: str) -> None:
     path = os.path.abspath(path)
     if WINDOWS:
@@ -70,7 +104,7 @@ def open_path(path: str) -> None:
     elif MACOS:
         subprocess.Popen(["open", path])
     else:
-        subprocess.Popen(["xdg-open", path])
+        _open_linux(path)
 
 
 def open_external(target: str) -> bool:
@@ -83,7 +117,7 @@ def open_external(target: str) -> bool:
         elif MACOS:
             subprocess.Popen(["open", target])
         else:
-            subprocess.Popen(["xdg-open", target])
+            return _open_linux(target)
         return True
     except OSError:
         return False
@@ -100,7 +134,7 @@ def reveal_path(path: str, select: bool = False) -> None:
         subprocess.Popen(["open", "-R", path] if select else ["open", path])
     else:
         target = os.path.dirname(path) if select and os.path.isfile(path) else path
-        subprocess.Popen(["xdg-open", target])
+        _open_linux(target)
 
 
 def detached_kwargs() -> dict:

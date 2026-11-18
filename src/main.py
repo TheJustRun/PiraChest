@@ -14,6 +14,11 @@ if _FROZEN and (sys.stdout is None or sys.stderr is None):
 
 os.environ.setdefault('QT_MEDIA_BACKEND', 'ffmpeg')
 
+if sys.platform.startswith('linux'):
+    _theme = os.environ.get('QT_QPA_PLATFORMTHEME', '')
+    if _theme in ('', 'gtk', 'gtk2', 'gtk3'):
+        os.environ['QT_QPA_PLATFORMTHEME'] = 'xdgdesktopportal'
+
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = (getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
