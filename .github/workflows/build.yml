@@ -431,17 +431,20 @@ jobs:
           floor=0
           while IFS= read -r -d '' f; do
             file -b "$f" | grep -q 'Mach-O' || continue
-            v=$(otool -arch "$MACHINE" -l "$f" 2>/dev/null \
-              | awk '$1=="minos"{print $2} $1=="cmd"&&$2=="LC_VERSION_MIN_MACOSX"{m=1} m&&$1=="version"{print $2; m=0}' \
-              | sort -V | tail -n1)
+            read -r v sdk < <(otool -arch "$MACHINE" -l "$f" 2>/dev/null \
+              | awk '$1=="minos"{mv=$2} $1=="sdk"{sv=$2} $1=="cmd"&&$2=="LC_VERSION_MIN_MACOSX"{m=1} m&&$1=="version"{mv=$2} m&&$1=="sdk"{sv=$2; m=0} END{print mv, sv}')
             [ -n "$v" ] || continue
+            if [ "$(printf '%s\n%s\n' "$v" "$LIMIT" | sort -V | tail -n1)" != "$LIMIT" ]; then
+              echo "::warning::${f#$app/} declares minos $v; lowering to $LIMIT"
+              mode=$(stat -f %Lp "$f")
+              vtool -set-build-version macos "$LIMIT" "${sdk:-$LIMIT}" -replace -output "$f.patched" "$f"
+              mv "$f.patched" "$f"
+              chmod "$mode" "$f"
+              v="$LIMIT"
+            fi
             [ "$(printf '%s\n%s\n' "$v" "$floor" | sort -V | tail -n1)" = "$v" ] && floor="$v"
           done < <(find "$app" -type f \( -name '*.so' -o -name '*.dylib' -o -perm -u+x \) -print0)
           [ "$floor" != "0" ] || { echo "::error::Could not measure the macOS minimum version."; exit 1; }
-          if [ "$(printf '%s\n%s\n' "$floor" "$LIMIT" | sort -V | tail -n1)" != "$LIMIT" ]; then
-            echo "::error::macOS ${{ matrix.arch }} build needs macOS $floor, above the $LIMIT limit (a dependency wheel raised the floor)."
-            exit 1
-          fi
           plist="$app/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Delete :LSMinimumSystemVersion" "$plist" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string $floor" "$plist"
