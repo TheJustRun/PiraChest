@@ -377,6 +377,8 @@ class _PosterTile(QFrame):
             size = (max(1, int(self.width() - 2 * pad)), max(1, int(self.height() - 2 * pad)))
             key = (size, pal['muted'])
             if key not in _placeholders:
+                if len(_placeholders) >= 64:
+                    _placeholders.pop(next(iter(_placeholders)))
                 _placeholders[key] = themed_icon('home.poster_placeholder', FluentIcon.PHOTO, size=max(size), color=pal['muted']).pixmap(*size)
             painter.drawPixmap(int(pad), int(pad), _placeholders[key])
         painter.end()

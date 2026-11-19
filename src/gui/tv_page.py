@@ -3914,7 +3914,7 @@ class _MediaTab(MediaPageBase):
         self._search_box.clearSignal.connect(self._on_search_commit)
         from src.gui.stuff.search_history import attach as attach_search_history
         attach_search_history(self._search_box, 'tv', lambda _text: self._on_search_commit())
-        self._search_box.setMinimumWidth(280)
+        self._search_box.setMinimumWidth(160)
         self._search_box.setMaximumWidth(360)
         search_row = QHBoxLayout()
         search_row.setSpacing(10)

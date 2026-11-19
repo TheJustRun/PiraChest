@@ -622,6 +622,7 @@ class AnimePlayerWidget(QWidget):
         self._master_url = url
         self._master_final_url = final_url
 
+        self._player.setVideoSink(self._video_widget.videoSink())
         self._player.stop()
         self._player.setSource(QUrl(final_url))
         self._player.setPlaybackRate(self._speed)

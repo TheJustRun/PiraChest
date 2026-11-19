@@ -184,10 +184,12 @@ def relaunch_as_admin() -> bool:
     except Exception:
         return False
 
-def relaunch_app() -> bool:
+def relaunch_app(env: dict | None = None) -> bool:
     cmd = [sys.executable] if getattr(sys, 'frozen', False) else [sys.executable, os.path.abspath(sys.argv[0])]
+    child_env = dict(os.environ if env is None else env)
+    child_env[_RESTART_ENV] = '1'
     try:
-        subprocess.Popen(cmd + sys.argv[1:], env={**os.environ, _RESTART_ENV: '1'}, **host.detached_kwargs())
+        subprocess.Popen(cmd + sys.argv[1:], env=child_env, **host.detached_kwargs())
         return True
     except OSError as exc:
         logger.warning('Failed to relaunch: %s', exc)
@@ -408,6 +410,7 @@ class Settings:
     search_history_enabled: bool = True
     sfx_volume: int = 25
     ambiance_volume: int = 45
+    ui_scale: int = 100
     background_image_enabled: bool = False
     background_image_path: str = ''
     background_image_blur: int = 12
@@ -491,6 +494,7 @@ _RANGES: dict[str, tuple[float, float]] = {
     'min_free_space_mb': (0, 10_000_000),
     'sfx_volume': (0, 100),
     'ambiance_volume': (0, 100),
+    'ui_scale': (70, 150),
     'background_image_blur': (0, 40),
     'background_image_darken': (0, 90),
     'sailseek_max_results': (5, 100),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Callable
@@ -1624,15 +1625,20 @@ class _Surface(QFrame):
 
 
 class _OverlayDialog(QDialog):
+    _EMBEDDED = sys.platform != 'win32'
 
     def __init__(self, owner: QWidget | None, steps: int = 1):
         super().__init__(owner.window() if owner is not None and owner.window() is not owner else owner)
         self._owner = owner.window() if owner is not None and owner.window() is not None else owner
         self.setObjectName('pirachestOnboardingOverlay')
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
-                            | Qt.WindowType.NoDropShadowWindowHint)
+        if self._EMBEDDED and self._owner is not None:
+            self.setWindowFlags(Qt.WindowType.Widget)
+        else:
+            self._EMBEDDED = False
+            self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
+                                | Qt.WindowType.NoDropShadowWindowHint)
+            self.setModal(True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setModal(True)
         self.setStyleSheet(
             '#pirachestOnboardingOverlay { background: transparent; border: none; }'
         )
@@ -1675,6 +1681,8 @@ class _OverlayDialog(QDialog):
 
     def _owner_rect(self) -> QRect:
         owner = self._owner
+        if self._EMBEDDED:
+            return owner.rect() if owner.width() > 80 and owner.height() > 80 else QRect(0, 0, 900, 600)
         rect = QRect()
         if owner is not None and owner.width() > 80 and owner.height() > 80:
             rect = owner.frameGeometry() if owner.isVisible() else owner.geometry()
@@ -1716,6 +1724,9 @@ class _OverlayDialog(QDialog):
     def showEvent(self, event) -> None:
         self._apply_bounds()
         super().showEvent(event)
+        if self._EMBEDDED:
+            self.raise_()
+            self.setFocus()
         self._request_refit()
 
     def _available(self) -> tuple[int, int]:

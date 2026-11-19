@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import ctypes
+import faulthandler
 import gc
 import logging
 import math
@@ -11,6 +12,7 @@ import shlex
 import struct
 import subprocess
 import sys
+import threading
 import time
 import weakref
 from contextlib import suppress
@@ -244,6 +246,8 @@ DISCORD_URL = 'https://discord.gg/j7dBxTZMDE'
 _LOG_FORMAT = '%(asctime)s [%(levelname)s] %(name)s — %(message)s'
 _LOG_FILE_HANDLER: logging.FileHandler | None = None
 _PREV_EXCEPTHOOK = None
+_CRASH_FILE = None
+_PENDING_CRASH_REPORT = ''
 _QT_MESSAGE_HANDLER_INSTALLED = False
 _LOG_MAX_BYTES = 2 * 1024 * 1024
 _LOG_BACKUPS = 3
@@ -289,11 +293,51 @@ def _crash_excepthook(exc_type, exc_value, exc_tb) -> None:
         _PREV_EXCEPTHOOK(exc_type, exc_value, exc_tb)
 
 
+def _thread_excepthook(args) -> None:
+    if args.exc_type is SystemExit:
+        return
+    name = getattr(args.thread, 'name', '?')
+    logging.getLogger().critical(
+        'Unhandled exception in thread %s', name, exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+
+def _unraisable_hook(unraisable) -> None:
+    logging.getLogger().error(
+        'Unraisable exception: %s (object=%r)', unraisable.err_msg or '', unraisable.object,
+        exc_info=(unraisable.exc_type, unraisable.exc_value, unraisable.exc_traceback))
+
+
+def _install_native_crash_log() -> None:
+    global _CRASH_FILE, _PENDING_CRASH_REPORT
+    if _CRASH_FILE is not None:
+        return
+    path = os.path.join(paths.app_data_dir, 'logs', 'crash.log')
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path):
+            with open(path, encoding='utf-8', errors='replace') as handle:
+                _PENDING_CRASH_REPORT = handle.read().strip()
+        _CRASH_FILE = open(path, 'w', encoding='utf-8')
+        faulthandler.enable(file=_CRASH_FILE, all_threads=True)
+    except Exception:
+        logger.exception('Could not enable native crash log')
+
+
+def _report_previous_crash() -> None:
+    global _PENDING_CRASH_REPORT
+    if _PENDING_CRASH_REPORT:
+        report, _PENDING_CRASH_REPORT = _PENDING_CRASH_REPORT, ''
+        logging.getLogger().critical('Previous run crashed natively:\n%s', report)
+
+
 def install_exception_hooks() -> None:
     global _PREV_EXCEPTHOOK
     if _PREV_EXCEPTHOOK is None:
         _PREV_EXCEPTHOOK = sys.excepthook
         sys.excepthook = _crash_excepthook
+        threading.excepthook = _thread_excepthook
+        sys.unraisablehook = _unraisable_hook
+    _install_native_crash_log()
 
 
 def set_file_logging_enabled(enabled: bool) -> None:
@@ -312,6 +356,7 @@ def set_file_logging_enabled(enabled: bool) -> None:
             root_logger.setLevel(logging.INFO)
         _LOG_FILE_HANDLER = handler
         logger.info('File logging enabled: %s', path)
+        _report_previous_crash()
     elif _LOG_FILE_HANDLER is not None:
         root_logger.removeHandler(_LOG_FILE_HANDLER)
         _LOG_FILE_HANDLER.close()
@@ -319,6 +364,8 @@ def set_file_logging_enabled(enabled: bool) -> None:
 
 
 def configure_logging(enable_file: bool = True) -> None:
+    install_exception_hooks()
+    install_qt_message_handler()
     root_logger = logging.getLogger()
     if not root_logger.handlers:
         logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
@@ -3284,6 +3331,7 @@ class MainWindow(FluentWindow):
         movie.frameChanged.connect(self._on_bg_movie_frame)
 
         movie.start()
+        self._sync_background_active()
 
     def _on_bg_movie_frame(self, _frame_index: int) -> None:
         now = time.monotonic()
@@ -3315,6 +3363,7 @@ class MainWindow(FluentWindow):
         player.play()
         self._bg_video_sink = sink
         self._bg_player = player
+        self._sync_background_active()
 
     def _on_bg_video_frame(self, frame) -> None:
         if getattr(self, '_bg_video_busy', False):
@@ -3381,6 +3430,13 @@ class MainWindow(FluentWindow):
         self.setProperty('pirachestCanary', IS_CANARY)
         self.resize(1100, 740)
         self.setMinimumSize(900, 600)
+        screen = self.screen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            width = max(640, min(1100, avail.width() - 40))
+            height = max(480, min(740, avail.height() - 60))
+            self.resize(width, height)
+            self.setMinimumSize(min(900, width), min(600, height))
         self._force_quit = False
         self._konami_pos = 0
         self._konami_seen = 0.0
@@ -4383,6 +4439,21 @@ class MainWindow(FluentWindow):
         media_bg = self._media_bg
         if media_bg is not None:
             media_bg.set_active(active)
+        player = getattr(self, '_bg_player', None)
+        if player is not None:
+            if active:
+                player.play()
+            else:
+                player.pause()
+        movie = getattr(self, '_bg_movie', None)
+        if movie is not None:
+            if active:
+                if movie.state() == QMovie.MovieState.NotRunning:
+                    movie.start()
+                else:
+                    movie.setPaused(False)
+            elif movie.state() == QMovie.MovieState.Running:
+                movie.setPaused(True)
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -6010,6 +6081,13 @@ def create_application(argv: list | None=None):
 
     surface_format.setSamples(0)
     QSurfaceFormat.setDefaultFormat(surface_format)
+    if not os.environ.get('QT_SCALE_FACTOR'):
+        try:
+            scale = int(settings.ui_scale)
+        except Exception:
+            scale = 100
+        if 70 <= scale <= 150 and scale != 100:
+            os.environ['QT_SCALE_FACTOR'] = f'{scale / 100:g}'
     app = QApplication(argv if argv is not None else sys.argv)
     if host.LINUX and getattr(sys, 'frozen', False):
         _install_clean_url_opener()

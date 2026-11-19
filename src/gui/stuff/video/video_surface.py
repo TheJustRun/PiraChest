@@ -32,6 +32,10 @@ class VideoSurface(QWidget):
         if self.isVisible():
             self.update()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.update()
+
     def clear(self) -> None:
         self._pending = None
         self._frame = QImage()

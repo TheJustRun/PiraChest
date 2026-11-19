@@ -238,6 +238,7 @@ _BADGE_KEYS = ('pink_paw', 'hypervisor', 'switch', 'ns2', 'ps3')
 _BADGE_FILES = {'pink_paw': 'pinkpaw.png', 'hypervisor': 'hv_icon.png', 'switch': 'ns.png', 'ns2': 'ns2.png', 'ps3': 'ps3.png'}
 _badge_cache: dict = {}
 _EXCL_CACHE: dict = {}
+_EXCL_CACHE_MAX = 64
 _TAG_EXCLUDE_SOURCES = frozenset({'fitgirl'})
 _EXCL_LANES = 4
 _EXCL_MAX_PAGES = 120
@@ -5782,7 +5783,11 @@ class SourceTab(MediaPageBase):
             self._excl_inflight -= 1
         self._excl_lanes[name] -= 1
         if self._excl_lanes[name] == 0:
-            _EXCL_CACHE[(self._source_key, norm_tag(name))] = set(self._excl_tag_urls[name])
+            cache_key = (self._source_key, norm_tag(name))
+            _EXCL_CACHE.pop(cache_key, None)
+            _EXCL_CACHE[cache_key] = set(self._excl_tag_urls[name])
+            while len(_EXCL_CACHE) > _EXCL_CACHE_MAX:
+                _EXCL_CACHE.pop(next(iter(_EXCL_CACHE)))
         if self._excl_inflight <= 0:
             self._excl_finish(key)
 
@@ -6855,6 +6860,98 @@ def _autostart_release_watching() -> None:
 _autostart_release_watching()
 
 
+class _ToolbarFlow(QLayout):
+
+    def __init__(self, spacing: int = 8, vspacing: int = 8):
+        super().__init__()
+        self._items: list[tuple[QLayoutItem, bool]] = []
+        self._vgap = vspacing
+        self.setSpacing(spacing)
+
+    def addWidget(self, widget, stretch=0, alignment=Qt.AlignmentFlag(0)) -> None:
+        super().addWidget(widget)
+        item = self._items.pop()[0]
+        self._items.append((item, bool(alignment & Qt.AlignmentFlag.AlignRight)))
+
+    def addStretch(self, *_args) -> None:
+        pass
+
+    def addItem(self, item: QLayoutItem) -> None:
+        self._items.append((item, False))
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        return self._items[index][0] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):
+        return self._items.pop(index)[0] if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._arrange(QRect(0, 0, width, 0), False)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._arrange(rect, True)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        m = self.contentsMargins()
+        w = max((it.minimumSize().width() for it, _r in self._items), default=0)
+        h = max((it.minimumSize().height() for it, _r in self._items), default=0)
+        return QSize(w + m.left() + m.right(), h + m.top() + m.bottom())
+
+    def _arrange(self, rect: QRect, apply: bool) -> int:
+        m = self.contentsMargins()
+        area = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        gap = self.spacing()
+        shown = [(it, r) for it, r in self._items if it.widget() is None or not it.widget().isHidden()]
+
+        def width_of(group):
+            return sum(it.sizeHint().width() for it in group) + gap * max(len(group) - 1, 0)
+
+        def pack(group):
+            rows, cur = [], []
+            for it in group:
+                if cur and width_of(cur + [it]) > area.width():
+                    rows.append(cur)
+                    cur = []
+                cur.append(it)
+            return rows + ([cur] if cur else [])
+
+        right = [it for it, r in shown if r]
+        rows = [[row, []] for row in pack([it for it, r in shown if not r])]
+        if right and rows and width_of(rows[-1][0]) + gap + width_of(right) <= area.width():
+            rows[-1][1] = right
+        else:
+            rows += [[[], row] for row in pack(right)]
+        y = area.y()
+        for left_items, right_items in rows:
+            row_h = max((it.sizeHint().height() for it in left_items + right_items), default=0)
+            if apply:
+                x = area.x()
+                for it in left_items:
+                    sz = it.sizeHint()
+                    it.setGeometry(QRect(QPoint(x, y + (row_h - sz.height()) // 2), sz))
+                    x += sz.width() + gap
+                x = area.right() + 1 - width_of(right_items)
+                for it in right_items:
+                    sz = it.sizeHint()
+                    it.setGeometry(QRect(QPoint(x, y + (row_h - sz.height()) // 2), sz))
+                    x += sz.width() + gap
+            y += row_h + self._vgap
+        return (y - self._vgap if rows else y) - rect.y() + m.bottom()
+
+
 class RepacksPage(QWidget):
     def __init__(self, manager: DownloadManager, parent=None):
         super().__init__(parent)
@@ -6930,9 +7027,8 @@ class RepacksPage(QWidget):
         if _discord_logo is None:
             apply_slot_icon_theme(self._discord_btn, 'repacks.discord', FluentIcon.CHAT)
         self._discord_btn.clicked.connect(self._on_discord_clicked)
-        search_row = QHBoxLayout()
+        search_row = _ToolbarFlow()
         search_row.setContentsMargins(24, 0, 24, 0)
-        search_row.setSpacing(8)
         search_row.addWidget(self._search_bar, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addWidget(self._donate_btn, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addWidget(self._upcoming_btn, 0, Qt.AlignmentFlag.AlignLeft)

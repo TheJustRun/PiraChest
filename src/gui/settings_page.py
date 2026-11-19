@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import ctypes
 import hashlib
 import html
@@ -7,7 +8,11 @@ import logging
 import os
 import random
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import warnings
 
@@ -154,9 +159,95 @@ def _repacks_tab_icon(source_key: str) -> QIcon | None:
     return icon if not icon.isNull() else None
 
 
+_CONSOLE_TERMINALS = (
+    ('konsole', ['-e']), ('gnome-terminal', ['--wait', '--']), ('xfce4-terminal', ['-x']),
+    ('kitty', []), ('alacritty', ['-e']), ('xterm', ['-e']), ('x-terminal-emulator', ['-e']),
+)
+_console_proc: subprocess.Popen | None = None
+_console_handler: logging.Handler | None = None
+_console_window: str | None = None
+
+
+def _osascript(script: str) -> str:
+    with suppress(Exception):
+        result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True, timeout=10)
+        return result.stdout.strip()
+    return ''
+
+
+def _open_mac_console(path: str) -> bool:
+    global _console_window
+    command = 'tail -n +1 -f ' + shlex.quote(path)
+    window_id = _osascript(
+        'tell application "Terminal"\n'
+        'activate\n'
+        'set t to do script ' + '"' + command.replace('\\', '\\\\').replace('"', '\\"') + '"\n'
+        'return id of (first window whose tabs contains t)\n'
+        'end tell'
+    )
+    if not window_id.isdigit():
+        return False
+    _console_window = window_id
+    atexit.register(_close_posix_console)
+    return True
+
+
+def _close_posix_console() -> None:
+    global _console_proc, _console_handler, _console_window
+    if _console_window is not None:
+        window_id, _console_window = _console_window, None
+        with suppress(Exception):
+            subprocess.run(['pkill', '-f', 'tail.*pirachest-console.log'], timeout=5)
+        _osascript('tell application "Terminal" to close (first window whose id is ' + window_id + ') saving no')
+    if _console_handler is not None:
+        logging.getLogger().removeHandler(_console_handler)
+        with suppress(Exception):
+            _console_handler.close()
+        _console_handler = None
+    if _console_proc is not None:
+        with suppress(Exception):
+            _console_proc.terminate()
+        _console_proc = None
+
+
+def _set_debug_console_posix(visible: bool) -> None:
+    global _console_proc, _console_handler
+    root_logger = logging.getLogger()
+    if not visible:
+        _close_posix_console()
+        root_logger.setLevel(logging.WARNING)
+        return
+    if _console_window is not None or (_console_proc is not None and _console_proc.poll() is None):
+        return
+    _close_posix_console()
+    path = os.path.join(tempfile.gettempdir(), 'pirachest-console.log')
+    _console_handler = logging.FileHandler(path, mode='w', encoding='utf-8', errors='replace')
+    _console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s — %(message)s'))
+    root_logger.addHandler(_console_handler)
+    root_logger.setLevel(logging.DEBUG)
+    for name in logging.root.manager.loggerDict:
+        if name == 'src' or name.startswith('src.'):
+            logging.getLogger(name).setLevel(logging.NOTSET)
+    if sys.platform == 'darwin':
+        if not _open_mac_console(path):
+            logger.warning('Could not open Terminal; debug log is at %s', path)
+        return
+    for term, args in _CONSOLE_TERMINALS:
+        exe = shutil.which(term)
+        if not exe:
+            continue
+        with suppress(OSError):
+            _console_proc = subprocess.Popen([exe, *args, 'tail', '-n', '+1', '-f', path],
+                                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL)
+            atexit.register(_close_posix_console)
+            return
+    logger.warning('No terminal emulator found; debug log is at %s', path)
+
+
 def set_debug_console_visible(visible: bool) -> None:
     if os.name != 'nt':
-        return
+        return _set_debug_console_posix(visible)
     kernel32 = ctypes.windll.kernel32
     user32 = ctypes.windll.user32
     hwnd = kernel32.GetConsoleWindow()
@@ -461,7 +552,9 @@ def show_update_dialog(parent: QWidget, result: dict, allow_skip: bool = True) -
         f'QScrollBar::handle:vertical:hover {{ background: {_alpha(body, 100)}; }}'
         'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }'
         'QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }')
-    view.setMinimumHeight(400)
+    screen = box.screen() or QApplication.primaryScreen()
+    avail_h = screen.availableGeometry().height() if screen is not None else 900
+    view.setMinimumHeight(min(400, max(160, avail_h - 300)))
     layout.addWidget(view, 1)
     skip_chk = None
     if allow_skip:
@@ -1169,6 +1262,10 @@ class SoundManager(QObject):
         self._media_sources: set[str] = set()
         self._media_owners: dict[str, Any] = {}
         self._suspended = False
+        self._muted = False
+        self._os_muted = False
+        self._silenced = False
+        self._mute_watcher = None
         self._devices = None
         self._effects: dict[str, list] = {}
         self._voice_index: dict[str, int] = {}
@@ -1217,7 +1314,7 @@ class SoundManager(QObject):
             logger.exception('Failed to initialize audio backend; sounds disabled')
             return False
         self._available = True
-        if self._suspended:
+        if self._suspended or self._silenced:
             self._stop_ambiance()
         elif self._ambiance_volume > 0:
             self._ambiance_tick.start()
@@ -1243,6 +1340,18 @@ class SoundManager(QObject):
         self._devices = QMediaDevices(self)
         self._devices.audioOutputsChanged.connect(self._on_audio_outputs_changed)
         self._ambiance_player.errorOccurred.connect(self._on_ambiance_error)
+        self._start_mute_watcher()
+
+    def _start_mute_watcher(self) -> None:
+        if not sys.platform.startswith('linux'):
+            return
+        try:
+            from src.core.audio_mute import AppMuteWatcher
+            self._mute_watcher = AppMuteWatcher(self)
+            self._mute_watcher.muted_changed.connect(self.set_os_muted)
+            self._mute_watcher.start()
+        except Exception:
+            logger.debug('Audio mute watcher unavailable', exc_info=True)
 
     def _on_audio_outputs_changed(self) -> None:
         from PySide6.QtMultimedia import QMediaDevices
@@ -1383,6 +1492,38 @@ class SoundManager(QObject):
             self._ambiance_tick.start()
         self._sync_ambiance()
 
+    def set_muted(self, muted: bool) -> None:
+        muted = bool(muted)
+        if muted == self._muted:
+            return
+        self._muted = muted
+        self._apply_mute_state()
+
+    def set_os_muted(self, muted: bool) -> None:
+        muted = bool(muted)
+        if muted == self._os_muted:
+            return
+        self._os_muted = muted
+        self._apply_mute_state()
+
+    def _apply_mute_state(self) -> None:
+        silenced = self._muted or self._os_muted
+        if silenced == self._silenced:
+            return
+        self._silenced = silenced
+        if not self._available:
+            return
+        if silenced:
+            self._ambiance_tick.stop()
+            self._stop_ambiance()
+            for voices in self._effects.values():
+                for effect in voices:
+                    effect.stop()
+            return
+        if self._ambiance_volume > 0:
+            self._ambiance_tick.start()
+        self._sync_ambiance()
+
     def _release_media_source(self, source: str, owner=None) -> None:
         if owner is not None and self._media_owners.get(source) is not owner:
             return
@@ -1400,7 +1541,7 @@ class SoundManager(QObject):
     def _sync_ambiance(self) -> None:
         if not self._available or self._suspended:
             return
-        if (self._ambiance_volume <= 0 or self._media_sources
+        if (self._silenced or self._ambiance_volume <= 0 or self._media_sources
                 or not self._ambiance_window_visible()):
             self._stop_ambiance()
             return
@@ -1486,7 +1627,7 @@ class SoundManager(QObject):
         logger.warning('Ambiance track stopped (%s); retrying in %.0fs', reason, delay)
 
     def warm(self) -> None:
-        if self._sfx_volume <= 0 and self._ambiance_volume <= 0:
+        if self._silenced or (self._sfx_volume <= 0 and self._ambiance_volume <= 0):
             return
         if not self._available and not self._setup_failed:
             self._ensure_ready()
@@ -1521,7 +1662,7 @@ class SoundManager(QObject):
         return voices
 
     def play(self, name: str) -> None:
-        if self._sfx_volume <= 0:
+        if self._sfx_volume <= 0 or self._silenced:
             return
         if not self._ensure_ready():
             return
@@ -2861,6 +3002,9 @@ class SettingsPage(QWidget):
         ambiance = int(settings.ambiance_volume)
         self._quiet(self._ambiance_slider, self._ambiance_slider.setValue, ambiance)
         self._ambiance_value_lbl.setText(str(ambiance) if ambiance > 0 else off)
+        scale = max(70, min(150, int(settings.ui_scale)))
+        self._quiet(self._scale_slider, self._scale_slider.setValue, scale)
+        self._scale_value_lbl.setText(f'{scale}%')
         self._sync_theme_lock_state()
 
     def _fill_sections(self) -> None:
@@ -3180,6 +3324,22 @@ class SettingsPage(QWidget):
             'settings.animations_title', 'Animations',
             'settings.animations_content', 'Animate navigation, cards, panels and transitions. Turn off for instant, motion-free interactions.',
             attr='animations_enabled')
+        yield
+
+        scale, scale_label = self._make_slider_row(70, 150, 100, '%')
+        scale.setSingleStep(5)
+        scale.setPageStep(5)
+        self._scale_slider = scale
+        self._scale_value_lbl = scale_label
+        self._scale_commit = _SliderCommit(
+            scale, self._on_ui_scale_live, self._on_ui_scale_commit, parent=self)
+        self._scale_card = self._plain_card(
+            group, 'settings.ui_scale', FluentIcon.ZOOM,
+            'settings.ui_scale_title', 'Interface scale',
+            'settings.ui_scale_content',
+            'Shrinks or enlarges the whole interface. Lower it if the window is too big for your screen. '
+            'Changing it restarts PiraChest automatically.',
+            scale, scale_label)
         yield
 
         self._accent_color_btn = ColorPickerButton(
@@ -4860,6 +5020,43 @@ class SettingsPage(QWidget):
 
     def _on_ambiance_volume_commit(self, value: int) -> None:
         self._apply_setting('ambiance_volume', int(value))
+
+    def _on_ui_scale_live(self, value: int) -> None:
+        self._scale_value_lbl.setText(f'{value}%')
+
+    def _on_ui_scale_commit(self, value: int) -> None:
+        value = int(value)
+        changed = int(settings.ui_scale) != value
+        self._apply_setting('ui_scale', value)
+        if changed:
+            self._restart_for_scale()
+
+    def _restart_for_scale(self) -> None:
+        window = self.window()
+        try:
+            busy = bool(window is not None and window._has_active_downloads())
+        except Exception:
+            busy = False
+        if busy:
+            InfoBar.info(
+                title=self._t('settings.ui_scale_title', 'Interface scale'),
+                content=self._t('settings.ui_scale_busy',
+                                'Saved. The new scale is applied the next time PiraChest starts '
+                                'because a download is running.'),
+                orient=Qt.Orientation.Horizontal, isClosable=True,
+                position=InfoBarPosition.TOP_RIGHT, duration=4500, parent=window)
+            return
+        env = dict(os.environ)
+        env.pop('QT_SCALE_FACTOR', None)
+        scale = max(70, min(150, int(settings.ui_scale)))
+        if scale != 100:
+            env['QT_SCALE_FACTOR'] = f'{scale / 100:g}'
+        if not relaunch_app(env=env):
+            return
+        if window is not None and hasattr(window, '_force_quit'):
+            window._force_quit = True
+        if window is not None:
+            window.close()
 
 
     def bind_network(self, source, apply) -> None:

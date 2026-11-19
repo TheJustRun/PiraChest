@@ -2170,6 +2170,11 @@ class PlayBar(QWidget):
     def _volume(self, v: int) -> None:
         self.player.set_volume(v / 100)
         self._vol_icon(v, False)
+        try:
+            from src.gui.settings_page import get_sound_manager
+            get_sound_manager().set_muted(False)
+        except Exception:
+            logger.debug('Could not unmute the app sounds', exc_info=True)
 
     def _sync_repeat(self, mode: int) -> None:
         b = self.b_repeat
@@ -2183,6 +2188,11 @@ class PlayBar(QWidget):
         m = not self.player.is_muted
         self.player.set_muted(m)
         self._vol_icon(self.vol.value(), m)
+        try:
+            from src.gui.settings_page import get_sound_manager
+            get_sound_manager().set_muted(m)
+        except Exception:
+            logger.debug('Could not mute the app sounds', exc_info=True)
 
     def _vol_icon(self, v: int, muted: bool) -> None:
         self.b_vol.setIconName('m_volx' if muted else 'm_vol0' if v == 0 else 'm_voldown' if v < 50 else 'm_volup')
@@ -2874,7 +2884,9 @@ class MusicPage(QWidget):
         self._pivot.setCurrentItem('songs')
         self._search = SearchLineEdit(lib)
         self._search.setPlaceholderText(tr('music.search_placeholder'))
-        self._search.setFixedWidth(340)
+        self._search.setMinimumWidth(160)
+        self._search.setMaximumWidth(340)
+        self._search.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._search.returnPressed.connect(self._on_search)
         self._search.searchSignal.connect(lambda _q: self._on_search())
         from src.gui.stuff.search_history import attach as attach_search_history
