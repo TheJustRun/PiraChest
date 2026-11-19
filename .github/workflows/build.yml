@@ -385,6 +385,7 @@ jobs:
             floor: "15.0"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    continue-on-error: true
     env:
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target }}
     steps:
@@ -571,7 +572,8 @@ jobs:
 
       - name: Combined checksums
         run: |
-          mv release-files/minos-*.txt release-files/glibc-*.txt .
+          mv release-files/glibc-*.txt .
+          mv release-files/minos-*.txt . 2>/dev/null || true
           cd release-files
           sha256sum $(ls | grep -v -e '\.sha256$' -e '^SHA256SUMS.txt$') > SHA256SUMS.txt
 
@@ -581,8 +583,8 @@ jobs:
         run: |
           REPO="${{ github.repository }}"
           TAG="${{ needs.version.outputs.tag }}"
-          MACARM=$(cat minos-arm64.txt)
-          MACX64=$(cat minos-x64.txt)
+          MACARM=$(cat minos-arm64.txt 2>/dev/null || true)
+          MACX64=$(cat minos-x64.txt 2>/dev/null || true)
           GLIBCX64=$(cat glibc-x64.txt)
           GLIBCARM=$(cat glibc-arm64.txt)
           distros() {
@@ -680,6 +682,8 @@ jobs:
           } | sed -e "s|@@BASE@@|$BASE|g" -e "s|@@APP@@|$APP|g" -e "s|@@MACARM@@|$MACARM|g" -e "s|@@MACX64@@|$MACX64|g" \
             -e "s|@@GLIBCX64@@|$GLIBCX64|g" -e "s|@@GLIBCARM@@|$GLIBCARM|g" \
             -e "s|@@DISTROSX64@@|$DISTROSX64|g" -e "s|@@DISTROSARM@@|$DISTROSARM|g" > notes.md
+          [ -n "$MACARM" ] || sed -i -e '/macOS-arm64/d' -e '/macOS (Apple Silicon)/d' notes.md
+          [ -n "$MACX64" ] || sed -i -e '/macOS-x64/d' -e '/macOS (Intel)/d' notes.md
 
       - id: release
         uses: softprops/action-gh-release@v2
