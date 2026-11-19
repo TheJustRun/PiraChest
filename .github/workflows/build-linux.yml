@@ -1,0 +1,189 @@
+name: Build Linux
+
+on:
+  workflow_call:
+    inputs:
+      base_build:
+        type: string
+        required: true
+      nickname:
+        type: string
+        required: true
+      canary:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+      slug:
+        type: string
+        required: true
+      app_name:
+        type: string
+        required: true
+      channel:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    name: PyInstaller (Linux ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+            glibc: "2.35"
+            machine: x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            glibc: "2.39"
+            machine: aarch64
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Write version file
+        shell: bash
+        env:
+          VERSION_BASE: ${{ inputs.base_build }}
+          VERSION_NICK: ${{ inputs.nickname }}
+          VERSION_CANARY: ${{ inputs.canary }}
+        run: |
+          printf '%s\n%s\n%s\n' "$VERSION_BASE" "$VERSION_NICK" "$VERSION_CANARY" > VERSION
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libdbus-1-3 libxcb-cursor0 zstd
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller==6.22.2 pyinstaller-hooks-contrib==2026.9
+
+      - name: Build with PyInstaller
+        env:
+          SKIP_MSI: "1"
+        run: python -m PyInstaller --noconfirm PiraChest.spec
+
+      - name: Verify glibc floor
+        env:
+          LIMIT: ${{ matrix.glibc }}
+        run: |
+          max=$(find dist -type f \( -name '*.so*' -o -perm -u+x \) -print0 \
+            | xargs -0 -r objdump -T 2>/dev/null \
+            | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -n1)
+          echo "Highest glibc symbol required: ${max:-none}" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -n "$max" ] && [ "$(printf '%s\n%s\n' "$max" "$LIMIT" | sort -V | tail -n1)" != "$LIMIT" ]; then
+            echo "::error::Linux build needs glibc $max, above the $LIMIT limit."
+            exit 1
+          fi
+
+      - name: Package + checksum
+        shell: bash
+        run: |
+          slug="${{ inputs.slug }}"
+          app="${{ inputs.app_name }}"
+          base="${{ inputs.base_build }}"
+          channel="${{ inputs.channel }}"
+          name="$slug-$base-Linux-${{ matrix.arch }}.tar.gz"
+          mkdir -p package
+          tar -czf "package/$name" -C dist "$slug"
+
+          pkg="build/deb"
+          pkgname=$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')
+          rm -rf "$pkg"
+          mkdir -p "$pkg/DEBIAN" "$pkg/opt/$pkgname" \
+                   "$pkg/usr/bin" "$pkg/usr/share/applications" \
+                   "$pkg/usr/share/icons/hicolor/256x256/apps"
+          cp -a "dist/$slug/." "$pkg/opt/$pkgname/"
+          ln -sf "/opt/$pkgname/$app" "$pkg/usr/bin/$pkgname"
+          icon="src/gui/photos/icon.ico"
+          [ "${{ inputs.canary }}" = "1" ] && [ -f src/gui/photos/icon_c.ico ] && icon="src/gui/photos/icon_c.ico"
+          python - "$pkg/usr/share/icons/hicolor/256x256/apps/$pkgname.png" "$icon" <<'PY'
+          import sys
+          sys.path.insert(0, '.')
+          from tools.make_icns import build_png
+
+          if not build_png(sys.argv[1], sys.argv[2]):
+              raise SystemExit('Could not read application icon')
+          PY
+          cat > "$pkg/usr/share/applications/$pkgname.desktop" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=$app
+          Comment=Stream, download and organize your media
+          Exec="/opt/$pkgname/$app" %U
+          Icon=$pkgname
+          Terminal=false
+          Categories=AudioVideo;Network;Utility;
+          StartupNotify=true
+          StartupWMClass=$app
+          EOF
+          debarch=${{ matrix.arch }}
+          [ "$debarch" = "x64" ] && debarch=amd64
+          size=$(du -sk "$pkg" | cut -f1)
+          debver="$base"
+          [ "$channel" = "canary" ] && debver="$base~canary"
+          cat > "$pkg/DEBIAN/control" <<EOF
+          Package: $pkgname
+          Version: $debver
+          Architecture: $debarch
+          Installed-Size: $size
+          Maintainer: JustRun <noreply@github.com>
+          Section: video
+          Priority: optional
+          Depends: libc6 (>= ${{ matrix.glibc }}), libegl1, libgl1, libxkbcommon-x11-0, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-render-util0, libxcb-shape0, libxcb-xkb1, libdbus-1-3, libpulse0
+          Description: $app
+           Stream, download and organize movies, shows, music, torrents and YouTube media.
+          Homepage: https://github.com/${{ github.repository }}
+          EOF
+          debname="$slug-$base-Linux-${{ matrix.arch }}.deb"
+          dpkg-deb --build --root-owner-group "$pkg" "package/$debname"
+
+          appdir="build/AppDir"
+          rm -rf "$appdir"
+          mkdir -p "$appdir"
+          cp -al "dist/$slug" "$appdir/app"
+          cp "$pkg/usr/share/icons/hicolor/256x256/apps/$pkgname.png" "$appdir/$pkgname.png"
+          sed 's|^Exec=.*|Exec=AppRun %U|' "$pkg/usr/share/applications/$pkgname.desktop" > "$appdir/$pkgname.desktop"
+          printf '#!/bin/sh\nexec "$(dirname "$(readlink -f "$0")")/app/%s" "$@"\n' "$app" > "$appdir/AppRun"
+          chmod +x "$appdir/AppRun"
+          curl -fsSL --retry 3 -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.machine }}.AppImage"
+          chmod +x appimagetool
+          ARCH=${{ matrix.machine }} ./appimagetool --appimage-extract-and-run --no-appstream \
+            "$appdir" "package/$slug-$base-Linux-${{ matrix.arch }}.AppImage"
+
+          cd package
+          for f in *.tar.gz *.deb *.AppImage; do
+            sha256sum "$f" > "$f.sha256"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}-package
+          path: package/*
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Record glibc floor for the release notes
+        run: echo "${{ matrix.glibc }}" > "glibc-${{ matrix.arch }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}-glibc
+          path: glibc-${{ matrix.arch }}.txt
+          if-no-files-found: error
+          retention-days: 3
+

@@ -55,7 +55,7 @@ jobs:
   readme:
     name: README
     needs: build
-    if: needs.build.outputs.is_new == 'true'
+    if: ${{ !cancelled() && needs.build.outputs.is_new == 'true' }}
     uses: ./.github/workflows/readme.yml
     with:
       tag: ${{ needs.build.outputs.tag }}
@@ -64,20 +64,21 @@ jobs:
   gitlab:
     name: GitLab
     needs: [ build, readme ]
-    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.build.result != 'skipped' }}
     uses: ./.github/workflows/mirror-gitlab.yml
     secrets: inherit
 
   sourceforge:
     name: SourceForge
     needs: build
+    if: ${{ !cancelled() && needs.build.result != 'skipped' }}
     uses: ./.github/workflows/mirror-sourceforge.yml
     secrets: inherit
 
   chocolatey:
     name: Chocolatey
     needs: build
-    if: needs.build.outputs.is_new == 'true'
+    if: ${{ !cancelled() && needs.build.outputs.is_new == 'true' }}
     uses: ./.github/workflows/chocolatey.yml
     with:
       tag: ${{ needs.build.outputs.tag }}
@@ -86,7 +87,7 @@ jobs:
   discord:
     name: Discord
     needs: [ build, readme, gitlab, sourceforge, chocolatey ]
-    if: ${{ !cancelled() && needs.build.result == 'success' && needs.build.outputs.is_new == 'true' }}
+    if: ${{ !cancelled() && needs.build.outputs.is_new == 'true' }}
     uses: ./.github/workflows/discord.yml
     with:
       tag: ${{ needs.build.outputs.tag }}
