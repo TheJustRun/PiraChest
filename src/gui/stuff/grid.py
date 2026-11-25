@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from functools import lru_cache, partial
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QPointF, QRect, QRectF, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, QRect, QRectF, Qt, QTimer, QVariantAnimation, Signal
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QPainter, QPainterPath, QPixmap
-from PySide6.QtWidgets import QAbstractScrollArea, QToolTip
+from PySide6.QtWidgets import QAbstractScrollArea, QScrollBar, QToolTip
 from qfluentwidgets import FluentIcon, TransparentToolButton, isDarkTheme, qconfig
 
 from src.core.theme import palette, animations_enabled
@@ -211,6 +211,18 @@ class _LazyImages:
 
 images = _LazyImages()
 
+
+def _fit():
+    from src.core.artwork import FRAME
+    return FRAME
+
+
+def _peek(src, size):
+    try:
+        return images.peek(src, size, mode=_fit())
+    except TypeError:
+        return images.peek(src, size)
+
 GRID, LIST = 'grid', 'list'
 
 
@@ -235,10 +247,11 @@ _WHEEL_PX = 120
 _ROW_H, _ROW_GAP = 76, 4
 _THUMB_W, _THUMB_H = 48, 68
 _STRIP_GAP, _STRIP_PAD = 12, 2
+_MARQ_BIG = 1000000
 
 _BAR_CSS = (
     'QScrollBar:{o} {{ {dim}: 6px; background: transparent; margin: 0; border: none; }}'
-    'QScrollBar::handle:{o} {{ background: rgba(255,255,255,60); border-radius: 3px; min-{long}: 24px; }}'
+    'QScrollBar::handle:{o} {{ background: {handle}; border-radius: 3px; min-{long}: 24px; }}'
     'QScrollBar::add-line:{o}, QScrollBar::sub-line:{o} {{ {long}: 0; border: none; }}'
     'QScrollBar::add-page:{o}, QScrollBar::sub-page:{o} {{ background: none; }}')
 
@@ -278,6 +291,115 @@ _SHADOWS: dict = {}
 _HOVER_RESET_EVENTS = frozenset({QEvent.Type.Leave, QEvent.Type.Hide, QEvent.Type.WindowDeactivate})
 
 
+class _SlimBar(QScrollBar):
+
+    def __init__(self, orientation, color_fn, parent=None):
+        super().__init__(orientation, parent)
+        self._color_fn = color_fn
+        self._hover = False
+        self._drag_off = None
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+
+    def _vert(self) -> bool:
+        return self.orientation() == Qt.Orientation.Vertical
+
+    def _geom(self) -> tuple[int, int]:
+        length = self.height() if self._vert() else self.width()
+        span = self.maximum() - self.minimum()
+        if span <= 0 or length <= 0:
+            return 0, 0
+        handle = max(24, min(length, int(length * self.pageStep() / (span + self.pageStep()))))
+        pos = int((length - handle) * (self.value() - self.minimum()) / span)
+        return pos, handle
+
+    def paintEvent(self, event) -> None:
+        pos, handle = self._geom()
+        if handle <= 0:
+            return
+        color = QColor(self._color_fn())
+        color.setAlpha(190 if (self._hover or self._drag_off is not None) else 120)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        w, h = self.width(), self.height()
+        rect = QRectF(0, pos, w, handle) if self._vert() else QRectF(pos, 0, handle, h)
+        r = (w if self._vert() else h) / 2
+        p.drawRoundedRect(rect, r, r)
+
+    def _coord(self, event) -> int:
+        point = event.position().toPoint()
+        return point.y() if self._vert() else point.x()
+
+    def mousePressEvent(self, event) -> None:
+        pos, handle = self._geom()
+        c = self._coord(event)
+        if pos <= c <= pos + handle:
+            self._drag_off = c - pos
+        else:
+            self.setValue(self.value() + (self.pageStep() if c > pos else -self.pageStep()))
+        self.update()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_off is None:
+            return
+        length = self.height() if self._vert() else self.width()
+        _pos, handle = self._geom()
+        room = max(1, length - handle)
+        frac = min(1.0, max(0.0, (self._coord(event) - self._drag_off) / room))
+        self.setValue(round(self.minimum() + frac * (self.maximum() - self.minimum())))
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_off = None
+        self.update()
+        event.accept()
+
+    def enterEvent(self, event) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+
+class _WheelPump(QObject):
+    def __init__(self, area, parent=None):
+        super().__init__(parent or area)
+        self._area = area
+        self._anim = QVariantAnimation(self, duration=160, easingCurve=QEasingCurve.Type.OutCubic)
+        self._anim.valueChanged.connect(lambda v: area.verticalScrollBar().setValue(round(v)))
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.Wheel:
+            bar = self._area.verticalScrollBar()
+            pixels = event.pixelDelta().y()
+            delta = pixels if pixels else -event.angleDelta().y() / 120 * _WHEEL_PX
+            self._anim.stop()
+            if pixels or not animations_enabled():
+                bar.setValue(round(max(0, min(bar.maximum(), bar.value() + delta))))
+            else:
+                base = self._anim.endValue() if self._anim.state() == QVariantAnimation.State.Running else bar.value()
+                self._anim.setStartValue(float(bar.value()))
+                self._anim.setEndValue(float(max(0, min(bar.maximum(), base + delta))))
+                self._anim.start()
+            return True
+        return super().eventFilter(obj, event)
+
+
+def slim_scroll_bar(area: QAbstractScrollArea) -> None:
+    bar = _SlimBar(Qt.Orientation.Vertical, lambda: grid_colors()[0], area)
+    area.setVerticalScrollBar(bar)
+    bar.setFixedWidth(_BAR_W)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    area.viewport().installEventFilter(_WheelPump(area))
+
+
 class _PosterView(QAbstractScrollArea):
     poster_clicked = Signal(object)
     context_requested = Signal(object, QPoint)
@@ -315,6 +437,7 @@ class _PosterView(QAbstractScrollArea):
         self._failed: set[int] = set()
         self._synced_span: tuple[int, int] | None = None
         self._lift: dict[int, float] = {}
+        self._marq: dict[int, list] = {}
         self._hover: int | None = None
         self._pressed: int | None = None
         self._icons: dict[int, object] = {}
@@ -337,11 +460,11 @@ class _PosterView(QAbstractScrollArea):
         self.viewport().setMouseTracking(True)
         (self.setHorizontalScrollBarPolicy if vertical else self.setVerticalScrollBarPolicy)(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        slim = _SlimBar(Qt.Orientation.Vertical if vertical else Qt.Orientation.Horizontal,
+                        lambda: grid_colors()[0], self)
+        (self.setVerticalScrollBar if vertical else self.setHorizontalScrollBar)(slim)
         bar = self._bar()
         (bar.setFixedWidth if vertical else bar.setFixedHeight)(_BAR_W)
-        bar.setStyleSheet(_BAR_CSS.format(o='vertical' if vertical else 'horizontal',
-                                          dim='width' if vertical else 'height',
-                                          long='height' if vertical else 'width'))
         bar.valueChanged.connect(self._on_scroll)
         self._settle.timeout.connect(self._on_settled)
         self._ticker.timeout.connect(self._step_lift)
@@ -376,7 +499,7 @@ class _PosterView(QAbstractScrollArea):
         waiting: dict = {}
         for i, entry in enumerate(entries[:preload]):
             src = next((str(v) for v in (getattr(entry, a, None) for a in self._cover_attrs) if v), '')
-            if src and images.peek(src, size) is None:
+            if src and _peek(src, size) is None:
                 batch['ready'][i] = False
                 waiting.setdefault(src, []).append(i)
         queue = self.__dict__.setdefault('_ready_queue', [])
@@ -393,7 +516,7 @@ class _PosterView(QAbstractScrollArea):
             self._pump_ready(epoch)
 
         for src in waiting:
-            images.get(src, size, partial(arrived, src), owner=self)
+            images.get(src, size, partial(arrived, src), mode=_fit(), owner=self)
         if waiting:
             QTimer.singleShot(timeout_ms, expire)
         self._pump_ready(epoch)
@@ -494,6 +617,7 @@ class _PosterView(QAbstractScrollArea):
         self._pending.clear()
         self._failed.clear()
         self._lift.clear()
+        self._marq.clear()
         self._hover = self._pressed = None
 
     def _entry(self, pos: int):
@@ -548,9 +672,9 @@ class _PosterView(QAbstractScrollArea):
             if pos in self._pending or pos in self._failed:
                 continue
             src = self._src(pos)
-            if not src or images.peek(src, size) is not None:
+            if not src or _peek(src, size) is not None:
                 continue
-            token = images.get(src, size, partial(self._on_image, pos, src), owner=self)
+            token = images.get(src, size, partial(self._on_image, pos, src), mode=_fit(), owner=self)
             if token:
                 self._pending[pos] = token
 
@@ -603,7 +727,11 @@ class _PosterView(QAbstractScrollArea):
     def _on_theme(self, *_args) -> None:
         QTimer.singleShot(0, self._apply_colors)
 
+    def _style_bar(self) -> None:
+        self._bar().update()
+
     def _apply_colors(self) -> None:
+        self._style_bar()
         self._text, self._muted, self._tint = self._colors_fn()
         self._icons.clear()
         self.viewport().update()
@@ -617,6 +745,8 @@ class _PosterView(QAbstractScrollArea):
     def _set_hover(self, pos: int | None) -> None:
         if pos != self._hover:
             old, self._hover = self._hover, pos
+            if old is not None:
+                self._marq.pop(old, None)
             self.viewport().setCursor(self._HOVER_CURSOR if pos is not None else Qt.CursorShape.ArrowCursor)
             for p in (old, pos):
                 if p is not None and p < len(self._rows):
@@ -633,8 +763,46 @@ class _PosterView(QAbstractScrollArea):
         if not self._ticker.isActive():
             self._ticker.start()
 
+    def _marquee_dims(self, pos: int) -> tuple[int, int]:
+        title = self._title(pos)
+        if self._rowmode:
+            cell = self._cell_rect(pos)
+            x = cell.x() + 12 + _THUMB_W + 14
+            width = max(0, cell.right() - x - 12)
+            badge = self._badge(pos)
+            return self._fm_title.horizontalAdvance(title), (width - 24 * len(badge)) if badge else width
+        fm = self._fm_title if self._meta(pos) else self._fm_small
+        return fm.horizontalAdvance(title), self._cw
+
+    def _marquee_tick(self) -> bool:
+        pos = self._hover
+        if pos is None or self.is_scrolling or pos >= len(self._rows):
+            return False
+        state = self._marq.get(pos)
+        if state is None:
+            text_w, box_w = self._marquee_dims(pos)
+            if text_w <= box_w:
+                return False
+            state = self._marq[pos] = [0.0, 1, 45, float(text_w - box_w)]
+            self.viewport().update(self._cell_rect(pos))
+            return True
+        if state[2]:
+            state[2] -= 1
+            return True
+        state[0] += state[1] * 1.2
+        if state[0] >= state[3]:
+            state[0] = state[3]
+            state[1] = -1
+            state[2] = 75
+        elif state[0] <= 0:
+            state[0] = 0.0
+            state[1] = 1
+            state[2] = 30
+        self.viewport().update(self._cell_rect(pos))
+        return True
+
     def _step_lift(self) -> None:
-        moving = False
+        moving = self._marquee_tick()
         for pos in set(self._lift) | ({self._hover} - {None}):
             now, goal = self._lift.get(pos, 0.0), self._target(pos)
             now += (goal - now) * 0.35
@@ -732,34 +900,41 @@ class _PosterView(QAbstractScrollArea):
             p.setFont(self._f_title if meta else self._f_small)
             p.setPen(self._text if meta else self._muted)
             fm = self._fm_title if meta else self._fm_small
-            elided = fm.elidedText(title, Qt.TextElideMode.ElideRight, box.width())
-            spans = _highlight_spans(elided, self._query) if self._query else []
+            scroll = self._marq.get(pos) if pos == self._hover else None
+            text = title if scroll else fm.elidedText(title, Qt.TextElideMode.ElideRight, box.width())
+            spans = _highlight_spans(text, self._query) if self._query else []
             if spans:
                 hot = QColor(palette().get('accent', '#4f7cff'))
-                cursor = box.x() + max(0, (box.width() - fm.horizontalAdvance(elided)) // 2)
+                cursor = box.x() - round(scroll[0]) if scroll else box.x() + max(0, (box.width() - fm.horizontalAdvance(text)) // 2)
                 position = 0
                 for left, right in spans:
                     if left > position:
-                        part = elided[position:left]
+                        part = text[position:left]
                         p.setPen(self._text if meta else self._muted)
-                        p.drawText(QRect(cursor, box.y(), box.width(), title_h),
+                        p.drawText(QRect(cursor, box.y(), _MARQ_BIG if scroll else box.width(), title_h),
                                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop), part)
                         cursor += fm.horizontalAdvance(part)
-                    part = elided[left:right]
+                    part = text[left:right]
                     p.setPen(hot)
-                    p.drawText(QRect(cursor, box.y(), box.width(), title_h),
+                    p.drawText(QRect(cursor, box.y(), _MARQ_BIG if scroll else box.width(), title_h),
                                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop), part)
                     cursor += fm.horizontalAdvance(part)
                     position = right
-                if position < len(elided):
+                if position < len(text):
                     p.setPen(self._text if meta else self._muted)
-                    p.drawText(QRect(cursor, box.y(), box.width(), title_h),
-                               int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop), elided[position:])
+                    p.drawText(QRect(cursor, box.y(), _MARQ_BIG if scroll else box.width(), title_h),
+                               int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop), text[position:])
+            elif scroll:
+                p.drawText(
+                    QRect(box.x() - round(scroll[0]), box.y(), _MARQ_BIG, title_h),
+                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop),
+                    text,
+                )
             else:
                 p.drawText(
                     QRect(box.x(), box.y(), box.width(), title_h),
                     int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
-                    elided,
+                    text,
                 )
             if meta:
                 p.setFont(self._f_small)
@@ -790,32 +965,40 @@ class _PosterView(QAbstractScrollArea):
         p.setPen(self._text)
         badge = self._badge(pos)
         title_w = max(0, width - 24 * len(badge)) if badge else width
-        title = self._fm_title.elidedText(self._title(pos), Qt.TextElideMode.ElideRight, title_w)
+        scroll = self._marq.get(pos) if pos == self._hover else None
+        if scroll:
+            title = self._title(pos)
+        else:
+            title = self._fm_title.elidedText(self._title(pos), Qt.TextElideMode.ElideRight, title_w)
         line_h = 20 if sub else cell.height()
+        start_x = x - round(scroll[0]) if scroll else x
+        if scroll:
+            p.save()
+            p.setClipRect(QRect(x, cell.y(), width, cell.height()))
         spans = _highlight_spans(title, self._query) if self._query else []
         if spans:
             hot = QColor(palette().get('accent', '#4f7cff'))
-            cursor = x
+            cursor = start_x
             position = 0
             for left, right in spans:
                 if left > position:
                     part = title[position:left]
                     p.setPen(self._text)
-                    p.drawText(QRect(cursor, top, width, line_h),
+                    p.drawText(QRect(cursor, top, _MARQ_BIG if scroll else width, line_h),
                                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), part)
                     cursor += self._fm_title.horizontalAdvance(part)
                 part = title[left:right]
                 p.setPen(hot)
-                p.drawText(QRect(cursor, top, width, line_h),
+                p.drawText(QRect(cursor, top, _MARQ_BIG if scroll else width, line_h),
                            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), part)
                 cursor += self._fm_title.horizontalAdvance(part)
                 position = right
             if position < len(title):
                 p.setPen(self._text)
-                p.drawText(QRect(cursor, top, width, line_h),
+                p.drawText(QRect(cursor, top, _MARQ_BIG if scroll else width, line_h),
                            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), title[position:])
         else:
-            p.drawText(QRect(x, top, width, line_h),
+            p.drawText(QRect(start_x, top, _MARQ_BIG if scroll else width, line_h),
                        int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), title)
         if badge:
             bx = x + self._fm_title.horizontalAdvance(title) + 6
@@ -830,17 +1013,24 @@ class _PosterView(QAbstractScrollArea):
             p.setPen(self._muted)
             sub = self._fm_small.elidedText(sub, Qt.TextElideMode.ElideRight, width)
             p.drawText(QRect(x, top + 24, width, 18), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), sub)
+        if scroll:
+            p.restore()
 
     def _paint_cover(self, p: QPainter, pos: int, rect: QRectF, icon_px: int, titled: bool) -> None:
         src = self._src(pos)
-        pixmap = images.peek(src, self._img_size()) if src else None
+        pixmap = _peek(src, self._img_size()) if src else None
         w, h = rect.width(), rect.height()
         p.save()
         p.translate(rect.x(), rect.y())
         p.setClipPath(_rounded_path(w, h))
         local = QRectF(0, 0, w, h)
         if pixmap is not None and not pixmap.isNull():
-            p.drawPixmap(local.toRect(), pixmap)
+            dpr = pixmap.devicePixelRatio() or 1
+            pw, ph = pixmap.width() / dpr, pixmap.height() / dpr
+            scale = min(w / pw, h / ph)
+            tw, th = pw * scale, ph * scale
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            p.drawPixmap(QRectF((w - tw) / 2, (h - th) / 2, tw, th), pixmap, QRectF(pixmap.rect()))
         else:
             p.fillRect(local, self._tint)
             icon = self._icon(icon_px)
@@ -1041,12 +1231,12 @@ class PosterGrid(_PosterView):
 class PosterStrip(_PosterView):
     def __init__(self, parent=None, *, cell_w=138, poster_h=207, cover_attrs=('poster_url',), key_attr='id',
                  title_attr='title', tooltip_fn=None, show_caption=True, fallback_icon_fn=None, colors_fn=None,
-                 img_size=None, cell_h=None, gap=_STRIP_GAP, pad=_STRIP_PAD, top=0, height=None):
+                 img_size=None, cell_h=None, meta_fn=None, gap=_STRIP_GAP, pad=_STRIP_PAD, top=0, height=None):
         self._sgap, self._spad, self._stop = gap, pad, top
         super().__init__(parent, vertical=False, cell_w=cell_w, poster_h=poster_h, cover_attrs=cover_attrs,
                          key_attr=key_attr, title_attr=title_attr, tooltip_fn=tooltip_fn, subtitle_fn=None,
                          show_caption=show_caption, fallback_icon_fn=fallback_icon_fn, colors_fn=colors_fn,
-                         img_size=img_size, cell_h=cell_h)
+                         img_size=img_size, cell_h=cell_h, meta_fn=meta_fn)
         self.setFixedHeight(height if height is not None else self._cell_h + top + _BAR_W + 8)
 
     def _layout(self) -> None:

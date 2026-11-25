@@ -23,6 +23,7 @@ import shiboken6
 from PySide6.QtCore import (
     QEasingCurve,
     QEvent,
+    QModelIndex,
     QFileSystemWatcher,
     QObject,
     QPropertyAnimation,
@@ -59,6 +60,7 @@ from PySide6.QtGui import (
     QShortcut,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QColorDialog,
     QDialog,
@@ -198,76 +200,185 @@ def pop_in(widget: QWidget, duration: int = 220) -> None:
         pass
 
 
-def _widget_global_pos(widget, point):
-    p = point
-    w = widget
-    while w is not None:
-        p = p + w.pos()
-        w = w.parentWidget()
-    return p
+def _menu_opaque(token: str, fallback: str) -> QColor:
+    color = _palette_color(manager.palette(), token)
+    color = QColor(color) if color is not None else QColor(fallback)
+    color.setAlpha(255)
+    return color
 
 
-def _patch_combobox_menu_exec() -> None:
+def _over_opaque(fg: QColor, bg: QColor) -> QColor:
+    a = fg.alphaF()
+    return QColor(round(fg.red() * a + bg.red() * (1 - a)),
+                  round(fg.green() * a + bg.green() * (1 - a)),
+                  round(fg.blue() * a + bg.blue() * (1 - a)))
+
+
+def _menu_surface_base() -> QColor:
+    pal = manager.palette()
+    page = _palette_color(pal, "page_bg") or QColor("#202020")
+    page.setAlpha(255)
+    card = _palette_color(pal, "card_bg")
+    under = _over_opaque(card, page) if card is not None else page
+    fill = _palette_color(pal, "input_bg")
+    return _over_opaque(fill, under) if fill is not None else under
+
+
+def _menu_text_pad(combo) -> int:
     try:
-        from qfluentwidgets.components.widgets import combo_box as _cb
-        from qfluentwidgets.components.widgets.menu import MenuAnimationType, MenuAnimationManager
-        from PySide6.QtCore import QPoint
-        from PySide6.QtCore import Qt as _Qt
-        from PySide6.QtGui import QAction
-    except Exception:
+        left = LAYOUT.get("input_padding", "7px 10px").split()[-1]
+        return max(0, int(float(left.replace("px", ""))) - 4)
+    except (ValueError, IndexError):
+        return 6
+
+
+def _menu_radius() -> int:
+    try:
+        return int(float(LAYOUT.get("input_radius", "6px").replace("px", "")))
+    except ValueError:
+        return 6
+
+
+def _menu_font_qss(combo) -> str:
+    if combo is None:
+        return ""
+    font = combo.font()
+    size = f"{font.pixelSize()}px" if font.pixelSize() > 0 else f"{font.pointSizeF():g}pt"
+    family = font.family().replace('"', "")
+    weight = font.weight().value if hasattr(font.weight(), "value") else int(font.weight())
+    return f' font-family: "{family}"; font-size: {size}; font-weight: {weight};'
+
+
+_HOVER_SOFTEN = 0.5
+_MENU_ROW = 33
+
+
+def _nav_state_css(token: str, fallback: str, scale: float = 1.0) -> str:
+    c = _palette_color(manager.palette(), token)
+    if c is None:
+        c = QColor(fallback)
+    return f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alpha() / 255 * scale:.3f})"
+
+
+def _menu_surface_qss(combo=None) -> str:
+    p = palette()
+    base = _menu_surface_base()
+    ink = _menu_opaque("primary_text", "#f2f2f2")
+    dim = QColor(ink)
+    dim.setAlpha(110)
+    dim_css = f"rgba({dim.red()}, {dim.green()}, {dim.blue()}, 0.43)"
+    raised = QColor(
+        round(base.red() * 0.9 + ink.red() * 0.1),
+        round(base.green() * 0.9 + ink.green() * 0.1),
+        round(base.blue() * 0.9 + ink.blue() * 0.1))
+    return (
+        "MenuActionListWidget, #comboListWidget {"
+        f" background-color: {base.name()}; background: {base.name()};"
+        f" border: 1px solid {p['dialog_border']}; border-radius: {_menu_radius()}px;"
+        f" padding: 0px; outline: none;{_menu_font_qss(combo)} }}"
+        "MenuActionListWidget::item, #comboListWidget::item {"
+        f" background: transparent; color: {ink.name()};"
+        f" border: none; border-radius: {max(3, _menu_radius() - 2)}px; margin: 1px 4px; padding: 0px 10px 0px {_menu_text_pad(combo)}px; }}"
+        "MenuActionListWidget::item:hover, #comboListWidget::item:hover {"
+        f" background-color: {_nav_state_css('nav_selected_bg', '#333333', _HOVER_SOFTEN)}; color: {ink.name()}; }}"
+        "MenuActionListWidget::item:selected, #comboListWidget::item:selected,"
+        "MenuActionListWidget::item:selected:active, #comboListWidget::item:selected:active {"
+        f" background-color: {_nav_state_css('nav_selected_bg', '#333333')}; color: {ink.name()}; }}"
+        "MenuActionListWidget::item:disabled, #comboListWidget::item:disabled {"
+        f" background: transparent; color: {dim_css}; }}"
+    )
+
+
+def _round_menu_surface(menu, combo=None) -> None:
+    view = getattr(menu, "view", None)
+    if view is None:
         return
+    if combo is None:
+        with suppress(Exception):
+            menu.setItemHeight(_MENU_ROW)
+    else:
+        with suppress(Exception):
+            menu.setItemHeight(max(24, combo.height()))
+            view.setFont(combo.font())
+            view.setMinimumWidth(combo.width())
+            view.setMaximumWidth(combo.width())
+    base = _menu_opaque("dialog_bg", "#202020")
+    menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    menu.setAutoFillBackground(False)
+    with suppress(Exception):
+        menu.setStyleSheet("RoundMenu, ComboBoxMenu { background: transparent; border: none; }")
+        view.setProperty("transparent", False)
+        view.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        view.setStyleSheet(_menu_surface_qss(combo))
+        pal = view.palette()
+        for role in (pal.ColorRole.Base, pal.ColorRole.Window, pal.ColorRole.AlternateBase):
+            pal.setColor(role, base)
+        view.setPalette(pal)
+        view.setAutoFillBackground(False)
+        viewport = view.viewport()
+        viewport.setAutoFillBackground(False)
+        viewport.setStyleSheet("background: transparent; border: none;")
+        view.setViewportMargins(0, 4, 0, 4)
+        if not getattr(view, "_pirachest_h", False):
+            measured = view.itemsHeight
+            view.itemsHeight = lambda: measured() + 2
+            view._pirachest_h = True
 
-    _ComboBox = getattr(_cb, "ComboBox", None)
-    if _ComboBox is None or getattr(_ComboBox, "_ani_kwarg_patch_applied", False):
+
+def _patch_qfluent_switch_and_menus() -> None:
+    from qfluentwidgets.components.widgets import switch_button as _sb
+    from qfluentwidgets.components.widgets.menu import RoundMenu
+    ind = _sb.Indicator
+    if not getattr(ind, "_pirachest_themed", False):
+        def _ink(token: str, alpha: int = 255) -> QColor:
+            color = _palette_color(manager.palette(), token)
+            color = QColor(color) if color is not None else QColor(255, 255, 255)
+            color.setAlpha(alpha)
+            return color
+
+        o_border, o_slider = ind._borderColor, ind._sliderColor
+
+        def _border(self):
+            if self.isChecked():
+                return o_border(self)
+            return _ink("primary_text", 153 if self.isEnabled() else 41)
+
+        def _slider(self):
+            if self.isChecked() and self.isEnabled():
+                return _ink("on_accent")
+            if not self.isChecked():
+                return _ink("primary_text", 201 if self.isEnabled() else 96)
+            return o_slider(self)
+
+        ind._borderColor, ind._sliderColor = _border, _slider
+        ind._pirachest_themed = True
+    if not getattr(RoundMenu, "_pirachest_themed", False):
+        original_init = RoundMenu.__init__
+
+        def _init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            _round_menu_surface(self)
+
+        RoundMenu.__init__ = _init
+        RoundMenu._pirachest_themed = True
+
+
+def _patch_native_menu_theming() -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QMenu
+    if getattr(QMenu, '_pirachest_native_theming', False):
         return
+    original_init = QMenu.__init__
 
-    def _safe_show_combo_menu(self):
-        if not self.items:
-            return
-        menu = self._createComboMenu()
-        for item in self.items:
-            action = QAction(item.icon, item.text)
-            action.setEnabled(item.isEnabled)
-            menu.addAction(action)
+    def _init(menu, *args, **kwargs):
+        original_init(menu, *args, **kwargs)
+        if type(menu) is QMenu:
+            menu.setProperty('piraNativeMenu', True)
+            menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            menu.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
 
-        menu.view.itemClicked.connect(lambda i: self._onItemClicked(self.findText(i.text().lstrip())))
-
-        if menu.view.width() < self.width():
-            menu.view.setMinimumWidth(self.width())
-            menu.adjustSize()
-
-        menu.setMaxVisibleItems(self.maxVisibleItems())
-        menu.setAttribute(_Qt.WidgetAttribute.WA_DeleteOnClose)
-        menu.closedSignal.connect(self._onDropMenuClosed)
-        self.dropMenu = menu
-
-        if self.currentIndex() >= 0 and self.items:
-            menu.setDefaultAction(menu.actions()[self.currentIndex()])
-
-        x = -menu.width() // 2 + menu.layout().contentsMargins().left() + self.width() // 2
-        pd = _widget_global_pos(self, QPoint(x, self.height()))
-        hd = menu.view.heightForAnimation(pd, MenuAnimationType.DROP_DOWN)
-
-        pu = _widget_global_pos(self, QPoint(x, 0))
-        hu = menu.view.heightForAnimation(pu, MenuAnimationType.PULL_UP)
-
-        if hd >= hu:
-            menu.view.adjustSize(pd, MenuAnimationType.DROP_DOWN)
-            target, aniType = pd, MenuAnimationType.DROP_DOWN
-        else:
-            menu.view.adjustSize(pu, MenuAnimationType.PULL_UP)
-            target, aniType = pu, MenuAnimationType.PULL_UP
-
-        menu.aniManager = MenuAnimationManager.make(menu, aniType)
-        menu.aniManager.exec(target)
-        menu.show()
-        if menu.isSubMenu:
-            menu.menuItem.setSelected(True)
-
-    _ComboBox._showComboMenu = _safe_show_combo_menu
-    _ComboBox._ani_kwarg_patch_applied = True
-
-_patch_combobox_menu_exec()
+    QMenu.__init__ = _init
+    QMenu._pirachest_native_theming = True
 
 
 LAYOUT: dict[str, str] = {
@@ -2611,16 +2722,13 @@ def apply_app_palette() -> None:
 
 def _restyle_qfluent_widgets() -> None:
     from qfluentwidgets.common.style_sheet import getStyleSheet
-    removes, sheets = [], {}
+    removes = []
     for widget, source in list(styleSheetManager.items()):
         try:
             if widget.isVisible():
-                sheet = sheets.get(source)
-                if sheet is None:
-                    sheet = sheets[source] = getStyleSheet(source)
-                if widget.styleSheet() != sheet:
-                    widget.setStyleSheet(sheet)
-                widget.setProperty('dirty-qss', False)
+                if widget.styleSheet() != getStyleSheet(source):
+                    widget.setProperty('dirty-qss', True)
+                widget.update()
             else:
                 widget.setProperty('dirty-qss', True)
         except RuntimeError:
@@ -2769,12 +2877,60 @@ HyperlinkLabel { color: @accent_text; }
 )
 _QSS_COLOR_DECL = re.compile(r"(?<![-\w])color\s*:\s*[^;{}]+;")
 _SCROLL_TPL = """
-QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
-QScrollBar::handle:vertical { background: @scrollbar_handle; border-radius: 5px; min-height: 24px; }
-QScrollBar::handle:vertical:hover { background: @scrollbar_handle_hover; }
-QScrollBar:horizontal { height: 0px; }
-QScrollBar::add-line, QScrollBar::sub-line { background: transparent; }
+QScrollBar:vertical { background: transparent; width: 11px; margin: 2px 2px 2px 0; }
+QScrollBar::handle:vertical {
+    background: @scrollbar_handle; border-radius: 3px; min-height: 32px; margin: 0 3px;
+}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:vertical:pressed {
+    background: @scrollbar_handle_hover;
+}
+QScrollBar:horizontal { background: transparent; height: 11px; margin: 0 2px 2px 2px; }
+QScrollBar::handle:horizontal {
+    background: @scrollbar_handle; border-radius: 3px; min-width: 32px; margin: 3px 0;
+}
+QScrollBar::handle:horizontal:hover, QScrollBar::handle:horizontal:pressed {
+    background: @scrollbar_handle_hover;
+}
+QScrollBar::add-line, QScrollBar::sub-line {
+    width: 0; height: 0; background: transparent; border: none;
+}
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+QScrollBar::up-arrow, QScrollBar::down-arrow,
+QScrollBar::left-arrow, QScrollBar::right-arrow { width: 0; height: 0; background: none; }
+QScrollArea { background: transparent; border: none; }
+QScrollArea > QWidget > QWidget { background: transparent; }
 """
+_POPUP_TPL = """
+QToolTip {
+    background-color: @dialog_bg; color: @primary_text;
+    border: 1px solid @dialog_border; border-radius: 6px; padding: 5px 9px;
+}
+QMenu[piraNativeMenu="true"] {
+    background-color: @dialog_bg; color: @primary_text;
+    border: 1px solid @dialog_border; border-radius: 8px; padding: 5px;
+}
+QMenu[piraNativeMenu="true"]::item {
+    background: transparent; color: @primary_text;
+    padding: 6px 26px 6px 12px; margin: 1px 2px; border-radius: 5px;
+}
+QMenu[piraNativeMenu="true"]::item:selected { background-color: @surface_tint_strong; color: @primary_text; }
+QMenu[piraNativeMenu="true"]::item:disabled { color: @faint_text; }
+QMenu[piraNativeMenu="true"]::separator { height: 1px; background: @dialog_border; margin: 4px 8px; }
+QMenu[piraNativeMenu="true"]::indicator { width: 14px; height: 14px; }
+QMenuBar { background: transparent; color: @primary_text; }
+QMenuBar::item { background: transparent; padding: 4px 9px; border-radius: 4px; }
+QMenuBar::item:selected { background: @surface_tint_strong; }
+"""
+def _tooltip_qss() -> str:
+    p = palette()
+    bg, fg = _parse_rgba(p["card_bg"]), _parse_rgba(p["primary_text"])
+    fill = _fmt(tuple(round(a * .9 + b * .1) for a, b in zip(bg[:3], fg[:3])) + (1.0,)) if bg and fg else p["card_bg"]
+    family = QApplication.font().family().replace('"', "")
+    return (f"ToolTip {{ border-radius: 4px; }}"
+            f"ToolTip > #container {{ background-color: {fill}; border: 1px solid {p['card_border']}; border-radius: 4px; }}"
+            f'QLabel {{ background-color: transparent; font: 12px "{family}"; color: {p["body_text"]}; border: none; }}')
+
+
 _CARD_TPL = """
 %C% { background-color: @card_bg; border: none; border-radius: %R%px; }
 %C%:hover { background-color: @card_hover; border: none; }
@@ -2828,6 +2984,10 @@ def scroll_area_qss() -> str:
     return manager.qss(("scroll",), _SCROLL_TPL)
 
 
+def popup_qss() -> str:
+    return manager.qss(("popup",), _POPUP_TPL)
+
+
 def settings_qss(page_object_names: tuple = ("#settingsPage", "#aboutPage")) -> str:
     pages = tuple(page_object_names)
 
@@ -2854,7 +3014,8 @@ def dialog_qss(selectors: tuple = ("MessageBoxBase", "QDialog", "Ui_MessageBox")
         "titles": _sels(sel, ("SubtitleLabel", "TitleLabel", "StrongBodyLabel")),
         "caption": _sels(sel, ("CaptionLabel",)), "btns": _sels(sel, ("PushButton", "PrimaryPushButton")),
         "primary": _sels(sel, ("PrimaryPushButton",), ":!disabled"), "btn": _sels(sel, ("PushButton",)), "btn_hover": _sels(sel, ("PushButton",), ":hover"),
-        "inputs": _sels(sel, ("LineEdit", "ComboBox")), "cardw": _sels(sel, ("CardWidget",)),
+        "inputs": _sels(sel, ("LineEdit", "ComboBox")),
+        "cardw": _sels(sel, ("CardWidget",)),
         "bar": _sels(sel, ("#pirachestButtonBar",)),
     }))
 
@@ -2875,7 +3036,8 @@ def _install_integration() -> None:
     for step in (_patch_qfluent_combo_menu_exec, _patch_message_box_theming,
                  _patch_infobar_theming, _patch_label_theming, _patch_spin_box_layout,
                  _patch_qfluent_text_tint, _patch_qfluent_tm_rules,
-                 _patch_qfluent_theme_color, _patch_nav_indicator):
+                 _patch_qfluent_theme_color, _patch_nav_indicator, _patch_icon_ink,
+                 _patch_native_menu_theming, _patch_qfluent_switch_and_menus):
         try:
             step()
         except Exception:
@@ -2885,7 +3047,8 @@ def _install_integration() -> None:
 def global_app_qss() -> str:
     _install_integration()
     return "\n".join(s for s in (base_text_qss(), qfluent_text_tint_qss(),
-                                 dialog_qss(), custom_theme_qss()) if s)
+                                 scroll_area_qss(), popup_qss(), dialog_qss(),
+                                 custom_theme_qss()) if s)
 
 
 def _qhex(c: QColor) -> str:
@@ -2985,9 +3148,18 @@ def _patch_qfluent_text_tint() -> None:
     if getattr(cls, "_pirachest_text_tint", False):
         return
     original = cls.content
+    cache = {}
 
     def _content(self, theme=_ss.Theme.AUTO):
-        return _QSS_COLOR_DECL.sub("", original(self, theme))
+        if self is cls.TOOL_TIP:
+            return _tooltip_qss()
+        key = (self, _ss.qconfig.theme if theme == _ss.Theme.AUTO else theme)
+        out = cache.get(key)
+        if out is None:
+            if len(cache) > 128:
+                cache.clear()
+            out = cache[key] = _QSS_COLOR_DECL.sub("", original(self, theme))
+        return out
 
     cls.content = _content
     cls._pirachest_text_tint = True
@@ -3013,14 +3185,30 @@ def _patch_qfluent_tm_rules() -> None:
             _restore_tm_rules(widget)
 
     original_event = _ss.DirtyStyleSheetWatcher.eventFilter
+    pending = weakref.WeakSet()
+
+    def _queue_restyle(w) -> None:
+        if w in pending:
+            return
+        pending.add(w)
+
+        def _run():
+            pending.discard(w)
+            if not shiboken6.isValid(w):
+                return
+            with suppress(Exception):
+                w.setProperty("dirty-qss", False)
+                w.setStyleSheet(_ss.getStyleSheet(_ss.styleSheetManager.source(w)))
+                _restore_tm_rules(w)
+
+        QTimer.singleShot(0, w, _run)
 
     def _event(self, obj, event):
-        dirty = event.type() == QEvent.Type.Paint and bool(obj.property("dirty-qss"))
-        result = original_event(self, obj, event)
-        if dirty:
-            with suppress(Exception):
-                _restore_tm_rules(obj)
-        return result
+        if event.type() != QEvent.Type.Paint or not obj.property("dirty-qss"):
+            return original_event(self, obj, event)
+        with suppress(Exception):
+            _queue_restyle(obj)
+        return False
 
     _ss.setStyleSheet = _set
     _ss.addStyleSheet = _add
@@ -3064,6 +3252,40 @@ def _patch_qfluent_theme_color() -> None:
 
     cls.color = _color
     cls._pirachest_exact_accent = True
+
+
+def _patch_icon_ink() -> None:
+    from qfluentwidgets.common import icon as _icon
+    from qfluentwidgets.components.widgets import button as _button, icon_widget as _iw
+    if getattr(_button, "_pirachest_ink", False):
+        return
+
+    def _ink() -> str:
+        return to_color(resolve_icon_color(), "#ffffff").name()
+
+    def _draw(icon, painter, rect, state=QIcon.State.Off, **kw):
+        if isinstance(icon, _icon.FluentIconBase):
+            icon.render(painter, rect, **{"fill": _ink(), **kw})
+        else:
+            _icon.drawIcon(icon, painter, rect, state, **kw)
+
+    _button.drawIcon = _iw.drawIcon = _draw
+    engine_paint = _icon.FluentIconEngine.paint
+
+    def _engine_paint(self, painter, rect, mode, state):
+        base = getattr(self.icon, "fluentIcon", self.icon)
+        if self.isThemeReversed or not isinstance(base, _icon.FluentIconBase):
+            return engine_paint(self, painter, rect, mode, state)
+        painter.save()
+        if mode == QIcon.Mode.Disabled:
+            painter.setOpacity(0.5)
+        elif mode == QIcon.Mode.Selected:
+            painter.setOpacity(0.7)
+        base.render(painter, QRectF(rect.adjusted(-1, 0, 0, 0) if rect.x() == 19 else rect), fill=_ink())
+        painter.restore()
+
+    _icon.FluentIconEngine.paint = _engine_paint
+    _button._pirachest_ink = True
 
 
 def _patch_nav_indicator() -> None:
@@ -4339,7 +4561,7 @@ class ChromeChip(QWidget):
         p.translate(-body_x, 0)
         x = body_x + self._pad
         if self._has_icon():
-            glyph = self._glyph(color)
+            glyph = self._glyph(to_color(resolve_icon_color()))
             if glyph is not None:
                 pm, dx, dy, logical = glyph
                 fm = QFontMetricsF(self._font)
@@ -5494,11 +5716,14 @@ def _apply_tm_rules(w) -> None:
     ss = w.styleSheet()
     base = ss.split(_TM_MARK)[0] if _TM_MARK in ss else ss
     hits = _tm_hits(w)
+    from src.gui.stuff.combo_box import combo_state_css, is_combo_button
+    combo = is_combo_button(w)
     new = base
-    if hits:
+    if hits or combo:
         tag = w.property("tmRule") or f"w{next(_tm_seq)}"
         w.setProperty("tmRule", tag)
-        new = base + _TM_MARK + "\n" + _tm_css(w, tag, hits)
+        extra = combo_state_css(tag) if combo else ""
+        new = base + _TM_MARK + "\n" + _tm_css(w, tag, hits) + ("\n" + extra if extra else "")
         _tm_touched.add(w)
     if new != ss:
         w.setStyleSheet(new)
@@ -6972,3 +7197,6 @@ def open_theme_maker(parent=None) -> ThemeMaker:
     ThemeMaker._instance.show()
     ThemeMaker._instance.raise_()
     return ThemeMaker._instance
+
+
+import src.gui.stuff.combo_box

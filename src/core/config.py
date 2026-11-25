@@ -411,6 +411,10 @@ class Settings:
     sfx_volume: int = 25
     ambiance_volume: int = 45
     ui_scale: int = 100
+    nav_collapsed: bool = False
+    start_page: str = 'home'
+    last_page: str = ''
+    last_route: dict = field(default_factory=dict)
     background_image_enabled: bool = False
     background_image_path: str = ''
     background_image_blur: int = 12
@@ -458,7 +462,8 @@ class Settings:
 _INVALID = object()
 
 _NET_PROXY_TYPES = frozenset(('none', 'http', 'socks5'))
-_NET_BOOL_KEYS = ('proxy_peers', 'force_proxy', 'anonymous', 'require_encryption', 'dht', 'lsd', 'upnp', 'private_history')
+_NET_BOOL_KEYS = ('proxy_peers', 'force_proxy', 'anonymous', 'require_encryption', 'dht', 'lsd', 'upnp',
+                  'block_ipv6', 'private_history')
 _NET_TEXT_KEYS = ('proxy_host', 'proxy_user', 'proxy_pass', 'bind')
 _MAX_NET_TEXT = 2048
 
@@ -593,8 +598,146 @@ def empty_dir(path: str) -> None:
             logger.debug('Could not remove %s', entry.path, exc_info=True)
 
 
-def wipe_all_app_data() -> None:
-    empty_dir(paths.app_data_dir)
+_WIPE_ENV = 'PIRACHEST_WIPE_PENDING'
+
+
+def _remove_path(path: str, attempts: int = 6) -> bool:
+    import stat
+
+    def _unlock(func, p, _exc):
+        with suppress(OSError):
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+            func(p)
+
+    for attempt in range(attempts):
+        try:
+            if os.path.islink(path) or os.path.isfile(path):
+                os.remove(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path, onerror=_unlock)
+        except OSError:
+            pass
+        if not os.path.lexists(path):
+            return True
+        time.sleep(0.25 * (attempt + 1))
+    return not os.path.lexists(path)
+
+
+WIPE_CATEGORIES: tuple[tuple[str, bool], ...] = (
+    ('settings', True),
+    ('themes', True),
+    ('cache', True),
+    ('library', True),
+    ('youtube', True),
+    ('other', True),
+    ('downloads', False),
+)
+ALL_WIPE_CATEGORIES = tuple(c[0] for c in WIPE_CATEGORIES)
+
+
+def _is_settings_name(name: str) -> bool:
+    low = name.lower()
+    return low.startswith(('pirachest_settings.json', 'minerva_settings.json'))
+
+
+def _is_theme_name(name: str) -> bool:
+    return 'theme' in name.lower()
+
+
+def _listdir(path: str) -> list[str]:
+    try:
+        return [os.path.join(path, n) for n in os.listdir(path)]
+    except OSError:
+        return []
+
+
+def wipe_targets(categories) -> dict[str, list[str]]:
+    chosen = {c for c in categories if c in ALL_WIPE_CATEGORIES}
+    root = paths.app_data_dir
+    known_dirs = {os.path.normcase(os.path.abspath(p)) for p in (
+        paths.data_dir, paths.cache_dir, paths.download_root, paths.config_dir, paths.yt_dir)}
+    result: dict[str, list[str]] = {c: [] for c in chosen}
+    if 'settings' in chosen:
+        result['settings'] += [p for p in _listdir(paths.config_dir) if _is_settings_name(os.path.basename(p))]
+        legacy = globals().get('_LEGACY_ROOT_SETTINGS_FILE')
+        if legacy:
+            result['settings'] += [legacy, legacy + '.corrupt']
+    if 'themes' in chosen:
+        result['themes'] += [p for p in _listdir(paths.config_dir) + _listdir(root)
+                             if _is_theme_name(os.path.basename(p))]
+    if 'cache' in chosen:
+        result['cache'].append(paths.cache_dir)
+    if 'library' in chosen:
+        result['library'].append(paths.data_dir)
+    if 'youtube' in chosen:
+        result['youtube'].append(paths.yt_dir)
+    if 'downloads' in chosen:
+        result['downloads'].append(paths.download_root)
+    if 'other' in chosen:
+        for p in _listdir(root):
+            if os.path.normcase(os.path.abspath(p)) not in known_dirs and not _is_theme_name(os.path.basename(p)):
+                result['other'].append(p)
+        for p in _listdir(paths.config_dir):
+            name = os.path.basename(p)
+            if not _is_settings_name(name) and not _is_theme_name(name):
+                result['other'].append(p)
+    return result
+
+
+def wipe_all_app_data(categories=None) -> list[str]:
+    failures: list[str] = []
+    for targets in wipe_targets(ALL_WIPE_CATEGORIES if categories is None else categories).values():
+        for target in targets:
+            if os.path.lexists(target) and not _remove_path(target):
+                failures.append(target)
+                logger.error('Could not delete %s', target)
+    with suppress(OSError):
+        paths.ensure_dirs()
+    return failures
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0 or pid == os.getpid():
+        return False
+    if sys.platform == 'win32':
+        import ctypes
+        SYNCHRONIZE = 0x00100000
+        handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle:
+            return False
+        try:
+            return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == 0x102
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def relaunch_app_and_wipe(env: dict | None = None, categories=None) -> bool:
+    cats = ALL_WIPE_CATEGORIES if categories is None else tuple(categories)
+    child_env = dict(os.environ if env is None else env)
+    child_env[_WIPE_ENV] = f"{os.getpid()}:{','.join(cats)}"
+    return relaunch_app(env=child_env)
+
+
+def _run_pending_wipe() -> None:
+    raw = os.environ.pop(_WIPE_ENV, None)
+    if not raw:
+        return
+    pid_text, _, cats_text = raw.partition(':')
+    cats = [c for c in cats_text.split(',') if c] or list(ALL_WIPE_CATEGORIES)
+    with suppress(ValueError):
+        deadline = time.monotonic() + 20
+        while _pid_alive(int(pid_text)) and time.monotonic() < deadline:
+            time.sleep(0.2)
+    failures = wipe_all_app_data(cats)
+    if failures:
+        logger.error('Wipe incomplete, %d item(s) remain', len(failures))
 
 
 paths = Paths()
@@ -608,6 +751,8 @@ _SETTINGS_FILE = os.path.join(_CONFIG_DIR, 'pirachest_settings.json')
 _LEGACY_SETTINGS_FILE = os.path.join(_CONFIG_DIR, 'minerva_settings.json')
 _LEGACY_ROOT_CONFIG_DIR = os.path.join(_PROJECT_ROOT, '.config')
 _LEGACY_ROOT_SETTINGS_FILE = os.path.join(_LEGACY_ROOT_CONFIG_DIR, 'pirachest_settings.json')
+_run_pending_wipe()
+paths.ensure_dirs()
 
 def load_settings() -> Settings:
     path = next((c for c in (_SETTINGS_FILE, _LEGACY_SETTINGS_FILE, _LEGACY_ROOT_SETTINGS_FILE) if os.path.isfile(c)), None)

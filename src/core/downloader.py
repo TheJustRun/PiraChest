@@ -227,6 +227,7 @@ class NetPrefs:
     lsd: bool = True
     upnp: bool = True
     bind: str = ""
+    block_ipv6: bool = True
     private_history: bool = False
 
     @property
@@ -245,7 +246,22 @@ class NetPrefs:
         except ValueError:
             return ""
 
+    def bind_alive(self) -> bool:
+        ip = self.bind_ip()
+        if not ip:
+            return True
+        try:
+            with socket.socket(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.bind((ip, 0))
+        except OSError:
+            return False
+        return True
+
     def leak_guard(self) -> str:
+        if self.bind.strip() and not self.bind_ip():
+            return "Bind address must be an IP address of your VPN adapter"
+        if not self.bind_alive():
+            return "Bound interface is down - all traffic is blocked"
         return "Force-proxy is enabled but no proxy is configured" if self.force_proxy and not self.has_proxy else ""
 
 
@@ -583,6 +599,21 @@ def new_session(connections: int, headers: Optional[dict] = None) -> Any:
         session.trust_env = False
         session.proxies = {"http": NET.proxy_url(), "https": NET.proxy_url()}
     return session
+
+
+def public_ip(timeout: float = 8.0) -> str:
+    session = new_session(1, headers={"Cache-Control": "no-store"})
+    try:
+        with session.get("https://api.ipify.org", timeout=timeout, stream=True) as response:
+            if response.status_code >= 400:
+                raise HttpError(f"HTTP {response.status_code}")
+            raw = response.text.strip()[:64]
+    finally:
+        session.close()
+    try:
+        return str(ipaddress.ip_address(raw))
+    except ValueError:
+        raise HttpError("The IP check service returned an unexpected reply")
 
 
 def _probe_once(session: Any, url: str, timeout: float) -> Probe:
@@ -1228,6 +1259,7 @@ class DownloadManager(QObject):
         self._pieces_cache: dict[str, tuple[float, Any]] = {}
         self._cap, self._best, self._peak = 0, 0.0, 0.0
         self._tick, self._was_working = 0, False
+        self._bind_ok = True
         self._limiter = RateLimiter(self.global_down_kbps * 1024)
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(16)
@@ -1272,7 +1304,19 @@ class DownloadManager(QObject):
                 params.settings = _known({**self._perf_pack(), **self._net_pack()})
                 self._ses = lt.session(params)
                 self._ses.set_alert_notify(self._wake.emit)
+                self._apply_ipv6_block()
         return self._ses
+
+    def _apply_ipv6_block(self) -> None:
+        if lt is None or self._ses is None:
+            return
+        try:
+            block = lt.ip_filter()
+            if NET.block_ipv6:
+                block.add_rule("::", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", 1)
+            self._ses.set_ip_filter(block)
+        except Exception:
+            logger.warning("Could not apply the IPv6 block filter", exc_info=True)
 
     def _perf_pack(self) -> dict[str, Any]:
         cat = lt.alert.category_t
@@ -1310,13 +1354,15 @@ class DownloadManager(QObject):
 
     def _net_pack(self, *, session_start: bool = True) -> dict[str, Any]:
         quiet, forced, port = NET.anonymous or bool(NET.leak_guard()), NET.require_encryption, int(getattr(settings, "torrent_port", 6881))
-        host = NET.bind.strip()
+        host = NET.bind_ip()
         host = f"[{host}]" if ":" in host else host
         enc = int(lt.enc_policy.forced if forced else lt.enc_policy.enabled)
+        listen = f"{host}:{port}" if host else (
+            f"0.0.0.0:{port}" if NET.block_ipv6 else f"0.0.0.0:{port},[::]:{port}")
         pack: dict[str, Any] = {
             "user_agent": "" if quiet else _UA, "anonymous_mode": NET.anonymous,
-            "listen_interfaces": f"{host}:{port}" if host else f"0.0.0.0:{port},[::]:{port}",
-            "outgoing_interfaces": NET.bind.strip(),
+            "listen_interfaces": listen,
+            "outgoing_interfaces": host,
             "enable_dht": NET.dht and not quiet, "enable_lsd": NET.lsd and not quiet,
             "enable_upnp": NET.upnp and not quiet, "enable_natpmp": NET.upnp and not quiet,
             "out_enc_policy": enc, "in_enc_policy": enc, "allowed_enc_level": int(lt.enc_level.both),
@@ -1349,8 +1395,13 @@ class DownloadManager(QObject):
         save_settings(settings)
         if self._ses is not None:
             self._ses.apply_settings(_known(self._net_pack(session_start=False)))
+            self._apply_ipv6_block()
         if NET.leak_guard():
             self.pause_all()
+        with suppress(Exception):
+            from src.core import net as _net
+            _net.install_urllib_guard()
+            _net.reset_clients()
 
     def _drain(self) -> None:
         if self._closed or self._ses is None:
@@ -1976,11 +2027,28 @@ class DownloadManager(QObject):
         except Exception:
             pass
 
+    def _enforce_bind(self) -> None:
+        ses = self._ses
+        if ses is None:
+            return
+        alive = NET.bind_alive()
+        if alive == self._bind_ok:
+            return
+        self._bind_ok = alive
+        try:
+            ses.resume() if alive else ses.pause()
+        except Exception:
+            pass
+        if not alive:
+            logger.warning("Bound interface %s is down - torrent traffic blocked", NET.bind.strip())
+
     def _poll(self) -> None:
         if self._closed:
             return
         self._sync_fast_timer()
         self._tick += 1
+        if self._tick % 3 == 0:
+            self._enforce_bind()
         self._drain()
         self._sample()
         active = bool(self._handles or self._probes) or any(
@@ -2867,9 +2935,12 @@ def _benchmark_torrent(source: str, save_path: str):
         atp = lt.add_torrent_params()
         if source.startswith(("http://", "https://")):
             import tempfile
-            import requests
-            response = requests.get(source, timeout=60)
-            response.raise_for_status()
+            session = new_session(1)
+            try:
+                response = session.get(source, timeout=60)
+                response.raise_for_status()
+            finally:
+                session.close()
             fd, path = tempfile.mkstemp(suffix=".torrent", prefix="pirachest-bench-")
             os.close(fd)
             try:

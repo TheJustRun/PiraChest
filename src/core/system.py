@@ -97,12 +97,17 @@ def _open_linux(target: str) -> bool:
     return False
 
 
+def _open_macos(target: str, reveal: bool = False) -> bool:
+    command = ["/usr/bin/open", "-R", target] if reveal else ["/usr/bin/open", target]
+    return _launch(command)
+
+
 def open_path(path: str) -> None:
     path = os.path.abspath(path)
     if WINDOWS:
         os.startfile(path)
     elif MACOS:
-        subprocess.Popen(["open", path])
+        _open_macos(path)
     else:
         _open_linux(path)
 
@@ -115,7 +120,7 @@ def open_external(target: str) -> bool:
         if WINDOWS:
             os.startfile(target)
         elif MACOS:
-            subprocess.Popen(["open", target])
+            return _open_macos(target)
         else:
             return _open_linux(target)
         return True
@@ -131,7 +136,7 @@ def reveal_path(path: str, select: bool = False) -> None:
         else:
             os.startfile(path if os.path.isdir(path) else os.path.dirname(path))
     elif MACOS:
-        subprocess.Popen(["open", "-R", path] if select else ["open", path])
+        _open_macos(path, reveal=bool(select))
     else:
         target = os.path.dirname(path) if select and os.path.isfile(path) else path
         _open_linux(target)
@@ -145,14 +150,16 @@ def detached_kwargs() -> dict:
 
 def clean_env() -> dict:
     env = dict(os.environ)
-    for name in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "_MEIPASS",
-                 "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH"):
+    for name in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "_MEIPASS", "_MEIPASS2",
+                 "PYINSTALLER_RESET_ENVIRONMENT", "QT_PLUGIN_PATH",
+                 "QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_PLATFORMTHEME", "QT_STYLE_OVERRIDE",
+                 "QT_SCALE_FACTOR"):
         env.pop(name, None)
     if MACOS:
         for name in ("DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_INSERT_LIBRARIES"):
             env.pop(name, None)
-    elif LINUX:
-        env.pop("LD_LIBRARY_PATH", None)
+    for name in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT"):
+        env.pop(name, None)
     return env
 
 

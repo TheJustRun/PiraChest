@@ -16,7 +16,6 @@ from qfluentwidgets.components.widgets.combo_box import ComboBoxMenu
 
 from src.core.minerva import console_variants
 from src.core.minerva import database as db
-from src.core.minerva import indexer
 from src.core.theme import accent_icon, legible_text, palette, register_theme_refresh, themed_icon
 from src.core.translations import register_locale_refresh, tr
 from src.core.worker import submit, wrap_callback
@@ -902,6 +901,7 @@ class MinervaPage(QWidget):
         self._progress_indeterminate.setVisible(True)
         self._progress_indeterminate.start()
         self._set_status(tr('home.indexing', default='Indexing… {count} ROMs so far', count='0'))
+        from src.core.minerva import indexer
         on_progress = wrap_callback(self._on_sync_progress)
         self._sync_task_id = submit(indexer.sync_index, kwargs={'on_progress': on_progress},
                                     on_done=self._on_sync_done, on_error=self._on_sync_error)

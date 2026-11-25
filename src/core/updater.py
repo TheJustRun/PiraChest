@@ -40,6 +40,7 @@ _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _ZIP_RE = re.compile(r"^pirachest.*windows.*x64\.zip$", re.I)
 _CANARY_RE = re.compile(r"canary|nightly|unstable|experimental", re.I)
 _MANIFEST_NAME = "update-manifest.json"
+_ERROR_LOG = "pirachest_update_error.log"
 _CACHE: dict[str, tuple[float, bytes]] = {}
 _CACHE_TTL = 300.0
 
@@ -75,6 +76,31 @@ class UpdateCancelled(Exception):
 
 class ChecksumMismatch(RuntimeError):
     pass
+
+
+class UpdateCheckError(RuntimeError):
+    pass
+
+
+def _error_log_path() -> str:
+    return os.path.join(tempfile.gettempdir(), _ERROR_LOG)
+
+
+def take_update_error() -> bool:
+    path = _error_log_path()
+    if not os.path.isfile(path):
+        return False
+    with suppress(OSError):
+        os.remove(path)
+    return True
+
+
+def _ensure_writable(root: str) -> None:
+    if _can_write(root):
+        return
+    if host.WINDOWS:
+        raise RuntimeError("PiraChest cannot write to its install folder. Run it as administrator or reinstall through Chocolatey.")
+    raise RuntimeError("PiraChest cannot write to its install folder. Move the app somewhere writable or reinstall it.")
 
 
 def _parse_version(tag: str) -> tuple:
@@ -159,7 +185,8 @@ _SOURCES = (_github, _gitlab, _sourceforge)
 
 def _urls(tag: str, asset: dict) -> list[str]:
     fields = {"tag": quote(tag), "name": quote(asset["name"])}
-    return list(dict.fromkeys([asset["url"], *(m.format(**fields) for m in _MIRRORS)]))
+    urls = dict.fromkeys([asset["url"], *(m.format(**fields) for m in _MIRRORS)])
+    return [u for u in urls if u.lower().startswith("https://")]
 
 
 def _manifest_choice(manifest: dict, assets: list[dict]) -> dict | None:
@@ -220,6 +247,8 @@ def _is_choco_install() -> bool:
     if not host.WINDOWS or not getattr(sys, "frozen", False):
         return False
     app = _app_dir()
+    if "\\windowsapps\\" in app.lower():
+        return True
     if os.path.isfile(os.path.join(app, ".pirachest-choco")):
         return True
     return "\\chocolatey\\lib\\" in app.lower()
@@ -235,6 +264,8 @@ def _is_package_managed() -> bool:
         return _is_choco_install()
     if not host.LINUX:
         return False
+    if any(os.environ.get(k) for k in ("APPIMAGE", "FLATPAK_ID", "SNAP")):
+        return True
     root = os.path.realpath(_install_root()).replace(os.sep, "/") + "/"
     if root.startswith(_MANAGED_PREFIXES):
         return True
@@ -266,9 +297,9 @@ def _newest(releases: list[dict], channel: str) -> dict | None:
         if picked is None:
             continue
         asset = picked["asset"]
-        digest = (picked.get("sha256") or asset["digest"]).lower().removeprefix("sha256:")
-        if not _HASH_RE.match(digest):
-            digest = ""
+        digest = next((d for d in ((picked.get("sha256") or "").lower(),
+                                   (asset["digest"] or "").lower().removeprefix("sha256:"))
+                       if _HASH_RE.match(d)), "")
         checksum = _checksum_asset(assets, asset["name"])
         if not digest and checksum is None:
             logger.warning("Release %s has no SHA-256 checksum; skipping", tag)
@@ -293,7 +324,7 @@ def _newest(releases: list[dict], channel: str) -> dict | None:
     return None
 
 
-def check_for_update(channel: str | None = None) -> dict | None:
+def check_for_update(channel: str | None = None, strict: bool = False) -> dict | None:
     if _is_package_managed():
         return None
     channel = (channel or ("auto" if IS_CANARY else "stable")).lower()
@@ -304,6 +335,8 @@ def check_for_update(channel: str | None = None) -> dict | None:
             return _newest(source(), channel)
         except Exception as exc:
             logger.warning("Update source %s failed: %s", source.__name__.lstrip("_"), exc)
+    if strict:
+        raise UpdateCheckError("All update sources failed")
     return None
 
 
@@ -327,11 +360,9 @@ def cleanup_update_staging(_path: str | None = None) -> None:
 def fetch_expected_checksum(checksum_url: str, asset_name: str) -> str | None:
     if not checksum_url or not asset_name:
         return None
-    req = urllib.request.Request(checksum_url, headers=_HEADERS)
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            text = resp.read().decode("utf-8-sig", errors="replace")
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        text = _get(checksum_url)[:1 << 20].decode("utf-8-sig", errors="replace")
+    except Exception as exc:
         logger.warning("Failed to fetch checksum file: %s", exc)
         return None
     for line in text.splitlines():
@@ -508,6 +539,10 @@ def _fetch_archive(url: str, dest: str, expected: str | None, on_progress, is_ca
     total, ranged = 0, False
     try:
         total, ranged = _probe_ranges(url)
+    except urllib.error.HTTPError as exc:
+        if exc.code < 500 and exc.code not in (408, 429):
+            raise
+        logger.info("Range probe failed, using single stream: %s", exc)
     except Exception as exc:
         logger.info("Range probe failed, using single stream: %s", exc)
     if ranged and total >= _SEG_MIN:
@@ -531,7 +566,8 @@ def _download_with_retries(url: str, dest: str, expected: str | None, on_progres
         except (UpdateCancelled, ChecksumMismatch):
             raise
         except Exception as exc:
-            if attempt >= 2:
+            if attempt >= 2 or (isinstance(exc, urllib.error.HTTPError)
+                                and exc.code < 500 and exc.code not in (408, 429)):
                 raise
             logger.warning("Update download attempt %s failed: %s", attempt + 1, exc)
             time.sleep(1.0 + attempt)
@@ -706,6 +742,8 @@ def download_and_verify_update(update_info: dict, on_progress=None, is_cancelled
                                       for url in update_info.get("checksum_urls", ()))), "")
     if not expected:
         raise RuntimeError("Could not verify the update checksum")
+    if getattr(sys, "frozen", False):
+        _ensure_writable(_install_root())
     staging = _update_staging_dir()
     need = int(update_info.get("asset_size") or 0) * 3
     try:
@@ -746,6 +784,26 @@ def download_and_verify_update(update_info: dict, on_progress=None, is_cancelled
     return out_dir
 
 
+def _snapshot(new_dir: str, install_dir: str, staging: str) -> tuple[str, str]:
+    backup = os.path.join(staging, "backup")
+    added_list = os.path.join(staging, "added.lst")
+    shutil.rmtree(backup, ignore_errors=True)
+    added = []
+    for current, _dirs, files in os.walk(new_dir):
+        for name in files:
+            rel = os.path.relpath(os.path.join(current, name), new_dir)
+            target = os.path.join(install_dir, rel)
+            if os.path.lexists(target):
+                saved = os.path.join(backup, rel)
+                os.makedirs(os.path.dirname(saved), exist_ok=True)
+                shutil.copy2(target, saved, follow_symlinks=False)
+            else:
+                added.append(rel)
+    with open(added_list, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("".join(f"{rel}\n" for rel in added))
+    return backup, added_list
+
+
 def _can_write(path: str) -> bool:
     probe = os.path.join(path, f".pirachest-write-{os.getpid()}")
     try:
@@ -768,6 +826,8 @@ set "EXE=%PIRACHEST_UPDATE_EXE%"
 set "NAME=%PIRACHEST_UPDATE_NAME%"
 set "PID=%PIRACHEST_UPDATE_PID%"
 set "DEL=%PIRACHEST_UPDATE_DEL%"
+set "BAK=%PIRACHEST_UPDATE_BAK%"
+set "ADD=%PIRACHEST_UPDATE_ADD%"
 set "TASKS=%LOG%.tasks"
 set "FAILED="
 del /q "%LOG%" >NUL 2>NUL
@@ -787,10 +847,12 @@ del /q "%TASKS%" >NUL 2>NUL
 robocopy "%SRC%" "%DST%" /E /IS /MT:16 /R:10 /W:1 /NFL /NDL /NJH /NJS /NP /XD "%DST%\\data" "%SRC%\\data" >NUL 2>&1
 if errorlevel 8 set FAILED=1
 if defined FAILED goto done
-if exist "%DEL%" for /f "usebackq tokens=* delims=" %%F in ("%DEL%") do del /f /q "%DST%\\%%F" >NUL 2>NUL
+if exist "%DEL%" for /f "usebackq eol=| tokens=* delims=" %%F in ("%DEL%") do del /f /q "%DST%\\%%F" >NUL 2>NUL
 
 :done
 if defined FAILED (
+    robocopy "%BAK%" "%DST%" /E /IS /R:5 /W:1 /NFL /NDL /NJH /NJS /NP >NUL 2>&1
+    if exist "%ADD%" for /f "usebackq eol=| tokens=* delims=" %%F in ("%ADD%") do del /f /q "%DST%\\%%F" >NUL 2>NUL
     echo Update copy failed. > "%LOG%"
 ) else (
     rmdir /S /Q "%STAGE%" >NUL 2>NUL
@@ -810,6 +872,11 @@ STAGE="$4"
 EXE="$5"
 DEL="$6"
 KIND="$7"
+LOG="$8"
+BAK="$9"
+ADD="${10}"
+rm -f "$LOG"
+OK=1
 i=0
 while kill -0 "$PID" 2>/dev/null; do
   i=$((i + 1))
@@ -817,19 +884,30 @@ while kill -0 "$PID" 2>/dev/null; do
   sleep 0.25
 done
 if [ "$KIND" = "bundle" ]; then
-  ditto "$SRC" "$DST" || exit 1
+  ditto "$SRC" "$DST" || OK=0
 else
-  cp -Rf "$SRC"/. "$DST"/ || exit 1
+  cp -Rf "$SRC"/. "$DST"/ || OK=0
 fi
-if [ -f "$DEL" ]; then
-  while IFS= read -r f; do
-    if [ -n "$f" ]; then rm -f "$DST/$f"; fi
-  done < "$DEL"
+if [ "$OK" = 1 ]; then
+  if [ -f "$DEL" ]; then
+    while IFS= read -r f; do
+      if [ -n "$f" ]; then rm -f "$DST/$f"; fi
+    done < "$DEL"
+  fi
+  rm -rf "$STAGE"
+else
+  if [ -d "$BAK" ]; then cp -Rf "$BAK"/. "$DST"/ 2>/dev/null; fi
+  if [ -f "$ADD" ]; then
+    while IFS= read -r f; do
+      if [ -n "$f" ]; then rm -f "$DST/$f"; fi
+    done < "$ADD"
+  fi
+  echo "Update copy failed." > "$LOG"
 fi
 chmod +x "$EXE" 2>/dev/null || true
-rm -rf "$STAGE"
+rm -f "$0"
 if [ "$KIND" = "bundle" ]; then
-  codesign --force --deep --sign - "$DST" >/dev/null 2>&1 || true
+  if [ "$OK" = 1 ]; then codesign --force --deep --sign - "$DST" >/dev/null 2>&1 || true; fi
   open "$DST" >/dev/null 2>&1
 else
   cd "$(dirname "$EXE")" 2>/dev/null || cd /
@@ -847,22 +925,18 @@ def _apply_update_posix(new_app_dir: str) -> None:
     marker = os.path.join(new_app_dir, "Contents", "MacOS", exe_name) if kind == "bundle" else os.path.join(new_app_dir, exe_name)
     if not os.path.isfile(marker):
         raise RuntimeError(f"The downloaded update is incomplete: {marker} is missing")
-    if not _can_write(install_root):
-        raise RuntimeError("PiraChest cannot write to its install folder. Move the app somewhere writable or reinstall it.")
+    _ensure_writable(install_root)
     staging = _update_staging_dir()
+    backup, added_list = _snapshot(new_app_dir, install_root, staging)
     temp = tempfile.gettempdir()
-    script_path = os.path.join(temp, "pirachest_update.sh")
-    with open(script_path, "w", encoding="utf-8", newline="\n") as fh:
+    fd, script_path = tempfile.mkstemp(prefix="pirachest_update_", suffix=".sh")
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(_POSIX_UPDATE_SCRIPT)
-    try:
-        os.chmod(script_path, 0o700)
-    except OSError:
-        pass
     env = os.environ.copy()
     env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     subprocess.Popen(
         ["/bin/sh", script_path, str(os.getpid()), new_app_dir, install_root, staging,
-         current_exe, os.path.join(staging, "delete.lst"), kind],
+         current_exe, os.path.join(staging, "delete.lst"), kind, _error_log_path(), backup, added_list],
         cwd=temp,
         env=env,
         start_new_session=True,
@@ -882,9 +956,9 @@ def apply_update_and_restart(new_app_dir: str) -> None:
     new_app_dir = os.path.abspath(new_app_dir)
     if not os.path.isfile(os.path.join(new_app_dir, exe_name)):
         raise RuntimeError(f"The downloaded update is incomplete: {os.path.join(new_app_dir, exe_name)} is missing")
-    if not _can_write(install_dir):
-        raise RuntimeError("PiraChest cannot write to its install folder. Run it as administrator or reinstall through Chocolatey.")
+    _ensure_writable(install_dir)
     staging = _update_staging_dir()
+    backup, added_list = _snapshot(new_app_dir, install_dir, staging)
     temp = tempfile.gettempdir()
     script_path = os.path.join(temp, "pirachest_update.bat")
     with open(script_path, "w", encoding="ascii", newline="\r\n") as fh:
@@ -894,11 +968,13 @@ def apply_update_and_restart(new_app_dir: str) -> None:
         "PIRACHEST_UPDATE_SRC": new_app_dir,
         "PIRACHEST_UPDATE_DST": install_dir,
         "PIRACHEST_UPDATE_STAGE": staging,
-        "PIRACHEST_UPDATE_LOG": os.path.join(temp, "pirachest_update_error.log"),
+        "PIRACHEST_UPDATE_LOG": _error_log_path(),
         "PIRACHEST_UPDATE_EXE": current_exe,
         "PIRACHEST_UPDATE_NAME": exe_name,
         "PIRACHEST_UPDATE_PID": str(os.getpid()),
         "PIRACHEST_UPDATE_DEL": os.path.join(staging, "delete.lst"),
+        "PIRACHEST_UPDATE_BAK": backup,
+        "PIRACHEST_UPDATE_ADD": added_list,
         "PYINSTALLER_RESET_ENVIRONMENT": "1",
     })
     subprocess.Popen(

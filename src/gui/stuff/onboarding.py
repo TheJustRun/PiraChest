@@ -9,7 +9,7 @@ from typing import Callable
 
 from PySide6.QtCore import (
     Property, QEasingCurve, QEvent, QObject, QPointF, QPropertyAnimation, QRect, QRectF, QRunnable, QSize, Qt,
-    QThreadPool, QTimer, Signal,
+    QThreadPool, QTimer, QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontMetrics, QIcon, QImage, QImageReader, QLinearGradient, QPainter, QPainterPath,
@@ -43,22 +43,14 @@ LANGUAGES = (
 )
 
 FEATURES = (
-    ('minerva_enabled', 'nav.minerva', 'Minerva', 'onboarding.feature_minerva_desc',
-     'Browse and sync the Minerva ROM index.'),
-    ('pc_games_enabled', 'nav.pc_games', 'PC Games', 'onboarding.feature_pc_games_desc',
-     'Download repacks and PC games.'),
-    ('youtube_enabled', 'nav.youtube', 'YouTube', 'onboarding.feature_youtube_desc',
-     'Download videos and audio from YouTube.'),
-    ('tv_enabled', 'nav.tv', 'TV', 'onboarding.feature_tv_desc',
-     'Browse movies, series and live channels.'),
-    ('tbhb_enabled', 'nav.tbhb', 'TBHB', 'onboarding.feature_tbhb_desc',
-     'Search torrents from The Black Hole Bay.'),
-    ('music_enabled', 'nav.music', 'Music', 'onboarding.feature_music_desc',
-     'Browse and manage your music library.'),
-    ('books_enabled', 'nav.books', 'Books', 'onboarding.feature_books_desc',
-     'Browse and manage your books.'),
-    ('sailseek_enabled', 'nav.sailseek', 'SailSeek', 'onboarding.feature_sailseek_desc',
-     'Search instantly and open YouTube links with one shortcut.'),
+    ('minerva_enabled', 'nav.minerva', 'onboarding.feature_minerva_desc'),
+    ('pc_games_enabled', 'nav.pc_games', 'onboarding.feature_pc_games_desc'),
+    ('youtube_enabled', 'nav.youtube', 'onboarding.feature_youtube_desc'),
+    ('tv_enabled', 'nav.tv', 'onboarding.feature_tv_desc'),
+    ('tbhb_enabled', 'nav.tbhb', 'onboarding.feature_tbhb_desc'),
+    ('music_enabled', 'nav.music', 'onboarding.feature_music_desc'),
+    ('books_enabled', 'nav.books', 'onboarding.feature_books_desc'),
+    ('sailseek_enabled', 'nav.sailseek', 'onboarding.feature_sailseek_desc'),
 )
 
 _PLAIN_THEMES = ('dark', 'light')
@@ -113,6 +105,42 @@ def _text_height(fm: QFontMetrics, text: str, width: int) -> int:
     flags = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap)
     rect = fm.boundingRect(QRect(0, 0, max(1, int(width)), 100000), flags, text)
     return max(fm.height(), rect.height() + 1)
+
+
+class _Tweens:
+
+    def _init_tweens(self, **values: float) -> None:
+        self._vals = values
+        self._tweens: dict[str, QVariantAnimation] = {}
+
+    def _tween(self, key: str, target: float, duration: int = 140) -> None:
+        anim = self._tweens.get(key)
+        if anim is not None:
+            anim.stop()
+        if not self.isVisible() or not animations_enabled():
+            self._vals[key] = float(target)
+            self.update()
+            return
+        if anim is None:
+            anim = self._tweens[key] = QVariantAnimation(self)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.valueChanged.connect(lambda value, k=key: self._on_tween(k, value))
+        anim.setDuration(duration)
+        anim.setStartValue(self._vals[key])
+        anim.setEndValue(float(target))
+        anim.start()
+
+    def _on_tween(self, key: str, value) -> None:
+        self._vals[key] = float(value)
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        self._tween('hover', 1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._tween('hover', 0.0)
+        super().leaveEvent(event)
 
 
 class _ThumbJob(QRunnable):
@@ -277,13 +305,13 @@ class _Label(QLabel):
         return super().heightForWidth(max(1, int(width)))
 
 
-class _Button(QAbstractButton):
+class _Button(_Tweens, QAbstractButton):
 
     def __init__(self, text: str, kind: str, metrics: _Metrics, parent=None):
         super().__init__(parent)
         self._kind = kind
         self._metrics = metrics
-        self._hover = False
+        self._init_tweens(hover=0.0)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.setFont(_font_px(self.font(), metrics.button_px, QFont.Weight.DemiBold))
@@ -306,16 +334,6 @@ class _Button(QAbstractButton):
         hint = self.sizeHint()
         self.setFixedSize(hint)
 
-    def enterEvent(self, event) -> None:
-        self._hover = True
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event) -> None:
-        self._hover = False
-        self.update()
-        super().leaveEvent(event)
-
     def keyPressEvent(self, event) -> None:
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.click()
@@ -336,23 +354,23 @@ class _Button(QAbstractButton):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         if not self.isEnabled():
             p.setOpacity(0.45)
-        hovered = self._hover or self.isDown()
+        hover = 1.0 if self.isDown() else self._vals['hover']
         if self._kind == 'primary':
-            fill = accent.lighter(108) if hovered else accent
+            fill = _mix(accent, accent.lighter(108), hover)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(fill)
             p.drawRoundedRect(rect, radius, radius)
             text_color = on_accent
         elif self._kind == 'ghost':
-            if hovered:
-                tint = accent
-                tint.setAlphaF(0.08)
+            if hover > 0:
+                tint = QColor(accent)
+                tint.setAlphaF(0.08 * hover)
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(tint)
                 p.drawRoundedRect(rect, radius, radius)
             text_color = to_color(pal.get('accent_text', pal.get('accent', '#0078d4')))
         else:
-            fill = _mix(surface, to_color(pal.get('card_hover', '#242424')), 0.8 if hovered else 0.0)
+            fill = _mix(surface, to_color(pal.get('card_hover', '#242424')), 0.8 * hover)
             p.setPen(QPen(border, 1))
             p.setBrush(fill)
             p.drawRoundedRect(rect, radius, radius)
@@ -368,7 +386,7 @@ class _Button(QAbstractButton):
         p.drawText(self.rect(), int(Qt.AlignmentFlag.AlignCenter), self.text())
 
 
-class _ToggleCard(QAbstractButton):
+class _ToggleCard(_Tweens, QAbstractButton):
 
     TRACK_W = 40.0
     TRACK_H = 22.0
@@ -380,7 +398,7 @@ class _ToggleCard(QAbstractButton):
         self._title = title
         self._description = description
         self._metrics = metrics
-        self._hover = False
+        self._init_tweens(hover=0.0)
         self._position = 0.0
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -448,16 +466,6 @@ class _ToggleCard(QAbstractButton):
     def minimumSizeHint(self) -> QSize:
         return QSize(0, self.heightForWidth(self._metrics.feature_min_col))
 
-    def enterEvent(self, event) -> None:
-        self._hover = True
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event) -> None:
-        self._hover = False
-        self.update()
-        super().leaveEvent(event)
-
     def paintEvent(self, _event) -> None:
         m = self._metrics
         pal = palette()
@@ -466,21 +474,21 @@ class _ToggleCard(QAbstractButton):
         bg = to_color(pal.get('card_bg', '#1b1b1b'))
         border = to_color(pal.get('card_border', '#444444'))
         position = self._position
-        hovered = self._hover or self.isDown()
+        hover = 1.0 if self.isDown() else self._vals['hover']
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         radius = 11.0
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(_mix(bg, to_color(pal.get('card_hover', '#242424')), 0.7 if hovered else 0.0))
+        p.setBrush(_mix(bg, to_color(pal.get('card_hover', '#242424')), 0.7 * hover))
         p.drawRoundedRect(rect, radius, radius)
         if position > 0:
             tint = QColor(accent)
             tint.setAlphaF(0.08 * position)
             p.setBrush(tint)
             p.drawRoundedRect(rect, radius, radius)
-        pen_color = _mix(border, accent, 0.55 if hovered else 0.55 * position)
+        pen_color = _mix(border, accent, 0.55 * max(hover, position))
         p.setPen(QPen(pen_color, 1.0 + 0.4 * position))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(rect, radius, radius)
@@ -536,7 +544,7 @@ class _ToggleCard(QAbstractButton):
         p.drawEllipse(knob_rect)
 
 
-class _VolumeCard(QWidget):
+class _VolumeCard(_Tweens, QWidget):
 
     changed = Signal(int)
 
@@ -548,7 +556,7 @@ class _VolumeCard(QWidget):
         self._description = description
         self._metrics = metrics
         self._off_text = off_text
-        self._hover = False
+        self._init_tweens(hover=0.0)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         policy = self.sizePolicy()
         policy.setHeightForWidth(True)
@@ -602,16 +610,6 @@ class _VolumeCard(QWidget):
         self._slider.setGeometry(m.card_pad, self.height() - m.card_pad - 22,
                                  max(1, self.width() - m.card_pad * 2), 22)
 
-    def enterEvent(self, event) -> None:
-        self._hover = True
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event) -> None:
-        self._hover = False
-        self.update()
-        super().leaveEvent(event)
-
     def _on_value(self, value: int) -> None:
         self.changed.emit(int(value))
         self.update()
@@ -632,7 +630,7 @@ class _VolumeCard(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(_mix(bg, to_color(pal.get('card_hover', '#242424')), 0.7 if self._hover else 0.0))
+        p.setBrush(_mix(bg, to_color(pal.get('card_hover', '#242424')), 0.7 * self._vals['hover']))
         p.drawRoundedRect(rect, radius, radius)
         p.setPen(QPen(border, 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -671,12 +669,12 @@ class _VolumeCard(QWidget):
                    int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), self._value_text())
 
 
-class _ChoiceCard(QAbstractButton):
+class _ChoiceCard(_Tweens, QAbstractButton):
 
     def __init__(self, text: str, metrics: _Metrics, parent=None):
         super().__init__(parent)
         self._metrics = metrics
-        self._hover = False
+        self._init_tweens(hover=0.0, sel=0.0)
         self.setText(text)
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -691,7 +689,7 @@ class _ChoiceCard(QAbstractButton):
     def set_selected(self, selected: bool) -> None:
         if self.isChecked() != selected:
             self.setChecked(selected)
-        self.update()
+        self._tween('sel', 1.0 if selected else 0.0)
 
     def heightForWidth(self, width: int) -> int:
         return self._metrics.lang_h
@@ -705,37 +703,27 @@ class _ChoiceCard(QAbstractButton):
     def minimumSizeHint(self) -> QSize:
         return QSize(0, self._metrics.lang_h)
 
-    def enterEvent(self, event) -> None:
-        self._hover = True
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event) -> None:
-        self._hover = False
-        self.update()
-        super().leaveEvent(event)
-
     def paintEvent(self, _event) -> None:
         pal = palette()
         accent = to_color(pal.get('accent', '#0078d4'))
         on_accent = to_color(pal.get('on_accent', '#111111'))
         bg = to_color(pal.get('card_bg', '#1b1b1b'))
         border = to_color(pal.get('card_border', '#444444'))
-        checked = self.isChecked()
+        sel = self._vals['sel']
+        hover = self._vals['hover']
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         radius = 10.0
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(_mix(bg, to_color(pal.get('card_hover', '#242424')), 0.7 if self._hover else 0.0))
+        p.setBrush(_mix(bg, to_color(pal.get('card_hover', '#242424')), 0.7 * self._vals['hover']))
         p.drawRoundedRect(rect, radius, radius)
-        if checked:
+        if sel > 0:
             tint = QColor(accent)
-            tint.setAlphaF(0.10)
+            tint.setAlphaF(0.10 * sel)
             p.setBrush(tint)
             p.drawRoundedRect(rect, radius, radius)
-        p.setPen(QPen(_mix(border, accent, 0.85 if checked else (0.35 if self._hover else 0.0)),
-                      1.8 if checked else 1.0))
+        p.setPen(QPen(_mix(border, accent, max(0.85 * sel, 0.35 * hover)), 1.0 + 0.8 * sel))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(rect, radius, radius)
         if self.hasFocus():
@@ -751,7 +739,13 @@ class _ChoiceCard(QAbstractButton):
                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), self.text())
 
         center = QPointF(self.width() - pad - check_d / 2, self.height() / 2)
-        if checked:
+        if sel < 1:
+            p.setOpacity(1.0 - sel)
+            p.setPen(QPen(_mix(border, to_color(pal.get('primary_text', '#eaeaea')), 0.25), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(center, check_d / 2 - 0.5, check_d / 2 - 0.5)
+        if sel > 0:
+            p.setOpacity(sel)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(accent)
             p.drawEllipse(center, check_d / 2, check_d / 2)
@@ -762,13 +756,9 @@ class _ChoiceCard(QAbstractButton):
                           Qt.PenJoinStyle.RoundJoin))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawPath(tick)
-        else:
-            p.setPen(QPen(_mix(border, to_color(pal.get('primary_text', '#eaeaea')), 0.25), 1))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(center, check_d / 2 - 0.5, check_d / 2 - 0.5)
 
 
-class _ThemeCard(QAbstractButton):
+class _ThemeCard(_Tweens, QAbstractButton):
 
     def __init__(self, option_id: str, label: str, swatch: tuple, media: str, kind: str,
                  metrics: _Metrics, parent=None):
@@ -779,7 +769,7 @@ class _ThemeCard(QAbstractButton):
         self._media = media
         self._kind = kind
         self._metrics = metrics
-        self._hover = False
+        self._init_tweens(hover=0.0, sel=0.0)
         self._requested = not media or kind == 'video'
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -794,7 +784,7 @@ class _ThemeCard(QAbstractButton):
     def set_selected(self, selected: bool) -> None:
         if self.isChecked() != selected:
             self.setChecked(selected)
-        self.update()
+        self._tween('sel', 1.0 if selected else 0.0)
 
     def refresh_theme(self) -> None:
         self.update()
@@ -875,7 +865,8 @@ class _ThemeCard(QAbstractButton):
         on_accent = to_color(pal.get('on_accent', '#111111'))
         bg = to_color(pal.get('card_bg', '#1b1b1b'))
         border = to_color(pal.get('card_border', '#444444'))
-        checked = self.isChecked()
+        sel = self._vals['sel']
+        hover = self._vals['hover']
         pad = m.theme_pad
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         radius = 10.0
@@ -883,15 +874,14 @@ class _ThemeCard(QAbstractButton):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(_mix(bg, to_color(pal.get('card_hover', '#242424')), 0.7 if self._hover else 0.0))
+        p.setBrush(_mix(bg, to_color(pal.get('card_hover', '#242424')), 0.7 * self._vals['hover']))
         p.drawRoundedRect(rect, radius, radius)
-        if checked:
+        if sel > 0:
             tint = QColor(accent)
-            tint.setAlphaF(0.09)
+            tint.setAlphaF(0.09 * sel)
             p.setBrush(tint)
             p.drawRoundedRect(rect, radius, radius)
-        p.setPen(QPen(_mix(border, accent, 0.88 if checked else (0.35 if self._hover else 0.0)),
-                      1.9 if checked else 1.0))
+        p.setPen(QPen(_mix(border, accent, max(0.88 * sel, 0.35 * hover)), 1.0 + 0.9 * sel))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(rect, radius, radius)
         if self.hasFocus():
@@ -923,13 +913,14 @@ class _ThemeCard(QAbstractButton):
 
         label_font = self._label_font()
         p.setFont(label_font)
-        p.setPen(accent if checked else to_color(pal.get('primary_text', '#eaeaea')))
+        p.setPen(_mix(to_color(pal.get('primary_text', '#eaeaea')), accent, sel))
         flags = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap)
         p.drawText(QRectF(pad, preview.bottom() + 5, max(1, self.width() - pad * 2), label_h),
                    flags, self._label)
 
-        if checked:
+        if sel > 0:
             center = QPointF(preview.right() - 11, preview.top() + 11)
+            p.setOpacity(sel)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(accent)
             p.drawEllipse(center, 9, 9)
@@ -940,16 +931,6 @@ class _ThemeCard(QAbstractButton):
                           Qt.PenJoinStyle.RoundJoin))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawPath(tick)
-
-    def enterEvent(self, event) -> None:
-        self._hover = True
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event) -> None:
-        self._hover = False
-        self.update()
-        super().leaveEvent(event)
 
 
 class _ResponsiveGrid(QWidget):
@@ -1295,7 +1276,7 @@ class _Greeting(QWidget):
         self._dot_area = max(12, round(metrics.base_px))
         line_h = QFontMetrics(self._font).height()
         self._height = line_h + self._dot_area + 8
-        self._texts = [(code, tr_for(code, 'onboarding.language_hello', 'Hello'))
+        self._texts = [(code, tr_for(code, 'onboarding.language_hello', ''))
                        for code, _name in LANGUAGES]
         self._index = next((i for i, (code, _text) in enumerate(self._texts)
                             if code == start_code), 0)
@@ -1435,7 +1416,7 @@ class _Progress(QWidget):
         self.setFixedHeight(metrics.progress_h)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._anim = QPropertyAnimation(self, b'progress', self)
-        self._anim.setDuration(380)
+        self._anim.setDuration(240)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
     def _get_progress(self) -> float:
@@ -1675,6 +1656,20 @@ class _OverlayDialog(QDialog):
         self._surface_layout.addWidget(self._footer)
         self._page: QWidget | None = None
         self._refit_scheduled = False
+        self._t = 1.0
+        self._closing = False
+        self._opened = False
+        self._close_result = 0
+        self._fx: QGraphicsOpacityEffect | None = None
+        self._shell_anim = QVariantAnimation(self)
+        self._shell_anim.valueChanged.connect(self._set_t)
+        self._shell_anim.finished.connect(self._shell_done)
+        self._fit = (1, 1, 1)
+        self._animate_resize = False
+        self._resize_anim = QVariantAnimation(self)
+        self._resize_anim.setDuration(170)
+        self._resize_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._resize_anim.valueChanged.connect(self._tick_resize)
         self._apply_bounds()
         if self._owner is not None:
             self._owner.installEventFilter(self)
@@ -1713,7 +1708,60 @@ class _OverlayDialog(QDialog):
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(0, 0, 0, 118))
+        p.fillRect(self.rect(), QColor(0, 0, 0, round(118 * self._t)))
+
+    def _place(self) -> None:
+        s = self._surface
+        off = round((1.0 - self._t) * 14)
+        s.move((self.width() - s.width()) // 2, (self.height() - s.height()) // 2 + off)
+
+    def _set_t(self, value) -> None:
+        self._t = float(value)
+        if self._fx is not None:
+            self._fx.setOpacity(self._t)
+        self._place()
+        self.update()
+
+    def _run_shell(self, end: float, ms: int, curve: QEasingCurve.Type) -> None:
+        anim = self._shell_anim
+        anim.stop()
+        if self._fx is None:
+            self._fx = QGraphicsOpacityEffect(self._surface)
+            self._fx.setOpacity(self._t)
+            self._surface.setGraphicsEffect(self._fx)
+        anim.setStartValue(self._t)
+        anim.setEndValue(float(end))
+        anim.setDuration(ms)
+        anim.setEasingCurve(curve)
+        anim.start()
+
+    def _shell_done(self) -> None:
+        if self._closing:
+            QDialog.done(self, self._close_result)
+            return
+        self._surface.setGraphicsEffect(None)
+        self._fx = None
+        self._place()
+
+    def done(self, result: int) -> None:
+        if self._closing:
+            return
+        if not (self.isVisible() and animations_enabled()):
+            super().done(result)
+            return
+        self._closing = True
+        self._close_result = result
+        self._surface.setEnabled(False)
+        self._run_shell(0.0, 120, QEasingCurve.Type.InCubic)
+
+    def _tick_resize(self, height) -> None:
+        width, header_h, footer_h = self._fit
+        height = int(height)
+        self._body.setFixedHeight(height)
+        self._header.setFixedWidth(width)
+        self._footer.setFixedWidth(width)
+        self._surface.setFixedSize(width, header_h + height + footer_h)
+        self._place()
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self._owner and event.type() in (QEvent.Type.Resize, QEvent.Type.Move):
@@ -1728,6 +1776,11 @@ class _OverlayDialog(QDialog):
             self.raise_()
             self.setFocus()
         self._request_refit()
+        if not self._opened:
+            self._opened = True
+            if animations_enabled():
+                self._t = 0.0
+                self._run_shell(1.0, 200, QEasingCurve.Type.OutCubic)
 
     def _available(self) -> tuple[int, int]:
         return (max(1, self._bounds.width() - self._inset * 2),
@@ -1764,6 +1817,8 @@ class _OverlayDialog(QDialog):
         self._refit_scheduled = False
         if not self.isVisible() and self.width() <= 1:
             return
+        animate = self._animate_resize
+        self._animate_resize = False
         self._apply_bounds()
         max_w, max_h = self._available()
         width = self._preferred_width()
@@ -1788,10 +1843,19 @@ class _OverlayDialog(QDialog):
             page.setMaximumHeight(16777215)
         self._body.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded if scroll else Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._body.setFixedHeight(max(1, int(body_h)))
-        self._header.setFixedWidth(width)
-        self._footer.setFixedWidth(width)
-        self._surface.setFixedSize(width, max(1, header_h + body_h + footer_h))
+        self._fit = (width, header_h, footer_h)
+        body_h = max(1, int(body_h))
+        anim = self._resize_anim
+        if anim.state() == QPropertyAnimation.State.Running and anim.endValue() == body_h:
+            return
+        anim.stop()
+        current = self._body.height()
+        if animate and current != body_h and self.isVisible() and animations_enabled():
+            anim.setStartValue(current)
+            anim.setEndValue(body_h)
+            anim.start()
+        else:
+            self._tick_resize(body_h)
 
     def _request_refit(self) -> None:
         if self._refit_scheduled:
@@ -1858,23 +1922,18 @@ class OnboardingWizard(_OverlayDialog):
         '_build_prefs_page',
     )
     _NEXT_KEYS = (
-        ('onboarding.language_continue', 'Continue'),
-        ('onboarding.theme_continue', 'Continue'),
-        ('onboarding.features_continue', 'Continue'),
-        ('onboarding.next', 'Next'),
-        ('onboarding.finish', 'Finish'),
+        'onboarding.language_continue',
+        'onboarding.theme_continue',
+        'onboarding.features_continue',
+        'onboarding.next',
+        'onboarding.finish',
     )
     _PAGE_TEXT = (
-        ('onboarding.language_title', 'Choose your language',
-         'onboarding.language_subtitle', "Choose the language you'd like to use. You can change it later in Settings."),
-        ('onboarding.theme_title', 'Choose your theme',
-         'onboarding.theme_subtitle', 'Pick a theme. You can change it any time in Settings.'),
-        ('onboarding.features_title', 'Choose Your Features',
-         'onboarding.features_subtitle', "Pick which sections you'd like to use. Everything is off by default."),
-        ('onboarding.downloads_title', 'Where should downloads go?',
-         'onboarding.downloads_subtitle', 'Pick one folder and PiraChest sets up every section inside it.'),
-        ('onboarding.prefs_title', 'A few preferences',
-         'onboarding.prefs_subtitle', 'All optional, and all changeable later in Settings.'),
+        ('onboarding.language_title', 'onboarding.language_subtitle'),
+        ('onboarding.theme_title', 'onboarding.theme_subtitle'),
+        ('onboarding.features_title', 'onboarding.features_subtitle'),
+        ('onboarding.downloads_title', 'onboarding.downloads_subtitle'),
+        ('onboarding.prefs_title', 'onboarding.prefs_subtitle'),
     )
 
     def __init__(self, owner: QWidget):
@@ -1902,25 +1961,34 @@ class OnboardingWizard(_OverlayDialog):
         self._theme_timer.timeout.connect(self._apply_pending_theme)
         self._footer.next.clicked.connect(self._advance)
         self._footer.back.clicked.connect(self._back)
+        self._enter_widgets: list[QWidget] = []
+        self._enter_dx = 0
+        self._enter_anim = QVariantAnimation(self)
+        self._enter_anim.setStartValue(0.0)
+        self._enter_anim.setEndValue(1.0)
+        self._enter_anim.setDuration(180)
+        self._enter_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._enter_anim.valueChanged.connect(self._tick_enter)
+        self._enter_anim.finished.connect(self._end_enter)
         self._content_ready = True
         self._go(0, animate=False)
         register_theme_refresh(self, self._theme_changed)
         register_locale_refresh(self, self._locale_changed)
 
-    def _t(self, key: str, default: str = '') -> str:
-        return tr(key, default)
+    def _t(self, key: str) -> str:
+        return tr(key)
 
     def _apply_texts(self) -> None:
         index = max(0, min(self._index, len(self._BUILDERS) - 1))
-        title_key, title_default, subtitle_key, subtitle_default = self._PAGE_TEXT[index]
+        title_key, subtitle_key = self._PAGE_TEXT[index]
         self._header.set_texts(
-            self._t(title_key, title_default),
-            self._t(subtitle_key, subtitle_default),
+            self._t(title_key),
+            self._t(subtitle_key),
             f'{index + 1} / {len(self._BUILDERS)}',
         )
         self._footer.set_texts(
-            self._t('onboarding.back', 'Back'),
-            self._t(*self._NEXT_KEYS[index]),
+            self._t('onboarding.back'),
+            self._t(self._NEXT_KEYS[index]),
             index > 0,
         )
         self._header.progress.set_step(index)
@@ -1973,35 +2041,50 @@ class OnboardingWizard(_OverlayDialog):
 
     def _go(self, index: int, animate: bool = False) -> None:
         index = max(0, min(int(index), len(self._BUILDERS) - 1))
+        self._end_enter()
         page = self._pages[index]
         if page is None:
             page = self._build_page(index)
         changed = page is not self._page
+        forward = index >= self._index
         self._index = index
+        self._animate_resize = animate and changed
         self.set_page(page)
         self._apply_texts()
         self._refit()
         if animate and changed:
-            self._fade_page(page)
+            self._enter(page, 28 if forward else -28)
 
-    def _fade_page(self, page: QWidget) -> None:
+    def _enter(self, page: QWidget, dx: int) -> None:
         if not animations_enabled():
-            if page.graphicsEffect() is not None:
-                page.setGraphicsEffect(None)
             return
-        if page.graphicsEffect() is not None:
-            page.setGraphicsEffect(None)
-        effect = QGraphicsOpacityEffect(page)
-        effect.setOpacity(0.0)
-        page.setGraphicsEffect(effect)
-        anim = QPropertyAnimation(effect, b'opacity', effect)
-        anim.setDuration(180)
-        anim.setStartValue(0.0)
-        anim.setEndValue(1.0)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.finished.connect(
-            lambda p=page: QTimer.singleShot(0, p, lambda: p.setGraphicsEffect(None)))
-        anim.start()
+        self._enter_dx = dx
+        self._enter_widgets = [page, self._header.title, self._header.subtitle]
+        for widget in self._enter_widgets:
+            effect = QGraphicsOpacityEffect(widget)
+            effect.setOpacity(0.0)
+            widget.setGraphicsEffect(effect)
+        self._enter_anim.start()
+
+    def _tick_enter(self, value) -> None:
+        value = float(value)
+        with suppress(RuntimeError):
+            for widget in self._enter_widgets:
+                effect = widget.graphicsEffect()
+                if effect is not None:
+                    effect.setOpacity(value)
+            page = self._enter_widgets[0]
+            page.move(round(self._enter_dx * (1.0 - value)), page.y())
+
+    def _end_enter(self) -> None:
+        self._enter_anim.stop()
+        widgets, self._enter_widgets = self._enter_widgets, []
+        for widget in widgets:
+            with suppress(RuntimeError):
+                widget.setGraphicsEffect(None)
+        if widgets:
+            with suppress(RuntimeError):
+                widgets[0].move(0, widgets[0].y())
 
     def _advance(self) -> None:
         if self._index < len(self._BUILDERS) - 1:
@@ -2127,10 +2210,10 @@ class OnboardingWizard(_OverlayDialog):
         page = _Page(self._metrics)
         grid = _ResponsiveGrid(self._metrics.grid_gap, self._metrics.feature_min_col, 2, page)
         self._feature_cards = {}
-        for attr, slot, fallback, desc_key, desc_default in FEATURES:
+        for attr, slot, desc_key in FEATURES:
             icon = themed_icon(slot, _feature_icon(slot), size=self._metrics.icon_px)
-            title = self._t(slot, fallback)
-            card = _ToggleCard(icon, title, self._t(desc_key, desc_default), self._metrics, grid)
+            title = self._t(slot)
+            card = _ToggleCard(icon, title, self._t(desc_key), self._metrics, grid)
             card.setChecked(bool(self._state.features.get(attr, False)))
             card.toggled.connect(lambda checked, a=attr: self._set_feature(a, checked))
             grid.add(card)
@@ -2179,7 +2262,7 @@ class OnboardingWizard(_OverlayDialog):
     def _browse_downloads(self) -> None:
         start = self._download_root()
         chosen = QFileDialog.getExistingDirectory(
-            self, self._t('onboarding.downloads_pick', 'Select download folder'), start)
+            self, self._t('onboarding.downloads_pick'), start)
         if not chosen:
             return
         chosen = os.path.normpath(chosen)
@@ -2282,12 +2365,11 @@ class _DownloadsPage(_Page):
 
     def retranslate(self) -> None:
         t = tr
-        self.path_row.set_browse_text(t('onboarding.downloads_browse', 'Browse'))
-        self.status_row.set_reset_text(t('onboarding.downloads_reset', 'Use default'))
-        self.subfolders.set_texts(t('onboarding.downloads_subfolders', 'Organize by section'),
-                                  t('onboarding.downloads_subfolders_desc',
-                                    'Each section gets its own subfolder.'))
-        self.folder_title.setText(t('onboarding.downloads_preview', 'Folders that will be used'))
+        self.path_row.set_browse_text(t('onboarding.downloads_browse'))
+        self.status_row.set_reset_text(t('onboarding.downloads_reset'))
+        self.subfolders.set_texts(t('onboarding.downloads_subfolders'),
+                                  t('onboarding.downloads_subfolders_desc'))
+        self.folder_title.setText(t('onboarding.downloads_preview'))
         self.updateGeometry()
 
     def refresh_theme(self) -> None:
@@ -2304,7 +2386,7 @@ class _DownloadsPage(_Page):
             self.status_row.set_status('')
         else:
             self.status_row.set_status(
-                f'{format_size(free)} {tr("onboarding.downloads_free", "free on this drive")}')
+                f'{format_size(free)} {tr("onboarding.downloads_free")}')
         changes = download_dir_changes(root, self._state.download_subfolders)
         if self._state.download_subfolders:
             folders = [os.path.basename(changes[attr].rstrip('\\/')) or changes[attr]
@@ -2316,7 +2398,7 @@ class _DownloadsPage(_Page):
 
     def show_error(self, problem: str) -> None:
         self.status_row.set_status(
-            f'{tr("onboarding.downloads_error", "Can\'t use this folder:")} {problem}', error=True)
+            f'{tr("onboarding.downloads_error")} {problem}', error=True)
 
 
 class _PrefsPage(_Page):
@@ -2343,7 +2425,7 @@ class _PrefsPage(_Page):
             card.toggled.connect(lambda checked, p=pref_id: self.pref_changed.emit(p, checked))
             grid.add(card)
             self.pref_cards[pref_id] = card
-        off_text = tr('settings.volume_off', 'Off')
+        off_text = tr('settings.volume_off')
         for volume_id, icon in (('sfx', FluentIcon.VOLUME), ('ambiance', FluentIcon.MUSIC)):
             card = _VolumeCard(themed_icon(None, icon, size=metrics.icon_px), '', '',
                                int(state.volumes.get(volume_id, 0)), metrics, off_text, grid)
@@ -2355,12 +2437,12 @@ class _PrefsPage(_Page):
     def retranslate(self) -> None:
         t = tr
         for pref_id, card in self.pref_cards.items():
-            title = t(f'onboarding.pref_{pref_id}', pref_id.title())
-            desc = t(f'onboarding.pref_{pref_id}_desc', '')
+            title = t(f'onboarding.pref_{pref_id}')
+            desc = t(f'onboarding.pref_{pref_id}_desc')
             card.set_texts(title, desc)
         for volume_id, card in self.volume_cards.items():
-            title = t(f'onboarding.pref_{volume_id}', volume_id.title())
-            desc = t(f'onboarding.pref_{volume_id}_desc', '')
+            title = t(f'onboarding.pref_{volume_id}')
+            desc = t(f'onboarding.pref_{volume_id}_desc')
             card.set_texts(title, desc)
         self.updateGeometry()
 
@@ -2383,7 +2465,7 @@ def _feature_icon(slot: str):
 
 def _theme_options() -> list[tuple[str, str, tuple, str, str]]:
     options = [
-        (mode, tr(f'settings.theme_{mode}', 'Dark' if mode == 'dark' else 'Light'),
+        (mode, tr(f'settings.theme_{mode}'),
          tuple(palette(dark=mode == 'dark')[k] for k in _SWATCH_KEYS), '', '')
         for mode in _PLAIN_THEMES
     ]
@@ -2425,7 +2507,7 @@ def _build_theme_sections(page: '_Page', metrics: '_Metrics', current: str,
         return grid
 
     page.add(make_grid(defaults), 0)
-    header = _Label(tr('settings.theme_custom_header', 'Custom themes'), 'section', metrics)
+    header = _Label(tr('settings.theme_custom_header'), 'section', metrics)
     if customs:
         page.add(header, 24)
         page.add(make_grid(customs, min_items=5), 10)
@@ -2460,13 +2542,13 @@ class ThemePickerDialog(_OverlayDialog):
         self._preview_timer.timeout.connect(self._apply_pending)
         self._build()
         self._header.set_texts(
-            tr('onboarding.theme_title', 'Choose your theme'),
-            tr('onboarding.theme_subtitle', 'Pick a theme. You can change it any time in Settings.'),
+            tr('onboarding.theme_title'),
+            tr('onboarding.theme_subtitle'),
             '',
         )
         self._footer.set_texts(
-            tr('common.cancel', 'Cancel'),
-            tr('onboarding.theme_continue', 'Continue'),
+            tr('common.cancel'),
+            tr('onboarding.theme_continue'),
             True,
         )
         self._footer.next.clicked.connect(self.accept)
@@ -2528,18 +2610,18 @@ class ThemePickerDialog(_OverlayDialog):
         if not self._cards:
             return
         self._header.set_texts(
-            tr('onboarding.theme_title', 'Choose your theme'),
-            tr('onboarding.theme_subtitle', 'Pick a theme. You can change it any time in Settings.'),
+            tr('onboarding.theme_title'),
+            tr('onboarding.theme_subtitle'),
             '',
         )
         self._footer.set_texts(
-            tr('common.cancel', 'Cancel'),
-            tr('onboarding.theme_continue', 'Continue'),
+            tr('common.cancel'),
+            tr('onboarding.theme_continue'),
             True,
         )
         header = getattr(self, '_custom_header', None)
         if header is not None:
-            header.setText(tr('settings.theme_custom_header', 'Custom themes'))
+            header.setText(tr('settings.theme_custom_header'))
         self._request_refit()
 
     def keyPressEvent(self, event) -> None:

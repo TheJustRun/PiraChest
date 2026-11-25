@@ -119,7 +119,10 @@ class _Inbox(QObject):
             if self._armed:
                 return
             self._armed = True
-        QCoreApplication.postEvent(self, QEvent(self._EVT))
+            try:
+                QCoreApplication.postEvent(self, QEvent(self._EVT))
+            except (RuntimeError, ReferenceError):
+                self._closed = True
 
     def close(self) -> None:
         with self._lock:
@@ -161,9 +164,11 @@ class _Pool:
         self._closed = False
         self._threads: list[threading.Thread] = []
         self._runner: Optional[Callable[[Task], None]] = None
+        self._discard: Optional[Callable[[Task], None]] = None
 
-    def start(self, runner: Callable[[Task], None]) -> None:
+    def start(self, runner: Callable[[Task], None], discard: Optional[Callable[[Task], None]] = None) -> None:
         self._runner = runner
+        self._discard = discard
 
     def push(self, task: Task) -> bool:
         with self._cv:
@@ -190,14 +195,19 @@ class _Pool:
         while True:
             with self._cv:
                 while not self._heap and not self._closed:
-                    self._cv.wait()
+                    if not self._cv.wait(timeout=1.0):
+                        continue
                 if self._closed:
                     return
                 _, _, task = heapq.heappop(self._heap)
                 if task._cancelled.is_set() or task._state != Task.QUEUED:
+                    if self._discard is not None:
+                        self._discard(task)
+                    task = None
                     continue
                 task._state = Task.RUNNING
             self._runner(task)
+            task = None
 
     def close(self) -> None:
         with self._cv:
@@ -222,8 +232,8 @@ class TaskEngine:
             self._inbox.moveToThread(app.thread())
         self._pools = {IO: _Pool("pc-io", io_threads), CPU: _Pool("pc-cpu", cpu_threads), DL: _Pool("pc-dl", dl_threads)}
         for p in self._pools.values():
-            p.start(self._run)
-        self._lock = threading.Lock()
+            p.start(self._run, self._discard)
+        self._lock = threading.RLock()
         self._seq = itertools.count()
         self._sub_seq = itertools.count(1)
         self._tasks: dict[int, Task] = {}
@@ -231,6 +241,14 @@ class TaskEngine:
         self._by_owner: dict[int, set[int]] = {}
         self._hooked: set[int] = set()
         self._closed = False
+        _app = QCoreApplication.instance()
+        if _app is not None:
+            _app.aboutToQuit.connect(self._on_quit)
+
+    def _on_quit(self) -> None:
+        self.shutdown()
+        for _p in self._pools.values():
+            _p.join(2.0)
 
     def submit(self, fn: Callable, args: tuple = (), kwargs: Optional[dict] = None, *,
                on_done: Optional[Callable] = None, on_error: Optional[Callable] = None,
@@ -413,6 +431,11 @@ class TaskEngine:
                 if not ids:
                     del self._by_owner[oid]
         t._owner_ids.clear()
+
+    def _discard(self, t: Task) -> None:
+        box = [t._fn, t._args, t._kwargs, t._subs]
+        t._fn, t._args, t._kwargs, t._subs = None, (), {}, []
+        self._inbox.post(box.clear)
 
     def _run(self, t: Task) -> None:
         if t._wants_cancel:

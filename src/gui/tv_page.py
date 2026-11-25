@@ -16,7 +16,6 @@ from typing import Any, Optional
 from PySide6.QtCore import (
     Qt, QSize, Signal, QTimer, QEvent, QUrl, QObject, QVariantAnimation, QEasingCurve,
 )
-from PySide6.QtWidgets import QGraphicsDropShadowEffect
 from PySide6.QtGui import QIcon, QFont, QColor, QPixmap, QDesktopServices, QBrush
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget, QListWidgetItem, QFileDialog, QDialog,
@@ -26,7 +25,7 @@ from qfluentwidgets import (
     Pivot, FluentIcon, IconWidget, BodyLabel, CaptionLabel, SearchLineEdit, ComboBox, PrimaryPushButton,
     PushButton, TransparentToolButton, StrongBodyLabel, TitleLabel, PillPushButton, ImageLabel, InfoBar,
     ListWidget, CardWidget, SmoothScrollArea, CheckBox, IndeterminateProgressRing, isDarkTheme,
-    MessageBoxBase, SubtitleLabel, TableWidget, TreeWidget, SegmentedWidget, LineEdit,
+    MessageBoxBase, SubtitleLabel, TableWidget, TreeWidget, LineEdit,
 )
 
 from src.core import worker as _worker_module
@@ -57,13 +56,13 @@ from PySide6.QtWidgets import QAbstractItemView, QBoxLayout, QFrame, QStyle, QSt
 from qfluentwidgets import Action, ListView, RoundMenu, TableItemDelegate, themeColor
 from src.core.models import AnimeItem, assess_source_files, classify_file
 from src.core.translations import tr, register_locale_refresh
-from src.core.theme import to_color, palette, apply_pivot_theme, apply_tool_button_theme, apply_label_theme, count_badge_qss, register_theme_refresh, themed_icon, apply_slot_icon_theme
+from src.core.theme import to_color, resolve_icon_color, palette, apply_pivot_theme, apply_tool_button_theme, apply_label_theme, count_badge_qss, register_theme_refresh, themed_icon, apply_slot_icon_theme
 from .home_page import MediaPageBase
-from .repacks_page import make_tag_chip, show_tag_menu, toggled_tags, bind_enter, split_tags, join_tags, partition_resolved
+from .repacks_page import ToolCluster, bind_back_keys, _fade_in_widget, make_tag_chip, show_tag_menu, toggled_tags, bind_enter, split_tags, join_tags, partition_resolved
 from .stuff.video import (
     AnimePlayerWidget, _Spinner, _UA, _accent, _ad_hoc_client, _play_icon, _wicon, close_ad_hoc_client,
 )
-from .stuff.grid import PosterGrid, PosterStrip, ViewModeButton, attrs_subtitle, grid_colors as _grid_colors
+from .stuff.grid import PosterGrid, PosterStrip, ViewModeButton, attrs_subtitle, grid_colors as _grid_colors, slim_scroll_bar
 
 
 _CATEGORIES = (
@@ -316,6 +315,7 @@ class _DiceButton(QToolButton):
             p.drawRoundedRect(QRectF(self.rect()), 6, 6)
         side = 15.0
         p.translate(self.width() / 2, self.height() / 2)
+        ink = to_color(resolve_icon_color(), '#ffffff')
         p.rotate(-12.0 * self._hover + self._angle)
         scale = 0.9 if self.isDown() else 1.0 + 0.08 * self._hover
         p.scale(scale, scale)
@@ -366,8 +366,9 @@ class _WatchLaterButton(PushButton):
         p.save()
         p.translate(14, (h - size) / 2)
         p.scale(size, size)
-        p.setPen(QPen(ink, 1.6 / size, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-        p.setBrush(ink if self._saved else Qt.BrushStyle.NoBrush)
+        glyph = to_color(resolve_icon_color(), '#ffffff')
+        p.setPen(QPen(glyph, 1.6 / size, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(glyph if self._saved else Qt.BrushStyle.NoBrush)
         p.drawPath(_HEART)
         p.restore()
         p.setPen(ink)
@@ -381,7 +382,7 @@ _icon_cache: dict[tuple, QIcon] = {}
 
 
 def _heart_icon() -> QIcon:
-    ink = to_color(palette().get('primary_text', '#ffffff'), '#ffffff')
+    ink = to_color(resolve_icon_color(), '#ffffff')
     key = ('heart', ink.rgba())
     cached = _icon_cache.get(key)
     if cached is not None:
@@ -1693,7 +1694,7 @@ class _ChannelsTab(QWidget):
         self._failed: set[str] = set()
 
         self._root = QBoxLayout(QBoxLayout.Direction.LeftToRight, self)
-        self._root.setContentsMargins(0, 0, 0, 0)
+        self._root.setContentsMargins(24, 0, 24, 0)
         self._root.setSpacing(16)
         self._list_panel = self._build_list_panel()
         self._player_panel = self._build_player_panel()
@@ -1735,13 +1736,16 @@ class _ChannelsTab(QWidget):
         lay.setSpacing(8)
 
         bar = QHBoxLayout()
-        bar.setSpacing(4)
+        bar.setSpacing(10)
         self._search = SearchLineEdit(panel)
+        self._search.setFixedHeight(36)
+        self._search.setMinimumWidth(180)
+        self._search.setMaximumWidth(400)
         self._search.setPlaceholderText(tr("tv.channels.search_placeholder", default="Search channels..."))
         self._search.textChanged.connect(lambda _t: self._filter_timer.start())
         self._search.searchSignal.connect(self._apply_filters_now)
         self._search.clearSignal.connect(self._apply_filters_now)
-        bar.addWidget(self._search, 1)
+        bar.addWidget(self._search, 0)
         self._countries_btn = self._tool_btn(panel, 'tv.channels_filter', _icon("GLOBE", FluentIcon.FILTER),
                                              tr("tv.channels.select_countries", default="Select countries"),
                                              self._prompt_countries)
@@ -1750,8 +1754,12 @@ class _ChannelsTab(QWidget):
         self._refresh_btn = self._tool_btn(panel, 'tv.channels_refresh', FluentIcon.SYNC,
                                            tr("tv.channels.refresh", default="Refresh"),
                                            lambda: self._load_channels(use_cache=False))
+        cluster = ToolCluster(panel)
         for b in (self._countries_btn, self._sources_btn, self._refresh_btn):
-            bar.addWidget(b)
+            b.setFixedSize(32, 32)
+            cluster.addWidget(b)
+        bar.addWidget(cluster)
+        bar.addStretch(1)
         lay.addLayout(bar)
 
         frow = QHBoxLayout()
@@ -2257,6 +2265,19 @@ class _TmdbItem:
         self.subtitle = f"\u2605 {rating:.1f}" if rating else ""
 
 
+def _pad_grid_edges(grid: QWidget, pad: int = 24) -> None:
+    """Keep poster cards from touching the far left/right edges of the page.
+
+    Works whether the grid is a scroll area (pad its content widget) or a
+    plain widget with a layout (pad the layout itself).
+    """
+    target = grid.widget() if isinstance(grid, QScrollArea) else grid
+    lay = target.layout() if target is not None else None
+    if lay is not None:
+        m = lay.contentsMargins()
+        lay.setContentsMargins(max(m.left(), pad), m.top(), max(m.right(), pad), m.bottom())
+
+
 class _MediaRow(QWidget):
     context_requested = Signal(object, QPoint)
 
@@ -2265,12 +2286,15 @@ class _MediaRow(QWidget):
         self._wrap = wrap
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
         _row_title_lbl = StrongBodyLabel(title, self)
         self._title_lbl = _row_title_lbl
         apply_label_theme(_row_title_lbl, "primary_text")
+        _title_font = _row_title_lbl.font()
+        _title_font.setPixelSize(15)
+        _row_title_lbl.setFont(_title_font)
         layout.addWidget(_row_title_lbl)
-        self._strip = PosterStrip(self, colors_fn=_grid_colors)
+        self._strip = PosterStrip(self, colors_fn=_grid_colors, meta_fn=attrs_subtitle("subtitle"), cell_w=150, poster_h=225)
         self._strip.poster_clicked.connect(lambda item: on_click(item.raw, media_type))
         self._strip.context_requested.connect(self.context_requested.emit)
         layout.addWidget(self._strip)
@@ -2280,8 +2304,11 @@ class _MediaRow(QWidget):
         self._title_lbl.setText(title)
 
     def set_items(self, items: list[dict]) -> None:
+        was_visible = self.isVisible()
         self._strip.set_entries([self._wrap(item) for item in items])
         self.setVisible(bool(items))
+        if items and not was_visible:
+            _fade_in_widget(self, 200)
 
 
 class _LeftClickCard(CardWidget):
@@ -2496,12 +2523,13 @@ class _MediaDetailsView(_DetailsChrome, QWidget):
         self._poll_timer.timeout.connect(self._poll_stream)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setContentsMargins(24, 0, 24, 0)
         outer.setSpacing(8)
 
         back_btn = PushButton(themed_icon('tv.media_back', FluentIcon.LEFT_ARROW), tr("tv.movies.back", default="Back"), self)
         back_btn.setFixedHeight(32)
         back_btn.clicked.connect(self._on_back)
+        bind_back_keys(self, self._on_back)
 
         scroll = SmoothScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -2549,6 +2577,7 @@ class _MediaDetailsView(_DetailsChrome, QWidget):
         info_col.setSpacing(14)
 
         self._title_lbl = TitleLabel("", content)
+        self._title_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._title_lbl.setWordWrap(True)
         info_col.addWidget(self._title_lbl)
         self._logo_lbl = QLabel(content)
@@ -3914,14 +3943,17 @@ class _MediaTab(MediaPageBase):
         self._search_box.clearSignal.connect(self._on_search_commit)
         from src.gui.stuff.search_history import attach as attach_search_history
         attach_search_history(self._search_box, 'tv', lambda _text: self._on_search_commit())
-        self._search_box.setMinimumWidth(160)
-        self._search_box.setMaximumWidth(360)
+        self._search_box.setMinimumWidth(180)
+        self._search_box.setMaximumWidth(400)
+        self._search_box.setFixedHeight(36)
         search_row = QHBoxLayout()
         search_row.setSpacing(10)
+        search_row.setContentsMargins(24, 0, 24, 0)
+        cluster = ToolCluster(self._browse_page)
         search_row.addWidget(self._search_box, 0)
         self._watchlater_btn = TransparentToolButton(self._browse_page)
         apply_tool_button_theme(self._watchlater_btn)
-        self._watchlater_btn.setIcon(_heart_icon())
+        register_theme_refresh(self._watchlater_btn, lambda: self._watchlater_btn.setIcon(_heart_icon()))
         self._watchlater_btn.setIconSize(QSize(22, 22))
         self._watchlater_btn.setFixedSize(32, 32)
         self._watchlater_badge = QLabel(self._watchlater_btn)
@@ -3933,22 +3965,23 @@ class _MediaTab(MediaPageBase):
         self._watchlater_btn.clicked.connect(self._show_watch_later)
         watch_later_store().changed.connect(self._sync_watchlater_badge)
         QTimer.singleShot(0, self._sync_watchlater_badge)
-        search_row.addWidget(self._watchlater_btn)
+        cluster.addWidget(self._watchlater_btn)
         self._refresh_btn = TransparentToolButton(FluentIcon.SYNC, self._browse_page)
         apply_tool_button_theme(self._refresh_btn)
         self._refresh_btn.setFixedSize(32, 32)
         self._refresh_btn.setToolTip(tr("tv.refresh", default="Refresh"))
         self._refresh_btn.clicked.connect(self.refresh)
-        search_row.addWidget(self._refresh_btn)
+        cluster.addWidget(self._refresh_btn)
         self._dice_btn = _DiceButton(tr("tv.random", default="Surprise me"), self._browse_page)
         self._dice_btn.clicked.connect(self._surprise_me)
-        search_row.addWidget(self._dice_btn)
+        cluster.addWidget(self._dice_btn)
+        search_row.addWidget(cluster)
         browse_layout.addLayout(search_row)
 
         self._genre_bar = QWidget(self._browse_page)
         self._genre_bar.setStyleSheet('background: transparent;')
         bar_row = QHBoxLayout(self._genre_bar)
-        bar_row.setContentsMargins(0, 0, 0, 0)
+        bar_row.setContentsMargins(24, 0, 24, 0)
         bar_row.setSpacing(8)
         self._genre_hint = CaptionLabel('', self._genre_bar)
         apply_label_theme(self._genre_hint, 'muted')
@@ -3981,22 +4014,25 @@ class _MediaTab(MediaPageBase):
         self._suggest_bar = QWidget(self._browse_page)
         self._suggest_bar.setStyleSheet('background: transparent;')
         self._suggest_row = QHBoxLayout(self._suggest_bar)
-        self._suggest_row.setContentsMargins(0, 0, 0, 0)
+        self._suggest_row.setContentsMargins(24, 0, 24, 0)
         self._suggest_row.setSpacing(8)
         self._suggest_bar.setVisible(False)
         browse_layout.addWidget(self._suggest_bar)
 
         self._status_lbl = BodyLabel("", self._browse_page)
+        self._status_lbl.setContentsMargins(24, 0, 24, 0)
         self._status_lbl.hide()
         browse_layout.addWidget(self._status_lbl)
 
-        rows_scroll = SmoothScrollArea(self._browse_page)
+        rows_scroll = QScrollArea(self._browse_page)
         rows_scroll.setWidgetResizable(True)
+        rows_scroll.setFrameShape(QAbstractScrollArea.Shape.NoFrame)
         rows_scroll.setStyleSheet("background: transparent; border: none;")
+        slim_scroll_bar(rows_scroll)
         rows_inner = QWidget()
         rows_inner.setStyleSheet("background: transparent;")
         self._rows_layout = QVBoxLayout(rows_inner)
-        self._rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._rows_layout.setContentsMargins(24, 0, 24, 0)
         self._rows_layout.setSpacing(20)
 
         self._category_rows: dict[str, _MediaRow] = {}
@@ -4011,7 +4047,9 @@ class _MediaTab(MediaPageBase):
         browse_layout.addWidget(rows_scroll, 1)
 
         self._search_grid = PosterGrid(self._browse_page, cover_attrs=("poster_url",), key_attr="id", show_caption=True,
-                                       subtitle_fn=attrs_subtitle("subtitle"), colors_fn=_grid_colors)
+                                       subtitle_fn=attrs_subtitle("subtitle"), meta_fn=attrs_subtitle("subtitle"), colors_fn=_grid_colors,
+                                       cell_w=150, poster_h=225)
+        _pad_grid_edges(self._search_grid)
         self._search_grid.poster_clicked.connect(lambda item: self._open_details(item.raw, self._media_type))
         self._search_grid.context_requested.connect(self._on_card_menu)
         self._search_grid.near_bottom.connect(self._on_genre_near_bottom)
@@ -5668,7 +5706,7 @@ class AnimeDetailView(_DetailsChrome, QWidget):
         self._banner_cache = (0, None)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setContentsMargins(24, 0, 24, 0)
         outer.setSpacing(0)
 
         top_row = QHBoxLayout()
@@ -5676,6 +5714,7 @@ class AnimeDetailView(_DetailsChrome, QWidget):
         self._back_btn = TransparentToolButton(themed_icon('tv.anime_back', FluentIcon.LEFT_ARROW))
         self._back_btn.setFixedSize(34, 34)
         self._back_btn.clicked.connect(self.back_requested.emit)
+        bind_back_keys(self, self.back_requested.emit)
         top_row.addWidget(self._back_btn)
         top_row.addStretch(1)
 
@@ -6812,10 +6851,12 @@ class _WatchLaterView(QWidget):
         outer.setSpacing(10)
 
         header = QHBoxLayout()
+        header.setContentsMargins(24, 0, 24, 0)
         self._back_btn = PushButton(themed_icon('tv.media_back', FluentIcon.LEFT_ARROW),
                                     tr('tv.movies.back', default='Back'), self)
         self._back_btn.setFixedHeight(32)
         self._back_btn.clicked.connect(self.back_requested.emit)
+        bind_back_keys(self, self.back_requested.emit)
         header.addWidget(self._back_btn)
         self._title_lbl = TitleLabel(tr('tv.watchlater', default='Watch later'), self)
         header.addWidget(self._title_lbl)
@@ -6830,7 +6871,9 @@ class _WatchLaterView(QWidget):
         outer.addLayout(header)
 
         self._grid = PosterGrid(self, cover_attrs=('poster_url',), key_attr='key', show_caption=True,
-                                subtitle_fn=attrs_subtitle('subtitle'), colors_fn=_grid_colors)
+                                subtitle_fn=attrs_subtitle('subtitle'), meta_fn=attrs_subtitle('subtitle'), colors_fn=_grid_colors,
+                                cell_w=150, poster_h=225)
+        _pad_grid_edges(self._grid)
         self._grid.poster_clicked.connect(lambda item: self.open_requested.emit(item.entry))
         self._grid.context_requested.connect(self._show_menu)
         outer.addWidget(self._grid, 1)
@@ -6925,14 +6968,17 @@ class TV_page(MediaPageBase):
         self.setStyleSheet('background: transparent;')
         self._download_manager: Any = None
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(24, self._TOP, 24, 0)
-        outer.setSpacing(12)
+        outer.setContentsMargins(0, self._TOP, 0, 0)
+        outer.setSpacing(10)
 
         self._pivot = Pivot()
         self._header = QWidget(self)
         header_layout = QVBoxLayout(self._header)
         header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.addWidget(self._pivot)
+        header_layout.addWidget(self._pivot, 0, Qt.AlignmentFlag.AlignHCenter)
+        with suppress(Exception):
+            self._pivot.hBoxLayout.setSpacing(40)
+            self._pivot.setItemFontSize(15)
         outer.addWidget(self._header)
         self._floating = False
         self._pivot_shown = True
@@ -7141,6 +7187,44 @@ class TV_page(MediaPageBase):
     def open_anime_detail(self, media: dict) -> None:
         if self.show_tab('anime'):
             self._tabs['anime'].open_detail(media)
+
+    def nav_state(self) -> dict:
+        key = self._current_tab_key
+        state = {'tab': key} if key else {}
+        tab = self._tabs.get(key) if key else None
+        stack = getattr(tab, '_stack', None)
+        if tab is None or stack is None:
+            return state
+        if key == 'anime':
+            view = getattr(tab, '_detail_view', None)
+            media = getattr(view, '_media', None)
+            if view is not None and stack.currentWidget() is view and isinstance(media, dict):
+                state['item'] = media
+            return state
+        details = getattr(tab, '_details', None)
+        if details is not None and stack.currentWidget() is details:
+            raw = getattr(details, '_raw', None)
+            if isinstance(raw, dict) and raw:
+                state['item'] = raw
+        return state
+
+    def restore_nav_state(self, state: dict) -> None:
+        if not isinstance(state, dict):
+            return
+        key = state.get('tab')
+        item = state.get('item')
+        if isinstance(item, dict) and item:
+            if key == 'anime':
+                self.open_anime_detail(item)
+                return
+            if key == 'movies':
+                self.open_detail(item, 'movie')
+                return
+            if key == 'series':
+                self.open_detail(item, 'show')
+                return
+        if key:
+            self.show_tab(key)
 
     def _apply_locale(self, *_args) -> None:
         for key, _icon, text_key in self._TABS:

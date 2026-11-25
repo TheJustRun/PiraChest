@@ -15,15 +15,15 @@ from PySide6.QtWidgets import (
     QSplitter, QStackedWidget, QStyle, QStyledItemDelegate, QTreeView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
-    Action, CaptionLabel, CheckBox, Pivot, CompactSpinBox, DoubleSpinBox, InfoBar, InfoBarPosition, LineEdit, MessageBoxBase,
-    PushButton, RoundMenu, StrongBodyLabel, SubtitleLabel, TransparentPushButton, qconfig,
+    Action, CaptionLabel, CheckBox, FluentIcon, Pivot, CompactSpinBox, DoubleSpinBox, InfoBar, InfoBarPosition, LineEdit, MessageBoxBase,
+    PushButton, RoundMenu, StrongBodyLabel, SubtitleLabel, TransparentPushButton, TransparentToolButton, isDarkTheme, qconfig,
 )
 
 from src.core import system as host
 from src.core.downloader import (
     DLState, DownloadItem, DownloadManager, human_bytes, human_duration, human_speed, parse_checksum,
 )
-from src.core.theme import palette, scroll_area_qss
+from src.core.theme import apply_slot_icon_theme, apply_tool_button_theme, palette, register_theme_refresh, scroll_area_qss, themed_icon, to_color, resolve_icon_color
 from src.core.translations import register_locale_refresh, tr
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,16 @@ def _qc(value: str, alpha: float | None = None) -> QColor:
 
 def _pal(key: str, alpha: float | None = None) -> QColor:
     return _qc(palette()[key], alpha)
+
+
+def _mix(c1: QColor, c2: QColor, t: float) -> QColor:
+    t = max(0.0, min(1.0, t))
+    return QColor(
+        round(c1.red() * (1 - t) + c2.red() * t),
+        round(c1.green() * (1 - t) + c2.green() * t),
+        round(c1.blue() * (1 - t) + c2.blue() * t),
+        max(0, min(255, round(c1.alpha() * (1 - t) + c2.alpha() * t))),
+    )
 
 
 _FALLBACK = {
@@ -226,9 +236,10 @@ class _IconButton(QAbstractButton):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(_pal("state_error", .14) if self._danger else _pal("primary_text", .08 if not self.isDown() else .14))
             p.drawRoundedRect(QRectF(self.rect()), 6, 6)
-            fg = _pal("state_error") if self._danger else _pal("primary_text")
+            fg = _pal("state_error") if self._danger else to_color(resolve_icon_color(), "#ffffff")
         else:
-            fg = _pal("muted", 1.0 if on else .35)
+            fg = to_color(resolve_icon_color(), "#ffffff")
+            fg.setAlphaF(1.0 if on else .35)
         off = (self.width() - self._glyph) / 2
         _blit(p, self._icon, off, (self.height() - self._glyph) / 2, self._glyph, fg, self.devicePixelRatioF())
 
@@ -237,9 +248,14 @@ class _AddButton(QAbstractButton):
     def __init__(self, text: str, parent=None):
         super().__init__(parent)
         self._hover = False
-        self.setFixedHeight(32)
+        self.setFixedHeight(36)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setText(text)
+        qconfig.themeChanged.connect(self._on_theme)
+
+    def _on_theme(self, *_) -> None:
+        self.setText(self.text())
+        self.update()
 
     def setText(self, text: str) -> None:
         super().setText(text)
@@ -260,12 +276,46 @@ class _AddButton(QAbstractButton):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         bg = _pal("accent")
+        if not self.isEnabled():
+            p.setOpacity(0.45)
+        elif self.isDown():
+            bg = _mix(bg, QColor(0, 0, 0), 0.18)
+        elif self._hover:
+            bg = _mix(bg, _pal("on_accent"), 0.16)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(bg.lighter(110) if self._hover else bg)
+        p.setBrush(bg)
         p.drawRoundedRect(QRectF(self.rect()), 7, 7)
-        white = QColor("white")
-        _blit(p, "plus", 12, (self.height() - 16) / 2, 16, white, self.devicePixelRatioF(), 2.0)
-        _text(p, QRectF(34, 0, self.width() - 42, self.height()), self.text(), _font(self.font(), 13, QFont.Weight.DemiBold), white)
+        fg = _pal("on_accent")
+        _blit(p, "plus", 12, (self.height() - 16) / 2, 16, fg, self.devicePixelRatioF(), 2.0)
+        _text(p, QRectF(34, 0, self.width() - 42, self.height()), self.text(), _font(self.font(), 13, QFont.Weight.DemiBold), fg)
+
+
+def _ink(alpha: int) -> QColor:
+    base = 255 if isDarkTheme() else 0
+    return QColor(base, base, base, alpha)
+
+
+class _ToolCluster(QFrame):
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(36)
+        self._lay = QHBoxLayout(self)
+        self._lay.setContentsMargins(4, 0, 4, 0)
+        self._lay.setSpacing(2)
+        self.setStyleSheet('background: transparent;')
+
+    def addWidget(self, widget) -> None:
+        self._lay.addWidget(widget, 0, Qt.AlignmentFlag.AlignVCenter)
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(_ink(10))
+        p.setPen(QPen(_ink(22), 1))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
+        p.end()
+        super().paintEvent(event)
 
 
 class StatsBar(QWidget):
@@ -1759,11 +1809,11 @@ class DownloadManagerPage(QWidget):
         self._flush.timeout.connect(self._flush_updates)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(28, 18, 28, 0)
+        root.setContentsMargins(24, 14, 24, 0)
         root.setSpacing(0)
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 14)
-        top.setSpacing(4)
+        top.setSpacing(8)
         self._stats = StatsBar()
         top.addWidget(self._stats, 1)
         self._actions: dict[str, tuple[QAbstractButton, str]] = {}
@@ -1771,17 +1821,23 @@ class DownloadManagerPage(QWidget):
         add.clicked.connect(self._on_add)
         top.addWidget(add, 0, _VCENTER)
         self._actions["add"] = (add, "download.add_torrent")
-        top.addSpacing(10)
-        for name, icon, slot, danger, handler in (
-            ("pause_all", "pause", "download.pause_all", False, manager.pause_all),
-            ("resume_all", "play", "download.resume_all", False, manager.resume_all),
-            ("delete_all", "trash", "download.delete_all", True, self._on_delete_all),
-            ("open_root", "folder", "download.open_downloads_folder", False, self._on_open_root),
+        top.addSpacing(8)
+        cluster = _ToolCluster(self)
+        for name, default_icon, slot, handler in (
+            ("pause_all", FluentIcon.PAUSE, "download.pause_all", manager.pause_all),
+            ("resume_all", FluentIcon.PLAY, "download.resume_all", manager.resume_all),
+            ("delete_all", FluentIcon.DELETE, "download.delete_all", self._on_delete_all),
+            ("open_root", FluentIcon.FOLDER, "download.open_downloads_folder", self._on_open_root),
         ):
-            b = _IconButton(icon, tr(slot), 32, 17, danger)
+            b = TransparentToolButton(themed_icon(slot, default_icon, size=17))
+            apply_tool_button_theme(b)
+            apply_slot_icon_theme(b, slot, default_icon, size=17)
+            b.setFixedSize(32, 32)
+            b.setToolTip(tr(slot))
             b.clicked.connect(lambda _=False, h=handler: h())
-            top.addWidget(b, 0, _VCENTER)
+            cluster.addWidget(b)
             self._actions[name] = (b, slot)
+        top.addWidget(cluster, 0, _VCENTER)
         root.addLayout(top)
         self._sep = QFrame()
         self._sep.setFixedHeight(1)
@@ -1841,7 +1897,7 @@ class DownloadManagerPage(QWidget):
         self._stats.retranslate()
         self._empty.update()
         self._pending.update(self._rows)
-        self._flush_updates()
+        QTimer.singleShot(0, self._flush_updates)
 
 
     def _insert(self, item: DownloadItem) -> None:

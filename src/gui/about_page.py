@@ -847,14 +847,17 @@ class AboutPage(QWidget):
         muted = c.get('muted', '#999999')
         self._apply_logo()
         self._author_avatar.setPixmap(self._build_author_avatar_pixmap())
-        self._hero_title_lbl.setStyleSheet(f'font-size: 23px; font-weight: 700; color: {primary};')
+        accent = c.get('accent_text', primary)
+        for btn in (self._github_btn, self._discord_btn, self._profile_btn):
+            btn.setStyleSheet(f'HyperlinkButton {{ color: {accent}; }}')
+        self._hero_title_lbl.setStyleSheet(f'font-size: 23px; font-weight: 700; color: {accent};')
         self._version_lbl.setStyleSheet(f'color: {muted}; font-size: 12px; padding-top: 4px;')
         self._desc_lbl.setStyleSheet(f'color: {body}; font-size: 14px;')
         self._secret_hint.setStyleSheet(f'color: {muted}; font-size: 12px; letter-spacing: 2px;')
-        self._credits_title_lbl.setStyleSheet(f'font-size: 16px; font-weight: 600; color: {primary};')
+        self._credits_title_lbl.setStyleSheet(f'font-size: 16px; font-weight: 600; color: {accent};')
         for label in (self._author_title_lbl, self._thanks_title_lbl,
                       self._services_title_lbl, self._packages_title_lbl):
-            label.setStyleSheet(f'color: {primary};')
+            label.setStyleSheet(f'color: {accent};')
         for label in (self._author_role_lbl, self._packages_body_lbl):
             label.setStyleSheet(f'color: {muted};')
         self._thanks_body_lbl.setStyleSheet(f'color: {muted}; font-size: 13px;')

@@ -28,10 +28,10 @@ import httpx
 from PySide6.QtCore import (QByteArray, QEasingCurve, QEvent, QObject, QPoint, QPropertyAnimation, QRect,
                             QRectF, QRunnable, QSize, Qt, QUrl, QThreadPool, QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetrics, QImage, QLinearGradient, QPainter,
-                           QPainterPath, QPalette, QPen, QPixmap, QRadialGradient, QBrush)
+                           QPainterPath, QPen, QPixmap, QRadialGradient)
 from PySide6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QHBoxLayout, QLabel,
                                QListWidgetItem, QProxyStyle, QScrollArea, QSizePolicy, QSlider,
                                QStackedWidget, QStyle, QStyledItemDelegate, QToolButton, QVBoxLayout,
                                QWidget)
@@ -43,6 +43,7 @@ from qfluentwidgets import (Action, CaptionLabel, CardWidget, CheckBox, FluentIc
 
 from src.core.artwork import images
 from .stuff.grid import PosterGrid
+from .repacks_page import ToolCluster
 from src.core.config import paths as app_paths, settings as app_settings
 from src.core.models import MusicItem as Song
 from src.core.net import LazyHttpClient
@@ -2886,6 +2887,7 @@ class MusicPage(QWidget):
         self._search.setPlaceholderText(tr('music.search_placeholder'))
         self._search.setMinimumWidth(160)
         self._search.setMaximumWidth(340)
+        self._search.setFixedHeight(36)
         self._search.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._search.returnPressed.connect(self._on_search)
         self._search.searchSignal.connect(lambda _q: self._on_search())
@@ -2902,7 +2904,12 @@ class MusicPage(QWidget):
         self._b_cancel.clicked.connect(self._on_cancel)
         top.addWidget(self._pivot)
         top.addStretch(1)
-        for w in (self._b_cancel, self._search, self._b_filter, self._b_view):
+        cluster = ToolCluster(lib)
+        for b in (self._b_filter, self._b_view):
+            b.setFixedSize(32, 32)
+            cluster.addWidget(b)
+        top.setSpacing(10)
+        for w in (self._b_cancel, self._search, cluster):
             top.addWidget(w)
         ll.addLayout(top)
         self._loading = IndeterminateProgressBar(lib, start=False)

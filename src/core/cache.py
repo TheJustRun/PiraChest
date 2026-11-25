@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -172,15 +171,19 @@ class CacheManager:
             self._con.close()
 
     async def get_entry_async(self, namespace: str, key: str) -> dict | None:
+        import asyncio
         return await asyncio.to_thread(self.get_entry, namespace, key)
 
     async def set_entry_async(self, namespace: str, key: str, entry: dict) -> None:
+        import asyncio
         await asyncio.to_thread(self.set_entry, namespace, key, entry)
 
     async def delete_entry_async(self, namespace: str, key: str) -> None:
+        import asyncio
         await asyncio.to_thread(self.delete_entry, namespace, key)
 
     async def delete_prefix_async(self, namespace: str, key_prefix: str) -> None:
+        import asyncio
         await asyncio.to_thread(self.delete_prefix, namespace, key_prefix)
 
 

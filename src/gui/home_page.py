@@ -6,10 +6,11 @@ import math
 import os
 import random
 import time
+from contextlib import suppress
 from functools import partial
 from types import SimpleNamespace
 from typing import Optional
-from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRegion
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget
 from qfluentwidgets import BodyLabel, CardWidget, CaptionLabel, FluentIcon, ProgressBar, SmoothScrollArea, StrongBodyLabel, SubtitleLabel, TitleLabel, TransparentToolButton
@@ -52,23 +53,40 @@ def _provider_badge(provider: str):
 _DEFAULT_BACKDROP = '#ff6a3d'
 _lazy_cache: dict = {}
 _placeholders: dict = {}
+_colors: dict = {}
+
+
+def _dominant_color(pixmap: QPixmap) -> Optional[QColor]:
+    image = pixmap.scaled(24, 36, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation).toImage()
+    buckets: dict = {}
+    for y in range(image.height()):
+        for x in range(image.width()):
+            h, sat, val, _ = image.pixelColor(x, y).getHsv()
+            if h < 0 or val < 40:
+                continue
+            weight = (sat / 255.0) * (val / 255.0) + 0.02
+            key = (h // 24, sat // 64, val // 64)
+            total = buckets.get(key)
+            if total is None:
+                buckets[key] = [weight, h * weight, sat * weight, val * weight]
+            else:
+                total[0] += weight
+                total[1] += h * weight
+                total[2] += sat * weight
+                total[3] += val * weight
+    if not buckets:
+        return None
+    w, h, sat, val = max(buckets.values(), key=lambda b: b[0])
+    return QColor.fromHsv(int(h / w) % 360, int(sat / w), int(val / w))
 _LANG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lang')
 _splash_cache: dict = {}
 _KIND_META = {
-    'repack': ('home.dashboard_popular_eyebrow', 'home.dashboard_popular_body', 'Popular This Week', 'One of the most downloaded PC game repacks right now.', 'pc_games_enabled', ('repacks', 'fitgirl')),
-    'movie': ('home.dashboard_popular_movie_eyebrow', 'home.dashboard_popular_movie_body', 'Popular Movie', 'One of the most popular movies right now.', 'tv_enabled', ('tv', 'movies')),
-    'show': ('home.dashboard_popular_show_eyebrow', 'home.dashboard_popular_show_body', 'Popular Show', 'One of the most popular shows right now.', 'tv_enabled', ('tv', 'series')),
-    'anime': ('home.dashboard_popular_anime_eyebrow', 'home.dashboard_popular_anime_body', 'Popular Anime', 'One of the most popular anime right now.', 'tv_enabled', ('tv', 'anime')),
-    'manga': ('home.dashboard_popular_manga_eyebrow', 'home.dashboard_popular_manga_body', 'Popular Manga', 'One of the most popular manga right now.', 'books_enabled', ('books', 'manga')),
+    'repack': ('home.dashboard_popular_eyebrow', 'home.dashboard_popular_body', 'pc_games_enabled', ('repacks', 'fitgirl')),
+    'movie': ('home.dashboard_popular_movie_eyebrow', 'home.dashboard_popular_movie_body', 'tv_enabled', ('tv', 'movies')),
+    'show': ('home.dashboard_popular_show_eyebrow', 'home.dashboard_popular_show_body', 'tv_enabled', ('tv', 'series')),
+    'anime': ('home.dashboard_popular_anime_eyebrow', 'home.dashboard_popular_anime_body', 'tv_enabled', ('tv', 'anime')),
+    'manga': ('home.dashboard_popular_manga_eyebrow', 'home.dashboard_popular_manga_body', 'books_enabled', ('books', 'manga')),
 }
-
-
-def _tr_safe(key: str, fallback: str) -> str:
-    try:
-        value = tr(key)
-    except Exception:
-        return fallback
-    return fallback if not value or value.strip().lower() == key.lower() else value
 
 
 def _saved_playlists() -> list:
@@ -89,7 +107,7 @@ def _saved_playlists() -> list:
                   if isinstance(songs, list) else [])
         playlists.append(SimpleNamespace(
             id=entry.get('id') or str(index),
-            name=entry.get('name') or _tr_safe('music.untitled', 'Untitled'),
+            name=entry.get('name') or tr('music.untitled'),
             songs=[SimpleNamespace(cover_url=cover) for cover in covers],
         ))
     return playlists
@@ -349,20 +367,16 @@ class _PosterTile(QFrame):
             self.update()
 
     def hideEvent(self, event) -> None:
-        try:
+        with suppress(Exception):
             images.release(self)
-        except Exception:
-            pass
         self._pix = None
         super().hideEvent(event)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
         if self._path and self._pix is None:
-            try:
+            with suppress(Exception):
                 images.get(self._path, self.size(), partial(self._on_ready, self._path), owner=self)
-            except Exception:
-                pass
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -528,8 +542,26 @@ class _CardStrip(PosterStrip):
                          gap=14, pad=2, top=self._MARGIN[0], height=height, colors_fn=_palette_colors)
         self._snaps: dict = {}
         self._badges: dict[int, QRect] = {}
-
+        self._home_pix: dict = {}
+        self._home_wait: set = set()
+        self._home_owner = QObject(self)
         self.poster_clicked.connect(self._on_card_clicked)
+
+    def _home_request(self, src: str) -> None:
+        if src in self._home_wait:
+            return
+        self._home_wait.add(src)
+        size = QSize(*self._img) if isinstance(self._img, tuple) else self._img
+        images.get(src, size, partial(self._home_loaded, src), owner=self._home_owner)
+
+    def _home_loaded(self, src: str, pixmap) -> None:
+        self._home_wait.discard(src)
+        if pixmap is None or pixmap.isNull():
+            return
+        if len(self._home_pix) >= 96:
+            self._home_pix.pop(next(iter(self._home_pix)))
+        self._home_pix[src] = pixmap
+        self.viewport().update()
 
     def _on_card_clicked(self, card) -> None:
         callback = getattr(card, 'on_click', None)
@@ -574,9 +606,13 @@ class _CardStrip(PosterStrip):
     def _paint_card(self, p, pos: int, cell: QRect) -> None:
         card = self._entry(pos)
         src = self._src(pos)
-        pixmap = images.peek(src, self._img) if src else None
-        if pixmap is not None and pixmap.isNull():
-            pixmap = None
+        pixmap = None
+        if src:
+            pixmap = images.peek(src, self._img) or self._home_pix.get(src)
+            if pixmap is not None and pixmap.isNull():
+                pixmap = None
+            if pixmap is None:
+                self._home_request(src)
         if self._pressed == pos:
             p.drawPixmap(cell.topLeft(), self._render(card, pixmap, 'pressed'))
             return
@@ -810,10 +846,10 @@ class _FeaturedCard(QFrame):
         self._btn.setText(action)
         self._btn.setVisible(bool(action))
         self._set_poster(poster)
-        if poster:
-            images.dominant(poster, partial(self._on_color, poster), owner=self)
-        else:
+        if not poster:
             self._set_colors(None)
+        elif poster in _colors:
+            self._set_colors(_colors[poster])
         self.setVisible(True)
 
     def _set_poster(self, path: Optional[str]) -> None:
@@ -844,11 +880,15 @@ class _FeaturedCard(QFrame):
             return
         self._pix = pixmap
         self._glow = pixmap.scaled(24, 36, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        color = _colors.get(source)
+        if color is None:
+            color = _dominant_color(self._glow)
+            if color is not None:
+                if len(_colors) >= 64:
+                    _colors.pop(next(iter(_colors)))
+                _colors[source] = color
+        self._set_colors(color)
         self._restart(self._poster_anim, '_pt')
-
-    def _on_color(self, source: str, colors: list) -> None:
-        if source == self._poster and colors:
-            self._set_colors(colors[0])
 
     def _set_colors(self, color) -> None:
         if color is not None:
@@ -913,10 +953,8 @@ class _FeaturedCard(QFrame):
         p.end()
 
     def hideEvent(self, event) -> None:
-        try:
+        with suppress(Exception):
             images.release(self)
-        except Exception:
-            pass
         self._poster_anim.stop()
         self._pix0 = self._pix = self._glow = None
         super().hideEvent(event)
@@ -924,11 +962,8 @@ class _FeaturedCard(QFrame):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         if self._poster and self._pix is None:
-            try:
-                images.get(self._poster, QSize(self._PW, self._H),
-                           partial(self._on_poster, self._poster), owner=self)
-            except Exception:
-                pass
+            with suppress(Exception):
+                images.get(self._poster, QSize(self._PW, self._H), partial(self._on_poster, self._poster), owner=self)
 
 
 class HomePage(QWidget):
@@ -1019,7 +1054,7 @@ class HomePage(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        self._rot_timer.start()
+        self._sync_rot_animation()
         if self._features_timer.isActive():
             self._features_timer.start(0)
         self.refresh()
@@ -1042,8 +1077,24 @@ class HomePage(QWidget):
         self._animation_active = bool(active)
         self._sync_splash_animation()
 
+    def changeEvent(self, event) -> None:
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._sync_rot_animation()
+        super().changeEvent(event)
+
     def _on_app_state_changed(self, _state) -> None:
         self._sync_splash_animation()
+        self._sync_rot_animation()
+
+    def _sync_rot_animation(self) -> None:
+        app = QApplication.instance()
+        active = (self.isVisible() and not self.window().isMinimized()
+                  and (app is None or app.applicationState() == Qt.ApplicationState.ApplicationActive))
+        if active:
+            if not self._rot_timer.isActive():
+                self._rot_timer.start()
+        else:
+            self._rot_timer.stop()
 
     def _sync_splash_animation(self, *_a) -> None:
         app = QApplication.instance()
@@ -1097,7 +1148,7 @@ class HomePage(QWidget):
         self._sync_splash_animation()
 
     def _candidates(self) -> list:
-        return [(k, v) for k, v in self._cands.items() if _on(_KIND_META[k][4]) and is_tab_enabled(*_KIND_META[k][5])]
+        return [(k, v) for k, v in self._cands.items() if _on(_KIND_META[k][2]) and is_tab_enabled(*_KIND_META[k][3])]
 
     def _set_cand(self, kind: str, title, poster, entry) -> None:
         if entry is None:
@@ -1107,9 +1158,9 @@ class HomePage(QWidget):
 
     def _show_candidate(self, cands: list) -> None:
         kind, (title, poster, entry) = cands[self._rot_idx % len(cands)]
-        eb_key, body_key, eb_fb, body_fb, _, _ = _KIND_META[kind]
-        action = tr('home.dashboard_browse_pc_games') if kind == 'repack' else _tr_safe('home.dashboard_open_item', 'Open')
-        self._featured.set_content('ref', _tr_safe(eb_key, eb_fb), title, _tr_safe(body_key, body_fb), action, poster, (kind, entry))
+        eb_key, body_key, _, _ = _KIND_META[kind]
+        action = tr('home.dashboard_browse_pc_games') if kind == 'repack' else tr('home.dashboard_open_item')
+        self._featured.set_content('ref', tr(eb_key), title, tr(body_key), action, poster, (kind, entry))
 
     def _on_featured_hover(self, on: bool) -> None:
         if not self.isVisible():
@@ -1117,7 +1168,7 @@ class HomePage(QWidget):
         if on:
             self._rot_timer.stop()
         else:
-            self._rot_timer.start()
+            self._sync_rot_animation()
 
     def _rotate(self) -> None:
         if not self.isVisible():

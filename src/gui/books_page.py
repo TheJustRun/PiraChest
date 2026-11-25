@@ -2,6 +2,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+from contextlib import suppress
 from collections import OrderedDict
 from PySide6.QtCore import (
     Qt, QSize, Signal, QTimer,
@@ -14,8 +15,7 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     TitleLabel, BodyLabel, StrongBodyLabel, CaptionLabel, SubtitleLabel,
     PushButton, PrimaryPushButton, SearchLineEdit, CheckBox, ScrollArea,
-    SmoothScrollArea, ImageLabel, PillPushButton,
-    FluentIcon, HyperlinkButton, qconfig, isDarkTheme, themeColor,
+    SmoothScrollArea, ImageLabel, FluentIcon, HyperlinkButton, qconfig, isDarkTheme, themeColor,
     FlowLayout as QFlowLayout, MessageBoxBase, InfoBar, InfoBarPosition,
     Pivot, TransparentToolButton, ComboBox,
 )
@@ -24,11 +24,10 @@ from src.core.worker import submit, cancel
 from src.core.books.manga import manager as manga_manager
 from src.core.books.manga.manager import MangaItem as MangaEntry, MangaChapter, MangaDownloadBridge
 from src.core.artwork import images
-from src.core.theme import palette, apply_pivot_theme, themed_icon, apply_tool_button_theme, register_theme_refresh, fade_in
-from src.core.translations import tr, register_locale_refresh
+from src.core.theme import palette, to_color, resolve_icon_color, apply_pivot_theme, themed_icon, apply_tool_button_theme, register_theme_refresh, fade_in
+from src.core.translations import tr
 from .repacks_page import (
-    bind_enter, split_tags, join_tags, partition_resolved, MetaField, make_tag_pill, render_description_html, _DiceButton, make_tag_chip, show_tag_menu, toggled_tags,
-    _stop_previous_movie,
+    ToolCluster, bind_back_keys, bind_enter, split_tags, join_tags, partition_resolved, MetaField, make_tag_pill, render_description_html, _DiceButton, make_tag_chip, show_tag_menu, toggled_tags,
     _muted_text_color, _body_text_color, _surface_tint_color, _grid_colors,
 )
 from .stuff.grid import PosterGrid, ViewModeButton, attrs_subtitle
@@ -63,7 +62,7 @@ def _manga_icon() -> QIcon:
     for name in ('BOOK_SHELF', 'LIBRARY', 'EDUCATION', 'DOCUMENT', 'FOLDER', 'GAME'):
         icon = getattr(FluentIcon, name, None)
         if icon is not None:
-            return icon.icon(color=QColor(_body_text_color()))
+            return icon.icon(color=to_color(resolve_icon_color()))
     return QIcon()
 
 
@@ -73,7 +72,7 @@ class MangaGridView(PosterGrid):
 
     def __init__(self, parent=None):
         super().__init__(parent, cover_attrs=('cover_url',), key_attr='key', show_caption=True,
-                         subtitle_fn=attrs_subtitle('status', 'year'),
+                         subtitle_fn=attrs_subtitle('status', 'year'), meta_fn=attrs_subtitle('status', 'year'),
                          fallback_icon_fn=_manga_icon, colors_fn=_grid_colors)
         self.poster_clicked.connect(self.manga_clicked.emit)
 
@@ -269,12 +268,13 @@ class MangaDetailsView(DetailsViewMixin, QWidget):
         self._row_widgets: dict[str, tuple[CaptionLabel, TransparentToolButton]] = {}
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 4, 0, 0)
+        outer.setContentsMargins(24, 4, 24, 0)
         outer.setSpacing(10)
 
         back_btn = PushButton(themed_icon('books.detail_back', FluentIcon.RETURN), tr('books.back_to_grid'))
         back_btn.setFixedHeight(32)
         back_btn.clicked.connect(self.back_requested.emit)
+        bind_back_keys(self, self.back_requested.emit)
         outer.addWidget(back_btn, 0, Qt.AlignmentFlag.AlignLeft)
 
         self._scroll = SmoothScrollArea()
@@ -705,7 +705,8 @@ class MangaBrowserTab(MediaPageBase):
         header_row = QHBoxLayout()
         self._search_edit = SearchLineEdit(self)
         self._search_edit.setMinimumWidth(140)
-        self._search_edit.setMaximumWidth(240)
+        self._search_edit.setMaximumWidth(320)
+        self._search_edit.setFixedHeight(36)
         self._search_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._search_edit.setPlaceholderText(tr('books.manga_search_placeholder'))
         bind_enter(self._search_edit, self._on_search)
@@ -719,19 +720,22 @@ class MangaBrowserTab(MediaPageBase):
         view_btn = ViewModeButton(self._grid, parent=self, list_tip=tr('books.list_view', default='List view'),
                                   grid_tip=tr('books.grid_view', default='Grid view'))
         apply_tool_button_theme(view_btn)
-        header_row.addWidget(view_btn)
+        cluster = ToolCluster(self)
+        cluster.addWidget(view_btn)
 
         self._refresh_btn = TransparentToolButton(themed_icon('repacks.refresh', FluentIcon.SYNC), self)
         apply_tool_button_theme(self._refresh_btn)
         self._refresh_btn.setToolTip(tr('repacks.refresh_tooltip'))
         self._refresh_btn.setFixedSize(32, 32)
         self._refresh_btn.clicked.connect(self._on_refresh_clicked)
-        header_row.addWidget(self._refresh_btn)
+        cluster.addWidget(self._refresh_btn)
 
         self._random_btn = _DiceButton(tr('repacks.random', default='Surprise me'), self)
         self._random_btn.clicked.connect(self._on_random)
-        header_row.addWidget(self._random_btn)
-        header_row.setSpacing(8)
+        cluster.addWidget(self._random_btn)
+        header_row.addWidget(cluster)
+        header_row.setSpacing(10)
+        header_row.setContentsMargins(24, 0, 24, 0)
         outer.addLayout(header_row)
 
         self._sort = self._make_combo([
@@ -761,7 +765,7 @@ class MangaBrowserTab(MediaPageBase):
         self._tag_bar = QWidget(self)
         self._tag_bar.setStyleSheet('background: transparent;')
         tag_row = QHBoxLayout(self._tag_bar)
-        tag_row.setContentsMargins(0, 0, 0, 0)
+        tag_row.setContentsMargins(24, 0, 24, 0)
         tag_row.setSpacing(8)
         self._tag_hint = CaptionLabel('', self._tag_bar)
         self._tag_hint.setStyleSheet(f'color: {_muted_text_color()}; background: transparent;')
@@ -794,13 +798,14 @@ class MangaBrowserTab(MediaPageBase):
         self._suggest_bar = QWidget(self)
         self._suggest_bar.setStyleSheet('background: transparent;')
         self._suggest_row = QHBoxLayout(self._suggest_bar)
-        self._suggest_row.setContentsMargins(0, 0, 0, 0)
+        self._suggest_row.setContentsMargins(24, 0, 24, 0)
         self._suggest_row.setSpacing(8)
         self._suggest_bar.setVisible(False)
         outer.addWidget(self._suggest_bar)
 
         self._status_lbl = CaptionLabel('', self)
         self._status_lbl.setStyleSheet(f'color: {_muted_text_color()};')
+        self._status_lbl.setContentsMargins(24, 0, 24, 0)
         self._status_lbl.setVisible(False)
         outer.addWidget(self._status_lbl)
 
@@ -1285,7 +1290,7 @@ class ComingSoonTab(QWidget):
         self._apply_theme()
 
     def _apply_theme(self) -> None:
-        self._icon.setPixmap(FluentIcon.BOOK_SHELF.icon(color=QColor(_body_text_color())).pixmap(56, 56))
+        self._icon.setPixmap(FluentIcon.BOOK_SHELF.icon(color=to_color(resolve_icon_color())).pixmap(56, 56))
         self._card.setStyleSheet(
             f"#comingSoonCard {{ background: {_surface_tint_color(12)}; "
             f"border: 1px solid {_surface_tint_color(7)}; border-radius: 20px; }}"
@@ -1298,11 +1303,14 @@ class BooksPage(QWidget):
         self.setObjectName('booksPage')
         self.setStyleSheet('background: transparent;')
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(20, 12, 20, 0)
-        outer.setSpacing(14)
+        outer.setContentsMargins(0, 12, 0, 0)
+        outer.setSpacing(10)
 
         self._pivot = Pivot()
-        outer.addWidget(self._pivot)
+        outer.addWidget(self._pivot, 0, Qt.AlignmentFlag.AlignHCenter)
+        with suppress(Exception):
+            self._pivot.hBoxLayout.setSpacing(40)
+            self._pivot.setItemFontSize(15)
 
         self._section_stack = QStackedWidget()
         outer.addWidget(self._section_stack, 1)
@@ -1375,6 +1383,35 @@ class BooksPage(QWidget):
         self._current_tab_key = 'manga'
         if hasattr(self._manga_tab, '_show_details'):
             self._manga_tab._show_details(entry)
+
+    def nav_state(self) -> dict:
+        key = self._current_tab_key
+        state = {'tab': key} if key else {}
+        if key != 'manga':
+            return state
+        tab = self._manga_tab
+        details = getattr(tab, '_details', None)
+        if details is None or tab._stack.currentWidget() is not details:
+            return state
+        entry = getattr(details, '_entry', None)
+        if entry is not None:
+            with suppress(Exception):
+                state['entry'] = entry.to_dict()
+        return state
+
+    def restore_nav_state(self, state: dict) -> None:
+        if not isinstance(state, dict):
+            return
+        key = state.get('tab')
+        data = state.get('entry')
+        if key == 'manga' and isinstance(data, dict):
+            try:
+                self.open_manga_detail(MangaEntry.from_dict(data))
+                return
+            except Exception:
+                logger.debug('Could not restore manga details', exc_info=True)
+        if key in self._tabs:
+            self._pivot.setCurrentItem(key)
 
     def shutdown(self) -> None:
         for tab in self._tabs.values():

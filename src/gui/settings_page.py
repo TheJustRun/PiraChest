@@ -5,6 +5,7 @@ import ctypes
 import hashlib
 import html
 import logging
+import math
 import os
 import random
 import re
@@ -13,16 +14,26 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import unicodedata
 import warnings
 
 import shiboken6
 from contextlib import suppress
 from functools import partial
+from operator import mul
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QStandardPaths, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QIcon, QKeySequence
+from PySide6.QtCore import (
+    QEasingCurve, QEvent, QObject, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QSize, QStandardPaths,
+    Qt, QTimer, QUrl, QVariantAnimation, Signal,
+)
+from PySide6.QtGui import (
+    QBrush, QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon, QKeySequence,
+    QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QShortcut,
+)
+from PySide6.QtNetwork import QNetworkInterface
 from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractItemView,
@@ -31,9 +42,17 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QFileDialog,
     QFrame,
+    QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
+    QLayout,
+    QLineEdit,
+    QScrollArea,
+    QSizePolicy,
+    QPushButton,
     QStackedWidget,
+    QStyle,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -51,21 +70,23 @@ from qfluentwidgets import (
     IndicatorPosition,
     InfoBar,
     InfoBarPosition,
+    isDarkTheme,
     LineEdit,
     MessageBoxBase,
     PillPushButton,
     PrimaryPushButton,
-    ProgressBar,
     PushButton,
     qconfig,
+    SearchLineEdit,
     setFontFamilies,
     SettingCard,
     SettingCardGroup,
-    Slider,
     SmoothScrollArea,
     StrongBodyLabel,
     SwitchButton,
+    TransparentPushButton,
     SwitchSettingCard,
+    themeColor,
     TransparentToolButton,
 )
 
@@ -99,7 +120,11 @@ from src.core.config import (
     SLUG,
     ThemeMode,
     VERSION_LABEL,
+    dir_size_bytes,
+    relaunch_app_and_wipe,
     wipe_all_app_data,
+    wipe_targets,
+    WIPE_CATEGORIES,
     write_settings_backup,
 )
 from src.core.theme import (
@@ -132,15 +157,226 @@ from src.core.translations import (
     register_locale_refresh,
     set_language,
     tr,
+    tr_for,
 )
-from PySide6.QtCore import QEasingCurve, QPointF, QPropertyAnimation, QRectF
-from PySide6.QtGui import QBrush, QConicalGradient, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen
-from PySide6.QtCore import QVariantAnimation
-from PySide6.QtWidgets import QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QScrollArea
-from qfluentwidgets import isDarkTheme, themeColor
-
 
 logger = logging.getLogger(__name__)
+
+
+_LIVE_WIPE_SAFE = frozenset(('themes', 'cache', 'downloads'))
+
+
+class _WipeSizeEmitter(QObject):
+    sized = Signal(str, int)
+
+
+class _WipeRow(QWidget):
+    toggled = Signal(bool)
+    _PAD_X, _PAD_Y, _BOX, _GAP, _SIZE_W, _RADIUS = 12, 11, 19, 14, 76, 10
+
+    def __init__(self, title: str, description: str, checked: bool, parent=None):
+        super().__init__(parent)
+        self._title = title
+        self._description = description
+        self._size_text = ''
+        self._checked = checked
+        self._hover = 0.0
+        self._progress = 1.0 if checked else 0.0
+        self._pressed = False
+        self._keyboard_focus = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setToolTip(description)
+        self.setAccessibleName(title)
+        policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+        self._hover_anim = self._tween(lambda v: setattr(self, '_hover', v))
+        self._check_anim = self._tween(lambda v: setattr(self, '_progress', v))
+
+    def _tween(self, apply) -> QVariantAnimation:
+        anim = QVariantAnimation(self)
+        anim.setDuration(170)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.valueChanged.connect(lambda value: (apply(float(value)), self.update()))
+        return anim
+
+    def _animate(self, anim: QVariantAnimation, current: float, target: float, apply) -> None:
+        anim.stop()
+        if not animations_enabled():
+            apply(target)
+            self.update()
+            return
+        anim.setStartValue(current)
+        anim.setEndValue(target)
+        anim.start()
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, checked: bool) -> None:
+        checked = bool(checked)
+        if checked == self._checked:
+            return
+        self._checked = checked
+        self._animate(self._check_anim, self._progress, 1.0 if checked else 0.0,
+                      lambda v: setattr(self, '_progress', v))
+        self.toggled.emit(checked)
+
+    def setSizeText(self, text: str) -> None:
+        self._size_text = text
+        self.update()
+
+    def _fonts(self) -> tuple[QFont, QFont]:
+        title = QFont(self.font())
+        title.setPixelSize(14)
+        title.setWeight(QFont.Weight.Medium)
+        desc = QFont(self.font())
+        desc.setPixelSize(12)
+        desc.setWeight(QFont.Weight.Normal)
+        return title, desc
+
+    def _text_left(self) -> int:
+        return self._PAD_X + self._BOX + self._GAP
+
+    def heightForWidth(self, width: int) -> int:
+        title_font, desc_font = self._fonts()
+        title_h = QFontMetrics(title_font).height()
+        text_w = max(40, width - self._text_left() - self._PAD_X)
+        desc_h = QFontMetrics(desc_font).boundingRect(
+            QRect(0, 0, text_w, 10000), int(Qt.TextFlag.TextWordWrap), self._description).height()
+        return self._PAD_Y * 2 + title_h + 2 + desc_h
+
+    def sizeHint(self):
+        return QSize(420, self.heightForWidth(420))
+
+    def minimumSizeHint(self):
+        return QSize(260, self.heightForWidth(260))
+
+    def _toggle(self) -> None:
+        self.setChecked(not self._checked)
+
+    def enterEvent(self, event) -> None:
+        self._animate(self._hover_anim, self._hover, 1.0, lambda v: setattr(self, '_hover', v))
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._pressed = False
+        self._animate(self._hover_anim, self._hover, 0.0, lambda v: setattr(self, '_hover', v))
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._pressed = True
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._pressed and self.rect().contains(event.position().toPoint()):
+            self._toggle()
+        self._pressed = False
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._toggle()
+            return
+        super().keyPressEvent(event)
+
+    def focusInEvent(self, event) -> None:
+        self._keyboard_focus = event.reason() in (
+            Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason, Qt.FocusReason.ShortcutFocusReason)
+        self.update()
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event) -> None:
+        self._keyboard_focus = False
+        self.update()
+        super().focusOutEvent(event)
+
+    def _mirror(self, rect: QRect) -> QRect:
+        return QStyle.visualRect(self.layoutDirection(), self.rect(), rect)
+
+    def paintEvent(self, event) -> None:
+        pal = palette()
+        text_color = to_color(pal['primary_text'])
+        muted = to_color(pal['muted'])
+        error = to_color(pal['accent'])
+        on_error = to_color(pal.get('on_accent') or ('#1a1a1a' if error.lightness() > 150 else '#ffffff'))
+        rtl = self.layoutDirection() == Qt.LayoutDirection.RightToLeft
+        lead = Qt.AlignmentFlag.AlignRight if rtl else Qt.AlignmentFlag.AlignLeft
+        title_font, desc_font = self._fonts()
+        title_fm, desc_fm = QFontMetrics(title_font), QFontMetrics(desc_font)
+        title_h = title_fm.height()
+        text_left = self._text_left()
+        width = self.width()
+
+        p = QPainter(self)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+        if self._hover > 0.001:
+            tint = QColor(127, 127, 127, int(30 * self._hover))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(tint)
+            p.drawRoundedRect(QRectF(self.rect()), self._RADIUS, self._RADIUS)
+
+        box_top = int(round((self.height() - self._BOX) / 2.0))
+        box = self._mirror(QRect(self._PAD_X, box_top, self._BOX, self._BOX))
+        box_rect = QRectF(box).adjusted(0.75, 0.75, -0.75, -0.75)
+        outline = QColor(muted)
+        outline.setAlpha(int(150 + (255 - 150) * self._progress))
+        if self._progress > 0.001:
+            outline = QColor(error)
+            outline.setAlphaF(0.55 + 0.45 * self._progress)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(outline, 1.5))
+        p.drawRoundedRect(box_rect, 5, 5)
+        if self._progress > 0.001:
+            fill = QColor(error)
+            fill.setAlphaF(self._progress)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fill)
+            p.drawRoundedRect(box_rect, 5, 5)
+            check = QPainterPath()
+            x, y = box.x(), box.y()
+            s = self._BOX
+            check.moveTo(x + s * 0.28, y + s * 0.53)
+            check.lineTo(x + s * 0.44, y + s * 0.69)
+            check.lineTo(x + s * 0.73, y + s * 0.34)
+            pen_color = QColor(on_error)
+            pen_color.setAlphaF(self._progress)
+            p.setPen(QPen(pen_color, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(check)
+
+        size_rect = self._mirror(QRect(width - self._PAD_X - self._SIZE_W, self._PAD_Y, self._SIZE_W, title_h))
+        p.setFont(desc_font)
+        p.setPen(muted)
+        advance = desc_fm.horizontalAdvance(self._size_text)
+        size_x = size_rect.left() if rtl else size_rect.right() + 1 - advance
+        p.drawText(QPointF(size_x, self._PAD_Y + title_fm.ascent()), self._size_text)
+
+        title_w = max(20, width - text_left - self._PAD_X - self._SIZE_W - 8)
+        title_rect = self._mirror(QRect(text_left, self._PAD_Y, title_w, title_h))
+        p.setFont(title_font)
+        p.setPen(text_color)
+        p.drawText(title_rect, int(lead | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine),
+                   title_fm.elidedText(self._title, Qt.TextElideMode.ElideRight, title_w))
+
+        desc_top = self._PAD_Y + title_h + 2
+        desc_w = max(40, width - text_left - self._PAD_X)
+        desc_rect = self._mirror(QRect(text_left, desc_top, desc_w, max(0, self.height() - desc_top - self._PAD_Y)))
+        p.setFont(desc_font)
+        p.setPen(muted)
+        p.drawText(desc_rect, int(lead | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap), self._description)
+
+        if self._keyboard_focus:
+            ring = QColor(error)
+            ring.setAlpha(170)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(ring, 1.5))
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), self._RADIUS, self._RADIUS)
+        p.end()
 
 
 _GUI_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -160,8 +396,12 @@ def _repacks_tab_icon(source_key: str) -> QIcon | None:
 
 
 _CONSOLE_TERMINALS = (
-    ('konsole', ['-e']), ('gnome-terminal', ['--wait', '--']), ('xfce4-terminal', ['-x']),
-    ('kitty', []), ('alacritty', ['-e']), ('xterm', ['-e']), ('x-terminal-emulator', ['-e']),
+    ('xdg-terminal-exec', []),
+    ('ptyxis', ['--']), ('kgx', ['--']), ('gnome-terminal', ['--wait', '--']),
+    ('konsole', ['-e']), ('xfce4-terminal', ['-x']), ('tilix', ['-e']),
+    ('terminator', ['-x']), ('mate-terminal', ['-x']), ('qterminal', ['-e']),
+    ('lxterminal', ['-e']), ('kitty', []), ('alacritty', ['-e']),
+    ('wezterm', ['start', '--']), ('xterm', ['-e']), ('x-terminal-emulator', ['-e']),
 )
 _console_proc: subprocess.Popen | None = None
 _console_handler: logging.Handler | None = None
@@ -192,6 +432,10 @@ def _open_mac_console(path: str) -> bool:
     return True
 
 
+def console_log_path() -> str:
+    return os.path.join(tempfile.gettempdir(), 'pirachest-console.log')
+
+
 def _close_posix_console() -> None:
     global _console_proc, _console_handler, _console_window
     if _console_window is not None:
@@ -210,17 +454,17 @@ def _close_posix_console() -> None:
         _console_proc = None
 
 
-def _set_debug_console_posix(visible: bool) -> None:
+def _set_debug_console_posix(visible: bool) -> bool:
     global _console_proc, _console_handler
     root_logger = logging.getLogger()
     if not visible:
         _close_posix_console()
         root_logger.setLevel(logging.WARNING)
-        return
+        return False
     if _console_window is not None or (_console_proc is not None and _console_proc.poll() is None):
-        return
+        return True
     _close_posix_console()
-    path = os.path.join(tempfile.gettempdir(), 'pirachest-console.log')
+    path = console_log_path()
     _console_handler = logging.FileHandler(path, mode='w', encoding='utf-8', errors='replace')
     _console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s — %(message)s'))
     root_logger.addHandler(_console_handler)
@@ -231,21 +475,28 @@ def _set_debug_console_posix(visible: bool) -> None:
     if sys.platform == 'darwin':
         if not _open_mac_console(path):
             logger.warning('Could not open Terminal; debug log is at %s', path)
-        return
+            return False
+        return True
+    env = host.clean_env()
     for term, args in _CONSOLE_TERMINALS:
-        exe = shutil.which(term)
+        exe = shutil.which(term, path=env.get('PATH'))
         if not exe:
             continue
-        with suppress(OSError):
-            _console_proc = subprocess.Popen([exe, *args, 'tail', '-n', '+1', '-f', path],
-                                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                             stderr=subprocess.DEVNULL)
-            atexit.register(_close_posix_console)
-            return
+        try:
+            _console_proc = subprocess.Popen(
+                [exe, *args, 'tail', '-n', '+1', '-f', path],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, env=env)
+        except OSError:
+            _console_proc = None
+            continue
+        atexit.register(_close_posix_console)
+        return True
     logger.warning('No terminal emulator found; debug log is at %s', path)
+    return False
 
 
-def set_debug_console_visible(visible: bool) -> None:
+def set_debug_console_visible(visible: bool) -> bool:
     if os.name != 'nt':
         return _set_debug_console_posix(visible)
     kernel32 = ctypes.windll.kernel32
@@ -278,6 +529,7 @@ def set_debug_console_visible(visible: bool) -> None:
     if hwnd:
         SW_SHOW, SW_HIDE = 5, 0
         user32.ShowWindow(hwnd, SW_SHOW if visible else SW_HIDE)
+    return bool(hwnd)
 
 
 class UpdateController(QObject):
@@ -526,7 +778,7 @@ def show_update_dialog(parent: QWidget, result: dict, allow_skip: bool = True) -
     title.setStyleSheet(f'QLabel {{ background: transparent; color: {strong.name()}; font-size: 17px; font-weight: 600; }}')
     layout.addWidget(title)
     layout.addSpacing(5)
-    channel = tr_or('update.channel_canary', 'Canary') if result.get('canary') else tr_or('update.channel_stable', 'Stable')
+    channel = tr_or('update.channel_canary') if result.get('canary') else tr_or('update.channel_stable')
     size = int(result.get('asset_size') or 0)
     meta = QLabel(f'<span style="color:{accent.name()}; font-weight:600;">{html.escape(channel)}</span>'
                   + (f'&nbsp;&nbsp;\u00b7&nbsp;&nbsp;{_fmt_bytes(size)}' if size else ''))
@@ -546,12 +798,7 @@ def show_update_dialog(parent: QWidget, result: dict, allow_skip: bool = True) -
     view.setHtml(notes + '<p style="margin:0; font-size:14px;">&nbsp;</p>')
     view.setStyleSheet(
         'QTextBrowser { background: transparent; border: none; font-size: 13px; }'
-        f'QTextBrowser {{ selection-background-color: {_alpha(accent, 90)}; }}'
-        'QScrollBar:vertical { width: 6px; background: transparent; margin: 0; }'
-        f'QScrollBar::handle:vertical {{ background: {_alpha(body, 50)}; border-radius: 3px; min-height: 28px; }}'
-        f'QScrollBar::handle:vertical:hover {{ background: {_alpha(body, 100)}; }}'
-        'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }'
-        'QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }')
+        f'QTextBrowser {{ selection-background-color: {_alpha(accent, 90)}; }}')
     screen = box.screen() or QApplication.primaryScreen()
     avail_h = screen.availableGeometry().height() if screen is not None else 900
     view.setMinimumHeight(min(400, max(160, avail_h - 300)))
@@ -1064,6 +1311,12 @@ def _fix_setting_card_icon_box(icon_label) -> None:
         icon_label.move(geo.x() - shift, geo.y() - shift)
 
 
+_SHOWN_TEXT = {
+    'setText': lambda o: o.text(),
+    'setTitle': lambda o: getattr(o, 'card', o).titleLabel.text(),
+    'setContent': lambda o: getattr(o, 'card', o).contentLabel.text(),
+}
+
 _SS_GROUP_TITLE = 'color: palette(text); font-weight: 600; font-size: 16px; background: transparent;'
 _SS_TEXT = 'color: palette(text); background: transparent;'
 _SS_MUTED = 'color: palette(placeholder-text); background: transparent;'
@@ -1149,7 +1402,7 @@ def _norm_gain(path: str) -> float:
                 if sys.byteorder == 'big':
                     samples.byteswap()
                 if samples:
-                    rms = (sum(s * s for s in samples) / len(samples)) ** 0.5 / 32768.0
+                    rms = (sum(map(mul, samples, samples)) / len(samples)) ** 0.5 / 32768.0
                     if rms > 1e-4:
                         gain = max(0.2, min(4.0, _SFX_TARGET_RMS / rms))
     except Exception:
@@ -1189,6 +1442,12 @@ def _pitch_variant(path: str, ratio: float) -> str:
     if cached and os.path.isfile(cached):
         return cached
     try:
+        directory = os.path.join(paths.cache_dir, 'sfx')
+        digest = hashlib.sha1(repr(key).encode('utf-8')).hexdigest()[:20]
+        target = os.path.join(directory, f'{digest}.wav')
+        if os.path.isfile(target):
+            _PITCH_CACHE[key] = target
+            return target
         import wave
         from array import array
         with wave.open(path, 'rb') as wav:
@@ -1235,21 +1494,103 @@ def _pitch_variant(path: str, ratio: float) -> str:
                 b = samples[j + 1]
                 out[i] = int(a + (b - a) * frac)
                 pos += ratio
-        directory = os.path.join(paths.cache_dir, 'sfx')
         os.makedirs(directory, exist_ok=True)
-        digest = hashlib.sha1(repr(key).encode('utf-8')).hexdigest()[:20]
-        target = os.path.join(directory, f'{digest}.wav')
-        if not os.path.isfile(target):
-            with wave.open(target, 'wb') as wav:
-                wav.setnchannels(channels)
-                wav.setsampwidth(2)
-                wav.setframerate(rate)
-                wav.writeframes(out.tobytes())
-            _prune_pitch_cache(directory)
+        with wave.open(target, 'wb') as wav:
+            wav.setnchannels(channels)
+            wav.setsampwidth(2)
+            wav.setframerate(rate)
+            wav.writeframes(out.tobytes())
+        _prune_pitch_cache(directory)
         _PITCH_CACHE[key] = target
         return target
     except Exception:
         return path
+
+
+_MUTE_LINE_RE = re.compile(r'^\s*Mute:\s*(yes|no)\s*$', re.M)
+_MUTE_MIN_QUERY_GAP = 0.25
+
+
+class AppMuteWatcher(QObject):
+    muted_changed = Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._thread = None
+        self._proc = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        if self._thread is not None or not sys.platform.startswith('linux'):
+            return
+        exe = shutil.which('pactl')
+        if not exe:
+            return
+        self._thread = threading.Thread(target=self._run, args=(exe,), name='pirachest-app-mute',
+                                        daemon=True)
+        self._thread.start()
+        atexit.register(self.stop)
+
+    def stop(self) -> None:
+        self._stop.set()
+        proc, self._proc = self._proc, None
+        if proc is not None and proc.poll() is None:
+            with suppress(Exception):
+                proc.terminate()
+
+    def _run(self, exe: str) -> None:
+        env = host.clean_env()
+        try:
+            proc = subprocess.Popen(
+                [exe, 'subscribe'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, env=env, text=True, encoding='utf-8', errors='replace',
+                bufsize=1)
+        except (OSError, ValueError):
+            return
+        self._proc = proc
+        try:
+            self._publish(self._query(exe, env))
+            last = 0.0
+            for line in proc.stdout:
+                if self._stop.is_set():
+                    break
+                if ' on sink-input ' not in line:
+                    continue
+                now = time.monotonic()
+                if now - last < _MUTE_MIN_QUERY_GAP:
+                    continue
+                last = now
+                self._publish(self._query(exe, env))
+        finally:
+            if proc.poll() is None:
+                with suppress(Exception):
+                    proc.terminate()
+            if self._proc is proc:
+                self._proc = None
+
+    def _publish(self, state) -> None:
+        if state is not None:
+            self.muted_changed.emit(bool(state))
+
+    @staticmethod
+    def _query(exe: str, env: dict):
+        try:
+            out = subprocess.run(
+                [exe, 'list', 'sink-inputs'], capture_output=True, text=True, encoding='utf-8',
+                errors='replace', env=env, timeout=5)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            return None
+        pid = str(os.getpid())
+        states = []
+        for block in out.stdout.split('Sink Input #')[1:]:
+            if f'application.process.id = "{pid}"' not in block and 'pirachest' not in block.lower():
+                continue
+            match = _MUTE_LINE_RE.search(block)
+            if match:
+                states.append(match.group(1) == 'yes')
+        return any(states) if states else None
 
 
 class SoundManager(QObject):
@@ -1346,7 +1687,6 @@ class SoundManager(QObject):
         if not sys.platform.startswith('linux'):
             return
         try:
-            from src.core.audio_mute import AppMuteWatcher
             self._mute_watcher = AppMuteWatcher(self)
             self._mute_watcher.muted_changed.connect(self.set_os_muted)
             self._mute_watcher.start()
@@ -1938,23 +2278,25 @@ def _on_off(checked: bool) -> str:
     lang = current_language()
     pair = _ONOFF_CACHE.get(lang)
     if pair is None:
-        pair = _ONOFF_CACHE[lang] = (tr_or('common.off', 'Off'), tr_or('common.on', 'On'))
+        pair = _ONOFF_CACHE[lang] = (tr_or('common.off'), tr_or('common.on'))
     return pair[bool(checked)]
 
 
-def tr_or(key: str, fallback: str, **kwargs) -> str:
+def tr_or(key: str, fallback: str | None = None, **kwargs) -> str:
     try:
         value = tr(key, **kwargs)
     except Exception:
         value = ''
-    if not value or value == key:
-        value = fallback
-    if kwargs and '{' in value:
+    if value and value != key:
+        return value
+    if fallback is None:
+        return key
+    if kwargs and '{' in fallback:
         try:
-            value = value.format(**kwargs)
+            return fallback.format(**kwargs)
         except (KeyError, IndexError, ValueError):
             pass
-    return value
+    return fallback
 
 
 class _DragHandle(QWidget):
@@ -2350,6 +2692,33 @@ class _ClickShield(QObject):
         return event.type() in self._BLOCKED
 
 
+class _ChevronHover(QObject):
+
+    def __init__(self, card) -> None:
+        super().__init__(card)
+        self._card = card
+        self._button = card.card.expandButton
+        card.card.installEventFilter(self)
+        self._button.installEventFilter(self)
+
+    def sync(self) -> None:
+        with suppress(RuntimeError, AttributeError):
+            self._button.setHover(bool(self._button.isEnabled() and self._button.underMouse()))
+
+    def eventFilter(self, obj, event) -> bool:
+        kind = event.type()
+        if obj is self._button:
+            if kind == QEvent.Type.Enter:
+                self.sync()
+            elif kind == QEvent.Type.Leave:
+                with suppress(RuntimeError, AttributeError):
+                    self._button.setHover(False)
+            return False
+        if kind in (QEvent.Type.Enter, QEvent.Type.Leave):
+            return True
+        return False
+
+
 class _HandleAnchor(QObject):
 
     def __init__(self, header, handle) -> None:
@@ -2380,9 +2749,25 @@ class _SectionCard(ExpandGroupSettingCard):
         self.switch = SwitchButton('', self, IndicatorPosition.RIGHT)
         self.addWidget(self.switch)
         self.switch.checkedChanged.connect(self._sync_switch_text)
+        self.switch.checkedChanged.connect(self._on_gate_toggled)
+        self._chev_hover = _ChevronHover(self)
 
     def _sync_switch_text(self, checked: bool) -> None:
         self.switch.setText(_on_off(checked))
+
+    def _on_gate_toggled(self, checked: bool) -> None:
+        self.refresh_gate(animate=True, user=True)
+
+    def refresh_gate(self, animate: bool = False, user: bool = False) -> None:
+        checked = self.switch.isChecked()
+        self.card.expandButton.setEnabled(checked)
+        if not checked and self.isExpand:
+            self.setExpand(False)
+        self._chev_hover.sync()
+
+    def search_mode(self, active: bool) -> None:
+        if self._handle is not None:
+            self._handle.setVisible(not active)
 
     def enable_reorder(self, key: str, begin) -> None:
         self.nav_key = key
@@ -2409,6 +2794,10 @@ class _SectionCard(ExpandGroupSettingCard):
 
 
 class _ExpandCard(ExpandGroupSettingCard):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._chev_hover = _ChevronHover(self)
 
     def setTitle(self, title: str) -> None:
         self.card.setTitle(title)
@@ -2498,15 +2887,14 @@ def confirm_experimental_features(parent=None) -> bool:
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(8)
     layout.addWidget(StrongBodyLabel(tr_or(
-        'settings.experimental_ack_title', 'Enable experimental features?')))
+        'settings.experimental_ack_title')))
     content = BodyLabel(tr_or(
-        'settings.experimental_ack_content',
-        'Experimental features are unfinished and can affect downloads, installers, or the entire interface. Only continue if you understand the risk.'))
+        'settings.experimental_ack_content'))
     content.setWordWrap(True)
     layout.addWidget(content)
     box.viewLayout.addLayout(layout)
-    box.yesButton.setText(tr_or('settings.experimental_ack_button', 'I understand'))
-    box.cancelButton.setText(tr_or('common.cancel', 'Cancel'))
+    box.yesButton.setText(tr_or('settings.experimental_ack_button'))
+    box.cancelButton.setText(tr_or('common.cancel'))
     if not box.exec():
         return False
     settings.experimental_acknowledged = True
@@ -2515,11 +2903,1018 @@ def confirm_experimental_features(parent=None) -> bool:
     return True
 
 
+def _sfold(text) -> str:
+    out = unicodedata.normalize('NFKD', str(text or '').casefold())
+    return ''.join(c for c in out if not unicodedata.combining(c) and c != '\u0640')
+
+
+def _words(folded: str) -> list:
+    return re.findall(r'\w+', folded)
+
+
+def _stem(w: str) -> str:
+    n = len(w)
+    if n > 4 and w.endswith('ies'):
+        return w[:-3] + 'y'
+    if n > 4 and w.endswith('es'):
+        return w[:-2]
+    if n > 3 and w.endswith('s') and not w.endswith('ss'):
+        return w[:-1]
+    if n > 5 and w.endswith('ing'):
+        return w[:-3]
+    if n > 4 and w.endswith('ed'):
+        return w[:-2]
+    return w
+
+
+_CJK = re.compile(r'[\u0600-\u06ff\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]')
+_SOFT = frozenset(
+    'the a an of to in for and or my on off is it me how do i can change set turn enable disable '
+    'show hide use toggle option options setting settings'.split())
+_NOISE = re.compile(r'^[\d\s%.,:;/+\-]*$')
+
+
+def _dl(a: str, b: str, limit: int) -> int:
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    prev2, prev = None, list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        if min(cur) > limit:
+            return limit + 1
+        prev2, prev = prev, cur
+    return prev[-1]
+
+
+_FUZZ_CACHE: dict = {}
+
+
+def _fuzzy(token: str, word: str) -> bool:
+    n = len(token)
+    if n < 6 or len(word) < 4:
+        return False
+    limit = 1 if n < 9 else 2
+    key = (token, word)
+    hit = _FUZZ_CACHE.get(key)
+    if hit is None:
+        if len(_FUZZ_CACHE) > 20000:
+            _FUZZ_CACHE.clear()
+        hit = token[0] == word[0] and (
+            _dl(token, word, limit) <= limit
+            or (len(word) > n and _dl(token, word[:n], limit) <= limit))
+        _FUZZ_CACHE[key] = hit
+    return hit
+
+
+_SYN: dict = {}
+for _g in (
+        'theme appearance color colour dark light accent mode', 'language lang locale translation',
+        'speed bandwidth limit rate throttle', 'download downloads save folder', 'folder directory path location',
+        'startup launch boot autostart login', 'update upgrade version release',
+        'proxy vpn socks network leak ip kill switch binding interface dns',
+        'torrent seed peer magnet upload ratio', 'shortcut hotkey keybind keyboard', 'font typeface text',
+        'size scale zoom', 'sound audio volume sfx music songs', 'notification notify alert toast',
+        'tray minimize background', 'cache cleanup temporary storage', 'delete remove clear wipe reset',
+        'backup export import restore', 'log logs debug console', 'admin administrator elevated',
+        'encryption encrypt secure privacy anonymous', 'background wallpaper image video gif photo',
+        'animation motion effects', 'game games repack repacks fitgirl gog', 'key token api',
+        'login account password credentials', 'debrid realdebrid alldebrid premium', 'ip address bind',
+        'sections section tabs sidebar navigation library', 'tv television movies series channels',
+        'rom roms minerva emulator', 'book books manga comics', 'history recent searches'):
+    _w = _g.split()
+    for _x in _w:
+        _SYN.setdefault(_x, set()).update(y for y in _w if y != _x)
+
+
+_FIELD_W = {'title': 10.0, 'desc': 5.5, 'ctl': 3.5, 'crumb': 3.0, 'kids': 3.0, 'atitle': 9.0, 'arest': 4.0}
+_KIND = {'exact': 1.0, 'stem': 0.95, 'prefix': 0.8, 'substr': 0.55, 'fuzzy': 0.45}
+
+
+class _Field:
+    __slots__ = ('text', 'words', 'stems', 'compact')
+
+    def __init__(self, text: str):
+        self.text = _sfold(text)
+        ws = _words(self.text)
+        self.words = tuple(dict.fromkeys(ws))
+        self.stems = tuple(_stem(w) for w in self.words)
+        self.compact = re.sub(r'\W+', '', self.text)
+
+
+def _word_kind(token: str, stem: str, word: str, wstem: str):
+    if word == token:
+        return 'exact'
+    if stem == wstem and len(stem) >= 3:
+        return 'stem'
+    if len(token) >= 2 and word.startswith(token):
+        return 'prefix'
+    if (len(token) >= 3 or _CJK.search(token)) and token in word:
+        return 'substr'
+    if _fuzzy(token, word):
+        return 'fuzzy'
+    return None
+
+
+def _best_in_field(alts, field: _Field, weight: float):
+    best, strong = 0.0, False
+    for alt, factor, stem in alts:
+        for word, wstem in zip(field.words, field.stems):
+            kind = _word_kind(alt, stem, word, wstem)
+            if not kind or (factor < 1.0 and kind in ('substr', 'fuzzy')):
+                continue
+            value = weight * _KIND[kind] * factor
+            if value > best:
+                best = value
+            if factor == 1.0 and kind != 'fuzzy':
+                strong = True
+    return best, strong
+
+
+class _Query:
+    def __init__(self, raw: str):
+        self.text = ' '.join(_sfold(raw).split())
+        self.tokens = _words(self.text)
+        self.soft = [t in _SOFT for t in self.tokens]
+        if all(self.soft):
+            self.soft = [False] * len(self.tokens)
+        self.compact = re.sub(r'\W+', '', self.text)
+        self.alts = []
+        for t in self.tokens:
+            alts = [(t, 1.0, _stem(t))]
+            alts += [(s, 0.45, _stem(s)) for s in sorted(_SYN.get(t, ()))]
+            self.alts.append(alts)
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.tokens) and len(self.compact) >= 2
+
+
+def _alive(w) -> bool:
+    return w is not None and shiboken6.isValid(w)
+
+
+def _sis_item(w) -> bool:
+    return (isinstance(getattr(w, 'titleLabel', None), QLabel)
+            and isinstance(getattr(w, 'contentLabel', None), QLabel))
+
+
+def _explicitly_hidden(w) -> bool:
+    return (w.testAttribute(Qt.WidgetAttribute.WA_WState_Hidden)
+            and w.testAttribute(Qt.WidgetAttribute.WA_WState_ExplicitShowHide))
+
+
+def _gate_open(expand) -> bool:
+    check = getattr(expand, 'isChecked', None)
+    if callable(check):
+        with suppress(Exception):
+            return bool(check())
+    return True
+
+
+def _alts(key: str, fallback, kwargs: dict, shown: str = '') -> str:
+    found = []
+    for code in available_languages():
+        with suppress(Exception):
+            text = tr_for(code, key, None, **kwargs)
+            if text and text != key:
+                found.append(text)
+    if fallback:
+        with suppress(Exception):
+            found.append(fallback.format(**kwargs) if kwargs else fallback)
+    return ' '.join(dict.fromkeys(t for t in found if t and t != shown))
+
+
+class _SEntry:
+    def __init__(self, order, key, label, item, unit, container, group, title, desc, ctl):
+        self.order, self.key, self.label = order, key, label
+        self.item, self.unit, self.container = item, unit, container
+        self.title, self.desc = title, desc
+        self.parent: _SEntry | None = None
+        self.kids: list = []
+        self.ctl_text = ctl
+        self.group = group
+        self.f_title, self.f_desc, self.f_ctl = _Field(title), _Field(desc), _Field(ctl)
+        self.f_crumb = _Field('')
+        self.f_atitle = self.f_arest = _Field('')
+        self.alt = ''
+        self.f_kids: _Field | None = None
+        self.avail = True
+        self.strong = True
+
+    def path(self) -> str:
+        parts = [self.label]
+        if self.parent is not None:
+            parts.append(self.parent.title)
+        elif self.group and _sfold(self.group) != _sfold(self.label):
+            parts.append(self.group)
+        return ' \u203a '.join(parts)
+
+
+def _extras(card) -> str:
+    out = []
+    for lbl in card.findChildren(QLabel):
+        if lbl is card.titleLabel or lbl is card.contentLabel:
+            continue
+        out.append(lbl.text())
+        out.append(lbl.toolTip())
+    for btn in card.findChildren(QAbstractButton):
+        if isinstance(btn, SwitchButton):
+            continue
+        out.append(btn.text())
+        out.append(btn.toolTip())
+    for combo in card.findChildren(ComboBox):
+        out += [combo.itemText(i) for i in range(min(combo.count(), 60))]
+    for edit in card.findChildren(QLineEdit):
+        out.append(edit.placeholderText())
+    out.append(card.toolTip())
+    out.append(str(card.property('searchKeywords') or ''))
+    keep = [t.strip() for t in out if t and len(t.strip()) > 1 and not _NOISE.match(t)
+            and t.strip().casefold() not in ('on', 'off')]
+    return ' '.join(dict.fromkeys(keep))
+
+
+def _sscan(host) -> list:
+    entries, headers, binds = [], {}, host.search_binds()
+
+    def alt_text(owners, names, shown=''):
+        out, seen = [], set()
+        for o in owners:
+            if o is None or id(o) in seen:
+                continue
+            seen.add(id(o))
+            for name, key, fb, kw in binds.get(id(o), ()):
+                if name in names:
+                    out.append(_alts(key, fb, kw, shown))
+        return ' '.join(t for t in out if t)
+
+    for order, (key, label, label_alt) in enumerate(host.search_categories()):
+        page = host.search_page(key)
+        if not _alive(page):
+            continue
+        for w in page.findChildren(QWidget):
+            if not _sis_item(w):
+                continue
+            try:
+                title = w.titleLabel.text().strip()
+                if not title:
+                    continue
+                desc = w.contentLabel.text().strip()
+                owner, expand, group, group_alt, hidden = w.parentWidget(), None, '', '', _explicitly_hidden(w)
+                while owner is not None and owner is not page:
+                    hidden = hidden or _explicitly_hidden(owner)
+                    if expand is None and isinstance(owner, ExpandGroupSettingCard):
+                        expand = owner
+                    if isinstance(owner, SettingCardGroup):
+                        if not _explicitly_hidden(owner.titleLabel):
+                            group = owner.titleLabel.text().strip()
+                            group_alt = alt_text((owner.titleLabel,), ('setText',), group)
+                        break
+                    owner = owner.parentWidget()
+                if hidden:
+                    continue
+                unit, container = w, expand
+                if expand is not None and expand.card is w:
+                    unit, container = expand, None
+                    up = expand.parentWidget()
+                    while up is not None and up is not page and not isinstance(up, ExpandGroupSettingCard):
+                        up = up.parentWidget()
+                    container = up if isinstance(up, ExpandGroupSettingCard) else None
+                entry = _SEntry(order, key, label, w, unit, container, group, title, desc, _extras(w))
+                a_title = alt_text((w, unit, w.titleLabel), ('setTitle', 'setText'), title)
+                a_rest = alt_text((w, unit, w.contentLabel), ('setContent', 'setText'), desc)
+                a_ctl = []
+                for child in w.findChildren(QWidget):
+                    if child is not w.titleLabel and child is not w.contentLabel:
+                        a_ctl.append(alt_text((child,), ('setText', 'setToolTip', 'setPlaceholderText')))
+                entry.f_atitle = _Field(a_title)
+                entry.f_arest = _Field(' '.join([a_rest, *a_ctl, label_alt, group_alt]))
+                entry.alt = ' '.join([a_title, a_rest, *a_ctl])
+            except (RuntimeError, AttributeError):
+                continue
+            entries.append(entry)
+            if unit is not w:
+                headers[id(unit)] = entry
+    for e in entries:
+        if e.container is not None:
+            e.parent = headers.get(id(e.container))
+            if e.parent is not None:
+                e.parent.kids.append(e)
+        crumbs = [e.label, e.group, e.parent.title if e.parent else '', e.parent.f_atitle.text if e.parent else '']
+        e.f_crumb = _Field(' '.join(crumbs))
+    return entries
+
+
+def _savail(e: _SEntry) -> bool:
+    if not (_alive(e.item) and _alive(e.unit)):
+        return False
+    if e.parent is not None:
+        if not _alive(e.parent.unit) or not _gate_open(e.parent.unit) or not e.item.isEnabled():
+            return False
+    return True
+
+
+def _bonus(ft: _Field, fd: _Field, q: _Query) -> float:
+    if not ft.text:
+        return 0.0
+    value = 100.0 if ft.text == q.text else 60.0 if ft.text.startswith(q.text) else 0.0
+    if len(q.tokens) > 1:
+        phrase = r'(?<!\w)' + re.escape(q.text)
+        value += 35 * bool(re.search(phrase, ft.text)) + 14 * bool(re.search(phrase, fd.text))
+    if all(_best_in_field(a, ft, 1.0)[0] for a in q.alts):
+        value += 20
+    if len(q.compact) >= 3:
+        value += 30 * (q.compact in ft.compact) + 12 * (q.compact in fd.compact)
+    return value
+
+
+def _sscore(entry: _SEntry, q: _Query) -> float:
+    fields = (('title', entry.f_title), ('desc', entry.f_desc), ('ctl', entry.f_ctl),
+              ('crumb', entry.f_crumb), ('kids', entry.f_kids), ('atitle', entry.f_atitle), ('arest', entry.f_arest))
+    total, matched, needed, required, solid = 0.0, 0, 0, 0, 0
+    for alts, soft in zip(q.alts, q.soft):
+        best, hard = 0.0, False
+        for name, field in fields:
+            if field is not None:
+                got, strong = _best_in_field(alts, field, _FIELD_W[name])
+                best, hard = max(best, got), hard or strong
+        if not soft:
+            required += 1
+            if best:
+                needed += 1
+                solid += hard
+        if best:
+            matched += 1
+        total += best
+    n = len(q.tokens)
+    allowed_miss = 1 if required >= 4 else 0
+    if needed < required - allowed_miss:
+        if not (len(q.compact) >= 3 and (q.compact in entry.f_title.compact or q.compact in entry.f_desc.compact)):
+            return 0.0
+    entry.strong = solid >= required - allowed_miss
+    value = total * (matched / n) + max(
+        _bonus(entry.f_title, entry.f_desc, q), _bonus(entry.f_atitle, entry.f_arest, q))
+    if entry.parent is None:
+        value += 2
+    return value
+
+
+def _srank(entries: list, q: _Query) -> list:
+    for e in entries:
+        e.avail = _savail(e)
+    for e in entries:
+        gone = [k for k in e.kids if not k.avail] if e.kids else []
+        e.f_kids = _Field(' '.join(f'{k.title} {k.desc} {k.ctl_text} {k.alt}' for k in gone)) if gone else None
+    scored = []
+    for e in entries:
+        if not e.avail:
+            continue
+        s = _sscore(e, q)
+        if s > 0:
+            scored.append((-s, e.order, id(e), e))
+    scored.sort(key=lambda t: t[:3])
+    if any(t[3].strong for t in scored):
+        scored = [t for t in scored if t[3].strong]
+    return [t[3] for t in scored[:60]]
+
+
+def _shighlight_markup(text: str, q: _Query, style: str):
+    chars, idx = [], []
+    for i, ch in enumerate(text):
+        for piece in unicodedata.normalize('NFKD', ch.casefold()):
+            if not unicodedata.combining(piece) and piece != '\u0640':
+                chars.append(piece)
+                idx.append(i)
+    folded = ''.join(chars)
+    spans = []
+    for m in re.finditer(r'\w+', folded):
+        word = m.group()
+        wstem = _stem(word)
+        for token in q.tokens:
+            if len(token) < 2:
+                continue
+            kind = _word_kind(token, _stem(token), word, wstem)
+            if kind == 'prefix':
+                spans.append((m.start(), m.start() + len(token)))
+            elif kind == 'substr':
+                at = word.find(token)
+                spans.append((m.start() + at, m.start() + at + len(token)))
+            elif kind in ('exact', 'stem', 'fuzzy'):
+                spans.append((m.start(), m.end()))
+    if not spans or not idx:
+        return None
+    spans.sort()
+    merged = [list(spans[0])]
+    for a, b in spans[1:]:
+        if a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    out, last = [], 0
+    for a, b in merged:
+        start, end = idx[a], idx[b - 1] + 1
+        out.append(html.escape(text[last:start]))
+        out.append(f'<span style="{style}">{html.escape(text[start:end])}</span>')
+        last = end
+    out.append(html.escape(text[last:]))
+    return ''.join(out)
+
+
+def _expand_list(layout):
+    return getattr(layout, '_ExpandLayout__widgets', None)
+
+
+def _home_of(unit):
+    parent = unit.parentWidget()
+    if parent is None:
+        return None
+    layouts = []
+    if parent.layout() is not None:
+        layouts.append(parent.layout())
+    layouts += parent.findChildren(QLayout)
+    for layout in layouts:
+        lst = _expand_list(layout)
+        if lst is not None:
+            if unit in lst:
+                return layout, lst.index(unit), parent
+            continue
+        index = layout.indexOf(unit)
+        if index >= 0:
+            return layout, index, parent
+    return None
+
+
+def _detach(unit, layout) -> None:
+    lst = _expand_list(layout)
+    if lst is not None:
+        with suppress(ValueError):
+            lst.remove(unit)
+        with suppress(Exception):
+            unit.removeEventFilter(layout)
+    else:
+        layout.removeWidget(unit)
+
+
+def _attach(unit, layout, index, parent) -> None:
+    lst = _expand_list(layout)
+    if lst is not None:
+        unit.setParent(parent)
+        lst.insert(min(index, len(lst)), unit)
+        unit.installEventFilter(layout)
+    else:
+        layout.insertWidget(min(index, layout.count()), unit)
+    unit.show()
+    layout.invalidate()
+
+
+def _snap_expand(card, state: bool) -> None:
+    if card.isExpand == state:
+        return
+    card.setExpand(state)
+    with suppress(Exception):
+        card.expandAni.setCurrentTime(card.expandAni.duration())
+
+
+class _SettingsSearch(QObject):
+    def __init__(self, host, edit, parent=None):
+        super().__init__(parent)
+        self.host, self.edit, self.active = host, edit, False
+        self._entries, self._dirty, self._sig = None, True, None
+        self._homes, self._junk, self._undo = [], [], []
+        self._page = self._layout = None
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(120)
+        self._timer.timeout.connect(self.run)
+        edit.textChanged.connect(lambda _t: self._timer.start())
+        edit.searchSignal.connect(lambda _t: self.run())
+
+    def invalidate(self) -> None:
+        self._restore()
+        self._dirty, self._sig = True, None
+        if self.active:
+            self._timer.start()
+
+    def run(self) -> None:
+        q = _Query(self.edit.text())
+        if not q.usable:
+            self.exit()
+            return
+        pending = self.host.search_prepare()
+        if self._dirty or pending or self._entries is None:
+            self._restore()
+            self._entries, self._dirty, self._sig = _sscan(self.host), bool(pending), None
+        hits = _srank(self._entries, q)
+        sig = (tuple(id(e) for e in hits), tuple(q.tokens))
+        if not (self.active and sig == self._sig):
+            self._present(hits, q)
+            self._sig = sig
+        if pending:
+            self._timer.start(250)
+
+    def exit(self, clear: bool = False) -> None:
+        if clear and self.edit.text():
+            self.edit.blockSignals(True)
+            self.edit.clear()
+            self.edit.blockSignals(False)
+        if not self.active:
+            self._dirty = self._dirty or clear
+            return
+        self.active, self._sig = False, None
+        self._restore()
+        self.host.search_chrome(False)
+        self.host.search_show_selected()
+        self._entries, self._dirty = None, True
+
+    def _ensure_page(self):
+        if self._page is None:
+            page = self._page = self.host.search_scroll_factory(self.host.search_stack())
+            page.setWidgetResizable(True)
+            page.setFrameShape(QFrame.Shape.NoFrame)
+            page.setStyleSheet('QScrollArea { background: transparent; border: none; }')
+            page.viewport().setStyleSheet('background: transparent;')
+            box = QWidget()
+            box.setStyleSheet('background: transparent;')
+            page.setWidget(box)
+            self._layout = QVBoxLayout(box)
+            self._layout.setContentsMargins(24, 4, 28, 24)
+            self._layout.setSpacing(4)
+            self._layout.addStretch(1)
+            self.host.search_stack().addWidget(page)
+        return self._page
+
+    def _present(self, hits: list, q: _Query) -> None:
+        self._restore()
+        page, layout = self._ensure_page(), self._layout
+        page.setUpdatesEnabled(False)
+
+        def add(widget, own: bool = True) -> None:
+            if own:
+                self._junk.append(widget)
+            layout.insertWidget(layout.count() - 1, widget)
+
+        try:
+            hitset = {id(e) for e in hits}
+            with_kids = {id(e.parent) for e in hits if e.parent is not None}
+            groups: dict = {}
+            for e in hits:
+                if e.parent is not None and id(e.parent) in hitset and _gate_open(e.parent.unit):
+                    continue
+                home = _home_of(e.unit)
+                if home is not None:
+                    groups.setdefault(e.path(), []).append((e, home))
+            placed = [pair for items in groups.values() for pair in items]
+            self._homes = [(e.unit, *home) for e, home in placed]
+            for e, home in placed:
+                _detach(e.unit, home[0])
+            expandable = sum(isinstance(e.unit, ExpandGroupSettingCard) for e, _ in placed)
+            dark, shown = isDarkTheme(), 0
+            row_css = ('QFrame#searchRow { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.06); border-radius: 6px; }'
+                       if dark else
+                       'QFrame#searchRow { background: rgba(0,0,0,0.04); border: 1px solid rgba(0,0,0,0.06); border-radius: 6px; }')
+            for path, items in groups.items():
+                caption = CaptionLabel(path)
+                caption.setContentsMargins(4, 10, 0, 2)
+                self._junk.append(caption)
+                layout.insertWidget(layout.count() - 1, caption)
+                for e, _home in items:
+                    unit = holder = e.unit
+                    if callable(getattr(unit, 'search_mode', None)):
+                        unit.search_mode(True)
+                    if isinstance(unit, ExpandGroupSettingCard):
+                        want = _gate_open(unit) and (id(e) in with_kids or expandable <= 3) and bool(unit.widgets)
+                        self._undo.append((unit, lambda u=unit, s=unit.isExpand: _snap_expand(u, s)))
+                        _snap_expand(unit, want)
+                    elif not isinstance(unit, SettingCard):
+                        holder = QFrame()
+                        holder.setObjectName('searchRow')
+                        holder.setStyleSheet(row_css)
+                        holder.setMinimumHeight(70)
+                        for lbl, px in ((unit.titleLabel, 14), (unit.contentLabel, 12)):
+                            font = QFont(lbl.font())
+                            self._undo.append((lbl, lambda l=lbl, f=lbl.font(): l.setFont(f)))
+                            font.setPixelSize(px)
+                            lbl.setFont(font)
+                        QVBoxLayout(holder).setContentsMargins(0, 0, 0, 0)
+                        holder.layout().addWidget(unit)
+                    add(holder, holder is not unit)
+                    unit.show()
+                    holder.show()
+                    self._highlight(unit, q)
+                    shown += 1
+                    if shown < 30:
+                        self.host.search_fade(holder, 90 + 18 * min(shown, 8))
+            if not placed:
+                label = BodyLabel(self.host.search_tr('settings.search_empty', 'No matching settings'))
+                label.setContentsMargins(4, 16, 0, 0)
+                add(label)
+        finally:
+            page.setUpdatesEnabled(True)
+        self.active = True
+        self.host.search_chrome(True)
+        self.host.search_stack().setCurrentWidget(page)
+        page.verticalScrollBar().setValue(0)
+
+    def _highlight(self, unit, q: _Query) -> None:
+        accent = QColor(themeColor())
+        style = f'background-color:{accent.name()}; color:{"#000000" if accent.lightness() > 150 else "#ffffff"};'
+        for card in ([unit] if _sis_item(unit) else []) + [w for w in unit.findChildren(QWidget) if _sis_item(w)]:
+            for lbl in (card.titleLabel, card.contentLabel):
+                text = lbl.text()
+                markup = _shighlight_markup(text, q, style) if text else None
+                if markup:
+                    self._undo.append((lbl, lambda l=lbl, t=text, f=lbl.textFormat(): (l.setTextFormat(f), l.setText(t))))
+                    lbl.setTextFormat(Qt.TextFormat.RichText)
+                    lbl.setText(markup)
+
+    def _restore(self) -> None:
+        for widget, undo in reversed(self._undo):
+            if _alive(widget):
+                undo()
+        self._undo = []
+        touched = []
+        for unit, layout, index, parent in sorted(self._homes, key=lambda h: (id(h[1]), h[2])):
+            if not _alive(unit):
+                continue
+            if callable(getattr(unit, 'search_mode', None)):
+                unit.search_mode(False)
+            holder = unit.parentWidget()
+            if holder is not None and holder.objectName() == 'searchRow':
+                holder.layout().removeWidget(unit)
+            if _alive(layout) and _alive(parent):
+                _attach(unit, layout, index, parent)
+                touched.append(parent)
+            else:
+                unit.deleteLater()
+        self._homes = []
+        for widget in self._junk:
+            if _alive(widget):
+                widget.hide()
+                widget.deleteLater()
+        self._junk = []
+        for owner in touched:
+            for _ in range(8):
+                if owner is None:
+                    break
+                with suppress(Exception):
+                    if isinstance(owner, ExpandGroupSettingCard):
+                        owner.viewLayout.invalidate()
+                        owner._adjustViewSize()
+                    elif isinstance(owner, SettingCardGroup):
+                        owner.adjustSize()
+                owner = owner.parentWidget()
+
+
+_UPDATE_INFO = {'ts': 0.0, 'channels': None}
+
+
+def _ago(ts: float) -> str:
+    if not ts:
+        return tr_or('update.never_checked')
+    d = max(0, int(time.time() - ts))
+    if d < 45:
+        return tr_or('update.just_now')
+    if d < 3600:
+        return tr_or('update.min_ago', n=max(1, d // 60))
+    if d < 86400:
+        return tr_or('update.hours_ago', n=d // 3600)
+    return time.strftime('%b %d, %H:%M', time.localtime(ts))
+
+
+class _UpdateButton(TransparentToolButton):
+    state = ''
+    busy = False
+    expandRequested = Signal()
+    _CHEV = 22
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._phase = 0.0
+        self._open = False
+        self._chev_down = False
+        self._chev_hover = False
+        self.setMouseTracking(True)
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setDuration(520)
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._anim.valueChanged.connect(self._tick)
+        self._anim.finished.connect(lambda: self._tick(0.0))
+        self.pressed.connect(self._spin)
+        self._pulse = QVariantAnimation(self)
+        self._pulse.setStartValue(0.0)
+        self._pulse.setEndValue(1.0)
+        self._pulse.setDuration(1800)
+        self._pulse.setLoopCount(-1)
+        self._pulse.valueChanged.connect(lambda _v: self.update())
+
+    def set_busy(self, busy: bool) -> None:
+        self.busy = busy
+        self._anim.setLoopCount(-1 if busy else 1)
+        if busy:
+            self._spin()
+
+    def set_open(self, value: bool) -> None:
+        self._open = value
+        self.update()
+
+    def _spin(self) -> None:
+        if animations_enabled() and self._anim.state() != QVariantAnimation.State.Running:
+            self._anim.start()
+
+    def set_state(self, state: str) -> None:
+        self.state = state
+        if state == 'found' and animations_enabled():
+            if self._pulse.state() != QVariantAnimation.State.Running:
+                self._pulse.start()
+        else:
+            self._pulse.stop()
+        self.update()
+
+    def _tick(self, value) -> None:
+        self._phase = float(value)
+        self.update()
+
+    def _in_chev(self, event) -> bool:
+        return event.position().x() >= self.width() - self._CHEV
+
+    def mousePressEvent(self, event) -> None:
+        if self._in_chev(event):
+            self._chev_down = True
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._chev_down:
+            self._chev_down = False
+            if self._in_chev(event):
+                self.expandRequested.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        hover = self._in_chev(event)
+        if hover != self._chev_hover:
+            self._chev_hover = hover
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._chev_hover = False
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if not self.isEnabled():
+            painter.setOpacity(0.6)
+        w, h = self.width(), self.height()
+        dark = isDarkTheme()
+        found, latest = self.state == 'found', self.state == 'latest'
+        base = QColor(themeColor()) if found else QColor('#3fb950')
+        ink = QColor(255, 255, 255, 215) if dark else QColor(0, 0, 0, 185)
+        if found or latest:
+            fill = QColor(base)
+            fill.setAlpha(255 if found else 46)
+            glow = 0.5 + 0.5 * math.sin(float(self._pulse.currentValue() or 0.0) * 2 * math.pi) if found else 1.0
+            edge = QColor(255, 255, 255, int(60 + 120 * glow)) if found else base
+            ink = (QColor('#000000') if base.lightness() > 150 else QColor('#ffffff')) if found else base
+        else:
+            fill = QColor(255, 255, 255, 22 if self.underMouse() else 13) if dark else QColor(0, 0, 0, 16 if self.underMouse() else 9)
+            edge = QColor(255, 255, 255, 18) if dark else QColor(0, 0, 0, 22)
+        painter.setPen(QPen(edge, 1.4))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 8, 8)
+        split = w - self._CHEV
+        if self._chev_hover or self._open:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(ink.red(), ink.green(), ink.blue(), 34))
+            painter.drawRoundedRect(QRectF(split + 1, 3, self._CHEV - 4, h - 6), 6, 6)
+        painter.setPen(QPen(QColor(ink.red(), ink.green(), ink.blue(), 55), 1))
+        painter.drawLine(QPointF(split, 8), QPointF(split, h - 8))
+        pixmap = themed_icon('settings.update', FluentIcon.SYNC).pixmap(16, 16)
+        if found or latest:
+            pixmap = QPixmap(pixmap)
+            tp = QPainter(pixmap)
+            tp.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+            tp.fillRect(pixmap.rect(), ink)
+            tp.end()
+        painter.translate(split / 2, h / 2)
+        painter.rotate(360.0 * self._phase)
+        painter.drawPixmap(-8, -8, pixmap)
+        painter.resetTransform()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(ink, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        cx, cy = split + (self._CHEV - 2) / 2, h / 2
+        sign = -1 if self._open else 1
+        painter.drawPolyline([QPointF(cx - 3.6, cy - 1.8 * sign), QPointF(cx, cy + 1.8 * sign),
+                              QPointF(cx + 3.6, cy - 1.8 * sign)])
+        painter.setPen(Qt.PenStyle.NoPen)
+        if found:
+            painter.setBrush(QColor('#ff4d4f'))
+            painter.setPen(QPen(base, 1.6))
+            painter.drawEllipse(QPointF(split - 5, 6), 4.4, 4.4)
+        elif latest:
+            painter.setBrush(QColor('#3fb950'))
+            painter.drawEllipse(QPointF(split - 6, h - 7), 5.6, 5.6)
+            painter.setPen(QPen(QColor('white'), 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolyline([QPointF(split - 8.6, h - 7), QPointF(split - 6.6, h - 5.2), QPointF(split - 3.4, h - 8.6)])
+
+
+_STABLE_BLUE, _CANARY_GOLD = '#4c9aff', '#f5c542'
+
+
+def _rgba(color: str, alpha: float) -> str:
+    c = QColor(color)
+    return f'rgba({c.red()},{c.green()},{c.blue()},{alpha})'
+
+
+class _ChannelRow(QFrame):
+    updateClicked = Signal()
+
+    def __init__(self, icon, color: str, parent=None):
+        super().__init__(parent)
+        self._icon, self._color = icon, color
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+        self.tile = QLabel()
+        self.tile.setFixedSize(32, 32)
+        self.tile.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        text = QVBoxLayout()
+        text.setSpacing(1)
+        self.name = BodyLabel()
+        self.sub = CaptionLabel()
+        text.addWidget(self.name)
+        text.addWidget(self.sub)
+        self.button = PushButton()
+        self.button.setFixedHeight(26)
+        self.button.clicked.connect(self.updateClicked)
+        self.switch = SwitchButton(self)
+        self.switch.setOnText('')
+        self.switch.setOffText('')
+        row.addWidget(self.tile)
+        row.addLayout(text, 1)
+        row.addWidget(self.button)
+        row.addWidget(self.switch)
+
+    def apply(self, name: str, sub: str, sub_color: str, update: str, switch, update_text: str) -> None:
+        self.name.setText(name)
+        self.sub.setText(sub)
+        self.sub.setStyleSheet(f'color: {sub_color}; background: transparent;')
+        self.tile.setStyleSheet(f'background: {_rgba(self._color, 0.16)}; border-radius: 9px;')
+        self.tile.setPixmap(self._icon.icon(color=QColor(self._color)).pixmap(16, 16))
+        ink = '#000000' if QColor(self._color).lightness() > 130 else '#ffffff'
+        self.button.setText(update_text)
+        self.button.setVisible(bool(update))
+        self.button.setStyleSheet(
+            f'QPushButton {{ background: {self._color}; color: {ink}; border: none; border-radius: 7px;'
+            f' padding: 0 12px; font-weight: 600; }} QPushButton:hover {{ background: {_rgba(self._color, 0.85)}; }}'
+            f'QPushButton:pressed {{ background: {_rgba(self._color, 0.7)}; }}')
+        self.switch.setVisible(switch is not None)
+        if switch is not None:
+            self.switch.blockSignals(True)
+            self.switch.setChecked(bool(switch))
+            self.switch.blockSignals(False)
+
+
+class _UpdatePopup(QWidget):
+    checkRequested = Signal()
+    channelChosen = Signal(str)
+    canaryToggled = Signal(bool)
+    autoToggled = Signal(bool)
+    closed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoMouseReplay)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 8, 16, 20)
+        self.card = QFrame(self)
+        self.card.setObjectName('updCard')
+        shadow = QGraphicsDropShadowEffect(self.card)
+        shadow.setBlurRadius(30)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(0, 0, 0, 130))
+        self.card.setGraphicsEffect(shadow)
+        outer.addWidget(self.card)
+        col = QVBoxLayout(self.card)
+        col.setContentsMargins(16, 14, 16, 12)
+        col.setSpacing(12)
+        head = QHBoxLayout()
+        self._title = StrongBodyLabel()
+        self._chip = QLabel()
+        head.addWidget(self._title)
+        head.addStretch(1)
+        head.addWidget(self._chip)
+        col.addLayout(head)
+        self._stable = _ChannelRow(FluentIcon.CERTIFICATE, _STABLE_BLUE, self.card)
+        self._canary = _ChannelRow(FluentIcon.DEVELOPER_TOOLS, _CANARY_GOLD, self.card)
+        self._stable.updateClicked.connect(lambda: self.channelChosen.emit('stable'))
+        self._canary.updateClicked.connect(lambda: self.channelChosen.emit('canary'))
+        self._canary.switch.checkedChanged.connect(self.canaryToggled)
+        col.addWidget(self._stable)
+        col.addWidget(self._canary)
+        self._line = QFrame()
+        self._line.setFixedHeight(1)
+        self._line.setObjectName('updLine')
+        col.addWidget(self._line)
+        auto = QHBoxLayout()
+        self._auto_label = BodyLabel()
+        self._auto = SwitchButton(self.card)
+        self._auto.setOnText('')
+        self._auto.setOffText('')
+        self._auto.checkedChanged.connect(self.autoToggled)
+        auto.addWidget(self._auto_label)
+        auto.addStretch(1)
+        auto.addWidget(self._auto)
+        col.addLayout(auto)
+        foot = QHBoxLayout()
+        self._checked = CaptionLabel()
+        self._button = TransparentPushButton(FluentIcon.SYNC, '')
+        self._button.setFixedHeight(28)
+        self._button.clicked.connect(self.checkRequested)
+        foot.addWidget(self._checked)
+        foot.addStretch(1)
+        foot.addWidget(self._button)
+        col.addLayout(foot)
+        self.setFixedWidth(390)
+        self._target = QPoint()
+        self._open_anim = QVariantAnimation(self)
+        self._open_anim.setStartValue(0.0)
+        self._open_anim.setEndValue(1.0)
+        self._open_anim.setDuration(150)
+        self._open_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._open_anim.valueChanged.connect(self._open_step)
+
+    def _open_step(self, value) -> None:
+        v = float(value)
+        self.setWindowOpacity(v)
+        self.move(self._target.x(), self._target.y() - round(8 * (1.0 - v)))
+
+    def fill(self, d: dict) -> None:
+        pal = palette()
+        bg = pal.get('dialog_bg') or pal.get('card_bg') or ('#262626' if isDarkTheme() else '#fcfcfc')
+        border = pal.get('dialog_border') or pal.get('card_border') or 'rgba(255,255,255,0.10)'
+        line = pal.get('surface_border') or border
+        self.card.setStyleSheet(
+            'QFrame#updCard { background: %s; border: 1px solid %s; border-radius: 14px; }'
+            'QFrame#updLine { background: %s; border: none; }' % (bg, border, line))
+        self._title.setText(d['title'])
+        self._chip.setText(d['version'])
+        self._chip.setStyleSheet(
+            f'background: {_rgba(d["here"], 0.16)}; color: {d["here"]}; border-radius: 9px;'
+            ' padding: 3px 10px; font-size: 11px; font-weight: 600;')
+        for row, key in ((self._stable, 'stable'), (self._canary, 'canary')):
+            name, sub, sub_color, update, switch = d[key]
+            row.apply(name, sub, sub_color, update, switch, d['update'])
+        self._auto_label.setText(d['auto_text'])
+        self._auto.blockSignals(True)
+        self._auto.setChecked(d['auto'])
+        self._auto.blockSignals(False)
+        self._checked.setText(d['checked'])
+        self._button.setText(d['check'])
+        self._button.setEnabled(not d['busy'])
+        self.adjustSize()
+
+    def show_under(self, button) -> None:
+        self.adjustSize()
+        self._target = button.mapToGlobal(QPoint(button.width() - self.width() + 16, button.height() - 6))
+        self._open_anim.stop()
+        if animations_enabled():
+            self.setWindowOpacity(0.0)
+            self.move(self._target.x(), self._target.y() - 8)
+            self.show()
+            self._open_anim.start()
+        else:
+            self.setWindowOpacity(1.0)
+            self.move(self._target)
+            self.show()
+
+    def hideEvent(self, event) -> None:
+        self._open_anim.stop()
+        self.setWindowOpacity(1.0)
+        super().hideEvent(event)
+        self.closed.emit()
+
+
 class SettingsPage(QWidget):
     settings_changed = Signal()
     _cache_size_ready = Signal(int)
     _cache_clear_finished = Signal(str)
+    _live_wipe_finished = Signal(str)
     _vyla_update_finished = Signal(str, str)
+    _channels_ready = Signal(object)
 
     _CATEGORIES = (
         ('appearance', 'settings.tab_appearance', 'Appearance'),
@@ -2536,6 +3931,8 @@ class SettingsPage(QWidget):
         'proxy_address': FluentIcon.WIFI,
         'proxy_login': FluentIcon.PEOPLE,
         'bind': FluentIcon.WIFI,
+        'leak': FluentIcon.GLOBE,
+        'block_ipv6': FluentIcon.GLOBE,
         'proxy': FluentIcon.GLOBE,
         'proxy_peers': FluentIcon.SHARE,
         'force_proxy': FluentIcon.CANCEL,
@@ -2565,8 +3962,8 @@ class SettingsPage(QWidget):
         **dict.fromkeys(('_chk_minerva', '_chk_minerva_extract', '_chk_pc_games', '_chk_music', '_chk_books',
                          '_chk_youtube', '_chk_tv', '_chk_tbhb'), 'sections'),
         **dict.fromkeys(('_chk_external_client', '_chk_launch_startup'), 'integrations'),
-        **dict.fromkeys(('_chk_admin_mode', '_chk_show_console', '_chk_log_to_file', '_chk_auto_update',
-                         '_chk_canary_update', '_chk_auto_install'), 'advanced'),
+        **dict.fromkeys(('_chk_admin_mode', '_chk_show_console', '_chk_log_to_file',
+                         '_chk_auto_install'), 'advanced'),
         '_chk_sailseek': 'sailseek',
     }
     _GROUP_TARGETS = {
@@ -2576,6 +3973,9 @@ class SettingsPage(QWidget):
         'settings.group_downloads_network': ('downloads', '_dl_group'),
         'settings.group_network': ('network', '_privacy_group'),
         'settings.privacy_group': ('network', '_privacy_group'),
+        'settings.group_vpn': ('network', '_privacy_group'),
+        'settings.group_proxy': ('network', '_proxy_group'),
+        'settings.group_privacy': ('network', '_privacy_opts_group'),
         'settings.group_features': ('sections', '_feature_group'),
         'settings.group_sections': ('sections', '_feature_group'),
         'settings.group_sound': ('appearance', '_sound_group'),
@@ -2621,9 +4021,19 @@ class SettingsPage(QWidget):
         self._sailseek_status_lbl = None
         self._net_apply = None
         self._net_loading = False
+        self._ip_testing = False
         self._net_widgets = {}
         self._theme_dirty = False
         self._scroll = None
+        self._search = None
+        self._search_engine = None
+        self._update_btn = None
+        self._update_result = None
+        self._update_popup = None
+        self._popup_closed_at = 0.0
+        self._probing = False
+        self._silent_check = False
+        self._channels_ready.connect(self._on_channels_ready)
         self.setStyleSheet('background: transparent;')
         self._pending_group_adjust = set()
         self._active_category = self._CATEGORIES[0][0]
@@ -2653,14 +4063,21 @@ class SettingsPage(QWidget):
             return object.__getattribute__(self, name)
         raise AttributeError(name)
 
+    def _next_unloaded(self) -> str | None:
+        return next((key for key, _t, _f in self._CATEGORIES if key not in self._loaded), None)
+
     def _try_prebuild(self) -> None:
-        if self._built or self._jobs:
+        if self._jobs or (self._built and not self.isVisible()):
+            return
+        key = self._next_unloaded() if self._built else self._selected_category
+        if key is None:
             return
         app = QApplication.instance()
-        if app is not None and app.activeModalWidget() is not None:
+        accent = self.__dict__.get('_accent_timer')
+        if (app is not None and app.activeModalWidget() is not None) or (accent is not None and accent.isActive()):
             self._prebuild_timer.start(600)
             return
-        self._ensure_category(self._selected_category, sliced=True)
+        self._ensure_category(key, sliced=True)
 
     def _ensure_shell(self) -> None:
         if self._shell:
@@ -2671,20 +4088,19 @@ class SettingsPage(QWidget):
             self.setStyleSheet(settings_qss())
             self._surface_styled = True
         self._make_shell()
+        self._shell_texts = list(self._texts)
         register_locale_refresh(self, self._apply_locale)
         register_theme_refresh(self, self._on_theme_refresh)
 
     def _ensure_category(self, key: str, sliced: bool = False) -> None:
         self._ensure_shell()
         if key in self._loaded:
-            if key in self._jobs and not sliced:
-                self._advance_job(key)
+            if key in self._jobs and not sliced and not self._advance_job(key, 0.035):
+                self._schedule_jobs()
             return
         self._start_job(key)
-        if sliced:
+        if sliced or not self._advance_job(key, 0.035):
             self._schedule_jobs()
-        else:
-            self._advance_job(key)
 
     def _start_job(self, key: str) -> None:
         self._loaded.add(key)
@@ -2771,6 +4187,9 @@ class SettingsPage(QWidget):
         self._flush_group_adjust()
         _restyle_setting_cards(page)
         self._built = True
+        self._search_invalidate()
+        if self.isVisible():
+            self._prebuild_timer.start(150)
 
     def _make_shell(self) -> None:
         outer = QVBoxLayout(self)
@@ -2779,10 +4198,20 @@ class SettingsPage(QWidget):
         self._category_bar = QWidget(self)
         self._category_bar.setObjectName('settingsCategoryBar')
         self._category_bar.setStyleSheet('background: transparent;')
-        self._category_flow = FlowLayout(self._category_bar)
-        self._category_flow.setContentsMargins(24, 10, 28, 4)
+        bar = QHBoxLayout(self._category_bar)
+        bar.setContentsMargins(0, 0, 20, 0)
+        bar.setSpacing(8)
+        self._category_flow_host = QWidget(self._category_bar)
+        self._category_flow = FlowLayout(self._category_flow_host)
+        self._category_flow.setContentsMargins(24, 10, 0, 4)
         self._category_flow.setHorizontalSpacing(6)
         self._category_flow.setVerticalSpacing(6)
+        bar.addWidget(self._category_flow_host, 1)
+        self._bar_spacer = QWidget(self._category_bar)
+        self._bar_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._bar_spacer.hide()
+        bar.addWidget(self._bar_spacer, 1)
+        bar.addWidget(self._make_tools(), 0, Qt.AlignmentFlag.AlignTop)
         outer.addWidget(self._category_bar)
         self._category_group = QButtonGroup(self)
         self._category_group.setExclusive(True)
@@ -2792,6 +4221,96 @@ class SettingsPage(QWidget):
         for key, text_key, fallback in self._CATEGORIES:
             self._make_category_button(key, text_key, fallback)
         self._category_buttons[self._selected_category].setChecked(True)
+
+    def _make_tools(self) -> QWidget:
+        tools = QWidget(self._category_bar)
+        tools.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        row = QHBoxLayout(tools)
+        row.setContentsMargins(0, 10, 0, 4)
+        row.setSpacing(6)
+        self._search = SearchLineEdit(tools)
+        self._search.setFixedSize(200, 30)
+        self._bind(self._search.setPlaceholderText, 'settings.search_placeholder')
+        from src.gui.stuff import search_history
+        search_history.attach(self._search, 'settings', on_pick=lambda _value: None)
+        self._search.installEventFilter(self)
+        self._search_engine = _SettingsSearch(self, self._search, self)
+        self._update_btn = _UpdateButton(tools)
+        apply_tool_button_theme(self._update_btn)
+        self._update_btn.setFixedSize(54, 30)
+        self._update_btn.expandRequested.connect(self._show_update_popup)
+        QTimer.singleShot(8000, self._auto_check_updates)
+        self._bind(self._update_btn.setToolTip, 'settings.check_for_updates')
+        self._update_btn.clicked.connect(self._on_update_button)
+        row.addWidget(self._search, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(self._update_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        find = QShortcut(QKeySequence(QKeySequence.StandardKey.Find), self)
+        find.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        find.activated.connect(self._focus_search)
+        return tools
+
+    def _focus_search(self) -> None:
+        self._search.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self._search.selectAll()
+
+    def _search_invalidate(self) -> None:
+        if self._search_engine is not None:
+            self._search_engine.invalidate()
+
+    def _exit_search(self, clear: bool = False) -> None:
+        if self._search_engine is not None:
+            self._search_engine.exit(clear)
+
+    def _hide_results(self) -> None:
+        self._exit_search(True)
+
+    @property
+    def _searching(self) -> bool:
+        return bool(self._search_engine is not None and self._search_engine.active)
+
+    def search_categories(self) -> list:
+        return [(key, self._category_buttons[key].text(),
+                 _alts(text_key, fallback, {}, self._category_buttons[key].text()))
+                for key, text_key, fallback in self._CATEGORIES if key in self._category_buttons]
+
+    def search_binds(self) -> dict:
+        out: dict = {}
+        for setter, key, fallback, kwargs in self._texts:
+            owner = getattr(setter, '__self__', None)
+            if owner is not None:
+                out.setdefault(id(owner), []).append((getattr(setter, '__name__', ''), key, fallback, kwargs))
+        return out
+
+    def search_page(self, key: str):
+        return self._category_pages.get(key)
+
+    def search_prepare(self) -> bool:
+        for key, _text_key, _fallback in self._CATEGORIES:
+            if key not in self._loaded:
+                self._ensure_category(key, sliced=True)
+        return bool(self._jobs)
+
+    def search_stack(self):
+        return self._stack
+
+    def search_chrome(self, active: bool) -> None:
+        self._category_flow_host.setVisible(not active)
+        self._bar_spacer.setVisible(active)
+
+    def search_show_selected(self) -> None:
+        page = self._category_pages.get(self._selected_category)
+        if page is not None:
+            self._stack.setCurrentWidget(page)
+
+    def search_tr(self, key: str, fallback: str) -> str:
+        return self._t(key, fallback)
+
+    def search_scroll_factory(self, parent):
+        return make_smooth_scroll_area(parent)
+
+    def search_fade(self, widget, ms: int) -> None:
+        if animations_enabled():
+            fade_in(widget, ms)
 
     def _make_category_page(self, key: str):
         scroll = make_smooth_scroll_area(self._stack)
@@ -2814,7 +4333,7 @@ class SettingsPage(QWidget):
         return scroll
 
     def _make_category_button(self, key: str, text_key: str, fallback: str) -> None:
-        button = _PillButton(self._t(text_key, fallback), self._category_bar)
+        button = _PillButton(self._t(text_key, fallback), self._category_flow_host)
         button.setCheckable(True)
         button.setFixedHeight(30)
         button.clicked.connect(lambda _checked=False, k=key: self._show_category(k))
@@ -2894,6 +4413,7 @@ class SettingsPage(QWidget):
                         obj.deleteLater()
             self._icon_entries.pop(key, None)
             self._stale.discard(key)
+            self._search_invalidate()
             self._category_layouts.pop(key, None)
             page = self._category_pages.pop(key, None)
             if page is not None:
@@ -2907,6 +4427,8 @@ class SettingsPage(QWidget):
     def _show_category(self, key: str, animate: bool = True) -> None:
         if key not in self._category_buttons:
             return
+        if self._searching:
+            self._exit_search(True)
         self._ensure_category(key)
         page = self._category_pages[key]
         button = self._category_buttons[key]
@@ -2914,17 +4436,20 @@ class SettingsPage(QWidget):
             button.setChecked(True)
         self._active_category = self._selected_category = key
         self._scroll = page
+        self._refresh_locale(key)
         if self._capturing_shortcut is not None:
             self._cancel_shortcut_capture()
         if key in self._jobs:
             page.setUpdatesEnabled(True)
             self._schedule_jobs()
         if self._stack.currentWidget() is page:
+            if animate:
+                page.verticalScrollBar().setValue(0)
             return
         self._refresh_page(key)
         self._stack.setCurrentWidget(page)
-        if animate and key not in self._jobs:
-            fade_in(page, 110)
+        if animate and key not in self._jobs and animations_enabled():
+            fade_in(page, 70)
 
     def scroll_to_group(self, key: str) -> None:
         target = self._GROUP_TARGETS.get(key)
@@ -2945,6 +4470,16 @@ class SettingsPage(QWidget):
                     self._scroll.verticalScrollBar().setValue(max(0, widget.y() - 12))
         _apply()
         QTimer.singleShot(80, _apply)
+
+    def nav_state(self) -> dict:
+        return {'category': self._active_category}
+
+    def restore_nav_state(self, state: dict) -> None:
+        if not isinstance(state, dict):
+            return
+        key = state.get('category')
+        if key in self._category_buttons:
+            self._show_category(key, animate=False)
 
     def _populate(self, key: str | None = None) -> None:
         if key is None:
@@ -2969,6 +4504,7 @@ class SettingsPage(QWidget):
                     self._quiet(card, card.setChecked, checked)
             for card, attr in part('_sections'):
                 self._quiet_switch(card.switch, bool(getattr(settings, attr, False)))
+                card.refresh_gate()
             for combo, attr in part('_combos'):
                 index = combo.findData(getattr(settings, attr, None))
                 self._quiet(combo, combo.setCurrentIndex, max(0, index))
@@ -2991,11 +4527,11 @@ class SettingsPage(QWidget):
         darken = int(settings.background_image_darken)
         self._quiet(self._bg_darken_slider, self._bg_darken_slider.setValue, darken)
         self._bg_darken_value_lbl.setText(f'{darken}%')
-        self._accent_color_btn.setColor(QColor(settings.accent_color))
+        self._accent_color_btn.setColor(QColor(palette()['accent']))
         language = current_language()
         if language in self._lang_codes:
             self._quiet(self._lang_combo, self._lang_combo.setCurrentIndex, self._lang_codes.index(language))
-        off = self._t('settings.volume_off', 'Off')
+        off = self._t('settings.volume_off')
         sfx = int(settings.sfx_volume)
         self._quiet(self._sfx_slider, self._sfx_slider.setValue, sfx)
         self._sfx_value_lbl.setText(str(sfx) if sfx > 0 else off)
@@ -3018,7 +4554,7 @@ class SettingsPage(QWidget):
         for key, switch in self._sailseek_source_switches.items():
             self._quiet_switch(switch, self._sailseek_category_enabled(key))
         self.refresh_sailseek_status()
-        self._sync_sailseek_state()
+        self._sync_sailseek_state(False)
 
     def _fill_integrations(self) -> None:
         self._quiet(self._chk_launch_startup, self._chk_launch_startup.setChecked, bool(get_launch_at_startup()))
@@ -3027,9 +4563,6 @@ class SettingsPage(QWidget):
             self._refresh_associations_status()
 
     def _fill_advanced(self) -> None:
-        if IS_CANARY:
-            self._quiet_switch(self._chk_canary_update.switchButton, True)
-            self._chk_canary_update.setEnabled(False)
         self._refresh_cache_size()
 
     def _fill_network(self) -> None:
@@ -3043,7 +4576,9 @@ class SettingsPage(QWidget):
             prefs = source()
             for key, widget in self._net_widgets.items():
                 value = prefs.get(key)
-                if key == 'proxy_type':
+                if key == 'bind':
+                    self._fill_bind_combo(widget, str(value or ''))
+                elif key == 'proxy_type':
                     widget.setCurrentIndex(max(0, widget.findData(value)))
                 elif key == 'proxy_port':
                     widget.setValue(int(value or 0))
@@ -3060,12 +4595,20 @@ class SettingsPage(QWidget):
             self._fill_network()
 
     def _t(self, key: str, fallback: str | None = None, **kwargs) -> str:
-        return tr(key, **kwargs) if fallback is None else tr_or(key, fallback, **kwargs)
+        return tr_or(key, **kwargs)
 
     def _bind(self, setter, key: str, fallback: str | None = None, **kwargs) -> None:
         self._texts.append((setter, key, fallback, kwargs))
         with suppress(TypeError):
-            setter(self._t(key, fallback, **kwargs))
+            text = self._t(key, fallback, **kwargs)
+            read = _SHOWN_TEXT.get(getattr(setter, '__name__', ''))
+            if read is not None:
+                try:
+                    if read(setter.__self__) == text:
+                        return
+                except Exception:
+                    pass
+            setter(text)
 
     def _bind_item(self, combo: ComboBox, index: int, key: str, fallback: str | None = None) -> None:
         self._bind(partial(combo.setItemText, index), key, fallback)
@@ -3092,6 +4635,11 @@ class SettingsPage(QWidget):
         self._stale = set(self._loaded)
         self.setUpdatesEnabled(False)
         try:
+            if self._update_btn is not None:
+                self._update_btn.update()
+            popup = self._update_popup
+            if popup is not None and shiboken6.isValid(popup) and popup.isVisible():
+                self._refresh_update_popup()
             self._sync_accent_button()
             self._refresh_page(self._selected_category)
             with suppress(Exception):
@@ -3162,6 +4710,33 @@ class SettingsPage(QWidget):
         self._bind(group.titleLabel.setText, key, fallback or None)
         return group
 
+    def _warning_banner(self, group: SettingCardGroup, title_key: str, title_fb: str,
+                        body_key: str, body_fb: str) -> QFrame:
+        amber = '#e0a030'
+        banner = QFrame(group)
+        banner.setObjectName('warnBanner')
+        banner.setStyleSheet(
+            'QFrame#warnBanner { background: %s; border: 1px solid %s; border-radius: 8px; }'
+            'QFrame#warnBanner QLabel { background: transparent; border: none; }'
+            % (_rgba(amber, 0.12), _rgba(amber, 0.45)))
+        lay = QVBoxLayout(banner)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(2)
+        title = StrongBodyLabel(self._t(title_key, title_fb))
+        title.setStyleSheet(f'color: {amber};')
+        body = BodyLabel(self._t(body_key, body_fb))
+        body.setWordWrap(True)
+        self._bind(title.setText, title_key, title_fb)
+        self._bind(body.setText, body_key, body_fb)
+        lay.addWidget(title)
+        lay.addWidget(body)
+        box = getattr(group, 'vBoxLayout', None)
+        if box is not None:
+            index = box.indexOf(group.cardLayout)
+            box.insertWidget(index if index >= 0 else box.count(), banner)
+            box.insertSpacing(index + 1 if index >= 0 else box.count(), 8)
+        return banner
+
     def _add_group(self, group: SettingCardGroup) -> None:
         layout = self._category_layouts.get(self._active_category)
         if layout is None:
@@ -3171,7 +4746,7 @@ class SettingsPage(QWidget):
         if first and self._active_category in ('appearance', 'integrations', 'advanced'):
             group.titleLabel.hide()
             group.titleLabel.setFixedHeight(0)
-        elif self._active_category in ('downloads', 'network', 'sailseek', 'shortcuts'):
+        elif self._active_category in ('downloads', 'sailseek', 'shortcuts'):
             group.titleLabel.hide()
         index = layout.count() - 1
         layout.insertWidget(index, group)
@@ -3283,6 +4858,8 @@ class SettingsPage(QWidget):
             setattr(settings, attr, value)
         save_settings(settings)
         self.settings_changed.emit()
+        if attr.endswith('_enabled') or attr == 'nav_order':
+            self._schedule_start_page_refresh()
 
 
     def _build_general(self):
@@ -3302,15 +4879,15 @@ class SettingsPage(QWidget):
         )
         yield
 
-        self._theme_btn = PushButton(self._t('settings.theme_choose', 'Choose theme'))
-        self._bind(self._theme_btn.setText, 'settings.theme_choose', 'Choose theme')
+        self._theme_btn = PushButton(self._t('settings.theme_choose'))
+        self._bind(self._theme_btn.setText, 'settings.theme_choose')
         self._theme_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._theme_btn.clicked.connect(self._on_theme_choose_clicked)
         self._theme_reload_btn = TransparentToolButton(themed_icon('settings.theme_reload', FluentIcon.SYNC), self)
         self._track_icon(self._theme_reload_btn, 'settings.theme_reload', FluentIcon.SYNC)
         apply_tool_button_theme(self._theme_reload_btn)
         self._theme_reload_btn.setFixedSize(32, 32)
-        self._bind(self._theme_reload_btn.setToolTip, 'settings.theme_reload', 'Reload themes')
+        self._bind(self._theme_reload_btn.setToolTip, 'settings.theme_reload')
         self._theme_reload_btn.clicked.connect(self._on_theme_reload_clicked)
         self._plain_card(
             group, 'settings.theme_mode', FluentIcon.BRUSH,
@@ -3368,12 +4945,12 @@ class SettingsPage(QWidget):
     def _build_background(self, group):
         self._bg_card = _SectionCard(
             themed_icon('settings.background', FluentIcon.PHOTO),
-            self._t('settings.background_title', 'Custom Background'),
-            self._t('settings.background_content', 'Use your own photo, GIF, or video as the app background'),
+            self._t('settings.background_title'),
+            self._t('settings.background_content'),
         )
         self._track_icon(self._bg_card, 'settings.background', FluentIcon.PHOTO)
-        self._bind(self._bg_card.setTitle, 'settings.background_title', 'Custom Background')
-        self._bind(self._bg_card.setContent, 'settings.background_content', 'Use your own photo, GIF, or video as the app background')
+        self._bind(self._bg_card.setTitle, 'settings.background_title')
+        self._bind(self._bg_card.setContent, 'settings.background_content')
         self._track_switch_text(self._bg_card.switch)
         self._bg_card.switch.checkedChanged.connect(self._on_background_toggled)
         self._sections.append((self._bg_card, 'background_image_enabled'))
@@ -3385,8 +4962,8 @@ class SettingsPage(QWidget):
         self._bg_browse_btn = PushButton(self._t('settings.browse'))
         self._bind(self._bg_browse_btn.setText, 'settings.browse')
         self._bg_browse_btn.clicked.connect(self._on_browse_background_image)
-        self._bg_clear_btn = PushButton(self._t('settings.background_clear', 'Clear'))
-        self._bind(self._bg_clear_btn.setText, 'settings.background_clear', 'Clear')
+        self._bg_clear_btn = PushButton(self._t('settings.background_clear'))
+        self._bind(self._bg_clear_btn.setText, 'settings.background_clear')
         self._bg_clear_btn.clicked.connect(self._on_clear_background_image)
         row = _path_row(self._bg_path_edit, self._bg_browse_btn, self._bg_clear_btn)
         self._bg_photo_group_widget = self._add_group_row(
@@ -3509,12 +5086,12 @@ class SettingsPage(QWidget):
 
 
     def _build_privacy(self):
-        group = self._privacy_group = self._group('settings.privacy_group', 'Privacy')
-        self._add_group(group)
+        vpn = self._privacy_group = self._group('settings.group_vpn', 'VPN & kill switch')
+        self._add_group(vpn)
         yield
         icons = self._NET_ICONS
 
-        def add_row(key: str, *widgets):
+        def add_row(group, key: str, *widgets):
             card = self._plain_card(
                 group, f'settings.privacy_{key}', icons[key],
                 f'settings.privacy_{key}_title', None,
@@ -3523,7 +5100,7 @@ class SettingsPage(QWidget):
             )
             return card
 
-        def add_switch(key: str):
+        def add_switch(group, key: str):
             card = self._switch_card(
                 group, f'settings.privacy_{key}', icons[key],
                 f'settings.privacy_{key}_title', None,
@@ -3533,7 +5110,7 @@ class SettingsPage(QWidget):
             self._net_widgets[key] = card
             return card
 
-        def add_edit(key: str, width: int, placeholder: str = '', password: bool = False) -> LineEdit:
+        def add_edit(group, key: str, width: int, placeholder: str = '', password: bool = False) -> LineEdit:
             edit = LineEdit()
             edit.setFixedWidth(width)
             edit.setClearButtonEnabled(True)
@@ -3546,6 +5123,36 @@ class SettingsPage(QWidget):
             self._net_widgets[key] = edit
             return edit
 
+        bind_combo = ComboBox()
+        bind_combo.setMinimumWidth(250)
+        bind_combo.currentIndexChanged.connect(
+            lambda _index, c=bind_combo: self._net_push(bind=str(c.currentData() or '')))
+        self._net_widgets['bind'] = bind_combo
+        self._fill_bind_combo(bind_combo, '')
+        register_locale_refresh(
+            bind_combo,
+            lambda c=bind_combo: self._fill_bind_combo(c, str(c.currentData() or '')))
+        add_row(vpn, 'bind', bind_combo)
+        yield
+
+        add_switch(vpn, 'block_ipv6')
+        yield
+
+        leak_label = BodyLabel(self._t('settings.privacy_leak_idle'))
+        leak_label.setWordWrap(True)
+        leak_label.setStyleSheet('color: #9aa0a6;')
+        leak_btn = PushButton(self._t('settings.privacy_leak_btn'))
+        self._bind(leak_btn.setText, 'settings.privacy_leak_btn')
+        leak_btn.clicked.connect(lambda _checked=False: self._test_public_ip())
+        self._leak_label, self._leak_btn = leak_label, leak_btn
+        register_locale_refresh(leak_label, self._reset_leak_label)
+        add_row(vpn, 'leak', leak_label, leak_btn)
+        yield
+
+        proxy = self._proxy_group = self._group('settings.group_proxy', 'Proxy')
+        self._add_group(proxy)
+        yield
+
         proxy_type = ComboBox()
         proxy_type.setMinimumWidth(150)
         for value, label in (('none', self._t('settings.privacy_proxy_none')),
@@ -3555,33 +5162,103 @@ class SettingsPage(QWidget):
         proxy_type.currentIndexChanged.connect(
             lambda index, c=proxy_type: self._net_push(proxy_type=c.itemData(index)))
         self._net_widgets['proxy_type'] = proxy_type
-        add_row('proxy', proxy_type)
+        add_row(proxy, 'proxy', proxy_type)
         yield
 
         port = CompactSpinBox()
         port.setRange(0, 65535)
         port.valueChanged.connect(lambda value: self._net_push(proxy_port=int(value)))
         self._net_widgets['proxy_port'] = port
-        host_edit = add_edit('proxy_host', 200, '127.0.0.1')
-        host_edit.setPlaceholderText('127.0.0.1')
-        add_row('proxy_address', host_edit, port)
+        host_edit = add_edit(proxy, 'proxy_host', 200, '127.0.0.1')
+        add_row(proxy, 'proxy_address', host_edit, port)
         yield
 
-        user_edit = add_edit('proxy_user', 130)
+        user_edit = add_edit(proxy, 'proxy_user', 130)
         self._bind(user_edit.setPlaceholderText, 'settings.privacy_user_placeholder')
-        pass_edit = add_edit('proxy_pass', 130, password=True)
+        pass_edit = add_edit(proxy, 'proxy_pass', 130, password=True)
         self._bind(pass_edit.setPlaceholderText, 'settings.privacy_pass_placeholder')
-        add_row('proxy_login', user_edit, pass_edit)
+        add_row(proxy, 'proxy_login', user_edit, pass_edit)
         yield
 
-        for key in ('proxy_peers', 'force_proxy', 'anonymous', 'require_encryption',
-                    'dht', 'lsd', 'upnp'):
-            add_switch(key)
+        for key in ('proxy_peers', 'force_proxy'):
+            add_switch(proxy, key)
             yield
-        add_row('bind', add_edit('bind', 220, '10.8.0.2'))
+
+        privacy = self._privacy_opts_group = self._group('settings.group_privacy', 'Torrent privacy')
+        self._add_group(privacy)
         yield
-        add_switch('private_history')
-        yield
+
+        for key in ('anonymous', 'require_encryption', 'dht', 'lsd', 'upnp', 'private_history'):
+            add_switch(privacy, key)
+            yield
+
+    def _fill_bind_combo(self, combo: ComboBox, current: str) -> None:
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem(self._t('settings.privacy_bind_none', 'No binding'), userData='')
+            for iface in QNetworkInterface.allInterfaces():
+                if not iface.flags() & QNetworkInterface.InterfaceFlag.IsUp:
+                    continue
+                name = iface.humanReadableName() or iface.name()
+                for entry in iface.addressEntries():
+                    ip = entry.ip().toString()
+                    if ':' in ip or ip.startswith(('127.', '169.254.', '0.')):
+                        continue
+                    combo.addItem(f'{name} · {ip}', userData=ip)
+            if current and combo.findData(current) < 0:
+                combo.addItem(f'{current} ({self._t("settings.privacy_bind_missing", "unavailable")})',
+                              userData=current)
+            combo.setCurrentIndex(max(0, combo.findData(current)))
+        finally:
+            combo.blockSignals(False)
+
+    def _reset_leak_label(self) -> None:
+        if not shiboken6.isValid(self):
+            return
+        self._leak_label.setStyleSheet('color: #9aa0a6;')
+        self._leak_label.setText(self._t('settings.privacy_leak_idle'))
+
+    def _test_public_ip(self) -> None:
+        if self._ip_testing:
+            return
+        self._ip_testing = True
+        with suppress(RuntimeError):
+            self._leak_btn.setEnabled(False)
+            self._leak_label.setText(self._t('settings.privacy_leak_testing'))
+        threading.Thread(target=self._ip_worker, name='ip-leak-test', daemon=True).start()
+
+    def _ip_worker(self) -> None:
+        from src.core.downloader import public_ip
+        try:
+            ip, error = public_ip(), ''
+        except Exception as exc:
+            ip, error = '', str(exc) or exc.__class__.__name__
+        QTimer.singleShot(0, self, lambda: self._ip_done(ip, error))
+
+    def _ip_done(self, ip: str, error: str) -> None:
+        from src.core.downloader import NET
+
+        self._ip_testing = False
+        if not shiboken6.isValid(self):
+            return
+        self._leak_btn.setEnabled(True)
+        if error:
+            self._leak_label.setStyleSheet('color: #d9534f;')
+            self._leak_label.setText(self._t('settings.privacy_leak_fail', error=error))
+            return
+        route = []
+        if NET.has_proxy:
+            route.append(NET.proxy_type.upper())
+        if NET.bind_ip():
+            route.append(NET.bind_ip())
+        if route:
+            self._leak_label.setStyleSheet('color: #46b450;')
+            self._leak_label.setText(
+                self._t('settings.privacy_leak_ok', ip=ip, route=' + '.join(route)))
+        else:
+            self._leak_label.setStyleSheet('color: #d9534f;')
+            self._leak_label.setText(self._t('settings.privacy_leak_none', ip=ip))
 
 
     def _section(self, group, slot: str, icon, title_key: str, content_key: str,
@@ -3686,6 +5363,7 @@ class SettingsPage(QWidget):
             self._set_switch_text(switch, checked)
         else:
             self._quiet_switch(switch, True)
+        self._schedule_start_page_refresh()
 
     def _build_sections_start(self):
         group = self._feature_group = self._group('settings.group_sections', 'Sections')
@@ -3725,7 +5403,7 @@ class SettingsPage(QWidget):
         card = self._chk_pc_games
         self._repack_source_combo = ComboBox()
         self._repack_source_combo.setMinimumWidth(150)
-        self._repack_source_combo.addItem(self._t('settings.repack_source_ask', 'Ask every time'), userData='ask')
+        self._repack_source_combo.addItem(self._t('settings.repack_source_ask'), userData='ask')
         self._bind_item(self._repack_source_combo, 0, 'settings.repack_source_ask', 'Ask every time')
         self._repack_source_combo.addItem('1337x', userData='1337x')
         self._repack_source_combo.addItem('RuTor', userData='rutor')
@@ -3921,11 +5599,11 @@ class SettingsPage(QWidget):
 
         self._external_status_lbl = CaptionLabel('')
         self._external_status_lbl.setWordWrap(True)
-        self._btn_external_setup = PushButton(self._t('settings.external_setup', 'Set up runtime'))
-        self._bind(self._btn_external_setup.setText, 'settings.external_setup', 'Set up runtime')
+        self._btn_external_setup = PushButton(self._t('settings.external_setup'))
+        self._bind(self._btn_external_setup.setText, 'settings.external_setup')
         self._btn_external_setup.clicked.connect(self._on_external_setup)
-        self._btn_vyla_update = PushButton(self._t('settings.vyla_update', 'Update Vyla SDK'))
-        self._bind(self._btn_vyla_update.setText, 'settings.vyla_update', 'Update Vyla SDK')
+        self._btn_vyla_update = PushButton(self._t('settings.vyla_update'))
+        self._bind(self._btn_vyla_update.setText, 'settings.vyla_update')
         self._btn_vyla_update.clicked.connect(self._on_vyla_update)
         self._vyla_update_finished.connect(self._on_vyla_update_finished)
         status_box = QWidget()
@@ -3976,8 +5654,7 @@ class SettingsPage(QWidget):
         self._edit_stream_addons = LineEdit()
         self._edit_stream_addons.setMinimumWidth(300)
         self._edit_stream_addons.setClearButtonEnabled(True)
-        self._bind(self._edit_stream_addons.setPlaceholderText, 'settings.tv_stream_addons_ph',
-                   'https://addon.example.com (one per line)')
+        self._bind(self._edit_stream_addons.setPlaceholderText, 'settings.tv_stream_addons_ph')
         self._edit_stream_addons.editingFinished.connect(self._on_stream_addons_changed)
         self._addons_save_timer = QTimer(self)
         self._addons_save_timer.setSingleShot(True)
@@ -4008,6 +5685,7 @@ class SettingsPage(QWidget):
     def _on_tv_tab(self, key: str, box: CheckBox, checked: bool) -> None:
         if not set_tab_enabled('tv', key, bool(checked)):
             self._quiet(box, box.setChecked, True)
+        self._schedule_start_page_refresh()
 
     def _schedule_stream_trim(self) -> None:
         if not self._loading:
@@ -4033,6 +5711,25 @@ class SettingsPage(QWidget):
         self._add_group(group)
         yield
 
+        start_combo = ComboBox()
+        start_combo.setMinimumWidth(170)
+        choices = self._start_page_choices()
+        self._start_page_keys = [key for key, _label in choices]
+        self._start_page_combo = start_combo
+        start_combo.addItems([label for _key, label in choices])
+        try:
+            index = self._start_page_keys.index(str(settings.start_page))
+        except ValueError:
+            index = 0
+        start_combo.setCurrentIndex(index)
+        start_combo.currentIndexChanged.connect(self._on_start_page_changed)
+        self._start_page_card = self._plain_card(
+            group, 'settings.start_page', FluentIcon.HISTORY,
+            'settings.start_page_title', 'Start app at',
+            'settings.start_page_content', 'Choose which page opens when PiraChest launches.',
+            start_combo)
+        yield
+
         self._history_card = self._switch_card(
             group, 'settings.search_history', FluentIcon.HISTORY,
             'settings.search_history_title', 'Search history',
@@ -4041,8 +5738,8 @@ class SettingsPage(QWidget):
             attr='search_history_enabled')
         yield
 
-        clear_history = PushButton(self._t('settings.clear_search_history', 'Clear search history'))
-        self._bind(clear_history.setText, 'settings.clear_search_history', 'Clear search history')
+        clear_history = PushButton(self._t('settings.clear_search_history'))
+        self._bind(clear_history.setText, 'settings.clear_search_history')
         clear_history.clicked.connect(self._on_clear_search_history)
         self._plain_card(
             group, 'settings.clear_search_history', FluentIcon.DELETE,
@@ -4114,14 +5811,12 @@ class SettingsPage(QWidget):
 
         sources = _ExpandCard(
             themed_icon('settings.sailseek_categories', FluentIcon.TILES),
-            self._t('settings.sailseek_categories_title', 'Search in'),
-            self._t('settings.sailseek_categories_content',
-                    'Choose what SailSeek looks through. Sections you turned off in Sections are skipped.'),
+            self._t('settings.sailseek_categories_title'),
+            self._t('settings.sailseek_categories_content'),
             self)
         self._track_icon(sources, 'settings.sailseek_categories', FluentIcon.TILES)
-        self._bind(sources.setTitle, 'settings.sailseek_categories_title', 'Search in')
-        self._bind(sources.setContent, 'settings.sailseek_categories_content',
-                   'Choose what SailSeek looks through. Sections you turned off in Sections are skipped.')
+        self._bind(sources.setTitle, 'settings.sailseek_categories_title')
+        self._bind(sources.setContent, 'settings.sailseek_categories_content')
         self._sailseek_source_switches = {}
         for key, icon, title_fb, content_fb in self._SAILSEEK_SOURCES:
             self._add_sailseek_source(sources, key, icon, title_fb, content_fb)
@@ -4174,9 +5869,8 @@ class SettingsPage(QWidget):
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._sailseek_status_lbl.setMinimumWidth(190)
         self._btn_sailseek_reset = PushButton(
-            self._t('settings.sailseek_reset_button', 'Reset position'))
-        self._bind(self._btn_sailseek_reset.setText, 'settings.sailseek_reset_button',
-                   'Reset position')
+            self._t('settings.sailseek_reset_button'))
+        self._bind(self._btn_sailseek_reset.setText, 'settings.sailseek_reset_button')
         self._btn_sailseek_reset.clicked.connect(self._on_sailseek_reset_position)
         self._plain_card(
             group, 'settings.sailseek_position', FluentIcon.FIT_PAGE,
@@ -4185,7 +5879,7 @@ class SettingsPage(QWidget):
             'Change the shortcut under Shortcuts. Reset if the window opens off-screen.',
             self._sailseek_status_lbl, self._btn_sailseek_reset)
         self.refresh_sailseek_status()
-        self._sync_sailseek_state()
+        self._sync_sailseek_state(False)
         yield
 
     def _add_sailseek_source(self, card, key: str, icon, title_fb: str, content_fb: str) -> None:
@@ -4212,13 +5906,13 @@ class SettingsPage(QWidget):
         self._save_switch('sailseek_enabled', checked)
         self._sync_sailseek_state()
 
-    def _sync_sailseek_state(self) -> None:
+    def _sync_sailseek_state(self, restyle: bool = True) -> None:
         enabled = bool(getattr(settings, 'sailseek_enabled', True))
         for widget in self._sailseek_dependents:
             with suppress(RuntimeError):
                 widget.setEnabled(enabled)
         page = self._category_pages.get('sailseek')
-        if page is not None:
+        if restyle and page is not None:
             _restyle_setting_cards(page)
 
     def _sailseek_category_enabled(self, key: str) -> bool:
@@ -4246,7 +5940,7 @@ class SettingsPage(QWidget):
         controller = getattr(self.window(), 'sailseek', None)
         if controller is None:
             self._set_sailseek_status(
-                self._t('settings.sailseek_status_ready', 'Shortcut status available in the app'))
+                self._t('settings.sailseek_status_ready'))
             return
         if not getattr(self, '_sailseek_status_connected', False):
             with suppress(Exception):
@@ -4262,9 +5956,8 @@ class SettingsPage(QWidget):
         with suppress(Exception):
             controller.reset_geometry()
         InfoBar.success(
-            title=self._t('settings.sailseek_reset_done_title', 'Position reset'),
-            content=self._t('settings.sailseek_reset_done_content',
-                            'SailSeek will open centered on the active monitor.'),
+            title=self._t('settings.sailseek_reset_done_title'),
+            content=self._t('settings.sailseek_reset_done_content'),
             orient=Qt.Orientation.Horizontal, isClosable=True,
             position=InfoBarPosition.TOP_RIGHT, duration=2500, parent=self.window())
 
@@ -4338,7 +6031,7 @@ class SettingsPage(QWidget):
         from src.core.tv import external as external_backend
         self._btn_vyla_update.setEnabled(False)
         self._external_status_lbl.setText(
-            self._t('settings.vyla_update_running', 'Updating Vyla SDK...'))
+            self._t('settings.vyla_update_running'))
         _worker.submit(
             external_backend.update_vyla_sdk,
             on_done=lambda version: self._vyla_update_finished.emit(str(version or ''), ''),
@@ -4352,33 +6045,27 @@ class SettingsPage(QWidget):
         if error:
             logger.error('Vyla SDK update failed: %s', error)
             InfoBar.error(
-                title=self._t('settings.vyla_update_failed', 'Vyla SDK update failed'),
+                title=self._t('settings.vyla_update_failed'),
                 content=error, duration=6000, parent=self.window())
             return
         InfoBar.success(
-            title=self._t('settings.vyla_update_done', 'Vyla SDK updated'),
-            content=self._t('settings.vyla_update_done_content',
-                            'Now running version {version}.', version=version),
+            title=self._t('settings.vyla_update_done'),
+            content=self._t('settings.vyla_update_done_content', version=version),
             duration=3500, parent=self.window())
 
     def _refresh_external_status(self) -> None:
         from src.core.tv import external as external_backend
         status = external_backend.integration_status()
         if status.get('provisioning'):
-            text = self._t('settings.external_status_preparing',
-                           'Preparing Node.js and provider dependencies...')
+            text = self._t('settings.external_status_preparing')
         elif status.get('ready'):
-            text = self._t('settings.external_status_ready',
-                           'Node.js ready · Vyla SDK loaded')
+            text = self._t('settings.external_status_ready')
         elif status.get('error'):
-            text = self._t('settings.external_status_error',
-                           'Setup failed: {error}', error=status['error'])
+            text = self._t('settings.external_status_error', error=status['error'])
         elif status.get('node'):
-            text = self._t('settings.external_status_deps',
-                           'Node.js found. Installing provider dependencies...')
+            text = self._t('settings.external_status_deps')
         else:
-            text = self._t('settings.external_status_missing',
-                           'Node.js runtime not installed. Set up downloads it automatically.')
+            text = self._t('settings.external_status_missing')
         self._external_status_lbl.setText(text)
         timer = getattr(self, '_external_timer', None)
         if timer is not None and not status.get('provisioning'):
@@ -4386,9 +6073,8 @@ class SettingsPage(QWidget):
             if status.get('ready') and getattr(self, '_external_setup_requested', False):
                 self._external_setup_requested = False
                 InfoBar.success(
-                    title=self._t('settings.external_setup_done', 'Providers ready'),
-                    content=self._t('settings.external_setup_done_content',
-                                   'Vyla is ready to use.'),
+                    title=self._t('settings.external_setup_done'),
+                    content=self._t('settings.external_setup_done_content'),
                     duration=3000, parent=self.window())
 
     def _build_debrid(self):
@@ -4398,11 +6084,11 @@ class SettingsPage(QWidget):
 
         self._debrid_connection = _SectionCard(
             themed_icon('settings.debrid_connection', FluentIcon.CLOUD),
-            self._t('settings.debrid_connection_title', 'Connection'),
-            self._t('settings.debrid_connection_content', 'Provider, token and request timeout'),
+            self._t('settings.debrid_connection_title'),
+            self._t('settings.debrid_connection_content'),
         )
         self._track_icon(self._debrid_connection, 'settings.debrid_connection', FluentIcon.CLOUD)
-        self._bind(self._debrid_connection.setTitle, 'settings.debrid_connection_title', 'Connection')
+        self._bind(self._debrid_connection.setTitle, 'settings.debrid_connection_title')
         self._track_switch_text(self._debrid_connection.switch)
         self._debrid_connection.switch.checkedChanged.connect(self._on_debrid_enabled_changed)
         self._sections.append((self._debrid_connection, 'debrid_enabled'))
@@ -4426,11 +6112,11 @@ class SettingsPage(QWidget):
         self._debrid_token_edit.setClearButtonEnabled(True)
         self._debrid_token_edit.setEchoMode(LineEdit.EchoMode.Password)
         self._debrid_token_edit.returnPressed.connect(self._on_debrid_save_token)
-        self._debrid_save_btn = PushButton(self._t('settings.debrid_token_save', 'Save'))
-        self._bind(self._debrid_save_btn.setText, 'settings.debrid_token_save', 'Save')
+        self._debrid_save_btn = PushButton(self._t('settings.debrid_token_save'))
+        self._bind(self._debrid_save_btn.setText, 'settings.debrid_token_save')
         self._debrid_save_btn.clicked.connect(self._on_debrid_save_token)
-        self._debrid_test_btn = PushButton(self._t('settings.debrid_token_test', 'Test'))
-        self._bind(self._debrid_test_btn.setText, 'settings.debrid_token_test', 'Test')
+        self._debrid_test_btn = PushButton(self._t('settings.debrid_token_test'))
+        self._bind(self._debrid_test_btn.setText, 'settings.debrid_token_test')
         self._debrid_test_btn.clicked.connect(self._on_debrid_test_token)
         self._debrid_token_card = self._add_group_row(
             self._debrid_connection, 'settings.debrid_token', FluentIcon.FINGERPRINT,
@@ -4439,13 +6125,12 @@ class SettingsPage(QWidget):
         yield
 
         self._debrid_status_lbl = CaptionLabel('')
-        self._debrid_help_btn = PushButton(self._t('settings.debrid_token_help', 'Get Token'))
-        self._bind(self._debrid_help_btn.setText, 'settings.debrid_token_help', 'Get Token')
-        self._bind(self._debrid_help_btn.setToolTip, 'settings.debrid_token_help_hint',
-                   'Sign in to the provider site first. The token page returns 403 when you are signed out.')
+        self._debrid_help_btn = PushButton(self._t('settings.debrid_token_help'))
+        self._bind(self._debrid_help_btn.setText, 'settings.debrid_token_help')
+        self._bind(self._debrid_help_btn.setToolTip, 'settings.debrid_token_help_hint')
         self._debrid_help_btn.clicked.connect(self._on_debrid_open_help)
-        self._debrid_clear_btn = PushButton(self._t('settings.debrid_token_clear', 'Clear'))
-        self._bind(self._debrid_clear_btn.setText, 'settings.debrid_token_clear', 'Clear')
+        self._debrid_clear_btn = PushButton(self._t('settings.debrid_token_clear'))
+        self._bind(self._debrid_clear_btn.setText, 'settings.debrid_token_clear')
         self._debrid_clear_btn.clicked.connect(self._on_debrid_clear_token)
         self._debrid_status_card = self._add_group_row(
             self._debrid_connection, 'settings.debrid_status', FluentIcon.INFO,
@@ -4455,7 +6140,7 @@ class SettingsPage(QWidget):
 
         self._debrid_timeout_spin = CompactSpinBox()
         self._debrid_timeout_spin.setRange(60, 7200)
-        self._bind(self._debrid_timeout_spin.setSuffix, 'settings.suffix_seconds', 's')
+        self._bind(self._debrid_timeout_spin.setSuffix, 'settings.suffix_seconds')
         self._debrid_timeout_spin.valueChanged.connect(
             lambda value: self._save_spin('debrid_timeout', value))
         self._debrid_timeout_card = self._add_group_row(
@@ -4467,14 +6152,12 @@ class SettingsPage(QWidget):
 
         self._debrid_automation = _ExpandCard(
             themed_icon('settings.debrid_automation', FluentIcon.SYNC),
-            self._t('settings.debrid_automation_title', 'Automation'),
-            self._t('settings.debrid_automation_content',
-                    'Choose where debrid is used and how transfers finish'),
+            self._t('settings.debrid_automation_title'),
+            self._t('settings.debrid_automation_content'),
         )
         self._track_icon(self._debrid_automation, 'settings.debrid_automation', FluentIcon.SYNC)
-        self._bind(self._debrid_automation.setTitle, 'settings.debrid_automation_title', 'Automation')
-        self._bind(self._debrid_automation.setContent, 'settings.debrid_automation_content',
-                   'Choose where debrid is used and how transfers finish')
+        self._bind(self._debrid_automation.setTitle, 'settings.debrid_automation_title')
+        self._bind(self._debrid_automation.setContent, 'settings.debrid_automation_content')
         for slot, title, content, attr in (
             ('settings.debrid_auto_repacks', 'settings.debrid_auto_repacks_title', 'settings.debrid_auto_repacks_content', 'debrid_auto_repacks'),
             ('settings.debrid_auto_tv', 'settings.debrid_auto_tv_title', 'settings.debrid_auto_tv_content', 'debrid_auto_tv'),
@@ -4517,12 +6200,11 @@ class SettingsPage(QWidget):
             logger.warning('Could not read the debrid token state', exc_info=True)
         if saved:
             date = time.strftime('%Y-%m-%d', time.localtime(updated)) if updated else ''
-            state = self._t('settings.debrid_token_saved', 'Saved {date}', date=date).strip()
-            placeholder = self._t('settings.debrid_token_replace',
-                                  'A token is saved. Paste a new one to replace it.')
+            state = self._t('settings.debrid_token_saved', date=date).strip()
+            placeholder = self._t('settings.debrid_token_replace')
         else:
-            state = self._t('settings.debrid_token_missing', 'No token saved')
-            placeholder = self._t('settings.debrid_token_placeholder', 'Paste your API token')
+            state = self._t('settings.debrid_token_missing')
+            placeholder = self._t('settings.debrid_token_placeholder')
         self._set_debrid_status(state)
         connection = getattr(self, '_debrid_connection', None)
         if connection is not None:
@@ -4540,9 +6222,8 @@ class SettingsPage(QWidget):
         if token_store.has(self._current_debrid_provider()):
             return
         InfoBar.warning(
-            title=self._t('settings.debrid_token_missing_title', 'Debrid needs a token'),
-            content=self._t('settings.debrid_token_missing_content',
-                            'Choose a provider and save its API token to start using debrid.'),
+            title=self._t('settings.debrid_token_missing_title'),
+            content=self._t('settings.debrid_token_missing_content'),
             orient=Qt.Orientation.Horizontal, isClosable=True,
             position=InfoBarPosition.TOP_RIGHT, duration=5000, parent=self.window())
 
@@ -4558,8 +6239,8 @@ class SettingsPage(QWidget):
         token = self._debrid_token_edit.text().strip()
         if not token:
             InfoBar.warning(
-                title=self._t('settings.debrid_empty_title', 'Token required'),
-                content=self._t('settings.debrid_empty_content', 'Paste a token before saving.'),
+                title=self._t('settings.debrid_empty_title'),
+                content=self._t('settings.debrid_empty_content'),
                 orient=Qt.Orientation.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT, duration=3500, parent=self.window())
             return
@@ -4568,7 +6249,7 @@ class SettingsPage(QWidget):
         except Exception as exc:
             logger.warning('Could not save the debrid token', exc_info=True)
             InfoBar.error(
-                title=self._t('settings.debrid_save_failed_title', 'Could not save token'),
+                title=self._t('settings.debrid_save_failed_title'),
                 content=str(exc), orient=Qt.Orientation.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT, duration=5000, parent=self.window())
             return
@@ -4576,8 +6257,8 @@ class SettingsPage(QWidget):
         self._refresh_debrid_token_state()
         label = PROVIDER_INFO.get(key, {}).get('label', key)
         InfoBar.success(
-            title=self._t('settings.debrid_saved_title', 'Token saved'),
-            content=self._t('settings.debrid_saved_content', 'The {provider} token is stored securely.',
+            title=self._t('settings.debrid_saved_title'),
+            content=self._t('settings.debrid_saved_content',
                             provider=label),
             orient=Qt.Orientation.Horizontal, isClosable=True,
             position=InfoBarPosition.TOP_RIGHT, duration=3500, parent=self.window())
@@ -4591,14 +6272,14 @@ class SettingsPage(QWidget):
         except Exception as exc:
             logger.warning('Could not clear the debrid token', exc_info=True)
             InfoBar.error(
-                title=self._t('settings.debrid_clear_failed_title', 'Could not remove token'),
+                title=self._t('settings.debrid_clear_failed_title'),
                 content=str(exc), orient=Qt.Orientation.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT, duration=5000, parent=self.window())
             return
         self._refresh_debrid_token_state()
         InfoBar.success(
-            title=self._t('settings.debrid_cleared_title', 'Token removed'),
-            content=self._t('settings.debrid_cleared_content', 'The {provider} token was deleted.',
+            title=self._t('settings.debrid_cleared_title'),
+            content=self._t('settings.debrid_cleared_content',
                             provider=label),
             orient=Qt.Orientation.Horizontal, isClosable=True,
             position=InfoBarPosition.TOP_RIGHT, duration=3000, parent=self.window())
@@ -4618,14 +6299,14 @@ class SettingsPage(QWidget):
             token = typed
         if not token:
             InfoBar.warning(
-                title=self._t('settings.debrid_empty_title', 'Token required'),
-                content=self._t('settings.debrid_empty_content', 'Paste a token before saving.'),
+                title=self._t('settings.debrid_empty_title'),
+                content=self._t('settings.debrid_empty_content'),
                 orient=Qt.Orientation.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT, duration=3500, parent=self.window())
             return
         provider_cls = PROVIDERS[key]
         self._debrid_test_btn.setEnabled(False)
-        self._set_debrid_status(self._t('settings.debrid_testing', 'Testing {provider}...',
+        self._set_debrid_status(self._t('settings.debrid_testing',
                                         provider=label))
         from src.core import worker as _worker
 
@@ -4641,15 +6322,14 @@ class SettingsPage(QWidget):
                 self._debrid_test_btn.setEnabled(True)
             info = info if isinstance(info, dict) else {}
             account = str(info.get('account') or '')
-            premium = self._t('common.on', 'On') if info.get('premium') else self._t('common.off', 'Off')
+            premium = self._t('common.on') if info.get('premium') else self._t('common.off')
             expires = str(info.get('expires') or '-')
             detail = self._t(
                 'settings.debrid_test_ok_content',
-                'Account: {account}. Premium: {premium}. Expires: {expires}.',
                 account=account or '-', premium=premium, expires=expires)
-            self._set_debrid_status(f'{label}: {self._t("settings.debrid_test_ok_status", "Verified")}')
+            self._set_debrid_status(f'{label}: {self._t("settings.debrid_test_ok_status")}')
             InfoBar.success(
-                title=self._t('settings.debrid_test_ok_title', 'Token works'),
+                title=self._t('settings.debrid_test_ok_title'),
                 content=detail, orient=Qt.Orientation.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT, duration=6000, parent=self.window())
 
@@ -4658,7 +6338,7 @@ class SettingsPage(QWidget):
                 self._debrid_test_btn.setEnabled(True)
             self._set_debrid_status(f'{label}: {message}')
             InfoBar.error(
-                title=self._t('settings.debrid_test_fail_title', 'Token test failed'),
+                title=self._t('settings.debrid_test_fail_title'),
                 content=str(message), orient=Qt.Orientation.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT, duration=7000, parent=self.window())
 
@@ -4685,17 +6365,17 @@ class SettingsPage(QWidget):
             group, 'settings.log_to_file', FluentIcon.SAVE,
             'settings.log_to_file_title', None, 'settings.log_to_file_content', None,
             attr='log_to_file', on_change=self._on_log_to_file_toggled)
-        self._btn_open_logs = PushButton(self._t('settings.open_logs_button', 'Open Logs Folder'))
-        self._bind(self._btn_open_logs.setText, 'settings.open_logs_button', 'Open Logs Folder')
+        self._btn_open_logs = PushButton(self._t('settings.open_logs_button'))
+        self._bind(self._btn_open_logs.setText, 'settings.open_logs_button')
         self._btn_open_logs.clicked.connect(self._on_open_logs_folder)
         self._tail(self._chk_log_to_file, self._btn_open_logs)
         yield
 
-        self._btn_export_settings = PushButton(self._t('settings.backup_export', 'Export…'))
-        self._bind(self._btn_export_settings.setText, 'settings.backup_export', 'Export…')
+        self._btn_export_settings = PushButton(self._t('settings.backup_export'))
+        self._bind(self._btn_export_settings.setText, 'settings.backup_export')
         self._btn_export_settings.clicked.connect(self._on_export_settings)
-        self._btn_import_settings = PushButton(self._t('settings.backup_import', 'Import…'))
-        self._bind(self._btn_import_settings.setText, 'settings.backup_import', 'Import…')
+        self._btn_import_settings = PushButton(self._t('settings.backup_import'))
+        self._bind(self._btn_import_settings.setText, 'settings.backup_import')
         self._btn_import_settings.clicked.connect(self._on_import_settings)
         self._backup_card = self._plain_card(
             group, 'settings.backup', FluentIcon.SAVE,
@@ -4705,31 +6385,7 @@ class SettingsPage(QWidget):
             self._btn_export_settings, self._btn_import_settings)
         yield
 
-        self._chk_auto_update = self._switch_card(
-            group, 'settings.auto_update_check', FluentIcon.SYNC,
-            'settings.auto_update_check_title', 'Check for updates automatically',
-            'settings.auto_update_check_content', 'Look for newer releases in the background when PiraChest starts. On by default.',
-            attr='auto_check_updates')
-        self._chk_canary_update = self._switch_card(
-            group, 'settings.canary_updates', FluentIcon.UPDATE,
-            'settings.canary_updates_title', 'PiraChest Canary',
-            'settings.canary_updates_content', 'Experimental cutting-edge builds that update faster and may be unstable. Canary builds also receive stable update notices.',
-            attr='canary_updates')
-        yield
-
         self._app_version = VERSION_LABEL
-        self._update_status_lbl = CaptionLabel('')
-        self._btn_check_update = PushButton(self._t('settings.check_for_updates'))
-        self._bind(self._btn_check_update.setText, 'settings.check_for_updates')
-        self._btn_check_update.clicked.connect(self._on_check_update)
-        self._update_card = self._plain_card(
-            group, 'settings.software_updates', FluentIcon.SYNC,
-            'settings.software_updates_title', None,
-            'settings.current_version', None,
-            self._update_status_lbl, self._btn_check_update,
-            content_kwargs={'version': self._app_version})
-        yield
-
         self._cache_status_lbl = CaptionLabel('')
         self._btn_clear_cache = PushButton(self._t('settings.clear_cache_button'))
         self._bind(self._btn_clear_cache.setText, 'settings.clear_cache_button')
@@ -4740,6 +6396,7 @@ class SettingsPage(QWidget):
         self._cache_status_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._cache_size_ready.connect(self._cache_ready_slot)
         self._cache_clear_finished.connect(self._on_cache_cleared)
+        self._live_wipe_finished.connect(self._on_live_wipe_finished)
         self._cache_card = self._plain_card(
             group, 'settings.clear_cache', FluentIcon.BROOM,
             'settings.clear_cache_title', None, 'settings.clear_cache_content', None,
@@ -4759,11 +6416,8 @@ class SettingsPage(QWidget):
     def _build_experimental(self):
         group = self._experimental_group = self._group('settings.group_experimental', 'Experimental')
         self._add_group(group)
-        yield
-
-        self._experimental_warning_card = self._plain_card(
-            group, 'settings.experimental_warning', FluentIcon.INFO,
-            'settings.experimental_warning_title', 'Experimental features',
+        self._experimental_banner = self._warning_banner(
+            group, 'settings.experimental_warning_title', 'Experimental features',
             'settings.experimental_warning_content',
             'These features are unfinished and may change, misbehave, or break things. Use them at your own risk.')
         yield
@@ -4775,8 +6429,8 @@ class SettingsPage(QWidget):
             attr='auto_install_games', on_change=self._on_auto_install_toggled)
         yield
 
-        self._btn_theme_maker = PushButton(self._t('settings.theme_maker_button', 'Open'))
-        self._bind(self._btn_theme_maker.setText, 'settings.theme_maker_button', 'Open')
+        self._btn_theme_maker = PushButton(self._t('settings.theme_maker_button'))
+        self._bind(self._btn_theme_maker.setText, 'settings.theme_maker_button')
         self._btn_theme_maker.clicked.connect(self._on_open_theme_maker)
         self._theme_maker_card = self._plain_card(
             group, 'settings.theme_maker', FluentIcon.BRUSH,
@@ -4788,22 +6442,38 @@ class SettingsPage(QWidget):
 
 
     def _apply_locale(self, *_args) -> None:
-        self.setUpdatesEnabled(False)
-        try:
-            for setter, key, fallback, kwargs in self._texts:
-                with suppress(RuntimeError, TypeError, KeyError):
-                    setter(self._t(key, fallback, **kwargs))
-            for switch in self._switch_labels:
-                with suppress(RuntimeError):
-                    self._set_switch_text(switch, switch.isChecked())
-            if 'appearance' in self._ranges and self._theme_provides_background():
-                self._bg_card.setContent(
-                    self._t('settings.background_locked_by_theme', 'This theme includes its own background.'))
-        finally:
-            self.setUpdatesEnabled(True)
-        if os.name == 'nt' and hasattr(self, '_assoc_status_lbl'):
-            self._refresh_associations_status()
-        self._refresh_debrid_token_state()
+        if not shiboken6.isValid(self):
+            return
+        self._search_invalidate()
+        self._set_texts(self.__dict__.get('_shell_texts', ()))
+        self._locale_stale = set(self._loaded)
+        for job in tuple(self._jobs.values()):
+            self._set_texts(job['lists']['_texts'])
+        self._refresh_locale(self._selected_category)
+
+    def _set_texts(self, texts) -> None:
+        for setter, key, fallback, kwargs in tuple(texts):
+            with suppress(RuntimeError, TypeError, KeyError):
+                setter(self._t(key, fallback, **kwargs))
+
+    def _refresh_locale(self, key: str) -> None:
+        stale = self.__dict__.get('_locale_stale')
+        if not stale or key not in stale or key not in self._ranges:
+            return
+        stale.discard(key)
+        rng = self._ranges[key]
+        a, b = rng['_texts']
+        self._set_texts(self._texts[a:b])
+        a, b = rng['_switch_labels']
+        for switch in list(self._switch_labels)[a:b]:
+            with suppress(RuntimeError):
+                self._set_switch_text(switch, switch.isChecked())
+        if key == 'appearance' and self._theme_provides_background():
+            self._bg_card.setContent(self._t('settings.background_locked_by_theme'))
+        elif key == 'integrations':
+            if os.name == 'nt' and hasattr(self, '_assoc_status_lbl'):
+                self._refresh_associations_status()
+            self._refresh_debrid_token_state()
 
 
     def _current_theme_id(self) -> str:
@@ -4859,12 +6529,9 @@ class SettingsPage(QWidget):
         reload_custom_themes()
 
     def _on_language_changed(self, index: int) -> None:
-        if 0 <= index < len(self._lang_codes):
-            set_language(self._lang_codes[index])
-            app = QApplication.instance()
-            if app is not None:
-                app.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
-            self.settings_changed.emit()
+        if self._loading or not 0 <= index < len(self._lang_codes):
+            return
+        set_language(self._lang_codes[index])
 
 
     def _on_accent_color_changed(self, color: QColor) -> None:
@@ -4952,10 +6619,23 @@ class SettingsPage(QWidget):
         if active:
             self._force_dark_theme_for_background()
         preset = active_preset_id()
-        self._accent_card.setEnabled(preset is None or not accent_locked(preset))
+        locked = preset is not None and accent_locked(preset)
+        self._accent_card.setEnabled(not locked)
+        for btn in (getattr(self, '_default_accent_btn', None), getattr(self, '_reset_accent_btn', None)):
+            if btn is None:
+                continue
+            btn.setEnabled(not locked)
+            fx = btn.graphicsEffect()
+            if locked:
+                if not isinstance(fx, QGraphicsOpacityEffect):
+                    fx = QGraphicsOpacityEffect(btn)
+                    btn.setGraphicsEffect(fx)
+                fx.setOpacity(0.45)
+            elif isinstance(fx, QGraphicsOpacityEffect):
+                btn.setGraphicsEffect(None)
         if theme_owns:
             self._bg_card.setContent(
-                self._t('settings.background_locked_by_theme', 'This theme includes its own background.'))
+                self._t('settings.background_locked_by_theme'))
 
     def _on_background_toggled(self, checked: bool) -> None:
         if self._loading:
@@ -4969,7 +6649,7 @@ class SettingsPage(QWidget):
 
     def _on_browse_background_image(self) -> None:
         path, _filter = QFileDialog.getOpenFileName(
-            self, self._t('settings.background_photo_title', 'Background file'), '',
+            self, self._t('settings.background_photo_title'), '',
             'Images and videos (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.mp4 *.webm *.mov *.mkv *.avi)')
         if not path:
             return
@@ -5008,14 +6688,14 @@ class SettingsPage(QWidget):
 
 
     def _on_sfx_volume_live(self, value: int) -> None:
-        self._sfx_value_lbl.setText(str(value) if value > 0 else self._t('settings.volume_off', 'Off'))
+        self._sfx_value_lbl.setText(str(value) if value > 0 else self._t('settings.volume_off'))
         get_sound_manager().set_sfx_volume(int(value))
 
     def _on_sfx_volume_commit(self, value: int) -> None:
         self._apply_setting('sfx_volume', int(value))
 
     def _on_ambiance_volume_live(self, value: int) -> None:
-        self._ambiance_value_lbl.setText(str(value) if value > 0 else self._t('settings.volume_off', 'Off'))
+        self._ambiance_value_lbl.setText(str(value) if value > 0 else self._t('settings.volume_off'))
         get_sound_manager().set_ambiance_volume(int(value))
 
     def _on_ambiance_volume_commit(self, value: int) -> None:
@@ -5023,6 +6703,47 @@ class SettingsPage(QWidget):
 
     def _on_ui_scale_live(self, value: int) -> None:
         self._scale_value_lbl.setText(f'{value}%')
+
+    def _start_page_choices(self) -> list:
+        choices = []
+        provider = getattr(self.window(), 'start_page_choices', None)
+        if callable(provider):
+            with suppress(Exception):
+                choices = list(provider())
+        if not choices:
+            choices = [('home', self._t('settings.start_page_default')),
+                       ('last', self._t('settings.start_page_last'))]
+        return choices
+
+    def _schedule_start_page_refresh(self) -> None:
+        if self.__dict__.get('_start_page_combo') is not None:
+            QTimer.singleShot(0, self, self._refresh_start_page_choices)
+
+    def _refresh_start_page_choices(self) -> None:
+        combo = self.__dict__.get('_start_page_combo')
+        if combo is None or not shiboken6.isValid(combo):
+            return
+        choices = self._start_page_choices()
+        keys = [key for key, _label in choices]
+        labels = [label for _key, label in choices]
+        if keys == self._start_page_keys and labels == [combo.itemText(i) for i in range(combo.count())]:
+            return
+        current = str(settings.start_page)
+        self._start_page_keys = keys
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItems(labels)
+            combo.setCurrentIndex(keys.index(current) if current in keys else 0)
+        finally:
+            combo.blockSignals(False)
+        if current not in keys:
+            self._apply_setting('start_page', keys[0])
+
+    def _on_start_page_changed(self, index: int) -> None:
+        keys = getattr(self, '_start_page_keys', ())
+        if 0 <= index < len(keys):
+            self._apply_setting('start_page', keys[index])
 
     def _on_ui_scale_commit(self, value: int) -> None:
         value = int(value)
@@ -5039,10 +6760,8 @@ class SettingsPage(QWidget):
             busy = False
         if busy:
             InfoBar.info(
-                title=self._t('settings.ui_scale_title', 'Interface scale'),
-                content=self._t('settings.ui_scale_busy',
-                                'Saved. The new scale is applied the next time PiraChest starts '
-                                'because a download is running.'),
+                title=self._t('settings.ui_scale_title'),
+                content=self._t('settings.ui_scale_busy'),
                 orient=Qt.Orientation.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT, duration=4500, parent=window)
             return
@@ -5059,28 +6778,6 @@ class SettingsPage(QWidget):
             window.close()
 
 
-    def bind_network(self, source, apply) -> None:
-        if not self._built:
-            self._pending_bind = (source, apply)
-            return
-        self._net_apply = apply
-        self._net_loading = True
-        try:
-            prefs = source()
-            for key, widget in self._net_widgets.items():
-                value = prefs.get(key)
-                if key == 'proxy_type':
-                    index = widget.findData(value)
-                    widget.setCurrentIndex(max(0, index))
-                elif key == 'proxy_port':
-                    widget.setValue(int(value or 0))
-                elif isinstance(widget, LineEdit):
-                    widget.setText(str(value or ''))
-                else:
-                    widget.setChecked(bool(value))
-        finally:
-            self._net_loading = False
-
     def _net_push(self, **values) -> None:
         if self._net_loading or self._net_apply is None:
             return
@@ -5091,12 +6788,11 @@ class SettingsPage(QWidget):
     def _offer_restart(self) -> None:
         box = MessageBoxBase(self.window())
         label = BodyLabel(self._t(
-            'settings.privacy_restart_prompt',
-            'Anonymous mode is fully applied after a restart. Restart now?'))
+            'settings.privacy_restart_prompt'))
         label.setWordWrap(True)
         box.viewLayout.addWidget(label)
-        box.yesButton.setText(self._t('settings.restart_now', 'Restart Now'))
-        box.cancelButton.setText(self._t('settings.restart_later', 'Later'))
+        box.yesButton.setText(self._t('settings.restart_now'))
+        box.cancelButton.setText(self._t('settings.restart_later'))
         if box.exec() and relaunch_app():
             window = self.window()
             if hasattr(window, '_force_quit'):
@@ -5129,8 +6825,8 @@ class SettingsPage(QWidget):
             yield
 
         self._btn_shortcuts_reset = PushButton(
-            self._t('settings.shortcuts_reset', 'Reset to defaults'), group)
-        self._bind(self._btn_shortcuts_reset.setText, 'settings.shortcuts_reset', 'Reset to defaults')
+            self._t('settings.shortcuts_reset'), group)
+        self._bind(self._btn_shortcuts_reset.setText, 'settings.shortcuts_reset')
         self._btn_shortcuts_reset.clicked.connect(self._on_shortcuts_reset)
         self._plain_card(
             group, 'settings.keyboard_shortcut', FluentIcon.SYNC,
@@ -5176,7 +6872,7 @@ class SettingsPage(QWidget):
             with suppress(Exception):
                 window._set_page_shortcuts_enabled(False)
         button.setText('…')
-        button.setToolTip(self._t('settings.shortcut_capture_tip', 'Press the new keys (Esc cancels)'))
+        button.setToolTip(self._t('settings.shortcut_capture_tip'))
         with suppress(Exception):
             button.setFocus()
             button.grabKeyboard()
@@ -5225,9 +6921,8 @@ class SettingsPage(QWidget):
         normalized = combo.replace(' ', '').lower()
         if normalized in {'alt+left', 'alt+right', 'f5', 'f1', 'ctrl+shift+t'}:
             InfoBar.warning(
-                title=self._t('settings.shortcut_conflict_title', 'Shortcut already in use'),
-                content=self._t('settings.shortcut_conflict_content_generic',
-                                'That combination is reserved by the app'),
+                title=self._t('settings.shortcut_conflict_title'),
+                content=self._t('settings.shortcut_conflict_content_generic'),
                 orient=Qt.Orientation.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT, duration=2500, parent=self.window())
             return
@@ -5269,18 +6964,16 @@ class SettingsPage(QWidget):
         from PySide6.QtWidgets import QDialog
         box = MessageBoxBase(self.window())
         box.viewLayout.addWidget(StrongBodyLabel(
-            self._t('settings.shortcut_conflict_title', 'Shortcut already in use')))
+            self._t('settings.shortcut_conflict_title')))
         box.viewLayout.addWidget(BodyLabel(
             self._t('settings.shortcut_conflict_content',
-                    "'{combo}' is already assigned to {other}. Are you sure you want to use it for {current}?",
                     combo=combo, other=other_label, current=current_label)))
         box.viewLayout.addWidget(CaptionLabel(
             self._t('settings.shortcut_conflict_hint',
-                    'Swap exchanges both shortcuts. Reassign moves {other} onto a new one - you will press it next.',
                     other=other_label)))
-        box.cancelButton.setText(self._t('common.cancel', 'Cancel'))
-        box.yesButton.setText(self._t('settings.shortcut_conflict_reassign', 'Reassign'))
-        swap = PushButton(self._t('settings.shortcut_conflict_swap', 'Swap'), box.buttonGroup)
+        box.cancelButton.setText(self._t('common.cancel'))
+        box.yesButton.setText(self._t('settings.shortcut_conflict_reassign'))
+        swap = PushButton(self._t('settings.shortcut_conflict_swap'), box.buttonGroup)
         box.buttonLayout.insertWidget(0, swap)
         picked = {'choice': None}
 
@@ -5348,6 +7041,11 @@ class SettingsPage(QWidget):
         return '+'.join(parts)
 
     def eventFilter(self, obj, event) -> bool:
+        if obj is self._search and obj is not None:
+            if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape and obj.text():
+                self._exit_search(True)
+                return True
+            return False
         if self._capturing_shortcut is not None and obj in [
                 button for _group, button in self._shortcut_rows.values()]:
             if event.type() == QEvent.Type.KeyRelease:
@@ -5371,7 +7069,7 @@ class SettingsPage(QWidget):
 
     def _pick_download_folder(self, attr: str, edit: LineEdit) -> None:
         path = QFileDialog.getExistingDirectory(
-            self, self._t('settings.select_download_dir', 'Select Download Directory'),
+            self, self._t('settings.select_download_dir'),
             edit.text() or default_download_dir(attr))
         if not path:
             return
@@ -5379,7 +7077,7 @@ class SettingsPage(QWidget):
         problem = check_dir_writable(path)
         if problem:
             InfoBar.error(
-                title=self._t('settings.folder_not_writable', "Can't use this folder"),
+                title=self._t('settings.folder_not_writable'),
                 content=problem, orient=Qt.Orientation.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT, duration=4500, parent=self.window())
             return
@@ -5395,25 +7093,191 @@ class SettingsPage(QWidget):
             self._apply_setting('tv_stream_addons', value)
 
 
+    def _set_update_status(self, text: str) -> None:
+        label = self.__dict__.get('_update_status_lbl')
+        if label is not None:
+            with suppress(RuntimeError):
+                label.setText(text)
+        if self._update_btn is not None and text:
+            self._update_btn.setToolTip(text)
+
+    def _set_update_busy(self, busy: bool) -> None:
+        if self._update_btn is not None:
+            with suppress(RuntimeError):
+                self._update_btn.set_busy(busy)
+                self._update_btn.setEnabled(not busy)
+
+    def _on_update_button(self) -> None:
+        if self._update_result is not None:
+            self._offer_update(self._update_result)
+        else:
+            self._on_check_update()
+
+    def _auto_check_updates(self) -> None:
+        if getattr(settings, 'auto_check_updates', True) and not _UPDATE_INFO['ts'] and not self._probing:
+            self._silent_check = True
+            self._on_check_update()
+
     def _on_check_update(self) -> None:
-        self._btn_check_update.setEnabled(False)
-        self._update_status_lbl.setText(tr('update.checking'))
+        self._set_update_busy(True)
+        self._set_update_status(tr('update.checking'))
         update_controller.disconnect_listeners()
         update_controller.check_finished.connect(self._on_update_check_done)
         update_controller.check()
 
     def _on_update_check_done(self, result) -> None:
-        self._btn_check_update.setEnabled(True)
+        silent, self._silent_check = self._silent_check, False
+        self._set_update_busy(False)
+        self._update_result = result
+        if self._update_btn is not None:
+            self._update_btn.set_state('found' if result is not None else 'latest')
+        _UPDATE_INFO['ts'] = time.time()
+        self._probe_channels()
+        self._refresh_update_popup()
         if result is None:
-            self._update_status_lbl.setText(tr('update.up_to_date'))
+            self._set_update_status(tr('update.up_to_date'))
             return
-        self._update_status_lbl.setText(tr('update.available', tag=result.get('label') or result['tag']))
+        self._set_update_status(tr('update.available', tag=result.get('label') or result['tag']))
+        if not silent:
+            self._offer_update(result)
+
+    def _probe_channels(self) -> None:
+        if self._probing:
+            return
+        self._probing = True
+        from src.core import updater as _updater
+        from src.core import worker as _worker
+
+        def _job():
+            out = {}
+            for name, channel in (('stable', 'stable'), ('canary', 'auto')):
+                try:
+                    out[name] = _updater.check_for_update(channel=channel)
+                except Exception:
+                    out[name] = False
+            return out
+
+        _worker.submit(_job, on_done=self._channels_ready.emit, on_error=lambda _m: self._channels_ready.emit(None),
+                       owner=self, key='update-channels', priority=_worker.Priority.NORMAL)
+
+    def _on_channels_ready(self, info) -> None:
+        self._probing = False
+        if info:
+            _UPDATE_INFO['channels'] = info
+            _UPDATE_INFO['ts'] = time.time()
+        self._refresh_update_popup()
+
+    def _confirm_canary(self) -> bool:
+        box = MessageBoxBase(self.window())
+        title = StrongBodyLabel(tr_or('update.canary_warn_title'))
+        title.setStyleSheet(f'color: {_CANARY_GOLD};')
+        box.viewLayout.addWidget(title)
+        body = BodyLabel(tr_or(
+            'update.canary_warn_body'))
+        body.setWordWrap(True)
+        box.viewLayout.addWidget(body)
+        box.widget.setMinimumWidth(420)
+        box.yesButton.setText(tr_or('update.canary_warn_confirm'))
+        box.cancelButton.setText(tr('download.cancel'))
+        return bool(box.exec())
+
+    def _on_channel_chosen(self, name: str) -> None:
+        result = (_UPDATE_INFO['channels'] or {}).get(name)
+        if not isinstance(result, dict):
+            return
+        if self._update_popup is not None:
+            self._update_popup.hide()
+        if name == 'canary' and not (IS_CANARY or settings.canary_updates):
+            if not self._confirm_canary():
+                return
+            self._apply_setting('canary_updates', True)
+        self._offer_update(result)
+
+    def _on_canary_toggled(self, on: bool) -> None:
+        popup = self._update_popup
+        if on:
+            if popup is not None:
+                popup.hide()
+            if not self._confirm_canary():
+                self._refresh_update_popup()
+                return
+            self._apply_setting('canary_updates', True)
+            self._on_check_update()
+        else:
+            self._apply_setting('canary_updates', False)
+            _UPDATE_INFO['channels'] = None
+            self._probe_channels()
+        self._refresh_update_popup()
+
+    def _on_popup_closed(self) -> None:
+        self._popup_closed_at = time.monotonic()
+        self._update_btn.set_open(False)
+
+    def _show_update_popup(self) -> None:
+        if time.monotonic() - self._popup_closed_at < 0.35:
+            return
+        if self._update_popup is None:
+            self._update_popup = _UpdatePopup(self.window())
+            self._update_popup.checkRequested.connect(self._on_check_update)
+            self._update_popup.channelChosen.connect(self._on_channel_chosen)
+            self._update_popup.canaryToggled.connect(self._on_canary_toggled)
+            self._update_popup.autoToggled.connect(lambda v: self._apply_setting('auto_check_updates', bool(v)))
+            self._update_popup.closed.connect(self._on_popup_closed)
+        if _UPDATE_INFO['channels'] is None or time.time() - _UPDATE_INFO['ts'] > 600:
+            self._probe_channels()
+        self._refresh_update_popup()
+        self._update_btn.set_open(True)
+        self._update_popup.show_under(self._update_btn)
+
+    def _refresh_update_popup(self) -> None:
+        popup = self._update_popup
+        if popup is None or not shiboken6.isValid(popup):
+            return
+        channels = _UPDATE_INFO['channels']
+        pal = palette()
+        muted = pal.get('muted') or '#8a8a8a'
+        green = pal.get('state_seeding') or '#3fb950'
+        auto_text = tr_or('update.auto_short')
+
+        def status(name):
+            value = (channels or {}).get(name)
+            if channels is None:
+                return (tr_or('update.checking_short'), muted, '')
+            if value is False:
+                return (tr_or('update.unavailable'), muted, '')
+            if value is None:
+                return (tr_or('update.up_to_date_short'), green, '')
+            version = str(value.get('label') or value.get('tag') or '')
+            return (tr_or('update.version_available', v=version), muted, version)
+
+        sub_s, col_s, up_s = status('stable')
+        sub_c, col_c, up_c = status('canary')
+        opted = bool(settings.canary_updates)
+        if not IS_CANARY and not up_c:
+            sub_c = (tr_or('update.canary_opted') if opted
+                     else tr_or('update.canary_desc'))
+            col_c = muted
+        popup.fill({
+            'title': tr_or('update.popup_title'),
+            'version': VERSION_LABEL, 'here': _CANARY_GOLD if IS_CANARY else _STABLE_BLUE,
+            'stable': (tr_or('update.stable'), sub_s, col_s, up_s, None),
+            'canary': (tr_or('update.canary'), sub_c, col_c, up_c, None if IS_CANARY else opted),
+            'update': tr_or('update.update_button'),
+            'auto': bool(getattr(settings, 'auto_check_updates', True)), 'auto_text': auto_text,
+            'checked': tr_or('update.last_checked', when=_ago(_UPDATE_INFO['ts'])),
+            'check': tr_or('update.check_now'),
+            'busy': bool(self._probing or (self._update_btn is not None and self._update_btn.busy)),
+        })
+        if popup.isVisible():
+            popup.adjustSize()
+
+    def _offer_update(self, result) -> None:
         if show_update_dialog(self.window(), result, allow_skip=True) == 'update':
             self._start_update_download(result)
 
     def _start_update_download(self, result) -> None:
-        self._update_status_lbl.setText(tr('update.downloading'))
-        self._btn_check_update.setEnabled(False)
+        self._set_update_status(tr('update.downloading'))
+        self._set_update_busy(True)
         update_controller.disconnect_listeners()
         update_controller.download_progress.connect(self._on_update_download_progress)
         update_controller.download_finished.connect(self._on_update_download_finished)
@@ -5425,14 +7289,14 @@ class SettingsPage(QWidget):
 
     def _on_update_download_progress(self, downloaded: int, total: int) -> None:
         if total > 0:
-            self._update_status_lbl.setText(
+            self._set_update_status(
                 tr('update.downloading_pct', percent=int(downloaded / total * 100)))
         window = self.window()
         if hasattr(window, 'set_update_overlay_progress'):
             window.set_update_overlay_progress(downloaded, total)
 
     def _on_update_download_finished(self, path: str) -> None:
-        self._update_status_lbl.setText(tr('update.restarting'))
+        self._set_update_status(tr('update.restarting'))
         window = self.window()
         if hasattr(window, 'set_update_overlay_indeterminate'):
             window.set_update_overlay_indeterminate(tr('update.restarting'))
@@ -5442,15 +7306,15 @@ class SettingsPage(QWidget):
             logger.exception('Failed to apply update')
             if hasattr(window, 'hide_update_overlay'):
                 window.hide_update_overlay()
-            self._update_status_lbl.setText(tr('update.failed'))
-            self._btn_check_update.setEnabled(True)
+            self._set_update_status(tr('update.failed'))
+            self._set_update_busy(False)
 
     def _on_update_download_error(self, _message: str) -> None:
         window = self.window()
         if hasattr(window, 'hide_update_overlay'):
             window.hide_update_overlay()
-        self._update_status_lbl.setText(tr('update.download_failed'))
-        self._btn_check_update.setEnabled(True)
+        self._set_update_status(tr('update.download_failed'))
+        self._set_update_busy(False)
 
 
     def _refresh_cache_size(self) -> None:
@@ -5506,30 +7370,256 @@ class SettingsPage(QWidget):
             orient=Qt.Orientation.Horizontal, isClosable=True,
             position=InfoBarPosition.TOP_RIGHT, duration=2500, parent=self.window())
 
-    def _on_wipe_all(self) -> None:
+    def _confirm_wipe_all(self) -> list[str] | None:
+        pal = palette()
+        error = QColor('#D83B3B')
+        error_name = error.name()
+        on_error = '#ffffff'
+        hover = error.lighter(112).name()
+        pressed = error.darker(115).name()
+        link = pal.get('accent_text', pal.get('accent', error_name))
+
         box = MessageBoxBase(self.window())
+        box.widget.setMinimumWidth(500)
         layout = QVBoxLayout()
-        warning = StrongBodyLabel(tr('settings.wipe_all_confirm_title'))
-        warning.setStyleSheet(f'color: {palette()["state_error"]};')
-        layout.addWidget(warning)
-        content = BodyLabel(tr('settings.wipe_all_confirm_content'))
-        content.setWordWrap(True)
-        layout.addWidget(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        title = StrongBodyLabel(self._t('settings.wipe_dialog_title'))
+        title.setStyleSheet('font-size: 18px; font-weight: 600;')
+        subtitle = BodyLabel(self._t('settings.wipe_dialog_content'))
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addSpacing(4)
+        layout.addWidget(subtitle)
+        layout.addSpacing(20)
+
+        toggles = QHBoxLayout()
+        toggles.setContentsMargins(12, 0, 0, 0)
+        summary = CaptionLabel('')
+        toggle_all = QPushButton()
+        toggle_all.setObjectName('wipeLink')
+        toggle_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        toggle_all.setFlat(True)
+        toggle_all.setStyleSheet(
+            f'QPushButton#wipeLink {{ border: none; background: transparent; color: {link}; '
+            f'padding: 3px 8px; border-radius: 6px; font-size: 12px; }}'
+            f'QPushButton#wipeLink:hover {{ background: rgba(127, 127, 127, 0.16); }}')
+        toggles.addWidget(summary, 1)
+        toggles.addWidget(toggle_all)
+        layout.addLayout(toggles)
+        layout.addSpacing(6)
+
+        rows: dict[str, _WipeRow] = {}
+        sizes: dict[str, int] = {}
+        list_layout = QVBoxLayout()
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.setSpacing(2)
+        for cat_id, default in WIPE_CATEGORIES:
+            row = _WipeRow(self._t(f'settings.wipe_cat_{cat_id}'), self._t(f'settings.wipe_cat_{cat_id}_desc'), default)
+            list_layout.addWidget(row)
+            rows[cat_id] = row
+        layout.addLayout(list_layout)
+        layout.addSpacing(16)
+
+        note = CaptionLabel(self._t('settings.wipe_all_restart_note', app=APP_NAME))
+        note.setWordWrap(True)
+        note.setContentsMargins(12, 0, 12, 0)
+        note_policy = note.sizePolicy()
+        note_policy.setRetainSizeWhenHidden(True)
+        note.setSizePolicy(note_policy)
+        layout.addWidget(note)
         box.viewLayout.addLayout(layout)
-        box.yesButton.setText(tr('settings.wipe_all_confirm_button'))
-        box.cancelButton.setText(tr('download.cancel'))
+
+        yes = box.yesButton
+        yes.setObjectName('wipeConfirm')
+        yes.setStyleSheet(
+            f'PrimaryPushButton#wipeConfirm {{ background-color: {error_name}; border: 1px solid {error_name}; '
+            f'color: {on_error}; }}'
+            f'PrimaryPushButton#wipeConfirm:hover {{ background-color: {hover}; border-color: {hover}; color: {on_error}; }}'
+            f'PrimaryPushButton#wipeConfirm:pressed {{ background-color: {pressed}; border-color: {pressed}; color: {on_error}; }}'
+            f'PrimaryPushButton#wipeConfirm:disabled {{ background-color: rgba(127, 127, 127, 0.18); '
+            f'border-color: transparent; color: rgba(127, 127, 127, 0.85); }}')
+        box.cancelButton.setText(self._t('download.cancel'))
+
+        def refresh(*_args) -> None:
+            chosen = [c for c, row in rows.items() if row.isChecked()]
+            yes.setEnabled(bool(chosen))
+            yes.setText(self._t('settings.wipe_dialog_confirm', count=len(chosen)) if chosen
+                        else self._t('settings.wipe_dialog_confirm_none'))
+            toggle_all.setText(self._t('settings.wipe_select_none' if len(chosen) == len(rows) else 'settings.wipe_select_all'))
+            note.setVisible(any(c not in _LIVE_WIPE_SAFE for c in chosen))
+            if chosen:
+                total = sum(sizes.get(c, 0) for c in chosen)
+                ready = all(c in sizes for c in chosen)
+                summary.setText(self._t(
+                    'settings.wipe_dialog_summary_size', count=len(chosen), total=len(rows),
+                    size=f'{format_size(total)}{"" if ready else "+"}'))
+            else:
+                summary.setText(self._t('settings.wipe_dialog_summary', count=0, total=len(rows)))
+
+        def toggle_everything() -> None:
+            target = not all(row.isChecked() for row in rows.values())
+            for row in rows.values():
+                row.setChecked(target)
+
+        for row in rows.values():
+            row.toggled.connect(refresh)
+        toggle_all.clicked.connect(toggle_everything)
+
+        emitter = _WipeSizeEmitter(box)
+
+        def on_sized(cat: str, size: int) -> None:
+            sizes[cat] = size
+            rows[cat].setSizeText(format_size(size))
+            refresh()
+
+        emitter.sized.connect(on_sized)
+        refresh()
+
+        def measure() -> None:
+            try:
+                targets = wipe_targets([c[0] for c in WIPE_CATEGORIES])
+            except Exception:
+                return
+            for cat, items in targets.items():
+                total = 0
+                for item in items:
+                    try:
+                        total += dir_size_bytes(item) if os.path.isdir(item) else os.path.getsize(item)
+                    except OSError:
+                        pass
+                with suppress(RuntimeError):
+                    emitter.sized.emit(cat, total)
+
+        threading.Thread(target=measure, name='wipe-size', daemon=True).start()
+
         if not box.exec():
-            return
+            return None
+        return [cat for cat, row in rows.items() if row.isChecked()]
+
+    def _release_app_data_handles(self) -> None:
+        for name, mod in list(sys.modules.items()):
+            if name.endswith('.database') and hasattr(mod, 'close_connection') and hasattr(mod, '_conn_cache'):
+                with suppress(Exception):
+                    for key in list(mod._conn_cache):
+                        mod.close_connection(key)
         try:
             from src.core.cache import cache
             cache.close()
-            wipe_all_app_data()
         except Exception:
-            logger.exception('Failed to wipe app data')
+            logger.exception('Failed to close cache before wipe')
+        with suppress(Exception):
+            from src.core import worker as _worker
+            _worker.cancel_all()
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            if isinstance(handler, logging.FileHandler):
+                with suppress(Exception):
+                    handler.close()
+                    root.removeHandler(handler)
+
+    def _download_managers(self) -> list:
+        try:
+            from src.core.downloader import DownloadManager
+        except Exception:
+            return []
+        found, seen = [], set()
+        roots = [self.window(), QApplication.instance()]
+        roots += list(QApplication.topLevelWidgets())
+        for root in roots:
+            if root is None:
+                continue
+            for mgr in root.findChildren(DownloadManager):
+                if id(mgr) not in seen:
+                    seen.add(id(mgr))
+                    found.append(mgr)
+        return found
+
+    def _wipe_without_restart(self, categories: list[str]) -> None:
+        from src.core import worker as _worker
+        self._live_wipe_cats = list(categories)
+        if 'downloads' in categories:
+            for mgr in self._download_managers():
+                with suppress(Exception):
+                    mgr.pause_all()
+                    mgr.remove_all(delete_files=True)
+
+        def job() -> str:
+            if 'cache' in categories:
+                from src.core.cache import clear_app_cache
+                from src.core.repacks.enrichment import clear_steam_cache
+                clear_app_cache()
+                clear_steam_cache()
+            files = [c for c in categories if c not in ('cache', 'settings')]
+            if files:
+                failures = wipe_all_app_data(files)
+                if failures:
+                    return os.path.basename(failures[0]) or 'unknown error'
+            return ''
+
+        _worker.submit(
+            job,
+            on_done=lambda result: self._live_wipe_finished.emit(str(result or '')),
+            on_error=lambda message: self._live_wipe_finished.emit(str(message) or 'unknown error'),
+            owner=self, key='live-wipe', priority=_worker.Priority.NORMAL)
+
+    def _on_live_wipe_finished(self, error: str) -> None:
+        self._btn_wipe_all.setEnabled(True)
+        self._last_cache_probe = 0.0
+        with suppress(Exception):
+            self._refresh_cache_size()
+        if error:
+            self._wipe_all_failed(error)
+            return
+        logger.info('Wipe finished without restart')
+        if 'themes' in getattr(self, '_live_wipe_cats', ()):
+            with suppress(Exception):
+                reload_custom_themes()
+        InfoBar.success(
+            title=self._t('settings.clear_cache_done_title'), content='',
+            orient=Qt.Orientation.Horizontal, isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT, duration=2500, parent=self.window())
+
+    def _wipe_all_failed(self, error: BaseException | str) -> None:
+        logger.error('Failed to wipe app data: %s', error)
+        self._btn_wipe_all.setEnabled(True)
+        InfoBar.error(
+            title=self._t('settings.wipe_all_failed_title'),
+            content=self._t(
+                'settings.wipe_all_failed_content',
+                error=str(error) or 'unknown error'),
+            orient=Qt.Orientation.Horizontal, isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT, duration=8000, parent=self.window())
+
+    def _on_wipe_all(self) -> None:
+        categories = self._confirm_wipe_all()
+        if not categories:
+            return
+        self._btn_wipe_all.setEnabled(False)
+        if all(c in _LIVE_WIPE_SAFE for c in categories):
+            self._wipe_without_restart(categories)
+            return
         window = self.window()
+        self._release_app_data_handles()
+        env = dict(os.environ)
+        env.pop('QT_SCALE_FACTOR', None)
+        if not relaunch_app_and_wipe(env=env, categories=categories):
+            try:
+                failures = wipe_all_app_data(categories)
+            except Exception as exc:
+                logger.exception('Failed to wipe app data')
+                self._wipe_all_failed(exc)
+                return
+            if failures:
+                self._wipe_all_failed(os.path.basename(failures[0]))
+                return
+        logger.info('Wipe scheduled; restarting')
         if hasattr(window, '_force_quit'):
             window._force_quit = True
         window.close()
+        with suppress(Exception):
+            QTimer.singleShot(1500, QApplication.quit)
 
 
     def _on_launch_at_startup_toggled(self, checked: bool) -> None:
@@ -5549,10 +7639,10 @@ class SettingsPage(QWidget):
         if checked and not is_admin():
             box = MessageBoxBase(self.window())
             layout = QVBoxLayout()
-            layout.addWidget(BodyLabel('Restart as administrator?'))
+            layout.addWidget(BodyLabel(tr('admin.restart_title')))
             box.viewLayout.addLayout(layout)
-            box.yesButton.setText('Restart Now')
-            box.cancelButton.setText('Later')
+            box.yesButton.setText(tr('admin.restart_yes'))
+            box.cancelButton.setText(tr('admin.restart_later'))
             if box.exec() and relaunch_as_admin():
                 window = self.window()
                 if hasattr(window, '_force_quit'):
@@ -5563,9 +7653,18 @@ class SettingsPage(QWidget):
     def _on_show_console_toggled(self, checked: bool) -> None:
         self._apply_setting('show_console', bool(checked))
         try:
-            set_debug_console_visible(bool(checked))
+            opened = set_debug_console_visible(bool(checked))
         except Exception:
             logger.exception('Failed to toggle debug console')
+            opened = not checked
+        if checked and not opened:
+            InfoBar.warning(
+                title=self._t('settings.show_console_title'),
+                content=self._t(
+                    'settings.show_console_failed',
+                    path=console_log_path()),
+                orient=Qt.Orientation.Horizontal, isClosable=True,
+                position=InfoBarPosition.TOP_RIGHT, duration=6000, parent=self.window())
 
     def _on_log_to_file_toggled(self, checked: bool) -> None:
         self._apply_setting('log_to_file', bool(checked))
@@ -5588,7 +7687,7 @@ class SettingsPage(QWidget):
             opened = False
         if not opened:
             InfoBar.error(
-                title=self._t('settings.open_logs_failed_title', "Couldn't open logs folder"),
+                title=self._t('settings.open_logs_failed_title'),
                 content=error, orient=Qt.Orientation.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT, duration=4000, parent=self.window())
 
@@ -5601,7 +7700,7 @@ class SettingsPage(QWidget):
     def _on_export_settings(self) -> None:
         name = time.strftime('pirachest-settings-%Y-%m-%d.json')
         path, _filter = QFileDialog.getSaveFileName(
-            self, self._t('settings.backup_export_title', 'Export Settings'),
+            self, self._t('settings.backup_export_title'),
             os.path.join(self._default_backup_dir(), name), 'JSON files (*.json)')
         if not path:
             return
@@ -5612,21 +7711,20 @@ class SettingsPage(QWidget):
         except (OSError, ValueError) as exc:
             logger.exception('Failed to export settings backup')
             InfoBar.error(
-                title=self._t('settings.backup_export_failed_title', "Couldn't export settings"),
+                title=self._t('settings.backup_export_failed_title'),
                 content=str(exc), orient=Qt.Orientation.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT, duration=5000, parent=self.window())
             return
         logger.info('Settings exported to %s', target)
         InfoBar.success(
-            title=self._t('settings.backup_export_done_title', 'Settings exported'),
-            content=self._t('settings.backup_export_done_content',
-                            'Your settings backup was saved successfully.'),
+            title=self._t('settings.backup_export_done_title'),
+            content=self._t('settings.backup_export_done_content'),
             orient=Qt.Orientation.Horizontal, isClosable=True,
             position=InfoBarPosition.TOP_RIGHT, duration=3500, parent=self.window())
 
     def _on_import_settings(self) -> None:
         path, _filter = QFileDialog.getOpenFileName(
-            self, self._t('settings.backup_import_title', 'Import Settings'),
+            self, self._t('settings.backup_import_title'),
             self._default_backup_dir(), 'JSON files (*.json)')
         if not path:
             return
@@ -5636,15 +7734,14 @@ class SettingsPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         layout.addWidget(StrongBodyLabel(self._t(
-            'settings.backup_confirm_title', 'Restore settings from this backup?')))
+            'settings.backup_confirm_title')))
         content = BodyLabel(self._t(
-            'settings.backup_confirm_content',
-            'This replaces all current settings with the values in the backup. PiraChest will recommend a restart afterwards.'))
+            'settings.backup_confirm_content'))
         content.setWordWrap(True)
         layout.addWidget(content)
         box.viewLayout.addLayout(layout)
-        box.yesButton.setText(self._t('settings.backup_restore_button', 'Restore'))
-        box.cancelButton.setText(self._t('common.cancel', 'Cancel'))
+        box.yesButton.setText(self._t('settings.backup_restore_button'))
+        box.cancelButton.setText(self._t('common.cancel'))
         if not box.exec():
             return
         try:
@@ -5653,16 +7750,15 @@ class SettingsPage(QWidget):
         except (OSError, ValueError) as exc:
             logger.exception('Failed to restore settings backup')
             InfoBar.error(
-                title=self._t('settings.backup_import_failed_title', "Couldn't restore settings"),
+                title=self._t('settings.backup_import_failed_title'),
                 content=str(exc), orient=Qt.Orientation.Horizontal, isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT, duration=6000, parent=self.window())
             return
         logger.info('Settings restored from backup (%d fields changed)', changed)
         self.settings_changed.emit()
         InfoBar.success(
-            title=self._t('settings.backup_import_done_title', 'Settings restored'),
+            title=self._t('settings.backup_import_done_title'),
             content=self._t('settings.backup_import_done_content',
-                            '{count} setting(s) updated. Restart PiraChest to apply everything.',
                             count=changed),
             orient=Qt.Orientation.Horizontal, isClosable=True,
             position=InfoBarPosition.TOP_RIGHT, duration=5000, parent=self.window())
@@ -5675,15 +7771,14 @@ class SettingsPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         layout.addWidget(StrongBodyLabel(self._t(
-            'settings.backup_restart_title', 'Restart to finish restoring?')))
+            'settings.backup_restart_title')))
         content = BodyLabel(self._t(
-            'settings.backup_restart_content',
-            'Some restored settings only take effect after a restart. Restart now?'))
+            'settings.backup_restart_content'))
         content.setWordWrap(True)
         layout.addWidget(content)
         box.viewLayout.addLayout(layout)
-        box.yesButton.setText(self._t('admin.restart_yes', 'Restart Now'))
-        box.cancelButton.setText(self._t('admin.restart_later', 'Later'))
+        box.yesButton.setText(self._t('admin.restart_yes'))
+        box.cancelButton.setText(self._t('admin.restart_later'))
         if box.exec() and relaunch_app():
             window = self.window()
             if hasattr(window, '_force_quit'):
@@ -5768,16 +7863,26 @@ class SettingsPage(QWidget):
 
 
     def showEvent(self, event) -> None:
+        if not self._category_buttons:
+            self._ensure_shell()
         self._show_category(self._selected_category, animate=False)
         super().showEvent(event)
         if self._theme_dirty:
             self._run_theme_refresh()
+        else:
+            self._sync_accent_button()
         self._refresh_cache_size()
+        if not self._jobs and self._next_unloaded() is not None:
+            self._prebuild_timer.start(300)
 
     def hideEvent(self, event) -> None:
         with suppress(Exception):
             self._cancel_shortcut_capture()
+        self._hide_results()
         super().hideEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
 
 
 _LAST_APPLIED_FONT_FAMILIES: tuple | None = None

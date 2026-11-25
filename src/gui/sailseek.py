@@ -798,13 +798,6 @@ class _ResultsView(QListView):
         self.viewport().setAutoFillBackground(False)
         self.setStyleSheet(
             'QListView { background: transparent; border: none; outline: none; }'
-            'QScrollBar:vertical { background: transparent; width: 6px; margin: 2px 0; }'
-            'QScrollBar::handle:vertical { background: rgba(154, 154, 154, 80); '
-            'min-height: 28px; border-radius: 3px; }'
-            'QScrollBar::handle:vertical:hover { background: rgba(154, 154, 154, 130); }'
-            'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }'
-            'QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical '
-            '{ background: transparent; }'
         )
         self.placeholder = ''
         self._hover_row = -1

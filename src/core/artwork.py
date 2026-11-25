@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
 from PySide6.QtCore import QRect, QSize, Qt
-from PySide6.QtGui import QColor, QGuiApplication, QImage, QImageReader, QPixmap
+from PySide6.QtGui import QColor, QGuiApplication, QImage, QImageReader, QPainter, QPainterPath, QPixmap
 from shiboken6 import isValid as _alive
 
 from src.core.config import paths
@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 COVER = 0
 FIT = 1
+FRAME = 2
 
 _STORE = os.path.join(paths.cache_dir, 'images')
 _MAX_BYTES = 16 * 1024 * 1024
@@ -78,8 +79,8 @@ def _http_client():
             if _client is None:
                 import httpx
 
-                from .net import shared_ssl_context
-                _client = httpx.Client(
+                from .net import LazyHttpClient, shared_ssl_context
+                _client = LazyHttpClient(
                     headers={'User-Agent': _UA, 'Accept': 'image/*,*/*;q=0.8', 'Accept-Encoding': 'gzip, deflate'},
                     follow_redirects=True, trust_env=False, timeout=httpx.Timeout(8.0, connect=3.0),
                     limits=httpx.Limits(max_connections=16, max_keepalive_connections=16),
@@ -302,11 +303,33 @@ def _decode(path: str, width: int, height: int, mode: int, dpr: float, src: str 
         return image
     if not known and pw > 0 and ph > 0:
         image = _fit(image, pw, ph, mode)
+    if mode == FRAME:
+        image = _frame(image, pw, ph, dpr)
     fmt = QImage.Format.Format_ARGB32_Premultiplied if image.hasAlphaChannel() else QImage.Format.Format_RGB32
     if image.format() != fmt:
         image = image.convertToFormat(fmt)
     image.setDevicePixelRatio(dpr)
     return image
+
+
+def _frame(image: QImage, pw: int, ph: int, dpr: float = 1.0) -> QImage:
+    if image.isNull() or pw <= 0 or ph <= 0 or image.height() <= 0:
+        return image
+    ratio = (image.width() / image.height()) / (pw / ph)
+    if 0.75 <= ratio <= 1.33:
+        return image.scaled(pw, ph, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    canvas = QImage(pw, ph, QImage.Format.Format_ARGB32_Premultiplied)
+    canvas.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(canvas)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    x, y = (pw - image.width()) // 2, (ph - image.height()) // 2
+    radius = 6 * dpr
+    clip = QPainterPath()
+    clip.addRoundedRect(x, y, image.width(), image.height(), radius, radius)
+    painter.setClipPath(clip)
+    painter.drawImage(x, y, image)
+    painter.end()
+    return canvas
 
 
 def _fit(image: QImage, pw: int, ph: int, mode: int) -> QImage:

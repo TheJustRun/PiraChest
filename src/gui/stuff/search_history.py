@@ -4,10 +4,10 @@ import json
 import logging
 import os
 
-from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QApplication, QGraphicsDropShadowEffect, QHBoxLayout,
-                               QSizePolicy, QVBoxLayout, QWidget)
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPropertyAnimation, Qt, QTimer
+from PySide6.QtGui import QColor, QIcon
+from PySide6.QtWidgets import (QApplication, QGraphicsDropShadowEffect, QGraphicsOpacityEffect,
+                               QHBoxLayout, QSizePolicy, QVBoxLayout, QWidget)
 
 from qfluentwidgets import (BodyLabel, CaptionLabel, FluentIcon, FlyoutViewBase,
                             TransparentPushButton, TransparentToolButton)
@@ -101,13 +101,64 @@ def clear(key: str | None = None) -> None:
     _save()
 
 
+def _theme() -> dict:
+    from src.core.theme import palette, to_color
+    pal = palette()
+
+    def color(key: str, fallback: str) -> QColor:
+        return to_color(pal.get(key) or fallback, fallback)
+
+    surface = color('dialog_bg', '#202020')
+    surface.setAlpha(255)
+    selected = color('nav_selected_bg', '#333333')
+    hover = QColor(selected)
+    hover.setAlphaF(hover.alphaF() * 0.5)
+    return {
+        'surface': surface,
+        'border': color('dialog_border', '#3a3a3a'),
+        'text': color('primary_text', '#f2f2f2'),
+        'muted': color('muted', '#9a9a9a'),
+        'icon': color('icon_color', pal.get('primary_text') or '#f2f2f2'),
+        'hover': hover,
+        'pressed': selected,
+    }
+
+
+def _rgba(c: QColor) -> str:
+    return f'rgba({c.red()}, {c.green()}, {c.blue()}, {c.alphaF():.3f})'
+
+
+def _themed_icon(icon, color: QColor) -> QIcon:
+    try:
+        return icon.icon(color=color)
+    except Exception:
+        return QIcon()
+
+
 class _HistoryView(FlyoutViewBase):
     def __init__(self, owner, parent=None):
         super().__init__(parent)
         self._owner = owner
+        self._colors = _theme()
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(6, 6, 6, 6)
         self._layout.setSpacing(1)
+
+    def backgroundColor(self):
+        return self._colors['surface']
+
+    def borderColor(self):
+        return self._colors['border']
+
+    def _apply_theme(self) -> None:
+        c = self._colors = _theme()
+        self.setStyleSheet(
+            f'BodyLabel {{ color: {_rgba(c["text"])}; background: transparent; }}'
+            f'CaptionLabel {{ color: {_rgba(c["muted"])}; background: transparent; }}'
+            'TransparentPushButton, TransparentToolButton '
+            '{ background: transparent; border: none; border-radius: 5px; }'
+            f'TransparentPushButton:hover, TransparentToolButton:hover {{ background-color: {_rgba(c["hover"])}; }}'
+            f'TransparentPushButton:pressed, TransparentToolButton:pressed {{ background-color: {_rgba(c["pressed"])}; }}')
 
     def _clear(self) -> None:
         for i in reversed(range(self._layout.count())):
@@ -118,6 +169,7 @@ class _HistoryView(FlyoutViewBase):
 
     def reload(self) -> None:
         self._clear()
+        self._apply_theme()
 
         head = QWidget(self)
         head.setFocusPolicy(Qt.NoFocus)
@@ -126,7 +178,8 @@ class _HistoryView(FlyoutViewBase):
         row.setContentsMargins(8, 2, 2, 2)
         row.setSpacing(0)
         title = CaptionLabel(tr('search.recent', default='Recent searches'), head)
-        clear_btn = TransparentToolButton(FluentIcon.DELETE, head)
+        clear_btn = TransparentToolButton(head)
+        clear_btn.setIcon(_themed_icon(FluentIcon.DELETE, self._colors['icon']))
         clear_btn.setFixedSize(24, 24)
         clear_btn.setFocusPolicy(Qt.NoFocus)
         clear_btn.setToolTip(tr('search.clear_all', default='Clear all'))
@@ -174,7 +227,8 @@ class _HistoryView(FlyoutViewBase):
         btn_lay = QHBoxLayout(btn)
         btn_lay.setContentsMargins(10, 0, 6, 0)
         btn_lay.addWidget(label)
-        remove_btn = TransparentToolButton(FluentIcon.CLOSE, host)
+        remove_btn = TransparentToolButton(host)
+        remove_btn.setIcon(_themed_icon(FluentIcon.CLOSE, self._colors['icon']))
         remove_btn.setFixedSize(24, 24)
         remove_btn.setFocusPolicy(Qt.NoFocus)
         remove_btn.setToolTip(tr('search.remove', default='Remove'))
@@ -211,15 +265,97 @@ class _HistoryPopup(QWidget):
         self._outer = QVBoxLayout(self)
         self._outer.setContentsMargins(12, 8, 12, 16)
         self.view = _HistoryView(owner, self)
+        self._set_shadow(True)
+        self._outer.addWidget(self.view)
+        self._fade = None
+        self._slide = None
+        self._closing = False
+
+    def _set_shadow(self, on: bool) -> None:
+        if not on:
+            self.view.setGraphicsEffect(None)
+            return
         shadow = QGraphicsDropShadowEffect(self.view)
         shadow.setBlurRadius(28)
         shadow.setOffset(0, 6)
         shadow.setColor(QColor(0, 0, 0, 70))
         self.view.setGraphicsEffect(shadow)
-        self._outer.addWidget(self.view)
 
     def reload(self) -> None:
         self.view.reload()
+
+    def _animated(self) -> bool:
+        try:
+            from src.core.theme import animations_enabled
+            return bool(animations_enabled())
+        except Exception:
+            return True
+
+    def _stop_animations(self) -> None:
+        for anim in (self._fade, self._slide):
+            if anim is not None:
+                anim.stop()
+        self._fade = self._slide = None
+        self._closing = False
+        if self.graphicsEffect() is not None:
+            self.setGraphicsEffect(None)
+        if self.view.graphicsEffect() is None:
+            self._set_shadow(True)
+
+    def _settle(self) -> None:
+        self._fade = self._slide = None
+        self.setGraphicsEffect(None)
+        self._set_shadow(True)
+
+    def animate_in(self) -> None:
+        self._stop_animations()
+        if not self._animated():
+            return
+        end = self.pos()
+        self._set_shadow(False)
+        effect = QGraphicsOpacityEffect(self)
+        effect.setOpacity(0.0)
+        self.setGraphicsEffect(effect)
+        self._fade = QPropertyAnimation(effect, b'opacity', self)
+        self._fade.setDuration(120)
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self._fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade.finished.connect(self._settle)
+        self._slide = QPropertyAnimation(self, b'pos', self)
+        self._slide.setDuration(150)
+        self._slide.setStartValue(end - QPoint(0, 8))
+        self._slide.setEndValue(end)
+        self._slide.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade.start()
+        self._slide.start()
+
+    def dismiss(self) -> None:
+        if not self.isVisible() or self._closing:
+            return
+        if not self._animated():
+            self.hide()
+            return
+        self._stop_animations()
+        self._closing = True
+        self._set_shadow(False)
+        effect = QGraphicsOpacityEffect(self)
+        effect.setOpacity(1.0)
+        self.setGraphicsEffect(effect)
+        self._fade = QPropertyAnimation(effect, b'opacity', self)
+        self._fade.setDuration(80)
+        self._fade.setStartValue(1.0)
+        self._fade.setEndValue(0.0)
+        self._fade.setEasingCurve(QEasingCurve.Type.InCubic)
+        self._fade.finished.connect(self._finish_close)
+        self._fade.start()
+
+    def _finish_close(self) -> None:
+        self._fade = self._slide = None
+        self._closing = False
+        self.hide()
+        self.setGraphicsEffect(None)
+        self._set_shadow(True)
 
     def _resize(self, width: int) -> None:
         self._width = width
@@ -232,11 +368,13 @@ class _HistoryPopup(QWidget):
         window = edit.window()
         if self.parentWidget() is not window:
             self.setParent(window)
+        self._stop_animations()
         self.reload()
         self._resize(max(240, edit.width()))
         self.position_for(edit)
         self.show()
         self.raise_()
+        self.animate_in()
 
     def position_for(self, edit) -> None:
         window = edit.window()
@@ -304,7 +442,7 @@ class _Attacher(QObject):
 
     def hide(self) -> None:
         self._resettle.stop()
-        self.popup.hide()
+        self.popup.dismiss()
 
     def _resettle_show(self) -> None:
         if not self.popup.isVisible():

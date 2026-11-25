@@ -10,13 +10,13 @@ from PySide6.QtCore import Qt, QSize, QSizeF, QRect, QThread, QObject, Signal, P
 from shiboken6 import isValid as _qt_is_valid
 from PySide6.QtGui import QBrush, QColor, QIcon, QImage, QFontMetrics, QMovie, QTextDocument
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLayout, QLayoutItem, QScrollArea, QDialog, QTreeWidgetItem, QHeaderView, QGridLayout, QLabel, QSizePolicy, QFileDialog, QGraphicsOpacityEffect, QGraphicsDropShadowEffect, QTextBrowser, QListWidget, QListWidgetItem
-from qfluentwidgets import CardWidget, FluentIcon, Pivot, TitleLabel, SubtitleLabel, BodyLabel, StrongBodyLabel, CaptionLabel, TransparentToolButton, PushButton, PrimaryPushButton, ImageLabel, PillPushButton, FlowLayout as QFlowLayout, themeColor, SearchLineEdit, LineEdit, CheckBox, ComboBox, TreeWidget, MessageBoxBase, IndeterminateProgressRing, SmoothScrollArea, HyperlinkButton, qconfig, isDarkTheme
+from qfluentwidgets import ToolTip, ToolTipFilter, ToolTipPosition, CardWidget, FluentIcon, Pivot, TitleLabel, SubtitleLabel, BodyLabel, StrongBodyLabel, CaptionLabel, TransparentToolButton, PushButton, PrimaryPushButton, ImageLabel, PillPushButton, FlowLayout as QFlowLayout, themeColor, SearchLineEdit, LineEdit, CheckBox, ComboBox, TreeWidget, MessageBoxBase, IndeterminateProgressRing, SmoothScrollArea, HyperlinkButton, qconfig, isDarkTheme
 from .home_page import AccentColorMixin, DetailsViewMixin, MediaPageBase
-from PySide6.QtGui import QAction, QDesktopServices, QPainter, QPainterPath, QPen, QPixmap, QRegion
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut, QPainter, QPainterPath, QPen, QPixmap, QRegion
 from PySide6.QtWidgets import QApplication, QGraphicsScene, QGraphicsView, QMenu, QPushButton as _QPB, QStackedWidget, QStyle, QSystemTrayIcon, QWidgetItem, QToolButton
 from PySide6.QtCore import QCoreApplication, QRectF, QUrl, QPoint
 from qfluentwidgets import InfoBar, InfoBarPosition, RoundMenu
-_bookmark_icon_cache: dict[str, QIcon] = {}
+_bookmark_icon_cache: dict[tuple, QIcon] = {}
 
 import re as _tm_re
 import unicodedata as _tm_ud
@@ -180,7 +180,8 @@ def _tm_variants(query: str) -> list[str]:
 
 
 def _bookmark_icon(filled: bool=False) -> QIcon:
-    key = 'filled' if filled else 'outline'
+    base = to_color(resolve_icon_color(), '#ffffff')
+    key = (filled, base.rgba())
     cached = _bookmark_icon_cache.get(key)
     if cached is not None:
         return cached
@@ -197,7 +198,6 @@ def _bookmark_icon(filled: bool=False) -> QIcon:
         x, y = (48.0 + r * math.cos(ang), 48.0 + r * math.sin(ang))
         path.moveTo(x, y) if i == 0 else path.lineTo(x, y)
     path.closeSubpath()
-    base = QColor(palette()['primary_text'])
     if filled:
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(base)
@@ -214,11 +214,12 @@ def _bookmark_icon(filled: bool=False) -> QIcon:
     return icon
 from src.core.models import assess_source_files, classify_file
 from src.core.repacks.base import RepackEntry, RepackDetails, display_title, magnet_display_name, REPACK_LIST_MENUS
-from PySide6.QtWidgets import QAbstractItemView, QListWidgetItem
-from qfluentwidgets import Flyout, FlyoutAnimationType, FlyoutViewBase, ListWidget, SearchLineEdit
+from PySide6.QtWidgets import QAbstractItemView
+from qfluentwidgets import Flyout, FlyoutAnimationType, FlyoutViewBase, ListWidget
 from src.core.worker import fetch_all_tags_async, random_entry_async, resolve_tags_async, fetch_tag_async, fetch_pink_paw_async, fetch_list_async, fetch_page_async, fetch_details_async, fetch_upcoming_repacks_async, fetch_search_async, fetch_popular_repacks_async, cancel as cancel_task, Priority
 from src.core.downloader import DownloadManager, DLState, category_dir
-from src.core.theme import palette, to_color, register_theme_refresh, apply_pivot_theme, apply_tool_button_theme, branded_icon, count_badge_qss, icon_override_pixmap, themed_icon, apply_slot_icon_theme, animations_enabled
+from src.core.theme import palette, to_color, register_theme_refresh, apply_pivot_theme, apply_tool_button_theme, branded_icon, tinted_icon, count_badge_qss, icon_override_pixmap, resolve_icon_color, themed_icon, apply_slot_icon_theme, animations_enabled
+from src.gui.stuff.combo_box import show_dropdown
 from .stuff.grid import PosterGrid, ViewModeButton, attrs_subtitle, play_sfx
 _source_subtitle = attrs_subtitle('source', labels={'fitgirl': 'FitGirl Repacks', 'gog': 'GOG Revived'})
 
@@ -465,6 +466,7 @@ class _DiceButton(QToolButton):
             p.drawRoundedRect(QRectF(self.rect()), 6, 6)
         side = 15.0
         p.translate(self.width() / 2, self.height() / 2)
+        ink = to_color(resolve_icon_color(), '#ffffff')
         p.rotate(-12.0 * self._hover + self._angle)
         scale = 0.9 if self.isDown() else 1.0 + 0.08 * self._hover
         p.scale(scale, scale)
@@ -756,7 +758,7 @@ class FlowLayout(QLayout):
             _flush_row(is_last=True)
         total_h = y - base_spacing - effective_rect.y() if line_height else 0
         return total_h + top + bottom
-from src.core.artwork import images, image_file, FIT
+from src.core.artwork import images, image_file, FIT, FRAME
 
 def _stop_previous_movie(image_label) -> None:
     try:
@@ -875,7 +877,6 @@ class PosterCard(_AnimatedPosterMixin, QWidget):
 
     def bind(self, entry) -> None:
         self._entry = entry
-        self.setToolTip(_entry_title(entry))
         if self._fallback_icon is not None:
             self._fallback_icon.deleteLater()
             self._fallback_icon = None
@@ -1016,7 +1017,7 @@ class PosterCard(_AnimatedPosterMixin, QWidget):
                 return
             self._poster_lbl.setImage(pix)
             self._poster_lbl.setFixedSize(self.POSTER_WIDTH, self.POSTER_HEIGHT)
-        images.get(path, (self.POSTER_WIDTH, self.POSTER_HEIGHT), _apply, owner=self)
+        images.get(path, (self.POSTER_WIDTH, self.POSTER_HEIGHT), _apply, mode=FRAME, owner=self)
 
     def unload_pixmap(self) -> None:
         if self._entry is not None and self._entry.poster_path and not self._poster_lbl.isNull():
@@ -1275,6 +1276,7 @@ class BookmarkPosterCard(PosterCard):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.installEventFilter(ToolTipFilter(self, 400, ToolTipPosition.TOP))
         self._remove_x = _QPB('✕', self._poster_lbl)
         self._remove_x.setFixedSize(20, 20)
         self._remove_x.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1298,6 +1300,7 @@ class BookmarkPosterCard(PosterCard):
 
     def bind(self, entry) -> None:
         super().bind(entry)
+        self.setToolTip(_entry_title(entry))
         self.set_source_badge(getattr(entry, 'source', ''))
         self._remove_x.raise_()
 
@@ -1361,7 +1364,7 @@ class BookmarksPage(QWidget):
         self._scroll = SmoothScrollArea(self)
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        self._scroll.setStyleSheet('background: transparent; border: none;')
+        self._scroll.setStyleSheet('QScrollArea { background: transparent; border: none; }')
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._wrap = QWidget()
         self._wrap.setStyleSheet('background: transparent;')
@@ -1459,7 +1462,7 @@ _HEART_ICON_CACHE: dict = {}
 
 
 def _filled_heart_icon() -> QIcon:
-    ink = to_color(palette().get('primary_text', '#ffffff'), '#ffffff')
+    ink = to_color(resolve_icon_color(), '#ffffff')
     cached = _HEART_ICON_CACHE.get(ink.rgba())
     if cached is not None:
         return cached
@@ -1494,7 +1497,7 @@ def _discord_logo_icon() -> QIcon | None:
         if candidate.is_file():
             pm = QPixmap(str(candidate))
             if not pm.isNull():
-                return QIcon(pm)
+                return tinted_icon(QIcon(pm), resolve_icon_color(), 20)
     logger.warning('Discord icon not found')
     return None
 
@@ -2090,44 +2093,6 @@ class ScreenshotGallery(QWidget):
         dialog.raise_()
         dialog.activateWindow()
 
-class _RotatingChevron(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedSize(16, 16)
-        self._angle = 0.0
-        self._color = _strong_text_qcolor()
-
-    def get_angle(self) -> float:
-        return self._angle
-
-    def set_angle(self, value: float) -> None:
-        self._angle = value
-        self.update()
-    angle = Property(float, get_angle, set_angle)
-
-    def set_color(self, color: QColor) -> None:
-        self._color = color
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(self._color)
-        pen.setWidthF(1.6)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        cx, cy = (self.width() / 2, self.height() / 2)
-        painter.translate(cx, cy)
-        painter.rotate(self._angle)
-        painter.translate(-cx, -cy)
-        path = QPainterPath()
-        path.moveTo(QPointF(cx - 4, cy - 2.5))
-        path.lineTo(QPointF(cx, cy + 2.5))
-        path.lineTo(QPointF(cx + 4, cy - 2.5))
-        painter.drawPath(path)
-        painter.end()
-
 class _SiteLinkButton(HyperlinkButton):
     def __init__(self, text: str, parent, icon, style_fn):
         super().__init__(parent)
@@ -2183,107 +2148,128 @@ class CachedRichLabel(BodyLabel):
         super().changeEvent(event)
 
 
-class CollapsibleSection(CardWidget):
-    _ANIM_MS = 190
+class CollapsibleSection(QWidget):
+    _ANIM_MS = 200
+    _HDR = 50
+    _PAD = 16
     toggled = Signal(bool)
 
     def __init__(self, title: str, parent=None, expanded: bool=False):
         super().__init__(parent)
-        self.setBorderRadius(12)
+        self._title = title
+        self._expanded = expanded
+        self._p = 1.0 if expanded else 0.0
+        self._hovering = False
+        self._body_h = 0
+        self._current_html = ''
+        self._raw_body_text = ''
+        self._body_is_features = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self._apply_card_background()
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-        self._header = QWidget()
-        self._header.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._header.setFixedHeight(50)
-        self._header.setObjectName('sectionHeader')
-        header_layout = QHBoxLayout(self._header)
-        header_layout.setContentsMargins(16, 0, 14, 0)
-        header_layout.setSpacing(10)
-        self._title_lbl = StrongBodyLabel(title)
-        self._title_lbl.setStyleSheet(f'font-size: 14px; font-weight: 600; background: transparent; color: {palette()['primary_text']};')
-        header_layout.addWidget(self._title_lbl, 1)
-        self._chevron = _RotatingChevron(self._header)
-        header_layout.addWidget(self._chevron, 0, Qt.AlignmentFlag.AlignRight)
-        outer.addWidget(self._header)
-
-
-        self._body_wrap = QWidget()
-        self._body_wrap.setObjectName('sectionBodyWrap')
-        wrap_layout = QVBoxLayout(self._body_wrap)
-        wrap_layout.setContentsMargins(0, 0, 0, 0)
-        wrap_layout.setSpacing(0)
-        self._body = QWidget()
-        body_layout = QVBoxLayout(self._body)
-        body_layout.setContentsMargins(16, 4, 16, 18)
-        self._body_lbl = CachedRichLabel()
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        self._body_lbl = CachedRichLabel(self)
         self._body_lbl.setWordWrap(True)
         self._body_lbl.setTextFormat(Qt.TextFormat.RichText)
         self._body_lbl.setOpenExternalLinks(True)
-        self._body_lbl.setStyleSheet(f'font-size: 14px; font-weight: 500; line-height: {_DESC_LINE_HEIGHT_PCT}%; color: {_body_text_color()}; background: transparent;')
-        body_layout.addWidget(self._body_lbl)
-        wrap_layout.addWidget(self._body)
-        outer.addWidget(self._body_wrap)
-
-        self._header.mousePressEvent = lambda _e: self.toggle()
+        self._body_lbl.setCursor(Qt.CursorShape.ArrowCursor)
+        self._body_lbl.setVisible(expanded)
         self._anim = QVariantAnimation(self)
-        self._anim.setDuration(self._ANIM_MS)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._anim.valueChanged.connect(self._on_wrap_height)
-        self._anim.finished.connect(self._on_anim_finished)
-        self._chevron_anim = QPropertyAnimation(self._chevron, b'angle')
-        self._chevron_anim.setDuration(self._ANIM_MS)
-        self._chevron_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-        self._hovering = False
-        self._expanded = expanded
-        self._raw_body_text = ''
-        self._body_is_features = False
-        self._current_html = ''
-        self._body.setFixedHeight(self._content_height())
-        self._body_wrap.setFixedHeight(self._content_height() if expanded else 0)
-        self._chevron.set_angle(180.0 if expanded else 0.0)
-        self._update_header_style()
+        self._anim.valueChanged.connect(self._set_progress)
+        self._load_theme()
+        self._measure()
+        self._apply()
         qconfig.themeChanged.connect(self._on_theme_changed)
-        self.destroyed.connect(self._disconnect_theme_signal)
+        qconfig.themeColorChanged.connect(self._on_theme_changed)
 
-    def _disconnect_theme_signal(self, *_args) -> None:
-        try:
-            qconfig.themeChanged.disconnect(self._on_theme_changed)
-        except TypeError:
-            pass
+    def _load_theme(self) -> None:
+        self._title_color = _strong_text_qcolor()
+        if isDarkTheme():
+            self._bg, self._hover_bg = QColor(255, 255, 255, 15), QColor(255, 255, 255, 21)
+        else:
+            self._bg, self._hover_bg = QColor(255, 255, 255, 179), QColor(249, 249, 249, 128)
+        self._body_lbl.setStyleSheet(f'font-size: 14px; font-weight: 500; line-height: {_DESC_LINE_HEIGHT_PCT}%; color: {_body_text_color()}; background: transparent;')
 
     def _on_theme_changed(self, *_args) -> None:
-        self._refresh_body_html()
-        self._update_header_style()
-        QTimer.singleShot(0, self._update_header_style)
+        self._refresh_all()
+        QTimer.singleShot(0, self._refresh_all)
 
-    def enterEvent(self, event):
-        self._hovering = True
-        self._update_header_style()
-        super().enterEvent(event)
+    def _refresh_all(self) -> None:
+        if not _qt_is_valid(self):
+            return
+        self._load_theme()
+        if self._raw_body_text:
+            html = render_features_html(self._raw_body_text) if self._body_is_features else render_description_html(self._raw_body_text)
+            if html != self._current_html:
+                self._current_html = html
+                self._body_lbl.setText(html)
+        self._measure()
+        self._apply()
+        self.update()
 
-    def leaveEvent(self, event):
-        self._hovering = False
-        self._update_header_style()
-        super().leaveEvent(event)
+    def set_body_text(self, text: str) -> None:
+        lines = [ln.strip() for ln in (text or '').split('\n') if ln.strip()]
+        self._raw_body_text = text or ''
+        self._body_is_features = bool(lines) and all(ln.startswith(('•', '- ', '* ')) for ln in lines)
+        render = render_features_html if self._body_is_features else render_description_html
+        self.set_body_html(render(text))
 
-    def focusInEvent(self, event):
-        self._hovering = True
-        self.isHover = True
-        self._update_header_style()
-        self._updateBackgroundColor()
-        super().focusInEvent(event)
+    def set_body_html(self, html: str) -> None:
+        self._current_html = html or ''
+        self._body_lbl.setText(self._current_html)
+        self._measure()
+        self._apply()
 
-    def focusOutEvent(self, event):
-        self._hovering = self.underMouse()
-        self.isHover = self._hovering
-        self._update_header_style()
-        self._updateBackgroundColor()
-        super().focusOutEvent(event)
+    def _measure(self) -> None:
+        width = self.width() - 2 * self._PAD
+        if width <= 0:
+            width = 268
+        height = self._body_lbl.heightForWidth(width)
+        if height <= 0:
+            height = self._body_lbl.sizeHint().height()
+        self._body_h = height + 22
+        self._body_lbl.setGeometry(self._PAD, self._HDR + 4, width, height)
+
+    def _apply(self) -> None:
+        height = self._HDR + round(self._body_h * self._p)
+        if self.height() != height:
+            self.setFixedHeight(height)
+        self._body_lbl.setVisible(self._p > 0.0)
+        self.update()
+
+    def _set_progress(self, value) -> None:
+        self._p = float(value)
+        self._apply()
+
+    def toggle(self) -> None:
+        self._set_expanded(not self._expanded)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self._expanded = expanded
+        self.toggled.emit(expanded)
+        target = 1.0 if expanded else 0.0
+        self._anim.stop()
+        self._measure()
+        if not self.isVisible() or not animations_enabled() or self._p == target:
+            self._set_progress(target)
+            return
+        self._anim.setStartValue(self._p)
+        self._anim.setEndValue(target)
+        self._anim.setDuration(max(60, int(self._ANIM_MS * abs(target - self._p))))
+        self._anim.start()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if event.oldSize().width() != event.size().width():
+            self._measure()
+            self._apply()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and event.position().y() < self._HDR:
+            self.toggle()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space) and \
@@ -2293,124 +2279,56 @@ class CollapsibleSection(CardWidget):
             return
         super().keyPressEvent(event)
 
-    def set_body_text(self, text: str) -> None:
-        lines = [ln.strip() for ln in (text or '').split('\n') if ln.strip()]
-        looks_like_features = bool(lines) and all((ln.startswith(('•', '- ', '* ')) for ln in lines))
-        self._raw_body_text = text or ''
-        self._body_is_features = looks_like_features
-        if looks_like_features:
-            html = render_features_html(text)
-        else:
-            html = render_description_html(text)
-        self.set_body_html(html)
+    def _set_hover(self, value: bool) -> None:
+        if self._hovering != value:
+            self._hovering = value
+            self.update()
 
-    def _refresh_body_html(self) -> None:
-        if not self._raw_body_text:
-            return
-        html = render_features_html(self._raw_body_text) if self._body_is_features else render_description_html(self._raw_body_text)
-        if html != self._current_html:
-            self.set_body_html(html)
+    def enterEvent(self, event):
+        self._set_hover(True)
+        super().enterEvent(event)
 
-    def _content_height(self) -> int:
-        width = self._body_lbl.width()
-        if width <= 0:
-            width = self.width() - 32 if self.width() > 32 else 268
-        h = self._body_lbl.heightForWidth(width)
-        if h <= 0:
-            h = self._body_lbl.sizeHint().height()
-        return h + 22
+    def leaveEvent(self, event):
+        self._set_hover(False)
+        super().leaveEvent(event)
 
-    def _apply_body_height(self) -> None:
-        height = self._content_height()
-        if abs(self._body.height() - height) > 1:
-            self._body.setFixedHeight(height)
+    def focusInEvent(self, event):
+        self._set_hover(True)
+        super().focusInEvent(event)
 
-    def set_body_html(self, html: str) -> None:
-        self._current_html = html or ''
-        self._body_lbl.setText(html)
-        self._apply_body_height()
-        self._sync_wrap_height()
-
-    def _anim_running(self) -> bool:
-        try:
-            return self._anim.state() == QAbstractAnimation.State.Running
-        except Exception:
-            return False
-
-    def _sync_wrap_height(self) -> None:
-        if self._anim_running():
-            return
-        target = self._content_height() if self._expanded else 0
-        if abs(self._body_wrap.height() - target) > 1:
-            self._body_wrap.setFixedHeight(target)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-
-        if not self._anim_running():
-            self._sync_wrap_height()
-
-    def toggle(self) -> None:
-        self._set_expanded(not self._expanded)
-
-    def _set_expanded(self, expanded: bool) -> None:
-        self._expanded = expanded
-        self.toggled.emit(expanded)
-        self._apply_body_height()
-        target = self._content_height() if expanded else 0
-        start = self._body_wrap.height()
-        if start == target or not animations_enabled():
-            self._anim.stop()
-            self._body_wrap.setFixedHeight(target)
-            self._chevron_anim.stop()
-            self._chevron.set_angle(180.0 if expanded else 0.0)
-        else:
-            self._anim.stop()
-            self._anim.setStartValue(start)
-            self._anim.setEndValue(target)
-            self._anim.start()
-            self._chevron_anim.stop()
-            self._chevron_anim.setStartValue(self._chevron.get_angle())
-            self._chevron_anim.setEndValue(180.0 if expanded else 0.0)
-            self._chevron_anim.start()
-        self._update_header_style()
-
-    def _on_wrap_height(self, value) -> None:
-        self._body_wrap.setFixedHeight(int(value))
-
-    def _on_anim_finished(self) -> None:
-        self._sync_wrap_height()
-
-    def _apply_card_background(self) -> None:
-        self.update()
-
-    def _card_bg_color(self) -> QColor:
-        return _qcolor_from_palette(palette()['section_card_bg'])
-
-    def _card_border_color(self) -> QColor:
-        return _qcolor_from_palette(palette()['section_card_border'])
+    def focusOutEvent(self, event):
+        self._set_hover(self.underMouse())
+        super().focusOutEvent(event)
 
     def paintEvent(self, event):
+        w, h = self.width(), self.height()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         path = QPainterPath()
-        r = float(self.getBorderRadius())
-        path.addRoundedRect(QRectF(0.5, 0.5, self.width() - 1, self.height() - 1), r, r)
-        painter.fillPath(path, self._card_bg_color())
-        painter.setPen(self._card_border_color())
-        painter.drawPath(path)
+        path.addRoundedRect(QRectF(0, 0, w, h), 12, 12)
+        painter.fillPath(path, self._hover_bg if self._hovering else self._bg)
+        font = QFont(self.font())
+        font.setPixelSize(14)
+        font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(font)
+        painter.setPen(self._title_color)
+        title_rect = QRect(self._PAD, 0, w - self._PAD - 48, self._HDR)
+        painter.drawText(title_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                         QFontMetrics(font).elidedText(self._title, Qt.TextElideMode.ElideRight, title_rect.width()))
+        pen = QPen(self._title_color)
+        pen.setWidthF(1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.translate(w - 22, self._HDR / 2)
+        painter.rotate(180.0 * self._p)
+        chevron = QPainterPath()
+        chevron.moveTo(-4, -2.5)
+        chevron.lineTo(0, 2.5)
+        chevron.lineTo(4, -2.5)
+        painter.drawPath(chevron)
         painter.end()
-        super().paintEvent(event)
 
-    def _update_header_style(self) -> None:
-        self._apply_card_background()
-        self._title_lbl.setStyleSheet(f'font-size: 14px; font-weight: 600; background: transparent; color: {palette()['primary_text']};')
-        self._chevron.set_color(_strong_text_qcolor())
-        self._body_lbl.setStyleSheet(f'font-size: 14px; font-weight: 500; line-height: {_DESC_LINE_HEIGHT_PCT}%; color: {_body_text_color()}; background: transparent;')
-        if self._hovering:
-            self._header.setStyleSheet(f'#sectionHeader {{ background: {_hover_tint_color()}; border-top-left-radius: 12px; border-top-right-radius: 12px; }}')
-        else:
-            self._header.setStyleSheet('#sectionHeader { background: transparent; }')
 
 _URL_RE = re.compile('(https?://[^\\s<>\\"]+)')
 _HTTP_URL_RE = re.compile('(?i)^https?://')
@@ -2846,8 +2764,8 @@ def send_to_external_torrent_client(source: str, parent=None) -> bool:
     return True
 
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QAbstractItemView, QFrame, QStyledItemDelegate
-from qfluentwidgets import LineEdit, TransparentPushButton, TransparentToolButton
+from PySide6.QtWidgets import QFrame, QStyledItemDelegate
+from qfluentwidgets import TransparentPushButton
 
 _ROLE_KIND = Qt.ItemDataRole.UserRole + 1
 _ROLE_TINT = Qt.ItemDataRole.UserRole + 2
@@ -4315,10 +4233,11 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         btn_row.addWidget(self._bookmark_btn, 0, Qt.AlignmentFlag.AlignLeft)
         btn_row.addStretch(1)
         back_btn.clicked.connect(self.back_requested.emit)
+        bind_back_keys(self, self.back_requested.emit)
         self._scroll = SmoothScrollArea(self)
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        self._scroll.setStyleSheet('background: transparent; border: none;')
+        self._scroll.setStyleSheet('QScrollArea { background: transparent; border: none; }')
         outer.addWidget(self._scroll, 1)
         self._scroll.verticalScrollBar().valueChanged.connect(lambda _v: self.banner_changed.emit())
         content = QWidget()
@@ -4380,6 +4299,7 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         info_col.setContentsMargins(0, 0, 0, 0)
         info_col.setSpacing(20)
         self._title_lbl = TitleLabel('')
+        self._title_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._title_lbl.setWordWrap(True)
         self._title_lbl.setStyleSheet(f'font-weight: 700; color: {palette()['primary_text']};')
         title_row = QHBoxLayout()
@@ -4440,8 +4360,8 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
         self._desc_lbl.setWordWrap(True)
         self._desc_lbl.setTextFormat(Qt.TextFormat.RichText)
         self._desc_lbl.setOpenExternalLinks(True)
-        self._desc_default_qss_template = 'font-size: 18px; font-weight: 500; line-height: {pct}%; color: {color};'
-        self._desc_announcement_qss_template = 'font-size: 16px; font-weight: 500; line-height: {pct}%; color: {color};'
+        self._desc_default_qss_template = 'font-size: 16px; font-weight: 400; line-height: {pct}%; color: {color};'
+        self._desc_announcement_qss_template = 'font-size: 15px; font-weight: 400; line-height: {pct}%; color: {color};'
         self._desc_default_qss = self._desc_default_qss_template.format(pct=_DESC_LINE_HEIGHT_PCT, color=_body_text_color())
         self._desc_lbl.setStyleSheet(self._desc_default_qss)
         info_col.addWidget(self._desc_lbl)
@@ -5147,18 +5067,14 @@ class RepackDetailsView(DetailsViewMixin, QWidget):
                 self._show_cover_fallback(title)
                 return
             self._cover_lbl.setImage(pix)
-            self._cover_lbl.setFixedSize(*size)
+            self._cover_lbl.setFixedSize(pix.deviceIndependentSize().toSize())
 
-        hit = images.peek(src, size)
+        hit = images.peek(src, size, FIT)
         if hit is not None and not hit.isNull():
             _apply(hit)
         else:
-            small = images.peek(src, (PosterCard.POSTER_WIDTH, PosterCard.POSTER_HEIGHT))
-            if small is not None and not small.isNull():
-                _apply(small)
-            else:
-                self._show_cover_fallback(title)
-            self._cover_token = images.get(src, size, _apply, owner=self)
+            self._show_cover_fallback(title)
+            self._cover_token = images.get(src, size, _apply, mode=FIT, owner=self)
         images.dominant(src, _accent, owner=self)
 
     def _show_cover_fallback(self, title: str) -> None:
@@ -5419,6 +5335,12 @@ class SourceTab(MediaPageBase):
         self._prefetch_dwell.setSingleShot(True)
         self._prefetch_dwell.setInterval(400)
         self._prefetch_dwell.timeout.connect(self._prefetch_hovered_details)
+        self._tip_entry = None
+        self._tip = None
+        self._tip_dwell = QTimer(self)
+        self._tip_dwell.setSingleShot(True)
+        self._tip_dwell.setInterval(500)
+        self._tip_dwell.timeout.connect(self._show_grid_tip)
         self._stack.setCurrentWidget(grid_page)
         self._load_latest_repacks()
 
@@ -6135,8 +6057,24 @@ class SourceTab(MediaPageBase):
     def _on_grid_hover(self, entry) -> None:
         self._prefetch_dwell.stop()
         self._hover_entry = entry
+        self._tip_entry = entry
+        self._tip_dwell.stop()
+        if self._tip is not None:
+            self._tip.hide()
+        if entry is not None:
+            self._tip_dwell.start()
         if entry is not None:
             self._prefetch_dwell.start()
+
+    def _show_grid_tip(self) -> None:
+        if self._tip_entry is None or not self._grid.viewport().underMouse():
+            return
+        if self._tip is None:
+            self._tip = ToolTip('', self.window())
+            self._tip.setDuration(-1)
+        self._tip.setText(_entry_title(self._tip_entry))
+        self._tip.move(QCursor.pos() + QPoint(10, 14))
+        self._tip.show()
 
     def _prefetch_hovered_details(self) -> None:
         entry, self._hover_entry = self._hover_entry, None
@@ -6214,8 +6152,8 @@ class SourceTab(MediaPageBase):
         self._grid.refresh()
 
 
-from PySide6.QtGui import QPainter, QPixmap, QPainterPath, QCursor, QFont as _QFont
-from PySide6.QtCore import QRectF, QPointF
+from PySide6.QtGui import QCursor, QFont as _QFont
+from PySide6.QtCore import QPointF
 
 _FEED_URL = 'https://fitgirl-repacks.site/feed/'
 _FEED_POLL_MS = 30 * 60 * 1000
@@ -6405,6 +6343,39 @@ def release_watcher() -> _ReleaseWatcher:
 def _ink(alpha: int) -> QColor:
     base = 255 if isDarkTheme() else 0
     return QColor(base, base, base, alpha)
+
+
+def bind_back_keys(view: QWidget, on_back) -> None:
+    def _go() -> None:
+        if not view.window().isFullScreen():
+            on_back()
+    for seq in ('Esc', 'Alt+Left'):
+        shortcut = QShortcut(QKeySequence(seq), view)
+        shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        shortcut.activated.connect(_go)
+
+
+class ToolCluster(QFrame):
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(36)
+        self._lay = QHBoxLayout(self)
+        self._lay.setContentsMargins(4, 0, 4, 0)
+        self._lay.setSpacing(2)
+        self.setStyleSheet('background: transparent;')
+
+    def addWidget(self, widget: QWidget) -> None:
+        self._lay.addWidget(widget, 0, Qt.AlignmentFlag.AlignVCenter)
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(_ink(10))
+        p.setPen(QPen(_ink(22), 1))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
+        p.end()
+        super().paintEvent(event)
 
 
 def _bell_icon(active: bool):
@@ -6969,7 +6940,10 @@ class RepacksPage(QWidget):
         header_layout = QVBoxLayout(self._header)
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(12)
-        header_layout.addWidget(self._pivot)
+        header_layout.addWidget(self._pivot, 0, Qt.AlignmentFlag.AlignHCenter)
+        with suppress(Exception):
+            self._pivot.hBoxLayout.setSpacing(40)
+            self._pivot.setItemFontSize(15)
         self._top_state = None
         self._floating = False
         self._header_h = 0
@@ -6977,7 +6951,8 @@ class RepacksPage(QWidget):
         self._search_bar = SearchLineEdit()
         self._search_bar.setPlaceholderText(tr('repacks.search_placeholder'))
         self._search_bar.setMinimumWidth(160)
-        self._search_bar.setMaximumWidth(320)
+        self._search_bar.setMaximumWidth(360)
+        self._search_bar.setFixedHeight(36)
         self._search_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._search_debounce = QTimer(self)
         self._search_debounce.setSingleShot(True)
@@ -6999,6 +6974,7 @@ class RepacksPage(QWidget):
         self._upcoming_btn.clicked.connect(self._on_upcoming_clicked)
         self._refresh_btn = TransparentToolButton(themed_icon('repacks.refresh', FluentIcon.SYNC))
         apply_tool_button_theme(self._refresh_btn)
+        apply_slot_icon_theme(self._refresh_btn, 'repacks.refresh', FluentIcon.SYNC)
         self._refresh_btn.setToolTip(tr('repacks.refresh_tooltip'))
         self._refresh_btn.setFixedSize(32, 32)
         self._refresh_btn.clicked.connect(self._on_refresh_clicked)
@@ -7009,7 +6985,7 @@ class RepacksPage(QWidget):
         apply_tool_button_theme(self._view_btn)
         self._bookmarks_btn = TransparentToolButton()
         apply_tool_button_theme(self._bookmarks_btn)
-        self._bookmarks_btn.setIcon(_bookmark_icon(True))
+        register_theme_refresh(self._bookmarks_btn, lambda: self._bookmarks_btn.setIcon(_bookmark_icon(True)))
         self._bookmarks_btn.setIconSize(QSize(22, 22))
         self._bookmarks_badge = QLabel(self._bookmarks_btn)
         self._bookmarks_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -7021,21 +6997,22 @@ class RepacksPage(QWidget):
         self._bookmarks_btn.setFixedSize(32, 32)
         self._bookmarks_btn.setCheckable(True)
         self._bookmarks_btn.clicked.connect(self._on_bookmarks_clicked)
-        _discord_logo = _discord_logo_icon()
-        self._discord_btn = PushButton(_discord_logo or themed_icon('repacks.discord', FluentIcon.CHAT), tr('repacks.gog_discord'))
+        self._discord_btn = PushButton(_discord_logo_icon() or themed_icon('repacks.discord', FluentIcon.CHAT), tr('repacks.gog_discord'))
         apply_tool_button_theme(self._discord_btn)
-        if _discord_logo is None:
-            apply_slot_icon_theme(self._discord_btn, 'repacks.discord', FluentIcon.CHAT)
+        register_theme_refresh(self._discord_btn, lambda: self._discord_btn.setIcon(_discord_logo_icon() or themed_icon('repacks.discord', FluentIcon.CHAT)))
         self._discord_btn.clicked.connect(self._on_discord_clicked)
+        for btn in (self._donate_btn, self._upcoming_btn, self._discord_btn):
+            btn.setFixedHeight(36)
+        cluster = ToolCluster(self)
+        for btn in (self._bookmarks_btn, self._refresh_btn, self._view_btn, self._dice_btn):
+            cluster.addWidget(btn)
         search_row = _ToolbarFlow()
         search_row.setContentsMargins(24, 0, 24, 0)
         search_row.addWidget(self._search_bar, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addWidget(self._donate_btn, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addWidget(self._upcoming_btn, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addWidget(self._discord_btn, 0, Qt.AlignmentFlag.AlignLeft)
-        search_row.addWidget(self._bookmarks_btn, 0, Qt.AlignmentFlag.AlignLeft)
-        search_row.addWidget(self._refresh_btn, 0, Qt.AlignmentFlag.AlignLeft)
-        search_row.addWidget(self._view_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        search_row.addWidget(cluster, 0, Qt.AlignmentFlag.AlignLeft)
         search_row.addStretch(1)
         self._tag_from_search = False
         self._list_bars: dict[str, QWidget] = {}
@@ -7045,7 +7022,6 @@ class RepacksPage(QWidget):
             bar = self._build_list_bar(source_key, groups)
             self._list_bars[source_key] = bar
             search_row.addWidget(bar, 0, Qt.AlignmentFlag.AlignRight)
-        search_row.addWidget(self._dice_btn, 0, Qt.AlignmentFlag.AlignRight)
         header_layout.addLayout(search_row)
         outer.addWidget(self._header)
         self._stack = QStackedWidget()
@@ -7146,6 +7122,7 @@ class RepacksPage(QWidget):
             icon = _fluent_icon(*self._LIST_ICONS.get(group_id, ('TAG',)))
             slot = f'repacks.list_{group_id}'
             btn = PushButton(themed_icon(slot, icon), group_label)
+            btn.setFixedHeight(36)
             apply_tool_button_theme(btn)
             apply_slot_icon_theme(btn, slot, icon)
             btn.clicked.connect(lambda _c=False, k=source_key, g=group_id: self._open_list_menu(k, g))
@@ -7160,12 +7137,11 @@ class RepacksPage(QWidget):
         btn, _label, _keys, names = self._list_buttons[source_key][group_id]
         tab = self._tabs.get(source_key)
         active = tab.active_list() if tab is not None else None
-        menu = _mica_menu(self)
-        for list_key, entry_label in names.items():
-            act = QAction(('\u2713  ' if list_key == active else '') + entry_label, menu)
-            act.triggered.connect(lambda _c=False, k=source_key, lk=list_key: self._on_list_chosen(k, lk))
-            menu.addAction(act)
-        menu.exec(btn.mapToGlobal(QPoint(0, btn.height() + 4)))
+        keys = list(names)
+        show_dropdown(
+            btn, [(names[k], True) for k in keys],
+            lambda i, k=source_key: self._on_list_chosen(k, keys[i]),
+            keys.index(active) if active in keys else -1)
 
     def _on_list_chosen(self, source_key: str, list_key) -> None:
         tab = self._tabs.get(source_key)
@@ -7363,6 +7339,35 @@ class RepacksPage(QWidget):
         self._update_list_buttons(source_key)
         if hasattr(tab, '_show_details'):
             tab._show_details(entry)
+
+    def nav_state(self) -> dict:
+        key = self._current_tab_key or 'fitgirl'
+        state = {'tab': key}
+        tab = self._tabs.get(key)
+        details = getattr(tab, '_details', None)
+        stack = getattr(tab, '_stack', None)
+        if details is None or stack is None or stack.currentWidget() is not details:
+            return state
+        entry = getattr(details, '_current_entry', None)
+        if entry is not None:
+            with suppress(Exception):
+                state['entry'] = entry.to_dict()
+        return state
+
+    def restore_nav_state(self, state: dict) -> None:
+        if not isinstance(state, dict):
+            return
+        key = state.get('tab')
+        if key in self._tabs:
+            self._pivot.setCurrentItem(key)
+            self._switch_tab_animated(key)
+            self._tabs[key].load_initial()
+        data = state.get('entry')
+        if key in self._tabs and isinstance(data, dict):
+            try:
+                self.open_detail(RepackEntry.from_dict(data), key)
+            except Exception:
+                logger.debug('Could not restore repack details', exc_info=True)
 
     def _switch_tab_animated(self, key: str) -> None:
         target = self._tabs.get(key)
@@ -7608,9 +7613,6 @@ def _alpha_rgba(rgb: str, alpha_percent: int) -> str:
 
 def _surface_tint_color(alpha_percent: int=10) -> str:
     return _alpha_rgba('255,255,255' if isDarkTheme() else '0,0,0', alpha_percent)
-
-def _hover_tint_color() -> str:
-    return _alpha_rgba('255,255,255' if isDarkTheme() else '0,0,0', 8)
 
 def _grid_colors() -> tuple[QColor, QColor, QColor]:
     base = 255 if isDarkTheme() else 0

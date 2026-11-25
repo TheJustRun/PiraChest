@@ -16,6 +16,7 @@ import threading
 import time
 import weakref
 from contextlib import suppress
+from functools import partial
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -146,6 +147,7 @@ from qfluentwidgets import (
     ToolTipPosition,
     TransparentToolButton,
 )
+from qfluentwidgets.components.navigation.navigation_panel import NavigationDisplayMode
 from shiboken6 import (
     isValid as _qt_is_valid,
 )
@@ -374,6 +376,8 @@ def configure_logging(enable_file: bool = True) -> None:
     formatter = _RedactingFormatter(_LOG_FORMAT)
     for handler in root_logger.handlers:
         handler.setFormatter(formatter)
+    for name in ('httpx', 'httpcore', 'urllib3', 'asyncio', 'multipart'):
+        logging.getLogger(name).setLevel(logging.WARNING)
     if enable_file:
         set_file_logging_enabled(True)
 
@@ -1848,9 +1852,9 @@ def _apply_switch_uplift() -> None:
         if not self.isEnabled():
             return QColor(0, 0, 0, 0)
         if self.isPressed:
-            return QColor(255, 255, 255, 18) if isDark else QColor(0, 0, 0, 23)
+            return _switch_ink(24)
         elif self.isHover:
-            return QColor(255, 255, 255, 10) if isDark else QColor(0, 0, 0, 15)
+            return _switch_ink(14)
         return QColor(0, 0, 0, 0)
 
     @patch(Indicator, '_borderColor')
@@ -1865,9 +1869,7 @@ def _apply_switch_uplift() -> None:
 
     @patch(Indicator, '_offBorderColor')
     def _offBorderColor(self, isDark: bool):
-        if self.isEnabled():
-            return QColor(255, 255, 255, 153) if isDark else QColor(0, 0, 0, 133)
-        return QColor(255, 255, 255, 41) if isDark else QColor(0, 0, 0, 56)
+        return _switch_ink(153 if self.isEnabled() else 41)
 
     @patch(Indicator, '_sliderColor')
     def _sliderColor(self):
@@ -1877,13 +1879,11 @@ def _apply_switch_uplift() -> None:
     def _onSliderColor(self, isDark: bool):
         if self.isEnabled():
             return QColor(text_on(ThemeColor.PRIMARY.color()))
-        return QColor(255, 255, 255, 77) if isDark else QColor(255, 255, 255)
+        return _switch_ink(77)
 
     @patch(Indicator, '_offSliderColor')
     def _offSliderColor(self, isDark: bool):
-        if self.isEnabled():
-            return QColor(255, 255, 255, 201) if isDark else QColor(0, 0, 0, 156)
-        return QColor(255, 255, 255, 96) if isDark else QColor(0, 0, 0, 91)
+        return _switch_ink(201 if self.isEnabled() else 96)
 
     @patch(Indicator, '_transitionColor')
     def _transitionColor(self, offColor, onColor):
@@ -2365,12 +2365,42 @@ class _GlobalToolTipFilter(QObject):
         tip.label.setMaximumWidth(self._MAX_WIDTH)
         tip.adjustSize()
         tip.setDuration(-1)
+        if host.LINUX:
+            tip.setWindowFlags(Qt.WindowType.Widget)
+            tip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._tip = tip
         return tip
+
+    def _place_linux(self, tip, anchor, rect) -> None:
+        try:
+            window = tip.parentWidget()
+            if window is None:
+                return
+            origin = window.mapToGlobal(QPoint(0, 0))
+            if rect is None:
+                base = anchor.mapToGlobal(QPoint(0, 0))
+                x = base.x() - origin.x() + (anchor.width() - tip.width()) // 2
+                y = base.y() - origin.y() - tip.height() - 2
+                if y < 4:
+                    y = base.y() - origin.y() + anchor.height() + 2
+            else:
+                viewport = anchor.viewport() if isinstance(anchor, QAbstractScrollArea) else anchor
+                base = viewport.mapToGlobal(rect.topLeft())
+                x = base.x() - origin.x()
+                y = base.y() - origin.y() - tip.height() + 10
+            x = max(4, min(x, window.width() - tip.width() - 4))
+            y = max(4, min(y, window.height() - tip.height() - 4))
+            tip.move(x, y)
+            tip.raise_()
+        except Exception:
+            logger.debug('Could not position Linux tooltip', exc_info=True)
 
     def _show(self) -> None:
         widget = self._widget
         if widget is None:
+            return
+        if QApplication.activePopupWidget() is not None:
+            self._dismiss()
             return
         try:
             if not _qt_is_valid(widget) or not widget.isVisible():
@@ -2391,7 +2421,9 @@ class _GlobalToolTipFilter(QObject):
             if window is None:
                 return
             tip = self._ensure_tip(window, text)
-            if rect is None:
+            if host.LINUX:
+                self._place_linux(tip, anchor, rect)
+            elif rect is None:
                 ToolTip.adjustPos(tip, anchor, ToolTipPosition.TOP)
             else:
                 tip_type = ItemViewToolTipType.TABLE if isinstance(anchor, QTableView) else ItemViewToolTipType.LIST
@@ -2618,6 +2650,12 @@ def _donate_t(key: str, default: str) -> str:
     except Exception:
         return default
     return default if not value or value == key else value
+
+
+def _switch_ink(alpha: int) -> QColor:
+    color = QColor(_donate_color('primary_text', '#ffffff'))
+    color.setAlpha(alpha)
+    return color
 
 
 def _donate_color(role: str, fallback: str = '#808080') -> QColor:
@@ -3511,6 +3549,10 @@ class MainWindow(FluentWindow):
         self.navigationInterface.setMenuButtonVisible(True)
         with suppress(Exception):
             self.navigationInterface.setIndicatorAnimationEnabled(animations_enabled())
+        with suppress(Exception):
+            self.navigationInterface.displayModeChanged.connect(self._on_nav_mode_changed)
+            if bool(settings.nav_collapsed):
+                QTimer.singleShot(0, self.navigationInterface.panel.collapse)
         self._remove_bottom_gaps()
         QTimer.singleShot(0, self._remove_bottom_gaps)
         QTimer.singleShot(400, self._remove_bottom_gaps)
@@ -3576,6 +3618,10 @@ class MainWindow(FluentWindow):
         self._downloads_badge_timer.setSingleShot(True)
         self._downloads_badge_timer.setInterval(200)
         self._downloads_badge_timer.timeout.connect(self._update_downloads_badge)
+        self._nav_state_timer = QTimer(self)
+        self._nav_state_timer.setSingleShot(True)
+        self._nav_state_timer.setInterval(600)
+        self._nav_state_timer.timeout.connect(self._save_nav_state)
         self._update_downloads_badge()
         self.settings_page = SettingsPage(self)
         self.settings_page.bind_network(self.download_manager.net_prefs, self.download_manager.set_net_prefs)
@@ -3600,13 +3646,14 @@ class MainWindow(FluentWindow):
         try:
             self.stackedWidget.currentChanged.connect(self._on_stacked_page_changed)
             self.stackedWidget.currentChanged.connect(self._record_nav_history)
+            self.stackedWidget.currentChanged.connect(lambda _i: self._schedule_nav_state_save())
         except Exception:
             logger.exception('Failed to hook navigation sound effects')
 
         try:
-            self.switchTo(self.home_nav_page)
+            self._restore_startup_page()
         except Exception:
-            logger.exception('Failed to switch to Home on launch')
+            logger.exception('Failed to restore the startup page')
         self.settings_page.settings_changed.connect(self._on_settings_changed)
         self._load_filters()
         QTimer.singleShot(2500, self, self._auto_sync)
@@ -4102,7 +4149,7 @@ class MainWindow(FluentWindow):
             return
         try:
             chrome = self._chrome
-            chip = ChromeChip(tr('download.donate'), trimmed_icon(filled_icon(FluentIcon.HEART, bake=64).pixmap(64, 64), fill=1.0), title_bar)
+            chip = ChromeChip(tr('download.donate'), trimmed_icon(filled_icon(FluentIcon.HEART, bake=64).pixmap(64, 64), fill=0.78), title_bar)
             chip.setObjectName('donateChip')
             chip.clicked.connect(lambda: DonateDialog(self).exec())
             if hasattr(title_bar, 'addChip'):
@@ -4232,16 +4279,53 @@ class MainWindow(FluentWindow):
         self._tray_icon = QSystemTrayIcon(QIcon(_tray) if _tray else self.windowIcon(), self)
         self._tray_icon.setToolTip(APP_NAME)
         menu = QMenu()
-        show_action = QAction('Show', self)
+        show_action = QAction(self.tr_or('tray.show', 'Show'), self)
         show_action.triggered.connect(self._restore_from_tray)
         menu.addAction(show_action)
         menu.addSeparator()
-        exit_action = QAction('Exit', self)
+        self._tray_downloads_action = QAction(tr('nav.downloads'), self)
+        self._tray_downloads_action.triggered.connect(lambda: self._tray_open('download_page'))
+        menu.addAction(self._tray_downloads_action)
+        settings_action = QAction(tr('nav.settings'), self)
+        settings_action.triggered.connect(lambda: self._tray_open('settings_page'))
+        menu.addAction(settings_action)
+        data_action = QAction(tr('nav.open_data_folder'), self)
+        data_action.triggered.connect(self._on_open_data_folder)
+        menu.addAction(data_action)
+        menu.addSeparator()
+        exit_action = QAction(self.tr_or('tray.exit', 'Exit'), self)
         exit_action.triggered.connect(self._quit_from_tray)
         menu.addAction(exit_action)
+        menu.aboutToShow.connect(self._refresh_tray_menu)
+        self._tray_menu = menu
         self._tray_icon.setContextMenu(menu)
         self._tray_icon.activated.connect(self._on_tray_activated)
         self._tray_icon.show()
+
+    def _active_download_count(self) -> int:
+        try:
+            from src.core.downloader import DLState
+            active = (DLState.queued, DLState.downloading, DLState.verifying)
+            return sum(1 for item in self.download_manager.items_in_order() if item.state in active)
+        except Exception:
+            return 0
+
+    def _refresh_tray_menu(self) -> None:
+        action = getattr(self, '_tray_downloads_action', None)
+        if action is None:
+            return
+        count = self._active_download_count()
+        label = tr('nav.downloads')
+        if count > 0:
+            label = self.tr_or('tray.downloads_active', 'Downloads ({count} active)').format(count=count)
+        action.setText(label)
+
+    def _tray_open(self, attr: str) -> None:
+        self._restore_from_tray()
+        page = getattr(self, attr, None)
+        if page is not None:
+            with suppress(Exception):
+                self.switchTo(page)
 
     def _on_tray_activated(self, reason):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
@@ -4540,6 +4624,14 @@ class MainWindow(FluentWindow):
 
     def eventFilter(self, obj, event):
         et = event.type()
+        if et == QEvent.Type.FileOpen:
+            with suppress(Exception):
+                url = event.url()
+                target = url.toLocalFile() if url.isValid() and url.isLocalFile() else (
+                    url.toString() if url.isValid() else event.file())
+                if target:
+                    self.handle_external_args([target])
+                    return True
         if et == _ET_KEY:
             with suppress(Exception):
                 self._observe_konami(event)
@@ -4615,6 +4707,8 @@ class MainWindow(FluentWindow):
         self._update_overlay.hide_overlay()
 
     def closeEvent(self, event):
+        with suppress(Exception):
+            self._save_nav_state()
         close_to_tray = settings.close_to_tray
         has_active_downloads = (not self._force_quit) and self._has_active_downloads()
         if close_to_tray and (not self._force_quit) and (self._tray_icon is not None) and (not has_active_downloads):
@@ -4906,11 +5000,12 @@ class MainWindow(FluentWindow):
 
     def _build_books_page(self):
         from .books_page import BooksPage
+        if self._books_manga_bridge is None:
+            from src.core.books.manga.manager import MangaDownloadBridge
+            self._books_manga_bridge = MangaDownloadBridge(self.download_manager, self)
         return BooksPage(self.download_manager, manga_download_bridge=self._books_manga_bridge)
 
     def _make_books_page(self) -> LazyPage:
-        from src.core.books.manga.manager import MangaDownloadBridge
-        self._books_manga_bridge = MangaDownloadBridge(self.download_manager, self)
         return LazyPage(
             self._build_books_page,
             keep_alive=True,
@@ -5083,6 +5178,125 @@ class MainWindow(FluentWindow):
                 pages.append(page)
         return pages
 
+    def _page_by_object_name(self, name: str):
+        if not name:
+            return None
+        for page in self._ordered_pages():
+            try:
+                if page.objectName() == name:
+                    return page
+            except Exception:
+                continue
+        return None
+
+    def start_page_choices(self) -> list[tuple[str, str]]:
+        labels = {
+            'homePage': tr('nav.home'),
+            'downloadPage': tr('nav.downloads'),
+            'settingsPage': tr('nav.settings'),
+            'aboutPage': tr('nav.about'),
+            'minervaPage': tr('nav.minerva'),
+            'pcGamesPage': tr('nav.pc_games'),
+            'tbhbPage': tr('nav.tbhb'),
+            'musicPage': tr('nav.music'),
+            'booksPage': tr('nav.books'),
+            'ytPage': tr('nav.youtube'),
+            'tvPageNav': tr('nav.tv'),
+        }
+        choices = [('home', tr('settings.start_page_default', 'Default (Home)')),
+                   ('last', tr('settings.start_page_last', 'Where you last left'))]
+        seen = {key for key, _label in choices}
+        for page in self._ordered_pages():
+            name = page.objectName()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            choices.append((name, labels.get(name, name)))
+        return choices
+
+    def _on_nav_mode_changed(self, mode) -> None:
+        collapsed = mode not in (NavigationDisplayMode.EXPAND, NavigationDisplayMode.MENU)
+        if collapsed == bool(settings.nav_collapsed):
+            return
+        settings.nav_collapsed = collapsed
+        with suppress(Exception):
+            save_settings(settings)
+
+    def _capture_nav_state(self) -> tuple[str, dict]:
+        try:
+            current = self.stackedWidget.currentWidget()
+        except Exception:
+            return '', {}
+        if current is None:
+            return '', {}
+        name = current.objectName() or ''
+        inner = current.page if isinstance(current, LazyPage) else current
+        fn = getattr(inner, 'nav_state', None) if inner is not None else None
+        if not callable(fn):
+            return name, {}
+        try:
+            state = fn()
+        except Exception:
+            logger.debug('nav_state failed for %s', name, exc_info=True)
+            return name, {}
+        return name, state if isinstance(state, dict) else {}
+
+    def _schedule_nav_state_save(self) -> None:
+        timer = getattr(self, '_nav_state_timer', None)
+        if timer is not None:
+            timer.start()
+
+    def _save_nav_state(self) -> None:
+        timer = getattr(self, '_nav_state_timer', None)
+        if timer is not None:
+            timer.stop()
+        changed = False
+        with suppress(Exception):
+            panel = self.navigationInterface.panel
+            collapsed = panel.displayMode not in (NavigationDisplayMode.EXPAND, NavigationDisplayMode.MENU)
+            if collapsed != bool(settings.nav_collapsed):
+                settings.nav_collapsed = collapsed
+                changed = True
+        name, state = self._capture_nav_state()
+        if name and (name != settings.last_page or state != settings.last_route):
+            settings.last_page = name
+            settings.last_route = state
+            changed = True
+        if changed:
+            with suppress(Exception):
+                save_settings(settings)
+
+    def _restore_startup_page(self) -> None:
+        want = str(settings.start_page or 'home')
+        state: dict = {}
+        name = ''
+        if want == 'last':
+            name = str(settings.last_page or '')
+            if isinstance(settings.last_route, dict):
+                state = settings.last_route
+        elif want != 'home':
+            name = want
+        target = self._page_by_object_name(name) if name else None
+        if target is None:
+            target = self.home_nav_page
+            state = {}
+        self.switchTo(target)
+        if not state:
+            return
+        if isinstance(target, LazyPage):
+            target.call_when_ready('restore_nav_state', state)
+        else:
+            QTimer.singleShot(0, lambda: self._apply_restore_state(target, state))
+
+    def _apply_restore_state(self, page, state: dict) -> None:
+        fn = getattr(page, 'restore_nav_state', None)
+        if not callable(fn):
+            return
+        try:
+            fn(state)
+        except Exception:
+            logger.exception('Failed to restore navigation state')
+
     def _init_keyboard_shortcuts(self) -> None:
         self._fixed_shortcuts = []
 
@@ -5101,30 +5315,37 @@ class MainWindow(FluentWindow):
         _add('F1', self._show_shortcuts_dialog)
         self._register_shortcuts()
 
+    def _sailseek_signature(self, mapping: dict) -> tuple:
+        names = sorted(n for n in dir(settings) if n.startswith('sailseek'))
+        return (mapping.get('sailseek'), *((n, repr(getattr(settings, n, None))) for n in names))
+
     def _register_shortcuts(self) -> None:
-        for sc in getattr(self, '_page_shortcuts', None) or []:
-            with suppress(Exception):
-                sc.setEnabled(False)
-                sc.deleteLater()
-        self._page_shortcuts = []
         mapping = shortcut_map()
-        for action_id, _default, _label, attr in SHORTCUT_DEFAULTS:
-            if action_id == 'sailseek':
-                continue
-            key = mapping[action_id]
-            try:
-                if attr is None:
-                    handler = self._go_back_history
-                else:
-                    handler = lambda _a=attr: self._goto_shortcut_page(_a)
-                sc = QShortcut(QKeySequence(key), self)
-                sc.setContext(Qt.ShortcutContext.WindowShortcut)
-                sc.activated.connect(handler)
-                self._page_shortcuts.append(sc)
-            except Exception:
-                logger.exception('Failed to register shortcut %s', key)
+        page_sig = tuple((action_id, mapping[action_id]) for action_id, *_rest in SHORTCUT_DEFAULTS
+                         if action_id != 'sailseek')
+        if page_sig != self.__dict__.get('_page_shortcut_sig') or not self.__dict__.get('_page_shortcuts'):
+            self._page_shortcut_sig = page_sig
+            for sc in self.__dict__.get('_page_shortcuts') or []:
+                with suppress(Exception):
+                    sc.setEnabled(False)
+                    sc.deleteLater()
+            self._page_shortcuts = []
+            for action_id, _default, _label, attr in SHORTCUT_DEFAULTS:
+                if action_id == 'sailseek':
+                    continue
+                key = mapping[action_id]
+                try:
+                    handler = self._go_back_history if attr is None else partial(self._goto_shortcut_page, attr)
+                    sc = QShortcut(QKeySequence(key), self)
+                    sc.setContext(Qt.ShortcutContext.WindowShortcut)
+                    sc.activated.connect(handler)
+                    self._page_shortcuts.append(sc)
+                except Exception:
+                    logger.exception('Failed to register shortcut %s', key)
         controller = getattr(self, 'sailseek', None)
-        if controller is not None:
+        signature = self._sailseek_signature(mapping)
+        if controller is not None and signature != self.__dict__.get('_sailseek_sig'):
+            self._sailseek_sig = signature
             with suppress(Exception):
                 controller.apply_settings()
 
@@ -6127,4 +6348,9 @@ def create_application(argv: list | None=None):
         install_global_tool_tip(app)
     except Exception:
         logger.exception('Failed to initialize sound manager')
+    try:
+        from src.core.net import install_urllib_guard
+        install_urllib_guard()
+    except Exception:
+        logger.exception('Failed to install the network guard')
     return app

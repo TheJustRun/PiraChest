@@ -1,20 +1,24 @@
 import logging
+import math
 import os
 import time
 from collections import Counter
+from contextlib import suppress
 from functools import lru_cache
 
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QRectF, Qt, QTimer, QUrl, QVariantAnimation, Signal
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QFont, QKeySequence, QPainter, QPen, QPixmap, QShortcut,
+)
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QButtonGroup, QHBoxLayout, QHeaderView, QLabel,
+    QAbstractItemView, QApplication, QButtonGroup, QFrame, QHBoxLayout, QHeaderView, QLabel,
     QSizePolicy, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
-    BodyLabel, CaptionLabel, CardWidget, ComboBox, FlowLayout, FluentIcon, IconWidget,
+    BodyLabel, CaptionLabel, ComboBox, FlowLayout, FluentIcon, IconWidget,
     IndeterminateProgressBar, InfoBar, InfoBarPosition, MessageBoxBase, PillPushButton,
     PushButton, SearchLineEdit, SmoothScrollArea, StrongBodyLabel, SubtitleLabel,
-    TableWidget, TransparentToolButton,
+    TableWidget, TransparentToolButton, isDarkTheme, themeColor,
 )
 
 from src.core.models import assess_source_files, assess_title, classify_file
@@ -27,7 +31,7 @@ from src.core.worker import Priority as TaskPriority, cancel as cancel_task, sub
 from src.core.config import save_settings, settings
 from src.core.downloader import DownloadManager
 from src.core.translations import tr, register_locale_refresh
-from src.core.theme import palette, pop_in, themed_icon, ScrollingTextDelegate
+from src.core.theme import animations_enabled, palette, pop_in, themed_icon, ScrollingTextDelegate
 from .repacks_page import DownloadActionWidget
 
 logger = logging.getLogger(__name__)
@@ -49,13 +53,19 @@ _DOUBLE_SEARCH_GUARD = 0.35
 _MAX_FILE_ROWS = 300
 _GUI_DIR = os.path.dirname(os.path.abspath(__file__))
 _LOGO_PATH = os.path.join(_GUI_DIR, 'photos', 'tbhb_logo.png')
-_LOGO_HEIGHT = 380
+_LOGO_HEIGHT = 340
 
-
-_ROW_SPACING = 16
-_COL_CAT, _COL_SIZE, _COL_AGE, _COL_SEEDS, _COL_LEECH = 64, 84, 84, 56, 56
+_ROW_HEIGHT = 54
+_ROW_GAP = 12
+_PAD_X = 14
+_LIST_RIGHT = 10
+_CONTROL_HEIGHT = 36
+_COL_CAT, _COL_SIZE, _COL_AGE, _COL_SEEDS, _COL_LEECH = 76, 76, 72, 48, 48
+_LANDING_WIDTH = 640
+_DETAIL_WIDTH = 1080
 
 _SORT_KEYS = ("best", "seeders", "newest", "largest")
+_HEADER_SORT = {"size": "largest", "age": "newest", "seeds": "seeders"}
 
 
 def _sort_labels() -> list[str]:
@@ -65,6 +75,18 @@ def _sort_labels() -> list[str]:
         tr('tbhb.sort_newest', default='Newest'),
         tr('tbhb.sort_largest', default='Largest'),
     ]
+
+
+def _ink(alpha: int) -> QColor:
+    color = QColor(255, 255, 255) if isDarkTheme() else QColor(0, 0, 0)
+    color.setAlpha(alpha)
+    return color
+
+
+def _tabular(font: QFont) -> QFont:
+    with suppress(Exception):
+        font.setFeature(QFont.Tag('tnum'), 1)
+    return font
 
 
 def _make_elided(base):
@@ -98,59 +120,158 @@ ElidedBodyLabel = _make_elided(BodyLabel)
 ElidedCaptionLabel = _make_elided(CaptionLabel)
 
 
-def _cell(text: str, width: int, color: str | None = None) -> CaptionLabel:
-    lbl = CaptionLabel(text)
+def _cell(text: str, width: int, color: str | None = None) -> QLabel:
+    lbl = QLabel(text)
     lbl.setFixedWidth(width)
-    lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    if color:
-        lbl.setStyleSheet(f"color: {color};")
+    lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    font = _tabular(lbl.font())
+    font.setPixelSize(12)
+    lbl.setFont(font)
+    lbl.setStyleSheet(f"color: {color or palette().get('body_text', '#d0d0d0')}; background: transparent;")
     return lbl
 
 
-class ColumnHeader(QWidget):
+def _info_button(parent, on_click) -> TransparentToolButton:
+    btn = TransparentToolButton(FluentIcon.INFO, parent)
+    btn.setFixedSize(_CONTROL_HEIGHT, _CONTROL_HEIGHT)
+    btn.setToolTip(tr('tbhb.info_tooltip', default='About TBHB'))
+    btn.clicked.connect(on_click)
+    return btn
+
+
+class _Panel(QFrame):
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(_ink(10))
+        painter.setPen(QPen(_ink(20), 1))
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 10, 10)
+        super().paintEvent(event)
+
+
+class _VDivider(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setFixedSize(9, 18)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setPen(_ink(28))
+        painter.drawLine(4, 0, 4, self.height())
+        painter.end()
+
+
+class _Chip(QLabel):
+    def __init__(self, text: str, width: int, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(width, 20)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet(f"color: {palette()['muted']}; background: transparent; font-size: 11px;")
+        self.setToolTip(text)
+        self.setText(self.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, width - 14))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(_ink(16))
+        painter.drawRoundedRect(QRectF(self.rect()), 10, 10)
+        painter.end()
+        super().paintEvent(event)
+
+
+class _HeaderLabel(QLabel):
+    clicked = Signal()
+
+    def __init__(self, text: str, sortable: bool, parent=None):
+        super().__init__(text, parent)
+        self._sortable = sortable
+        self._active = False
+        if sortable:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._restyle()
+
+    def set_active(self, active: bool) -> None:
+        if active != self._active:
+            self._active = active
+            self._restyle()
+
+    def _restyle(self) -> None:
+        pal = palette()
+        color = themeColor().name() if self._active else pal['muted']
+        weight = 600 if self._active else 500
+        sheet = f"QLabel {{ color: {color}; font-size: 11px; font-weight: {weight}; background: transparent; }}"
+        if self._sortable and not self._active:
+            sheet += f"QLabel:hover {{ color: {pal.get('primary_text', '#ffffff')}; }}"
+        self.setStyleSheet(sheet)
+
+    def mouseReleaseEvent(self, event):
+        if self._sortable and event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
+class ColumnHeader(QWidget):
+    sort_requested = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(24)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(20, 0, 20, 0)
-        layout.setSpacing(_ROW_SPACING)
-        muted = palette()['muted']
+        layout.setContentsMargins(_PAD_X, 0, _PAD_X + _LIST_RIGHT, 0)
+        layout.setSpacing(_ROW_GAP)
         self._labels = {}
         for key, default, width in (
             ('name', 'Name', 0), ('cat', 'Type', _COL_CAT), ('size', 'Size', _COL_SIZE),
             ('age', 'Added', _COL_AGE), ('seeds', '↑ Seeds', _COL_SEEDS), ('leech', '↓ Peers', _COL_LEECH),
         ):
-            lbl = CaptionLabel(tr(f'tbhb.col_{key}', default=default))
-            lbl.setStyleSheet(f"color: {muted};")
+            sort_key = _HEADER_SORT.get(key)
+            lbl = _HeaderLabel(tr(f'tbhb.col_{key}', default=default), bool(sort_key))
+            if sort_key:
+                lbl.clicked.connect(lambda k=sort_key: self.sort_requested.emit(k))
             if width:
                 lbl.setFixedWidth(width)
-                lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 layout.addWidget(lbl)
             else:
                 layout.addWidget(lbl, 1)
             self._labels[key] = (lbl, default)
 
+    def set_active(self, sort_key: str) -> None:
+        for key, (lbl, _default) in self._labels.items():
+            lbl.set_active(_HEADER_SORT.get(key) == sort_key)
+
     def refresh_locale(self) -> None:
         for key, (lbl, default) in self._labels.items():
             lbl.setText(tr(f'tbhb.col_{key}', default=default))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setPen(_ink(22))
+        painter.drawLine(_PAD_X, self.height() - 1, self.width() - _PAD_X - _LIST_RIGHT, self.height() - 1)
+        painter.end()
+        super().paintEvent(event)
 
 
 _assess_title_cached = lru_cache(maxsize=1024)(assess_title)
 
 
-class ResultRow(CardWidget):
+class ResultRow(QWidget):
     def __init__(self, entry: TBHBEntry, on_click, parent=None):
         super().__init__(parent)
         self.entry = entry
         self._on_click = on_click
+        self._hover = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(68)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setFixedHeight(_ROW_HEIGHT)
         pal = palette()
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(20, 8, 20, 8)
-        layout.setSpacing(_ROW_SPACING)
+        layout.setContentsMargins(_PAD_X, 0, _PAD_X, 0)
+        layout.setSpacing(_ROW_GAP)
 
         title_col = QVBoxLayout()
-        title_col.setSpacing(3)
+        title_col.setSpacing(2)
         title_col.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         title_col.addWidget(ElidedBodyLabel(entry.title))
         meta_parts = []
@@ -167,15 +288,55 @@ class ResultRow(CardWidget):
             meta_parts.append(safety.summary)
         if entry.source:
             meta_parts.append(entry.source)
-        title_col.addWidget(ElidedCaptionLabel(" • ".join(meta_parts)))
+        meta = ElidedCaptionLabel(" · ".join(meta_parts))
+        meta.setStyleSheet(f"color: {pal['muted']}; background: transparent;")
+        title_col.addWidget(meta)
         layout.addLayout(title_col, 1)
 
-        layout.addWidget(_cell(category_name, _COL_CAT), 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(_Chip(category_name, _COL_CAT), 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(_cell(entry.size_label or "—", _COL_SIZE), 0, Qt.AlignmentFlag.AlignVCenter)
-        layout.addWidget(_cell(entry.age_label or "—", _COL_AGE), 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(_cell(entry.age_label or "—", _COL_AGE, pal['muted']), 0, Qt.AlignmentFlag.AlignVCenter)
         seed_color = pal['state_seeding'] if entry.seeders > 0 else pal['faint_text']
         layout.addWidget(_cell(str(entry.seeders), _COL_SEEDS, seed_color), 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(_cell(str(entry.leechers), _COL_LEECH, pal['muted']), 0, Qt.AlignmentFlag.AlignVCenter)
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def focusInEvent(self, event):
+        self.update()
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event):
+        self.update()
+        super().focusOutEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        focused = self.hasFocus()
+        if self._hover or focused:
+            painter.setPen(QPen(themeColor(), 1.5) if focused else Qt.PenStyle.NoPen)
+            painter.setBrush(_ink(15 if self._hover else 10))
+            painter.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 8, 8)
+        else:
+            painter.setPen(_ink(12))
+            painter.drawLine(_PAD_X, self.height() - 1, self.width() - _PAD_X, self.height() - 1)
+        painter.end()
+        super().paintEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self._on_click(self.entry)
+            return
+        super().keyPressEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
@@ -183,30 +344,127 @@ class ResultRow(CardWidget):
         super().mouseReleaseEvent(event)
 
 
+class _SkeletonRow(QWidget):
+    def __init__(self, index: int, parent=None):
+        super().__init__(parent)
+        self._index = index
+        self._phase = 0.0
+        self.setFixedHeight(_ROW_HEIGHT)
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setDuration(1500)
+        self._anim.setLoopCount(-1)
+        self._anim.valueChanged.connect(self._tick)
+
+    def _tick(self, value) -> None:
+        self._phase = float(value)
+        self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if animations_enabled():
+            self._anim.start()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._anim.stop()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        wave = 0.5 + 0.5 * math.sin(self._phase * 2 * math.pi - self._index * 0.55)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(_ink(int(9 + 11 * wave)))
+        width = self.width()
+        title_w = width * (0.28 + 0.16 * ((self._index * 3) % 5) / 4)
+        painter.drawRoundedRect(QRectF(_PAD_X, 14, title_w, 10), 5, 5)
+        painter.drawRoundedRect(QRectF(_PAD_X, 32, title_w * 0.55, 8), 4, 4)
+        x = width - _PAD_X
+        for col in (_COL_LEECH, _COL_SEEDS, _COL_AGE, _COL_SIZE, _COL_CAT):
+            x -= col
+            bar = col * 0.6
+            painter.drawRoundedRect(QRectF(x + col - bar, 21, bar, 10), 5, 5)
+            x -= _ROW_GAP
+        painter.end()
+
+
+class _EmptyState(QWidget):
+    def __init__(self, title: str, hint: str, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 64, 24, 24)
+        layout.setSpacing(8)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        icon = IconWidget(FluentIcon.SEARCH)
+        icon.setFixedSize(30, 30)
+        layout.addWidget(icon, 0, Qt.AlignmentFlag.AlignHCenter)
+        head = StrongBodyLabel(title)
+        head.setWordWrap(True)
+        head.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(head)
+        if hint:
+            sub = CaptionLabel(hint)
+            sub.setWordWrap(True)
+            sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            sub.setStyleSheet(f"color: {palette()['muted']};")
+            layout.addWidget(sub)
+
+
 class ResultsList(QWidget):
     def __init__(self, on_row_click, parent=None):
         super().__init__(parent)
         self._on_row_click = on_row_click
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(4, 4, 4, 0)
-        self._layout.setSpacing(10)
+        self._layout.setContentsMargins(0, 2, _LIST_RIGHT, 0)
+        self._layout.setSpacing(0)
         self._layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self._rows: list[ResultRow] = []
+        self._items: list[QWidget] = []
+        self._mode = "empty"
+
+    @property
+    def has_rows(self) -> bool:
+        return self._mode == "rows"
 
     def clear(self) -> None:
-        for r in self._rows:
-            r.setParent(None)
-            r.deleteLater()
-        self._rows.clear()
+        for item in self._items:
+            item.setParent(None)
+            item.deleteLater()
+        self._items.clear()
+        self._mode = "empty"
+
+    def _add(self, widget: QWidget) -> None:
+        self._layout.addWidget(widget)
+        self._items.append(widget)
 
     def set_entries(self, entries: list[TBHBEntry]) -> None:
         self.setUpdatesEnabled(False)
         try:
             self.clear()
             for entry in entries:
-                row = ResultRow(entry, self._on_row_click)
-                self._layout.addWidget(row)
-                self._rows.append(row)
+                self._add(ResultRow(entry, self._on_row_click))
+            self._mode = "rows"
+        finally:
+            self.setUpdatesEnabled(True)
+
+    def show_skeleton(self) -> None:
+        if self._mode == "skeleton":
+            return
+        self.setUpdatesEnabled(False)
+        try:
+            self.clear()
+            for index in range(9):
+                self._add(_SkeletonRow(index))
+            self._mode = "skeleton"
+        finally:
+            self.setUpdatesEnabled(True)
+
+    def show_message(self, title: str, hint: str = "") -> None:
+        self.setUpdatesEnabled(False)
+        try:
+            self.clear()
+            self._add(_EmptyState(title, hint))
+            self._mode = "message"
         finally:
             self.setUpdatesEnabled(True)
 
@@ -219,12 +477,14 @@ class PaginationBar(QWidget):
         self._busy = False
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(2)
         self._prev_btn = TransparentToolButton(themed_icon('tbhb.results_prev_page', FluentIcon.LEFT_ARROW))
         self._prev_btn.setFixedSize(28, 28)
         self._prev_btn.clicked.connect(on_prev)
         layout.addWidget(self._prev_btn)
         self._label = StrongBodyLabel(tr('tbhb.page', num=1))
+        self._label.setMinimumWidth(52)
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._label)
         self._next_btn = TransparentToolButton(themed_icon('tbhb.results_next_page', FluentIcon.RIGHT_ARROW))
         self._next_btn.setFixedSize(28, 28)
@@ -249,35 +509,47 @@ class PaginationBar(QWidget):
         self._label.setText(tr('tbhb.page', num=self._page + 1))
 
 
-class DetailsView(QWidget):
-    def __init__(self, manager: DownloadManager, parent=None):
+class _CappedHost(QWidget):
+    def __init__(self, max_width: int, parent=None):
         super().__init__(parent)
+        self._max_width = max_width
+        self.body = QWidget(self)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        width = min(self.width() - _PAD_X, self._max_width)
+        self.body.setGeometry(_PAD_X + (self.width() - _PAD_X - width) // 2, 0, width, self.height())
+
+
+class DetailsView(_CappedHost):
+    def __init__(self, manager: DownloadManager, parent=None):
+        super().__init__(_DETAIL_WIDTH, parent)
         self._details: TBHBDetails | None = None
         self._rep_for = ""
         self._page_url = ""
         self._download_action = DownloadActionWidget(manager, "tbhb")
         self._download_action.download_started.connect(self._track_download)
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 4, 0, 0)
+        outer = QVBoxLayout(self.body)
+        outer.setContentsMargins(0, 2, 0, 0)
         outer.setSpacing(10)
 
         top = QHBoxLayout()
         top.setSpacing(8)
         self._back_btn = PushButton(themed_icon('tbhb.detail_back', FluentIcon.RETURN), tr('tbhb.back_to_results'))
-        self._back_btn.setFixedHeight(32)
+        self._back_btn.setFixedHeight(_CONTROL_HEIGHT)
         self.back_requested = self._back_btn.clicked
         top.addWidget(self._back_btn)
+        top.addStretch(1)
         self._copy_btn = PushButton(themed_icon('tbhb.detail_copy', FluentIcon.COPY), tr('tbhb.copy_magnet', default='Copy magnet'))
-        self._copy_btn.setFixedHeight(32)
+        self._copy_btn.setFixedHeight(_CONTROL_HEIGHT)
         self._copy_btn.clicked.connect(self._copy_magnet)
         top.addWidget(self._copy_btn)
         self._page_btn = PushButton(themed_icon('tbhb.detail_page', FluentIcon.LINK),
                                     tr('tbhb.open_page', default='Open source page'))
-        self._page_btn.setFixedHeight(32)
+        self._page_btn.setFixedHeight(_CONTROL_HEIGHT)
         self._page_btn.setVisible(False)
         self._page_btn.clicked.connect(self._open_page)
         top.addWidget(self._page_btn)
-        top.addStretch(1)
         outer.addLayout(top)
 
         scroll = SmoothScrollArea()
@@ -286,15 +558,15 @@ class DetailsView(QWidget):
         body = QWidget()
         body.setStyleSheet("background: transparent;")
         body_l = QVBoxLayout(body)
-        body_l.setContentsMargins(0, 0, 8, 0)
-        body_l.setSpacing(14)
+        body_l.setContentsMargins(0, 0, _LIST_RIGHT, 12)
+        body_l.setSpacing(10)
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
 
-        header_card = CardWidget()
+        header_card = _Panel()
         header_l = QVBoxLayout(header_card)
-        header_l.setContentsMargins(20, 18, 20, 18)
-        header_l.setSpacing(12)
+        header_l.setContentsMargins(18, 14, 18, 14)
+        header_l.setSpacing(10)
         self._title_lbl = SubtitleLabel("")
         self._title_lbl.setWordWrap(True)
         self._title_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -304,8 +576,8 @@ class DetailsView(QWidget):
         stats_host.setStyleSheet("background: transparent;")
         flow = FlowLayout(stats_host, needAni=False)
         flow.setContentsMargins(0, 0, 0, 0)
-        flow.setHorizontalSpacing(28)
-        flow.setVerticalSpacing(8)
+        flow.setHorizontalSpacing(20)
+        flow.setVerticalSpacing(6)
         self._category_lbl = self._stat(flow, themed_icon('tbhb.stat_category', FluentIcon.TAG))
         self._size_lbl = self._stat(flow, themed_icon('tbhb.stat_size', FluentIcon.DOCUMENT))
         self._seeders_lbl = self._stat(flow, themed_icon('tbhb.stat_seeders', FluentIcon.UP))
@@ -319,16 +591,17 @@ class DetailsView(QWidget):
         header_l.addWidget(stats_host)
 
         self._hash_lbl = CaptionLabel("")
+        self._hash_lbl.setStyleSheet(f"color: {palette()['muted']};")
         self._hash_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         header_l.addWidget(self._hash_lbl)
         body_l.addWidget(header_card)
 
         body_l.addWidget(self._download_action)
 
-        self._desc_card = CardWidget()
+        self._desc_card = _Panel()
         desc_l = QVBoxLayout(self._desc_card)
-        desc_l.setContentsMargins(20, 16, 20, 16)
-        desc_l.setSpacing(8)
+        desc_l.setContentsMargins(18, 12, 18, 14)
+        desc_l.setSpacing(6)
         self._desc_title = StrongBodyLabel(tr('tbhb.description', default='Description'))
         desc_l.addWidget(self._desc_title)
         self._desc_lbl = CaptionLabel("")
@@ -339,27 +612,29 @@ class DetailsView(QWidget):
         self._desc_card.setVisible(False)
         body_l.addWidget(self._desc_card)
 
-        files_card = CardWidget()
+        files_card = _Panel()
         files_l = QVBoxLayout(files_card)
-        files_l.setContentsMargins(20, 16, 20, 16)
+        files_l.setContentsMargins(18, 12, 18, 14)
         files_l.setSpacing(8)
         files_head = QHBoxLayout()
+        files_head.setSpacing(10)
         self._files_title = StrongBodyLabel(tr('tbhb.files', default='Files'))
         files_head.addWidget(self._files_title)
         self._files_caption = CaptionLabel("")
-        files_head.addWidget(self._files_caption)
-        files_head.addStretch(1)
+        self._files_caption.setStyleSheet(f"color: {palette()['muted']};")
+        files_head.addWidget(self._files_caption, 1)
         files_l.addLayout(files_head)
         self._files_table = TableWidget()
         self._files_table.setColumnCount(3)
         self._files_table.verticalHeader().hide()
+        self._files_table.verticalHeader().setDefaultSectionSize(32)
         self._files_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._files_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self._files_table.setShowGrid(False)
         self._files_table.setWordWrap(False)
-        self._files_table.setBorderVisible(True)
+        self._files_table.setBorderVisible(False)
         self._files_table.setBorderRadius(8)
-        self._files_table.setFixedHeight(260)
+        self._files_table.setFixedHeight(200)
         header = self._files_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -385,7 +660,7 @@ class DetailsView(QWidget):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(6)
         icon_w = IconWidget(icon)
-        icon_w.setFixedSize(16, 16)
+        icon_w.setFixedSize(14, 14)
         h.addWidget(icon_w)
         lbl = BodyLabel("")
         h.addWidget(lbl)
@@ -512,6 +787,7 @@ class DetailsView(QWidget):
             table.setItem(len(shown), 0, QTableWidgetItem(tr('tbhb.files_more', default='… and more files') + f" (+{extra})"))
             table.setItem(len(shown), 1, QTableWidgetItem(""))
             table.setItem(len(shown), 2, QTableWidgetItem(""))
+        table.setFixedHeight(min(40 + 32 * table.rowCount(), 420))
         table.setVisible(True)
 
     def refresh_locale(self) -> None:
@@ -579,104 +855,130 @@ class TBHBPage(QWidget):
         self._details_entry_id = None
         self._pill_sets: list[dict[int, PillPushButton]] = []
         self._source_items: list[tuple[str, int]] = []
+        self._info_buttons: list[TransparentToolButton] = []
         self._reset_results()
         self._search_watchdog = QTimer(self)
         self._search_watchdog.setSingleShot(True)
         self._search_watchdog.timeout.connect(self._on_search_timeout)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 16, 24, 0)
+        root.setContentsMargins(24 - _PAD_X, 14, 24, 0)
         root.setSpacing(8)
-
-        header_row = QHBoxLayout()
-        header_row.setContentsMargins(0, 0, 0, 0)
-        header_row.addStretch(1)
-        self._info_btn = TransparentToolButton(FluentIcon.INFO, self)
-        self._info_btn.setFixedSize(32, 32)
-        self._info_btn.setToolTip(tr('tbhb.info_tooltip', default='About TBHB'))
-        self._info_btn.clicked.connect(self._show_disclaimer)
-        header_row.addWidget(self._info_btn)
-        root.addLayout(header_row)
 
         self._search_section = QWidget()
         search_layout = QVBoxLayout(self._search_section)
-        search_layout.setContentsMargins(0, 0, 0, 0)
-        search_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        search_layout.setContentsMargins(_PAD_X, 0, 0, 0)
         search_layout.addStretch(2)
+
+        column = QWidget()
+        column.setMaximumWidth(_LANDING_WIDTH)
+        column_l = QVBoxLayout(column)
+        column_l.setContentsMargins(0, 0, 0, 0)
+        column_l.setSpacing(16)
+
         logo_lbl = QLabel()
         if os.path.isfile(_LOGO_PATH):
-            pix = QPixmap(_LOGO_PATH)
-            logo_lbl.setPixmap(pix.scaledToHeight(_LOGO_HEIGHT, Qt.TransformationMode.SmoothTransformation))
+            ratio = self.devicePixelRatioF()
+            pix = QPixmap(_LOGO_PATH).scaledToHeight(int(_LOGO_HEIGHT * ratio), Qt.TransformationMode.SmoothTransformation)
+            pix.setDevicePixelRatio(ratio)
+            logo_lbl.setPixmap(pix)
         else:
             logo_lbl.setText("The Black Hole Bay")
         logo_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        search_layout.addWidget(logo_lbl)
+        column_l.addWidget(logo_lbl)
 
         bar_row = QHBoxLayout()
-        bar_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bar_row.setSpacing(6)
         self._search_bar = SearchLineEdit()
         self._search_bar.setPlaceholderText(tr('tbhb.search_placeholder'))
-        self._search_bar.setMinimumWidth(200)
-        self._search_bar.setMaximumWidth(480)
-        self._search_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._search_bar.setFixedHeight(44)
         self._bind_search(self._search_bar)
-        bar_row.addWidget(self._search_bar)
-        search_layout.addLayout(bar_row)
+        bar_row.addWidget(self._search_bar, 1)
+        landing_info = _info_button(self, self._show_disclaimer)
+        self._info_buttons.append(landing_info)
+        bar_row.addWidget(landing_info)
+        column_l.addLayout(bar_row)
 
         cat_row = self._build_pills()
-        cat_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        search_layout.addLayout(cat_row)
+        cat_row.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        column_l.addLayout(cat_row)
 
         self._hint_lbl = CaptionLabel(tr('tbhb.browse_hint', default='Press Enter on an empty search to browse the latest uploads'))
         self._hint_lbl.setStyleSheet(f"color: {palette()['muted']};")
         self._hint_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        search_layout.addWidget(self._hint_lbl)
+        column_l.addWidget(self._hint_lbl)
+
+        center = QHBoxLayout()
+        center.addStretch(1)
+        center.addWidget(column, 100)
+        center.addStretch(1)
+        search_layout.addLayout(center)
         search_layout.addStretch(3)
         root.addWidget(self._search_section, 1)
 
         self._results_section = QWidget()
         results_layout = QVBoxLayout(self._results_section)
         results_layout.setContentsMargins(0, 0, 0, 0)
-        results_layout.setSpacing(10)
+        results_layout.setSpacing(8)
 
         top_row = QHBoxLayout()
-        top_row.setSpacing(10)
+        top_row.setContentsMargins(_PAD_X, 0, 0, 0)
+        top_row.setSpacing(8)
         self._new_search_btn = PushButton(themed_icon('tbhb.new_search', FluentIcon.HOME), tr('tbhb.new_search'))
+        self._new_search_btn.setFixedHeight(_CONTROL_HEIGHT)
         self._new_search_btn.clicked.connect(self._reset_to_search)
         top_row.addWidget(self._new_search_btn)
         self._results_search = SearchLineEdit()
         self._results_search.setPlaceholderText(tr('tbhb.search_placeholder'))
+        self._results_search.setFixedHeight(_CONTROL_HEIGHT)
         self._bind_search(self._results_search)
         top_row.addWidget(self._results_search, 1)
+        results_info = _info_button(self, self._show_disclaimer)
+        self._info_buttons.append(results_info)
+        top_row.addWidget(results_info)
         results_layout.addLayout(top_row)
 
-        results_layout.addLayout(self._build_pills())
+        filter_row = QHBoxLayout()
+        filter_row.setContentsMargins(_PAD_X, 0, 0, 0)
+        filter_row.setSpacing(8)
+        filter_row.addLayout(self._build_pills())
 
-        info_row = QHBoxLayout()
-        info_row.setSpacing(10)
         self._status_lbl = CaptionLabel("")
-        info_row.addWidget(self._status_lbl, 1)
+        self._status_lbl.setStyleSheet(f"color: {palette()['muted']};")
+        self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._status_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._status_lbl.setMinimumWidth(0)
+        filter_row.addWidget(self._status_lbl, 1)
+
+        self._pagination = PaginationBar(self._on_prev_page, self._on_next_page)
+        filter_row.addWidget(self._pagination)
+        filter_row.addWidget(_VDivider())
+
         self._source_combo = ComboBox()
-        self._source_combo.setFixedWidth(170)
+        self._source_combo.setFixedSize(150, 30)
         self._source_combo.setVisible(False)
         self._source_combo.currentIndexChanged.connect(self._on_source_changed)
-        info_row.addWidget(self._source_combo)
-        self._sort_lbl = CaptionLabel(tr('tbhb.sort_by', default='Sort by'))
-        info_row.addWidget(self._sort_lbl)
+        filter_row.addWidget(self._source_combo)
         self._sort_combo = ComboBox()
         self._sort_combo.addItems(_sort_labels())
-        self._sort_combo.setFixedWidth(150)
+        self._sort_combo.setFixedSize(140, 30)
+        self._sort_combo.setToolTip(tr('tbhb.sort_by', default='Sort by'))
         self._sort_combo.currentIndexChanged.connect(self._on_sort_changed)
-        info_row.addWidget(self._sort_combo)
-        self._pagination = PaginationBar(self._on_prev_page, self._on_next_page)
-        info_row.addWidget(self._pagination)
-        results_layout.addLayout(info_row)
+        filter_row.addWidget(self._sort_combo)
+        results_layout.addLayout(filter_row)
 
+        busy_host = QWidget()
+        busy_host.setFixedHeight(4)
+        busy_l = QVBoxLayout(busy_host)
+        busy_l.setContentsMargins(0, 0, 0, 0)
         self._busy_bar = IndeterminateProgressBar(start=False)
         self._busy_bar.setVisible(False)
-        results_layout.addWidget(self._busy_bar)
+        busy_l.addWidget(self._busy_bar)
+        results_layout.addWidget(busy_host)
 
         self._column_header = ColumnHeader()
+        self._column_header.set_active(self._sort_key)
+        self._column_header.sort_requested.connect(self._on_header_sort)
         results_layout.addWidget(self._column_header)
 
         self._list = ResultsList(self._open_details)
@@ -686,6 +988,7 @@ class TBHBPage(QWidget):
         self._scroll_area.setStyleSheet("QScrollArea{background: transparent; border: none;}")
         self._list.setStyleSheet("background: transparent;")
         results_layout.addWidget(self._scroll_area, 1)
+
         self._results_section.setVisible(False)
         root.addWidget(self._results_section, 1)
 
@@ -698,6 +1001,10 @@ class TBHBPage(QWidget):
         esc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         esc.activated.connect(self._on_escape)
 
+        find = QShortcut(QKeySequence(QKeySequence.StandardKey.Find), self)
+        find.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        find.activated.connect(self._focus_search)
+
         register_locale_refresh(self, self._apply_locale)
 
     def _bind_search(self, bar: SearchLineEdit) -> None:
@@ -706,13 +1013,15 @@ class TBHBPage(QWidget):
 
     def _build_pills(self) -> QHBoxLayout:
         row = QHBoxLayout()
-        row.setSpacing(8)
+        row.setSpacing(6)
         group = QButtonGroup(self)
         group.setExclusive(True)
         buttons: dict[int, PillPushButton] = {}
         for code, name in CATEGORIES:
             btn = PillPushButton(name)
             btn.setCheckable(True)
+            btn.setFixedHeight(30)
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             group.addButton(btn)
             row.addWidget(btn)
             buttons[code] = btn
@@ -721,13 +1030,21 @@ class TBHBPage(QWidget):
         self._pill_sets.append(buttons)
         return row
 
+    def _focus_search(self) -> None:
+        if self._details_view.isVisible():
+            return
+        bar = self._search_bar if self._search_section.isVisible() else self._results_search
+        bar.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        bar.selectAll()
+
     def _apply_locale(self, *_args) -> None:
         for bar in (self._search_bar, self._results_search):
             bar.setPlaceholderText(tr('tbhb.search_placeholder'))
         self._hint_lbl.setText(tr('tbhb.browse_hint', default='Press Enter on an empty search to browse the latest uploads'))
         self._new_search_btn.setText(tr('tbhb.new_search'))
-        self._info_btn.setToolTip(tr('tbhb.info_tooltip', default='About TBHB'))
-        self._sort_lbl.setText(tr('tbhb.sort_by', default='Sort by'))
+        for btn in self._info_buttons:
+            btn.setToolTip(tr('tbhb.info_tooltip', default='About TBHB'))
+        self._sort_combo.setToolTip(tr('tbhb.sort_by', default='Sort by'))
         for i, text in enumerate(_sort_labels()):
             self._sort_combo.setItemText(i, text)
         if self._source_combo.count():
@@ -797,8 +1114,13 @@ class TBHBPage(QWidget):
         if changed and self._results_section.isVisible():
             self._start_search(use_cache=True)
 
+    def _on_header_sort(self, key: str) -> None:
+        target = "best" if self._sort_key == key else key
+        self._sort_combo.setCurrentIndex(_SORT_KEYS.index(target))
+
     def _on_sort_changed(self, index: int) -> None:
         self._sort_key = _SORT_KEYS[max(0, min(index, len(_SORT_KEYS) - 1))]
+        self._column_header.set_active(self._sort_key)
         self._page = 0
         if not self._loading:
             self._fetches_left = _AUTO_FETCHES
@@ -816,6 +1138,7 @@ class TBHBPage(QWidget):
         self._cancel_search()
         self._reset_results()
         self._page = 0
+        self._list.clear()
         self._search_section.setVisible(False)
         self._details_view.setVisible(False)
         self._results_section.setVisible(True)
@@ -838,6 +1161,8 @@ class TBHBPage(QWidget):
         if loading:
             self._busy_bar.start()
             self._status_lbl.setText(tr('tbhb.loading'))
+            if not self._list.has_rows:
+                self._list.show_skeleton()
         else:
             self._busy_bar.stop()
 
@@ -919,8 +1244,8 @@ class TBHBPage(QWidget):
         if self._all_entries:
             self._render_page()
         else:
-            self._status_lbl.setText(text)
-            self._list.clear()
+            self._status_lbl.setText("")
+            self._list.show_message(text)
             self._pagination.set_page(0, False)
 
     def _sorted_entries(self) -> list[TBHBEntry]:
@@ -958,8 +1283,10 @@ class TBHBPage(QWidget):
         self._pagination.set_page(self._page, self._has_next)
         if not view:
             label = f'"{self._query}"' if self._query else tr('tbhb.latest_uploads')
-            self._status_lbl.setText(tr('tbhb.no_results_for', category=self._current_category_name(), query=label))
-            self._list.clear()
+            self._status_lbl.setText(tr('tbhb.results_count', count=0))
+            self._list.show_message(
+                tr('tbhb.no_results_for', category=self._current_category_name(), query=label),
+                tr('tbhb.empty_hint', default='Try different keywords or another category.'))
             return
         count = len(view) if self._server_exhausted else f"{len(view)}+"
         if self._fallback_active:
@@ -977,6 +1304,31 @@ class TBHBPage(QWidget):
             if code == self._category:
                 return name
         return "All"
+
+    def nav_state(self) -> dict:
+        state = {'category': self._category}
+        if self._details_view.isVisible() and self._details_entry_id:
+            for entry in self._all_entries:
+                if entry.id == self._details_entry_id:
+                    try:
+                        from dataclasses import asdict
+                        state['entry'] = asdict(entry)
+                    except Exception:
+                        logger.debug('Could not capture TBHB details', exc_info=True)
+                    break
+        return state
+
+    def restore_nav_state(self, state: dict) -> None:
+        if not isinstance(state, dict):
+            return
+        data = state.get('entry')
+        if not isinstance(data, dict):
+            return
+        try:
+            from src.core.tbhb.models import TBHBEntry
+            self._open_details(TBHBEntry(**data))
+        except Exception:
+            logger.debug('Could not restore TBHB details', exc_info=True)
 
     def _open_details(self, entry: TBHBEntry) -> None:
         if self._details_task is not None:

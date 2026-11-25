@@ -170,5 +170,15 @@ if IS_MAC:
             'NSHighResolutionCapable': True,
             'LSMinimumSystemVersion': min_macos,
             'NSRequiresAquaSystemAppearance': False,
+            'CFBundleDocumentTypes': [{
+                'CFBundleTypeName': 'BitTorrent File',
+                'CFBundleTypeExtensions': ['torrent'],
+                'CFBundleTypeRole': 'Viewer',
+                'LSHandlerRank': 'Owner',
+            }],
+            'CFBundleURLTypes': [{
+                'CFBundleURLName': 'Magnet Link',
+                'CFBundleURLSchemes': ['magnet'],
+            }],
         },
     )
