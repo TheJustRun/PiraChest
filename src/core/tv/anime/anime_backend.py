@@ -31,12 +31,19 @@ async def _get_shared_client() -> httpx.AsyncClient:
     with _loop_clients_lock:
         client = _loop_clients.get(loop)
         if client is None or client.is_closed:
-            client = httpx.AsyncClient(
+            from src.core.net import async_httpx_transport
+
+            transport = async_httpx_transport()
+            options = dict(
                 headers={"User-Agent": UA},
                 timeout=httpx.Timeout(15, connect=6),
                 follow_redirects=True,
                 limits=httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=20),
+                trust_env=False,
             )
+            if transport is not None:
+                options["transport"] = transport
+            client = httpx.AsyncClient(**options)
             _loop_clients[loop] = client
     return client
 

@@ -4588,6 +4588,7 @@ class SettingsPage(QWidget):
                     widget.setChecked(bool(value))
         finally:
             self._net_loading = False
+        self._refresh_net_banner()
 
     def bind_network(self, source, apply) -> None:
         self._pending_bind = (source, apply)
@@ -5088,6 +5089,7 @@ class SettingsPage(QWidget):
     def _build_privacy(self):
         vpn = self._privacy_group = self._group('settings.group_vpn', 'VPN & kill switch')
         self._add_group(vpn)
+        self._build_net_banner(vpn)
         yield
         icons = self._NET_ICONS
 
@@ -5191,6 +5193,50 @@ class SettingsPage(QWidget):
         for key in ('anonymous', 'require_encryption', 'dht', 'lsd', 'upnp', 'private_history'):
             add_switch(privacy, key)
             yield
+
+    def _build_net_banner(self, group) -> None:
+        banner = QFrame(group)
+        banner.setObjectName('netBanner')
+        lay = QVBoxLayout(banner)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(2)
+        self._net_banner_title = StrongBodyLabel('')
+        self._net_banner_body = BodyLabel('')
+        self._net_banner_body.setWordWrap(True)
+        lay.addWidget(self._net_banner_title)
+        lay.addWidget(self._net_banner_body)
+        box = getattr(group, 'vBoxLayout', None)
+        if box is not None:
+            index = box.indexOf(group.cardLayout)
+            box.insertWidget(index if index >= 0 else box.count(), banner)
+            box.insertSpacing(index + 1 if index >= 0 else box.count(), 8)
+        self._net_banner = banner
+        register_locale_refresh(banner, self._refresh_net_banner)
+        self._refresh_net_banner()
+
+    def _refresh_net_banner(self) -> None:
+        banner = getattr(self, '_net_banner', None)
+        if banner is None or not shiboken6.isValid(banner):
+            return
+        from src.core.downloader import NET
+
+        if NET.bind.strip() and not NET.bind_alive():
+            color = '#d9534f'
+            title_key, body_key = 'settings.privacy_warn_dead_title', 'settings.privacy_warn_dead_body'
+        elif not NET.has_proxy and not NET.bind_ip():
+            color = '#e0a030'
+            title_key, body_key = 'settings.privacy_warn_exposed_title', 'settings.privacy_warn_exposed_body'
+        else:
+            banner.hide()
+            return
+        banner.setStyleSheet(
+            'QFrame#netBanner { background: %s; border: 1px solid %s; border-radius: 8px; }'
+            'QFrame#netBanner QLabel { background: transparent; border: none; }'
+            % (_rgba(color, 0.12), _rgba(color, 0.45)))
+        self._net_banner_title.setStyleSheet(f'color: {color};')
+        self._net_banner_title.setText(self._t(title_key))
+        self._net_banner_body.setText(self._t(body_key))
+        banner.show()
 
     def _fill_bind_combo(self, combo: ComboBox, current: str) -> None:
         combo.blockSignals(True)
@@ -6782,6 +6828,7 @@ class SettingsPage(QWidget):
         if self._net_loading or self._net_apply is None:
             return
         self._net_apply(**values)
+        self._refresh_net_banner()
         if 'anonymous' in values:
             self._offer_restart()
 

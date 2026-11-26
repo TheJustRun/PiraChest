@@ -6349,8 +6349,8 @@ def create_application(argv: list | None=None):
     except Exception:
         logger.exception('Failed to initialize sound manager')
     try:
-        from src.core.net import install_urllib_guard
-        install_urllib_guard()
+        from src.core.net import apply_network_policy
+        apply_network_policy()
     except Exception:
         logger.exception('Failed to install the network guard')
     return app

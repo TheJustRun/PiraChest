@@ -40,37 +40,64 @@ def _loopback_proxy() -> bool:
     return _prefs().proxy_host.strip().lower() in ('127.0.0.1', 'localhost', '::1')
 
 
-def _primary_ipv4() -> str:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(('192.0.2.1', 9))
-            return sock.getsockname()[0]
-    except OSError:
-        return ''
-
-
 def source_ip() -> str:
     net = _prefs()
     if net.has_proxy and _loopback_proxy():
         return ''
-    if ip := net.bind_ip():
-        return ip
-    return _primary_ipv4() if net.block_ipv6 else ''
+    return net.bind_ip()
 
 
-def httpx_transport(verify=None):
-    import httpx
+_block_ipv6 = True
+_getaddrinfo = socket.getaddrinfo
 
+
+def _ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+    results = _getaddrinfo(host, port, family, type, proto, flags)
+    if not _block_ipv6:
+        return results
+    if family in (0, socket.AF_UNSPEC, socket.AF_INET6):
+        ipv4 = [entry for entry in results if entry[0] == socket.AF_INET]
+        if ipv4:
+            return ipv4
+    return results
+
+
+def apply_network_policy() -> None:
+    global _block_ipv6
+    _block_ipv6 = bool(_prefs().block_ipv6)
+    if socket.getaddrinfo is not _ipv4_only:
+        socket.getaddrinfo = _ipv4_only
+    _install_requests_guard()
+    install_urllib_guard()
+    reset_clients()
+
+
+def _transport_options(verify, extra):
     proxy = proxy_url()
     if proxy and not proxy.startswith(('http://', 'https://')) and importlib.util.find_spec('socksio') is None:
         proxy = ''
     source = source_ip()
-    if not proxy and not source:
+    if not proxy and not source and not extra:
         return None
     options = {'proxy': proxy or None, 'local_address': source or None}
     if verify is not None:
         options['verify'] = verify
-    return httpx.HTTPTransport(**options)
+    options.update(extra)
+    return options
+
+
+def httpx_transport(verify=None, **extra):
+    import httpx
+
+    options = _transport_options(verify, extra)
+    return None if options is None else httpx.HTTPTransport(**options)
+
+
+def async_httpx_transport(verify=None, **extra):
+    import httpx
+
+    options = _transport_options(verify, extra)
+    return None if options is None else httpx.AsyncHTTPTransport(**options)
 
 
 def reset_clients() -> None:
@@ -79,6 +106,57 @@ def reset_clients() -> None:
             client.close()
         except Exception:
             pass
+
+
+def _requests_adapter(connections: int = 4):
+    import requests.adapters
+
+    class _BoundAdapter(requests.adapters.HTTPAdapter):
+        def init_poolmanager(self, *args, **kwargs):
+            source = source_ip()
+            if source:
+                kwargs['source_address'] = (source, 0)
+            super().init_poolmanager(*args, **kwargs)
+
+        def proxy_manager_for(self, proxy, **kwargs):
+            source = source_ip()
+            if source:
+                kwargs['source_address'] = (source, 0)
+            return super().proxy_manager_for(proxy, **kwargs)
+
+    return _BoundAdapter(pool_connections=1, pool_maxsize=max(1, connections))
+
+
+def guarded_requests(connections: int = 4):
+    import requests
+
+    guard()
+    session = requests.Session()
+    adapter = _requests_adapter(connections)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    session.trust_env = False
+    if url := proxy_url():
+        session.proxies = {'http': url, 'https': url}
+    return session
+
+
+def _install_requests_guard() -> None:
+    import requests
+
+    original = requests.Session.request
+    if getattr(original, '_pira_guard', False):
+        return
+
+    def request(self, method, url, **kwargs):
+        guard()
+        url_proxy = proxy_url()
+        if url_proxy and not self.proxies and 'proxies' not in kwargs:
+            kwargs['proxies'] = {'http': url_proxy, 'https': url_proxy}
+        return original(self, method, url, **kwargs)
+
+    request._pira_guard = True
+    requests.Session.request = request
 
 
 def shared_ssl_context() -> ssl.SSLContext:

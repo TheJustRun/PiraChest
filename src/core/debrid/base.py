@@ -89,11 +89,15 @@ def wanted_indices(file_ids: Optional[Iterable[int]]) -> list[int]:
 def fetch_torrent_bytes(source: str, timeout: float = _DEFAULT_TIMEOUT) -> tuple[bytes, str]:
     source = (source or "").strip()
     if source.startswith(("http://", "https://")):
-        import requests
+        from src.core.net import guarded_requests
 
-        response = requests.get(source, timeout=timeout, headers={"User-Agent": _USER_AGENT})
-        response.raise_for_status()
-        data = response.content
+        session = guarded_requests(2)
+        try:
+            response = session.get(source, timeout=timeout, headers={"User-Agent": _USER_AGENT})
+            response.raise_for_status()
+            data = response.content
+        finally:
+            session.close()
         name = os.path.basename(source.split("?", 1)[0]) or "torrent"
     else:
         with open(source, "rb") as handle:
@@ -120,8 +124,10 @@ class DebridProvider:
         self._timeout = max(5.0, float(timeout))
         import requests
 
+        from src.core.net import guarded_requests
+
         self._requests = requests
-        self._session = requests.Session()
+        self._session = guarded_requests(4)
         self._session.headers.update({"User-Agent": _USER_AGENT, "Accept": "application/json"})
         self._apply_proxy()
 

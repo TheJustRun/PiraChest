@@ -584,10 +584,12 @@ def new_session(connections: int, headers: Optional[dict] = None) -> Any:
 
     if msg := NET.leak_guard():
         raise HttpError(msg)
+    from src.core.net import source_ip
+
     session = requests.Session()
     session.max_redirects = 10
     session.hooks["response"].append(_redirect_guard)
-    adapter = _Adapter(connections, NET.bind_ip())
+    adapter = _Adapter(connections, source_ip())
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.headers.update({"Accept-Encoding": "identity", "User-Agent": "Mozilla/5.0" if NET.anonymous else _UA, **(headers or {})})
@@ -1400,8 +1402,7 @@ class DownloadManager(QObject):
             self.pause_all()
         with suppress(Exception):
             from src.core import net as _net
-            _net.install_urllib_guard()
-            _net.reset_clients()
+            _net.apply_network_policy()
 
     def _drain(self) -> None:
         if self._closed or self._ses is None:

@@ -12,6 +12,7 @@ winrt-Windows.Storage.Streams==4!10.0.28000.2705; sys_platform == "win32"
 httpx==0.28.1
 requests==2.34.2
 PySocks==1.7.1
+socksio==1.0.0
 beautifulsoup4==4.15.0
 
 libtorrent==2.1.1

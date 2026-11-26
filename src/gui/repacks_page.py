@@ -12,7 +12,7 @@ from PySide6.QtGui import QBrush, QColor, QIcon, QImage, QFontMetrics, QMovie, Q
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLayout, QLayoutItem, QScrollArea, QDialog, QTreeWidgetItem, QHeaderView, QGridLayout, QLabel, QSizePolicy, QFileDialog, QGraphicsOpacityEffect, QGraphicsDropShadowEffect, QTextBrowser, QListWidget, QListWidgetItem
 from qfluentwidgets import ToolTip, ToolTipFilter, ToolTipPosition, CardWidget, FluentIcon, Pivot, TitleLabel, SubtitleLabel, BodyLabel, StrongBodyLabel, CaptionLabel, TransparentToolButton, PushButton, PrimaryPushButton, ImageLabel, PillPushButton, FlowLayout as QFlowLayout, themeColor, SearchLineEdit, LineEdit, CheckBox, ComboBox, TreeWidget, MessageBoxBase, IndeterminateProgressRing, SmoothScrollArea, HyperlinkButton, qconfig, isDarkTheme
 from .home_page import AccentColorMixin, DetailsViewMixin, MediaPageBase
-from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut, QPainter, QPainterPath, QPen, QPixmap, QRegion
+from PySide6.QtGui import QCursor, QAction, QDesktopServices, QKeySequence, QShortcut, QPainter, QPainterPath, QPen, QPixmap, QRegion
 from PySide6.QtWidgets import QApplication, QGraphicsScene, QGraphicsView, QMenu, QPushButton as _QPB, QStackedWidget, QStyle, QSystemTrayIcon, QWidgetItem, QToolButton
 from PySide6.QtCore import QCoreApplication, QRectF, QUrl, QPoint
 from qfluentwidgets import InfoBar, InfoBarPosition, RoundMenu
@@ -850,6 +850,9 @@ class _AnimatedPosterMixin:
 
     def hideEvent(self, event) -> None:
         self._stop_poster_animation()
+        poster_lbl = getattr(self, '_poster_lbl', None)
+        if poster_lbl is not None and _qt_is_valid(poster_lbl):
+            poster_lbl.move(self._anim_base_pos)
         super().hideEvent(event)
 
 class PosterCard(_AnimatedPosterMixin, QWidget):
@@ -1276,7 +1279,6 @@ class BookmarkPosterCard(PosterCard):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.installEventFilter(ToolTipFilter(self, 400, ToolTipPosition.TOP))
         self._remove_x = _QPB('✕', self._poster_lbl)
         self._remove_x.setFixedSize(20, 20)
         self._remove_x.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1300,7 +1302,6 @@ class BookmarkPosterCard(PosterCard):
 
     def bind(self, entry) -> None:
         super().bind(entry)
-        self.setToolTip(_entry_title(entry))
         self.set_source_badge(getattr(entry, 'source', ''))
         self._remove_x.raise_()
 
@@ -1379,14 +1380,79 @@ class BookmarksPage(QWidget):
         self._wrap_lay.addStretch(1)
         self._scroll.setWidget(self._wrap)
         outer.addWidget(self._scroll, 1)
-        self._empty_lbl = BodyLabel(tr('repacks.bookmarks_empty'))
-        self._empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty_lbl.setStyleSheet(f'color: {_muted_text_color()};')
-        outer.addWidget(self._empty_lbl)
-        self._empty_lbl.hide()
+        self._empty = QWidget(self)
+        self._empty.setStyleSheet('background: transparent;')
+        empty_lay = QVBoxLayout(self._empty)
+        empty_lay.setContentsMargins(0, 0, 0, 0)
+        empty_lay.setSpacing(8)
+        empty_lay.addStretch(2)
+        self._empty_icon = QLabel(self._empty)
+        self._empty_icon.setFixedSize(96, 96)
+        self._empty_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_lay.addWidget(self._empty_icon, 0, Qt.AlignmentFlag.AlignHCenter)
+        empty_lay.addSpacing(10)
+        self._empty_title = SubtitleLabel(self._empty)
+        self._empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_lay.addWidget(self._empty_title)
+        self._empty_hint = BodyLabel(self._empty)
+        self._empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_hint.setWordWrap(True)
+        self._empty_hint.setMaximumWidth(360)
+        empty_lay.addWidget(self._empty_hint, 0, Qt.AlignmentFlag.AlignHCenter)
+        empty_lay.addStretch(3)
+        outer.addWidget(self._empty, 1)
+        self._empty.hide()
+        self._style_empty()
+        register_theme_refresh(self, self._style_empty)
+        register_locale_refresh(self, self._apply_empty_locale)
         self._cards = []
         self._dirty = True
+        self._tip = None
+        self._tip_entry = None
+        self._tip_dwell = QTimer(self)
+        self._tip_dwell.setSingleShot(True)
+        self._tip_dwell.setInterval(400)
+        self._tip_dwell.timeout.connect(self._show_tip)
         bookmark_store().changed.connect(lambda: setattr(self, '_dirty', True))
+
+    def _apply_empty_locale(self, *_args) -> None:
+        self._empty_title.setText(tr('repacks.bookmarks_empty_title'))
+        self._empty_hint.setText(tr('repacks.bookmarks_empty_hint'))
+
+    def _style_empty(self) -> None:
+        with suppress(RuntimeError):
+            self._empty_icon.setStyleSheet(f'background-color: {_surface_tint_color(14)}; border-radius: 48px;')
+            self._empty_icon.setPixmap(_bookmark_icon(True).pixmap(40, 40))
+            self._empty_title.setStyleSheet(f'color: {palette()["primary_text"]}; background: transparent;')
+            self._empty_hint.setStyleSheet(f'color: {_muted_text_color()}; background: transparent;')
+            self._apply_empty_locale()
+
+    def _hide_tip(self) -> None:
+        self._tip_entry = None
+        self._tip_dwell.stop()
+        if self._tip is not None:
+            self._tip.hide()
+
+    def _on_card_hover(self, entry) -> None:
+        self._hide_tip()
+        if entry is not None:
+            self._tip_entry = entry
+            self._tip_dwell.start()
+
+    def _show_tip(self) -> None:
+        if self._tip_entry is None or not any(c.underMouse() for c in self._cards):
+            return
+        if self._tip is None:
+            self._tip = ToolTip('', self.window())
+            self._tip.setDuration(-1)
+        self._tip.setText(_entry_title(self._tip_entry))
+        self._tip.adjustSize()
+        self._tip.move(QCursor.pos() + QPoint(10, 14))
+        self._tip.show()
+
+    def hideEvent(self, event) -> None:
+        self._hide_tip()
+        super().hideEvent(event)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -1396,6 +1462,7 @@ class BookmarksPage(QWidget):
 
     def rebuild(self) -> None:
         self._dirty = False
+        self._hide_tip()
         entries = [bookmark_store().to_entry(d) for d in bookmark_store().all()]
         for card in self._cards:
             self._flow.removeWidget(card)
@@ -1406,7 +1473,8 @@ class BookmarksPage(QWidget):
         for entry in entries:
             card = BookmarkPosterCard(self._flow_container)
             card.bind(entry)
-            card.clicked_poster.connect(self.open_requested.emit)
+            card.hovered.connect(self._on_card_hover)
+            card.clicked_poster.connect(lambda e: (self._hide_tip(), self.open_requested.emit(e)))
             card.open_requested.connect(self.open_requested.emit)
             card.download_requested.connect(self.download_requested.emit)
             card.website_requested.connect(self._open_website)
@@ -1421,7 +1489,8 @@ class BookmarksPage(QWidget):
             else:
                 card.show_fallback_icon()
         self._count_lbl.setText(f'{len(entries)}')
-        self._empty_lbl.setVisible(not entries)
+        self._empty.setVisible(not entries)
+        self._scroll.setVisible(bool(entries))
         self._flow.invalidate()
         self._flow.update()
         self._flow.activate()

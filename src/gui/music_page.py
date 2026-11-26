@@ -2844,6 +2844,40 @@ class SlideStack(QWidget):
         self._set(self._p)
 
 
+class _EmptyState(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        lay.addStretch(2)
+        self._badge = QLabel(self)
+        self._badge.setFixedSize(96, 96)
+        self._badge.setAlignment(Qt.AlignCenter)
+        self._badge.setStyleSheet('background:rgba(255,255,255,18);border-radius:48px;')
+        lay.addWidget(self._badge, 0, Qt.AlignHCenter)
+        lay.addSpacing(10)
+        self._title = SubtitleLabel(self)
+        self._title.setAlignment(Qt.AlignCenter)
+        self._title.setStyleSheet('color:rgba(255,255,255,240);background:transparent;')
+        lay.addWidget(self._title)
+        self._hint = CaptionLabel(self)
+        self._hint.setAlignment(Qt.AlignCenter)
+        self._hint.setWordWrap(True)
+        self._hint.setFixedWidth(360)
+        self._hint.setStyleSheet('color:rgba(255,255,255,150);background:transparent;font-size:13px;')
+        lay.addWidget(self._hint, 0, Qt.AlignHCenter)
+        lay.addStretch(3)
+
+    def set_state(self, icon, title: str, hint: str) -> None:
+        self._badge.setPixmap(icon.icon(Theme.DARK).pixmap(40, 40))
+        self._title.setText(title)
+        self._hint.setText(hint)
+        rect = self._hint.fontMetrics().boundingRect(0, 0, self._hint.width(), 10000,
+                                                     int(Qt.TextWordWrap | Qt.AlignCenter), hint)
+        self._hint.setFixedHeight(rect.height() + 8)
+
+
 class MusicPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2935,26 +2969,32 @@ class MusicPage(QWidget):
         self._res_stack.addWidget(self.grid_songs)
         self._grid_mode = False
         sl.addWidget(self._res_stack, 1)
-        self._empty = CaptionLabel(tr('music.search_hint'), st)
-        self._empty.setAlignment(Qt.AlignCenter)
-        sl.addWidget(self._empty)
+        self._empty = _EmptyState(st)
+        sl.addWidget(self._empty, 1)
+        self._show_empty('start')
         self._tabs.addWidget(st)
 
         recent = QWidget()
         rl = QVBoxLayout(recent)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(8)
+        self._recent_content = QWidget(recent)
+        rc = QVBoxLayout(self._recent_content)
+        rc.setContentsMargins(0, 0, 0, 0)
+        rc.setSpacing(8)
         rrow = QHBoxLayout()
-        self._recent_empty = CaptionLabel(_t('music.no_recent', 'No recently played songs yet.'), recent)
-        b_clear_recent = PushButton(FluentIcon.DELETE, _t('music.clear_recent', 'Clear recent'), recent)
-        b_clear_recent.clicked.connect(self._clear_recent)
-        rrow.addWidget(self._recent_empty)
+        self._b_clear_recent = PushButton(FluentIcon.DELETE, _t('music.clear_recent', 'Clear recent'), self._recent_content)
+        self._b_clear_recent.clicked.connect(self._clear_recent)
         rrow.addStretch(1)
-        rrow.addWidget(b_clear_recent)
-        rl.addLayout(rrow)
-        rl.addWidget(ListHeader(recent))
-        self.recent = SongList(parent=recent)
-        rl.addWidget(self.recent, 1)
+        rrow.addWidget(self._b_clear_recent)
+        rc.addLayout(rrow)
+        rc.addWidget(ListHeader(self._recent_content))
+        self.recent = SongList(parent=self._recent_content)
+        rc.addWidget(self.recent, 1)
+        rl.addWidget(self._recent_content, 1)
+        self._recent_empty = _EmptyState(recent)
+        rl.addWidget(self._recent_empty, 1)
+        self._update_recent_empty()
         self._tabs.addWidget(recent)
 
         pt = QStackedWidget()
@@ -2964,14 +3004,14 @@ class MusicPage(QWidget):
         hl.setContentsMargins(0, 0, 0, 0)
         hl.setSpacing(8)
         hrow = QHBoxLayout()
-        self._pl_empty = CaptionLabel(_t('music.no_playlists', 'No playlists yet. Create one to get started.'), home)
         self._b_new = PrimaryPushButton(FluentIcon.ADD, tr('music.new_playlist'), home)
         self._b_new.clicked.connect(self._new_playlist)
-        hrow.addWidget(self._pl_empty)
         hrow.addStretch(1)
         hrow.addWidget(self._b_new)
         hl.addLayout(hrow)
         hl.addWidget(self.grid, 1)
+        self._pl_empty = _EmptyState(home)
+        hl.addWidget(self._pl_empty, 1)
         pt.addWidget(home)
         detail = QWidget()
         dl = QVBoxLayout(detail)
@@ -3046,7 +3086,7 @@ class MusicPage(QWidget):
         register_locale_refresh(self, self._apply_locale)
         self._refresh_playlists()
         self.recent.set_songs(self._recent_songs)
-        self._recent_empty.setVisible(not self._recent_songs)
+        self._update_recent_empty()
 
     def _remember(self, song) -> None:
         key = song.key
@@ -3055,13 +3095,20 @@ class MusicPage(QWidget):
         del self._recent_songs[_RECENT_LIMIT:]
         self.recent.set_songs(self._recent_songs)
         self.recent.set_playing(self._cur_key)
-        self._recent_empty.setVisible(not self._recent_songs)
+        self._update_recent_empty()
         _save_recent(self._recent_songs)
+
+    def _update_recent_empty(self) -> None:
+        empty = not self._recent_songs
+        self._recent_empty.set_state(FluentIcon.HISTORY, _t('music.no_recent_title', 'Nothing played yet'),
+                                     _t('music.no_recent_hint', 'Songs you play will show up here.'))
+        self._recent_empty.setVisible(empty)
+        self._recent_content.setVisible(not empty)
 
     def _clear_recent(self) -> None:
         self._recent_songs = []
         self.recent.set_songs([])
-        self._recent_empty.setVisible(True)
+        self._update_recent_empty()
         _save_recent(self._recent_songs)
 
     def _add_current(self) -> None:
@@ -3094,14 +3141,30 @@ class MusicPage(QWidget):
                 return
         super().keyPressEvent(e)
 
+    def _render_empty(self) -> None:
+        if self._empty_kind == 'none':
+            self._empty.set_state(FluentIcon.SEARCH, tr('music.no_results_title'), tr('music.no_results_hint'))
+        else:
+            self._empty.set_state(FluentIcon.MUSIC, tr('music.search_empty_title'), tr('music.search_hint'))
+
+    def _show_empty(self, kind: str) -> None:
+        self._empty_kind = kind
+        self._render_empty()
+        self._empty.show()
+        self._res_stack.hide()
+
+    def _hide_empty(self) -> None:
+        self._empty.hide()
+        self._res_stack.show()
+
     def _apply_locale(self, *_):
         self._b_new.setText(tr('music.new_playlist'))
-        self._pl_empty.setText(_t('music.no_playlists', 'No playlists yet. Create one to get started.'))
+        self._update_playlists_empty()
+        self._update_recent_empty()
         self._search.setPlaceholderText(tr('music.search_placeholder'))
         self._pivot.setItemText('playlists', tr('music.playlists'))
         self._pivot.setItemText('recent', _t('music.recent', 'Recent'))
-        if not self._songs:
-            self._empty.setText(tr('music.search_hint'))
+        self._render_empty()
 
     def _toast(self, kind: str, title: str, content: str = '', ms: int = 3000) -> None:
         getattr(InfoBar, kind)(title=title, content=content, orient=Qt.Horizontal, isClosable=True,
@@ -3139,7 +3202,7 @@ class MusicPage(QWidget):
         self._tabs.setCurrentIndex(0)
         self._loading.start()
         self._b_cancel.show()
-        self._empty.hide()
+        self._hide_empty()
         self._token = submit(music_service.search_streaming, args=(q,),
                              kwargs={'on_source_done': wrap_callback(partial(self._on_batch, sid)),
                                      'sources': music_settings.preferred_sources, 'use_cache': True,
@@ -3180,8 +3243,7 @@ class MusicPage(QWidget):
             return
         self._end_search()
         if not self._songs:
-            self._empty.setText(tr('music.no_results_try_different'))
-            self._empty.show()
+            self._show_empty('none')
 
     def _on_error(self, sid: int, error: str) -> None:
         if sid != self._sid:
@@ -3315,13 +3377,20 @@ class MusicPage(QWidget):
     def _refresh_playlists(self) -> None:
         pls = self._store.all_playlists()
         self.grid.set_playlists(pls)
-        self._pl_empty.setVisible(not pls)
+        self._update_playlists_empty()
         if self._cur_pl:
             pl = self._store.get(self._cur_pl)
             if pl is None:
                 self._close_playlist()
             else:
                 self._fill_detail(pl)
+
+    def _update_playlists_empty(self) -> None:
+        empty = not self._store.all_playlists()
+        self._pl_empty.set_state(FluentIcon.ALBUM, _t('music.no_playlists_title', 'No playlists yet'),
+                                 _t('music.no_playlists', 'No playlists yet. Create one to get started.'))
+        self._pl_empty.setVisible(empty)
+        self.grid.setVisible(not empty)
 
     def _fill_detail(self, pl) -> None:
         self._pl_name.setText(pl.name)

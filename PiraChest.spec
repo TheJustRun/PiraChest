@@ -43,6 +43,7 @@ hiddenimports = [
     'qframelesswindow',
     'socks',
     'sockshandler',
+    'socksio',
     'src.core.tv.external',
 ]
 

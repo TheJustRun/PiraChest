@@ -53,6 +53,8 @@ FEATURES = (
     ('sailseek_enabled', 'nav.sailseek', 'onboarding.feature_sailseek_desc'),
 )
 
+_UI_FAMILIES = ('Segoe UI Variable Text', 'Segoe UI', 'Inter', 'SF Pro Text', 'Noto Sans',
+                'Helvetica Neue', 'Arial')
 _PLAIN_THEMES = ('dark', 'light')
 _SWATCH_KEYS = ('page_bg', 'primary_text', 'accent')
 _VIDEO_EXT = frozenset(('.mp4', '.webm', '.mkv', '.mov', '.avi', '.m4v'))
@@ -84,6 +86,17 @@ def _font_px(base: QFont, px: int, weight: QFont.Weight | None = None) -> QFont:
     if weight is not None:
         font.setWeight(weight)
     return font
+
+
+def _paint_icon_tile(p: QPainter, icon: QIcon, rect: QRectF, accent: QColor, strength: float) -> None:
+    tile = QColor(accent)
+    tile.setAlphaF(max(0.0, min(1.0, strength)))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(tile)
+    p.drawRoundedRect(rect, rect.width() * 0.28, rect.width() * 0.28)
+    if not icon.isNull():
+        inset = rect.width() * 0.2
+        icon.paint(p, rect.adjusted(inset, inset, -inset, -inset).toRect(), Qt.AlignmentFlag.AlignCenter)
 
 
 def _height_for_width(widget: QWidget, width: int) -> int:
@@ -225,13 +238,13 @@ class _Metrics:
 
 def _make_metrics(font: QFont, compact: bool) -> _Metrics:
     fm = QFontMetrics(font)
-    base = max(12, round(fm.height() * 0.82))
+    base = max(14, round(fm.height() * 0.78))
     return _Metrics(
         compact=compact,
         base_px=base,
         title_px=round(base * (1.5 if compact else 1.82)),
         subtitle_px=base + 1,
-        caption_px=max(10, base - 2),
+        caption_px=max(12, base - 1),
         button_px=base + 1,
         side=20 if compact else 28,
         top=16 if compact else 22,
@@ -450,7 +463,7 @@ class _ToggleCard(_Tweens, QAbstractButton):
         return _font_px(self.font(), self._metrics.base_px + 1, QFont.Weight.DemiBold)
 
     def _description_font(self) -> QFont:
-        return _font_px(self.font(), max(10, self._metrics.base_px - 1))
+        return _font_px(self.font(), max(12, self._metrics.base_px - 1))
 
     def heightForWidth(self, width: int) -> int:
         m = self._metrics
@@ -498,8 +511,7 @@ class _ToggleCard(_Tweens, QAbstractButton):
 
         pad = m.card_pad
         icon_rect = QRectF(pad, (self.height() - m.icon_px) / 2, m.icon_px, m.icon_px)
-        if not self._icon.isNull():
-            self._icon.paint(p, icon_rect.toRect(), Qt.AlignmentFlag.AlignCenter)
+        _paint_icon_tile(p, self._icon, icon_rect, accent, 0.09 + 0.09 * position)
 
         text_x = pad + m.icon_px + m.gap
         text_w = self._text_width(self.width())
@@ -548,6 +560,8 @@ class _VolumeCard(_Tweens, QWidget):
 
     changed = Signal(int)
 
+    _SLIDER_H = 22
+
     def __init__(self, icon: QIcon, title: str, description: str, value: int,
                  metrics: _Metrics, off_text: str, parent=None):
         super().__init__(parent)
@@ -584,18 +598,32 @@ class _VolumeCard(_Tweens, QWidget):
         return _font_px(self.font(), self._metrics.base_px + 1, QFont.Weight.DemiBold)
 
     def _description_font(self) -> QFont:
-        return _font_px(self.font(), max(10, self._metrics.base_px - 1))
+        return _font_px(self.font(), max(12, self._metrics.base_px - 1))
+
+    def _value_font(self) -> QFont:
+        return _font_px(self.font(), self._metrics.caption_px, QFont.Weight.DemiBold)
+
+    def _pill_width(self) -> int:
+        fm = QFontMetrics(self._value_font())
+        return max(44, max(fm.horizontalAdvance('100%'), fm.horizontalAdvance(self._off_text)) + 18)
 
     def _text_width(self, width: int) -> int:
         m = self._metrics
-        return max(40, int(width) - m.card_pad * 2 - m.icon_px - m.gap - 54)
+        return max(40, int(width) - m.card_pad * 2 - m.icon_px - m.gap - self._pill_width() - m.gap)
 
-    def heightForWidth(self, width: int) -> int:
-        m = self._metrics
+    def _text_heights(self, width: int) -> tuple[int, int]:
         text_w = self._text_width(width)
         title_h = _text_height(QFontMetrics(self._title_font()), self._title, text_w)
         desc_h = _text_height(QFontMetrics(self._description_font()), self._description, text_w)
-        return m.card_pad * 2 + max(m.icon_px, title_h) + 4 + desc_h + 6 + 22
+        return title_h, desc_h
+
+    def _top_height(self, width: int) -> int:
+        title_h, desc_h = self._text_heights(width)
+        return max(self._metrics.icon_px, title_h + (4 + desc_h if desc_h else 0))
+
+    def heightForWidth(self, width: int) -> int:
+        m = self._metrics
+        return m.card_pad * 2 + self._top_height(width) + 12 + self._SLIDER_H
 
     def sizeHint(self) -> QSize:
         return QSize(self._metrics.feature_min_col, self.heightForWidth(self._metrics.feature_min_col))
@@ -606,9 +634,8 @@ class _VolumeCard(_Tweens, QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         m = self._metrics
-        self._slider.setFixedHeight(22)
-        self._slider.setGeometry(m.card_pad, self.height() - m.card_pad - 22,
-                                 max(1, self.width() - m.card_pad * 2), 22)
+        self._slider.setGeometry(m.card_pad, self.height() - m.card_pad - self._SLIDER_H,
+                                 max(1, self.width() - m.card_pad * 2), self._SLIDER_H)
 
     def _on_value(self, value: int) -> None:
         self.changed.emit(int(value))
@@ -616,7 +643,7 @@ class _VolumeCard(_Tweens, QWidget):
 
     def _value_text(self) -> str:
         value = self.value()
-        return str(value) if value > 0 else self._off_text
+        return f'{value}%' if value > 0 else self._off_text
 
     def paintEvent(self, _event) -> None:
         m = self._metrics
@@ -624,6 +651,8 @@ class _VolumeCard(_Tweens, QWidget):
         accent = to_color(pal.get('accent', '#0078d4'))
         bg = to_color(pal.get('card_bg', '#1b1b1b'))
         border = to_color(pal.get('card_border', '#444444'))
+        muted = to_color(pal.get('muted', '#9a9a9a'))
+        active = self.value() > 0
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         radius = 11.0
         p = QPainter(self)
@@ -637,36 +666,37 @@ class _VolumeCard(_Tweens, QWidget):
         p.drawRoundedRect(rect, radius, radius)
 
         pad = m.card_pad
-        icon_rect = QRectF(pad, pad, m.icon_px, m.icon_px)
-        tile = QColor(accent)
-        tile.setAlphaF(0.08)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(tile)
-        p.drawRoundedRect(icon_rect, 8, 8)
-        if not self._icon.isNull():
-            self._icon.paint(p, icon_rect.toRect(), Qt.AlignmentFlag.AlignCenter)
+        top_h = self._top_height(self.width())
+        title_h, desc_h = self._text_heights(self.width())
+        text_h = title_h + (4 + desc_h if desc_h else 0)
+        icon_rect = QRectF(pad, pad + (top_h - m.icon_px) / 2, m.icon_px, m.icon_px)
+        _paint_icon_tile(p, self._icon, icon_rect, accent, 0.09 + (0.09 if active else 0.0))
 
         text_x = pad + m.icon_px + m.gap
         text_w = self._text_width(self.width())
+        text_y = pad + (top_h - text_h) / 2
+        flags = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap)
         title_font = self._title_font()
-        desc_font = self._description_font()
-        title_h = _text_height(QFontMetrics(title_font), self._title, text_w)
         p.setFont(title_font)
         p.setPen(to_color(pal.get('primary_text', '#eaeaea')))
-        flags = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap)
-        p.drawText(QRectF(text_x, pad, text_w, title_h), flags, self._title)
-        p.setFont(desc_font)
-        p.setPen(to_color(pal.get('muted', '#9a9a9a')))
-        desc_y = pad + max(m.icon_px, title_h) + 4
-        p.drawText(QRectF(text_x, desc_y, text_w, max(1, self.height() - pad - 22 - desc_y - 6)),
-                   flags, self._description)
+        p.drawText(QRectF(text_x, text_y, text_w, title_h), flags, self._title)
+        p.setFont(self._description_font())
+        p.setPen(muted)
+        p.drawText(QRectF(text_x, text_y + title_h + 4, text_w, desc_h), flags, self._description)
 
-        value_font = _font_px(self.font(), m.caption_px, QFont.Weight.DemiBold)
+        value_font = self._value_font()
+        pill_w = self._pill_width()
+        pill_h = QFontMetrics(value_font).height() + 6
+        line_h = QFontMetrics(title_font).height()
+        pill = QRectF(self.width() - pad - pill_w, text_y + (line_h - pill_h) / 2, pill_w, pill_h)
+        fill = QColor(accent if active else muted)
+        fill.setAlphaF(0.16 if active else 0.12)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fill)
+        p.drawRoundedRect(pill, pill_h / 2, pill_h / 2)
         p.setFont(value_font)
-        value_color = accent if self.value() > 0 else to_color(pal.get('muted', '#9a9a9a'))
-        p.setPen(value_color)
-        p.drawText(QRectF(self.width() - pad - 50, pad, 50, m.icon_px),
-                   int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), self._value_text())
+        p.setPen(accent if active else muted)
+        p.drawText(pill, int(Qt.AlignmentFlag.AlignCenter), self._value_text())
 
 
 class _ChoiceCard(_Tweens, QAbstractButton):
@@ -790,7 +820,7 @@ class _ThemeCard(_Tweens, QAbstractButton):
         self.update()
 
     def _label_font(self) -> QFont:
-        return _font_px(self.font(), max(10, self._metrics.base_px - 1), QFont.Weight.DemiBold)
+        return _font_px(self.font(), max(12, self._metrics.base_px - 1), QFont.Weight.DemiBold)
 
     def _label_height(self, width: int) -> int:
         pad = self._metrics.theme_pad
@@ -1626,6 +1656,9 @@ class _OverlayDialog(QDialog):
         self._bounds = QRect(0, 0, 900, 600)
         self._inset = 24
         self._font = QFont(self.font())
+        self._font.setFamilies(list(_UI_FAMILIES))
+        self._font.setPointSizeF(10.0)
+        self.setFont(self._font)
         rect = self._owner_rect()
         self._bounds = rect
         self._inset = max(10, min(28, round(min(rect.width(), rect.height()) * 0.045)))
@@ -1656,7 +1689,7 @@ class _OverlayDialog(QDialog):
         self._surface_layout.addWidget(self._footer)
         self._page: QWidget | None = None
         self._refit_scheduled = False
-        self._t = 1.0
+        self._shell_t = 1.0
         self._closing = False
         self._opened = False
         self._close_result = 0
@@ -1708,17 +1741,17 @@ class _OverlayDialog(QDialog):
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(0, 0, 0, round(118 * self._t)))
+        p.fillRect(self.rect(), QColor(0, 0, 0, round(118 * self._shell_t)))
 
     def _place(self) -> None:
         s = self._surface
-        off = round((1.0 - self._t) * 14)
+        off = round((1.0 - self._shell_t) * 14)
         s.move((self.width() - s.width()) // 2, (self.height() - s.height()) // 2 + off)
 
     def _set_t(self, value) -> None:
-        self._t = float(value)
+        self._shell_t = float(value)
         if self._fx is not None:
-            self._fx.setOpacity(self._t)
+            self._fx.setOpacity(self._shell_t)
         self._place()
         self.update()
 
@@ -1727,9 +1760,9 @@ class _OverlayDialog(QDialog):
         anim.stop()
         if self._fx is None:
             self._fx = QGraphicsOpacityEffect(self._surface)
-            self._fx.setOpacity(self._t)
+            self._fx.setOpacity(self._shell_t)
             self._surface.setGraphicsEffect(self._fx)
-        anim.setStartValue(self._t)
+        anim.setStartValue(self._shell_t)
         anim.setEndValue(float(end))
         anim.setDuration(ms)
         anim.setEasingCurve(curve)
@@ -1779,7 +1812,7 @@ class _OverlayDialog(QDialog):
         if not self._opened:
             self._opened = True
             if animations_enabled():
-                self._t = 0.0
+                self._shell_t = 0.0
                 self._run_shell(1.0, 200, QEasingCurve.Type.OutCubic)
 
     def _available(self) -> tuple[int, int]:

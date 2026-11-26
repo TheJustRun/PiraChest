@@ -144,10 +144,16 @@ def stream_score(source: StreamSource) -> float:
 
 
 def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(
+    from src.core.net import async_httpx_transport
+
+    transport = async_httpx_transport()
+    options = dict(
         timeout=_TIMEOUT, follow_redirects=True, trust_env=False,
         headers={"User-Agent": _UA, "Accept": "application/json,text/plain,*/*"},
     )
+    if transport is not None:
+        options["transport"] = transport
+    return httpx.AsyncClient(**options)
 
 
 async def find_streams(imdb_id: str, media_type: str, season: Optional[int] = None,

@@ -15,7 +15,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from src.core.net import shared_ssl_context
+from src.core.net import httpx_transport, shared_ssl_context
 
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
@@ -27,10 +27,12 @@ _HTTP_TIMEOUT = httpx.Timeout(connect=6.0, read=15.0, write=10.0, pool=8.0)
 
 def _new_session(insecure: bool = False) -> httpx.Client:
     verify = False if insecure else shared_ssl_context()
+    transport = (httpx_transport(verify=verify, retries=2)
+                 or httpx.HTTPTransport(retries=2, verify=verify))
     return httpx.Client(
         timeout=_HTTP_TIMEOUT, follow_redirects=True,
         limits=httpx.Limits(max_connections=16, max_keepalive_connections=8, keepalive_expiry=30),
-        transport=httpx.HTTPTransport(retries=2, verify=verify),
+        transport=transport,
     )
 
 
